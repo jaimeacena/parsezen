@@ -1,0 +1,1723 @@
+"""Shared fidelity checks for local Markdown translations."""
+
+from __future__ import annotations
+
+import re
+import unicodedata
+from collections import Counter
+from collections.abc import Callable
+from dataclasses import dataclass
+from difflib import SequenceMatcher
+from enum import StrEnum
+from hashlib import sha256
+
+MAX_DETECTION_CHARACTERS = 20_000
+MIN_LANGUAGE_CONFIDENCE = 0.65
+MIN_LANGUAGE_VALIDATION_LETTERS = 120
+MIN_BLOCK_LANGUAGE_LETTERS = 180
+MIN_SOURCE_TEXT_REPORT_LETTERS = 24
+MIN_CONTENT_RATIO = 0.55
+MAX_CONTENT_RATIO = 1.80
+MAX_REPORT_ISSUES = 20
+MAX_REPORT_EXCERPT_CHARACTERS = 320
+MAX_AUTOMATIC_SOURCE_TEXT_REPAIRS = 5
+
+TARGET_LANGUAGE_CODES = {
+    "Español": "es",
+    "Inglés": "en",
+    "Francés": "fr",
+    "Alemán": "de",
+    "Italiano": "it",
+    "Portugués": "pt",
+}
+
+DETECTED_LANGUAGE_ALIASES = {
+    "zh-cn": "zh",
+    "zh-tw": "zt",
+}
+
+TITLE_LANGUAGE_HINTS = {
+    "en": frozenset(
+        {
+            "the",
+            "and",
+            "of",
+            "to",
+            "day",
+            "chapter",
+            "introduction",
+            "challenge",
+            "first",
+            "second",
+            "third",
+            "fourth",
+            "fifth",
+            "sixth",
+            "seventh",
+            "eighth",
+            "ninth",
+            "tenth",
+            "house",
+            "houses",
+            "face",
+            "faces",
+            "table",
+            "contents",
+            "part",
+            "volume",
+            "book",
+            "section",
+            "preface",
+            "foreword",
+            "appendix",
+            "ancient",
+            "astrology",
+            "aquarius",
+            "appendices",
+            "cancer",
+            "capricorn",
+            "condition",
+            "exercise",
+            "fortune",
+            "gemini",
+            "judgment",
+            "lot",
+            "moon",
+            "nodes",
+            "planet",
+            "planets",
+            "planetary",
+            "pisces",
+            "quadrant",
+            "readings",
+            "releasing",
+            "sagittarius",
+            "scorpio",
+            "scorpion",
+            "source",
+            "taurus",
+        }
+    ),
+    "es": frozenset({"el", "la", "los", "las", "de", "del", "y", "día", "capítulo"}),
+    "fr": frozenset({"le", "la", "les", "de", "du", "et", "jour", "chapitre"}),
+    "de": frozenset({"der", "die", "das", "und", "von", "tag", "kapitel"}),
+    "it": frozenset({"il", "la", "i", "le", "di", "e", "giorno", "capitolo"}),
+    "pt": frozenset({"o", "a", "os", "as", "de", "do", "e", "dia", "capítulo"}),
+}
+
+ORGANIZATION_NAME_SUFFIXES = frozenset(
+    {
+        "books",
+        "inc",
+        "llc",
+        "ltd",
+        "press",
+        "publisher",
+        "publishers",
+        "publishing",
+    }
+)
+
+NUMBER_PATTERN = re.compile(r"(?<!\d)[+-]?\d+(?:[.,:/-]\d+)*(?!\d)")
+TITLE_ROMAN_REFERENCE_PATTERN = re.compile(
+    r"(?<![A-Za-z])([IVXLCDM]+)(?=[ \t]+[+-]?\d)",
+)
+INLINE_LINK_PATTERN = re.compile(r"\]\(\s*(?:<([^>]+)>|([^\s)]+))")
+REFERENCE_LINK_PATTERN = re.compile(r"(?m)^\s*\[[^\]]+\]:\s*(?:<([^>]+)>|(\S+))")
+INLINE_CODE_PATTERN = re.compile(r"(?<!`)`[^`\n]+`(?!`)")
+FENCE_PATTERN = re.compile(r"^\s{0,3}(`{3,}|~{3,})")
+ATX_HEADING_PATTERN = re.compile(r"(?m)^\s{0,3}(#{1,6})(?:\s+|$)")
+TABLE_DIVIDER_PATTERN = re.compile(r"^\s*\|?\s*:?-{3,}:?\s*(?:\|\s*:?-{3,}:?\s*)+\|?\s*$")
+UNESCAPED_PIPE_PATTERN = re.compile(r"(?<!\\)\|")
+LIST_ITEM_PATTERN = re.compile(r"(?m)^([ \t]*)([-+*]|\d+[.)])[ \t]+")
+BLOCKQUOTE_PATTERN = re.compile(r"(?m)^([ \t]{0,3}>+)[ \t]?")
+IMAGE_PATTERN = re.compile(r"!\[[^\]]*\]\(")
+HTML_COMMENT_PATTERN = re.compile(r"<!--[\s\S]*?-->")
+PDF_PAGE_MARKER_PATTERN = re.compile(
+    r"(?m)^\s*<!--\s*PZDOC PDF PAGE \d+\s*-->\s*$",
+    re.IGNORECASE,
+)
+MARKDOWN_LINK_PATTERN = re.compile(r"!?\[([^\]]*)\]\(\s*(?:<[^>]+>|[^\s)]+)(?:\s+[^)]*)?\)")
+RAW_URL_PATTERN = re.compile(r"(?:https?://|mailto:)\S+")
+HTML_TAG_PATTERN = re.compile(r"</?[A-Za-z][^>]*>")
+REFERENCE_DEFINITION_LINE_PATTERN = re.compile(r"(?m)^\s{0,3}\[[^\]]+\]:\s*\S+.*$")
+SENTENCE_SPLIT_PATTERN = re.compile(r"(?<=[.!?])\s+|\n+")
+
+
+class TranslationQualityError(ValueError):
+    """A translation is not safe enough to publish."""
+
+
+class TranslationIssueKind(StrEnum):
+    """Small set of non-blocking reasons exposed by the review report."""
+
+    SOURCE_TEXT = "source_text"
+    LENGTH = "length"
+    LANGUAGE = "language"
+    ALIGNMENT = "alignment"
+    FIDELITY = "fidelity"
+
+
+@dataclass(frozen=True, slots=True)
+class TranslationQualityIssue:
+    """One local signal that deserves human review, with bounded excerpts."""
+
+    segment_number: int
+    kind: TranslationIssueKind
+    message: str
+    original_excerpt: str
+    translated_excerpt: str
+    identifier: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class TranslationQualityReport:
+    """Non-blocking diagnostics produced after a structurally safe translation."""
+
+    source_language: str | None
+    target_language: str
+    detected_language: str | None
+    checked_segments: int
+    source_characters: int
+    translated_characters: int
+    total_issues: int
+    issues: tuple[TranslationQualityIssue, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class TranslationRepairResult:
+    """A translation after bounded, conservative source-text repair attempts."""
+
+    translated: str
+    attempted_segments: int
+    repaired_segments: int
+
+
+TranslationRepairCallback = Callable[[str, str], str]
+
+
+def resolve_language_code(language: str | None) -> str | None:
+    """Resolve one supported display name or ISO code without raising."""
+    if not isinstance(language, str):
+        return None
+    normalized = language.strip().casefold()
+    for display_name, language_code in TARGET_LANGUAGE_CODES.items():
+        if normalized in {display_name.casefold(), language_code.casefold()}:
+            return language_code
+    return None
+
+
+def detect_language_code(
+    markdown: str,
+    *,
+    minimum_letters: int = 20,
+    minimum_confidence: float = MIN_LANGUAGE_CONFIDENCE,
+) -> str | None:
+    """Detect the dominant natural-language code locally and deterministically."""
+    sample = natural_language_text(markdown)[:MAX_DETECTION_CHARACTERS]
+    if _letter_count(sample) < minimum_letters:
+        return None
+    try:
+        from langdetect import DetectorFactory, LangDetectException, detect_langs
+
+        DetectorFactory.seed = 0
+        candidates = detect_langs(sample)
+    except (ImportError, LangDetectException):
+        return None
+    if not candidates or candidates[0].prob < minimum_confidence:
+        return None
+    detected_language = str(candidates[0].lang)
+    return DETECTED_LANGUAGE_ALIASES.get(detected_language, detected_language)
+
+
+def validate_translation_quality(
+    source: str,
+    translated: str,
+    *,
+    source_language: str | None,
+    target_language: str | None,
+    preserve_paragraphs: bool,
+) -> None:
+    """Reject incomplete, wrong-language or structurally unsafe translations."""
+    _validate_structure(source, translated, preserve_paragraphs=preserve_paragraphs)
+    _validate_content_coverage(source, translated)
+    if _has_critical_polarity_reversal(
+        source,
+        translated,
+        source_language=source_language,
+        target_language=target_language,
+    ):
+        raise TranslationQualityError(
+            "La traducción invirtió una relación de certeza o ambigüedad."
+        )
+    if target_language is not None:
+        _validate_target_language(source, translated, source_language, target_language)
+
+
+def build_translation_quality_report(
+    source: str,
+    translated: str,
+    *,
+    target_language: str,
+    source_language: str | None = None,
+) -> TranslationQualityReport:
+    """Return bounded, non-blocking review signals without logging document text."""
+
+    resolved_source_language = source_language or detect_language_code(source)
+    detected_language = detect_language_code(translated)
+    source_blocks = _report_blocks(source)
+    translated_blocks = _report_blocks(translated)
+    checked_segments = min(len(source_blocks), len(translated_blocks))
+    issues: list[TranslationQualityIssue] = []
+    total_issues = 0
+
+    def add_issue(issue: TranslationQualityIssue) -> None:
+        nonlocal total_issues
+        total_issues += 1
+        if len(issues) < MAX_REPORT_ISSUES:
+            issues.append(issue)
+
+    translated_natural_letters = _letter_count(natural_language_text(translated))
+    if (
+        translated_natural_letters >= MIN_LANGUAGE_VALIDATION_LETTERS
+        and detected_language is not None
+        and detected_language != target_language
+    ):
+        add_issue(
+            _report_issue(
+                0,
+                TranslationIssueKind.LANGUAGE,
+                "El idioma predominante no parece ser el idioma solicitado.",
+                source_blocks[0] if source_blocks else source,
+                translated_blocks[0] if translated_blocks else translated,
+            )
+        )
+
+    if len(source_blocks) != len(translated_blocks):
+        add_issue(
+            _report_issue(
+                0,
+                TranslationIssueKind.ALIGNMENT,
+                "No se pudieron alinear todos los fragmentos para el informe.",
+                source_blocks[-1] if source_blocks else source,
+                translated_blocks[-1] if translated_blocks else translated,
+            )
+        )
+
+    for index, (source_block, translated_block) in enumerate(
+        zip(source_blocks, translated_blocks, strict=False),
+        start=1,
+    ):
+        issue = _translation_segment_issue(
+            index,
+            source_block,
+            translated_block,
+            resolved_source_language,
+            target_language,
+        )
+        if issue is not None:
+            add_issue(issue)
+
+    if resolved_source_language is not None and resolved_source_language != target_language:
+        for issue in _heading_fidelity_issues(
+            source,
+            translated,
+            source_language=resolved_source_language,
+            target_language=target_language,
+        ):
+            add_issue(issue)
+
+    return TranslationQualityReport(
+        source_language=resolved_source_language,
+        target_language=target_language,
+        detected_language=detected_language,
+        checked_segments=checked_segments,
+        source_characters=len(source),
+        translated_characters=len(translated),
+        total_issues=total_issues,
+        issues=tuple(issues),
+    )
+
+
+def _heading_fidelity_issues(
+    source: str,
+    translated: str,
+    *,
+    source_language: str,
+    target_language: str,
+) -> tuple[TranslationQualityIssue, ...]:
+    source_headings = _markdown_heading_texts(source)
+    translated_headings = _markdown_heading_texts(translated)
+    if not source_headings or len(source_headings) != len(translated_headings):
+        return ()
+    issues = list(
+        _inconsistent_heading_term_issues(
+            source_headings,
+            translated_headings,
+        )
+    )
+    for index, (source_heading, translated_heading) in enumerate(
+        zip(source_headings, translated_headings, strict=True),
+        start=1,
+    ):
+        if not _is_third_language_heading(
+            source_heading,
+            source_language=source_language,
+            target_language=target_language,
+        ):
+            continue
+        if _natural_text_similarity(source_heading, translated_heading) >= 0.92:
+            continue
+        issues.append(
+            _report_issue(
+                index,
+                TranslationIssueKind.FIDELITY,
+                (
+                    "Se transformó un encabezado que parece estar en un tercer idioma; "
+                    "conviene revisar su sentido."
+                ),
+                source_heading,
+                translated_heading,
+            )
+        )
+    return tuple(issues)
+
+
+def restore_changed_third_language_headings(
+    source: str,
+    translated: str,
+    *,
+    source_language: str,
+    target_language: str,
+) -> str:
+    """Restore a clearly third-language heading if translation changed its wording."""
+
+    source_matches = _markdown_heading_line_matches(source)
+    translated_matches = _markdown_heading_line_matches(translated)
+    if not source_matches or len(source_matches) != len(translated_matches):
+        return translated
+
+    repairs: list[tuple[int, int, str]] = []
+    for source_match, translated_match in zip(
+        source_matches,
+        translated_matches,
+        strict=True,
+    ):
+        source_heading = source_match.group("text").strip()
+        translated_heading = translated_match.group("text").strip()
+        if not _is_third_language_heading(
+            source_heading,
+            source_language=source_language,
+            target_language=target_language,
+        ):
+            continue
+        if _natural_text_similarity(source_heading, translated_heading) >= 0.92:
+            continue
+        replacement = (
+            f"{translated_match.group('prefix')}{source_heading}"
+            f"{translated_match.group('closing') or ''}"
+        )
+        repairs.append((translated_match.start(), translated_match.end(), replacement))
+
+    repaired = translated
+    for start, end, replacement in reversed(repairs):
+        repaired = f"{repaired[:start]}{replacement}{repaired[end:]}"
+    return repaired
+
+
+def _is_third_language_heading(
+    heading: str,
+    *,
+    source_language: str,
+    target_language: str,
+) -> bool:
+    source_text = natural_language_text(heading)
+    words = re.findall(r"[^\W\d_]+", source_text)
+    normalized_words = {word.casefold() for word in words}
+    if (
+        not 4 <= len(words) <= 16
+        or _letter_count(source_text) < 24
+        or normalized_words & TITLE_LANGUAGE_HINTS.get(source_language, frozenset())
+        or is_probable_organization_name_line(source_text)
+        or _looks_like_probable_proper_name(source_text, source_language)
+    ):
+        return False
+    detected = detect_language_code(
+        heading,
+        minimum_letters=20,
+        minimum_confidence=0.80,
+    )
+    return detected not in {None, source_language, target_language}
+
+
+def _inconsistent_heading_term_issues(
+    source_headings: tuple[str, ...],
+    translated_headings: tuple[str, ...],
+) -> tuple[TranslationQualityIssue, ...]:
+    observations: dict[str, list[tuple[str, int, str, str]]] = {}
+    for index, (source_heading, translated_heading) in enumerate(
+        zip(source_headings, translated_headings, strict=True),
+        start=1,
+    ):
+        source_words = {
+            _normalized_word(word)
+            for word in re.findall(r"[^\W\d_]+", natural_language_text(source_heading))
+            if len(_normalized_word(word)) >= 6
+        }
+        translated_words = {
+            _normalized_word(word)
+            for word in re.findall(r"[^\W\d_]+", natural_language_text(translated_heading))
+            if len(_normalized_word(word)) >= 6
+        }
+        for source_word in source_words:
+            ranked = sorted(
+                (
+                    (
+                        SequenceMatcher(
+                            None,
+                            source_word,
+                            translated_word,
+                            autojunk=False,
+                        ).ratio(),
+                        translated_word,
+                    )
+                    for translated_word in translated_words
+                ),
+                reverse=True,
+            )
+            if not ranked or ranked[0][0] < 0.60:
+                continue
+            observations.setdefault(source_word, []).append(
+                (ranked[0][1], index, source_heading, translated_heading)
+            )
+
+    issues: list[TranslationQualityIssue] = []
+    for records in observations.values():
+        counts = Counter(record[0] for record in records)
+        common = counts.most_common(2)
+        if len(common) < 2 or common[0][1] < 2 or common[0][1] <= common[1][1]:
+            continue
+        canonical = common[0][0]
+        for variant, index, source_heading, translated_heading in records:
+            if variant == canonical or not _looks_like_incompatible_cognate(
+                canonical,
+                variant,
+            ):
+                continue
+            issues.append(
+                _report_issue(
+                    index,
+                    TranslationIssueKind.FIDELITY,
+                    "Un término repetido parece haberse traducido de formas incompatibles.",
+                    source_heading,
+                    translated_heading,
+                )
+            )
+            break
+    return tuple(issues)
+
+
+def _looks_like_incompatible_cognate(canonical: str, variant: str) -> bool:
+    if canonical.startswith(variant) or variant.startswith(canonical):
+        return False
+    if abs(len(canonical) - len(variant)) > 2:
+        return False
+    similarity = SequenceMatcher(None, canonical, variant, autojunk=False).ratio()
+    if similarity < 0.75:
+        return False
+    common_prefix = 0
+    while (
+        common_prefix < min(len(canonical), len(variant))
+        and canonical[common_prefix] == variant[common_prefix]
+    ):
+        common_prefix += 1
+    return common_prefix < min(len(canonical), len(variant)) - 1
+
+
+def _normalized_word(word: str) -> str:
+    return "".join(
+        character
+        for character in unicodedata.normalize("NFKD", word.casefold())
+        if not unicodedata.combining(character)
+    )
+
+
+def _markdown_heading_texts(markdown: str) -> tuple[str, ...]:
+    return tuple(match.group("text").strip() for match in _markdown_heading_line_matches(markdown))
+
+
+def _markdown_heading_line_matches(markdown: str) -> tuple[re.Match[str], ...]:
+    return tuple(
+        re.finditer(
+            (
+                r"(?m)^(?P<prefix>[ \t]{0,3}#{1,6}[ \t]+)"
+                r"(?P<text>.*?)(?P<closing>[ \t]+#+[ \t]*)?$"
+            ),
+            markdown,
+        )
+    )
+
+
+def repair_untranslated_source_text(
+    source: str,
+    translated: str,
+    *,
+    target_language: str,
+    translate_segment: TranslationRepairCallback,
+    source_language: str | None = None,
+    preserve_paragraphs: bool = True,
+) -> TranslationRepairResult:
+    """Retry aligned blocks with source-language residue or a critical polarity reversal.
+
+    Ambiguous language, length and alignment warnings remain review-only. A proposed replacement
+    is accepted only when the shared structural and translation checks pass for both the block and
+    the complete document.
+    """
+
+    resolved_source_language = source_language or detect_language_code(source)
+    if (
+        resolved_source_language is None
+        or resolved_source_language == target_language
+        or not source.strip()
+        or not translated.strip()
+    ):
+        return TranslationRepairResult(translated, 0, 0)
+
+    source_parts, source_blocks = _repairable_report_blocks(source)
+    translated_parts, translated_blocks = _repairable_report_blocks(translated)
+    if len(source_blocks) != len(translated_blocks):
+        return TranslationRepairResult(translated, 0, 0)
+
+    page_aligned = bool(PDF_PAGE_MARKER_PATTERN.search(source)) and bool(
+        PDF_PAGE_MARKER_PATTERN.search(translated)
+    )
+    attempted = 0
+    repaired = 0
+
+    def propose_repair(
+        source_fragment: str,
+        current_fragment: str,
+        segment_number: int,
+    ) -> str | None:
+        nonlocal attempted
+        if attempted >= MAX_AUTOMATIC_SOURCE_TEXT_REPAIRS:
+            return None
+        attempted += 1
+        proposal = translate_segment(source_fragment, current_fragment)
+        if not isinstance(proposal, str) or not proposal.strip() or proposal == current_fragment:
+            return None
+        try:
+            validate_translation_quality(
+                source_fragment,
+                proposal,
+                source_language=resolved_source_language,
+                target_language=target_language,
+                preserve_paragraphs=True,
+            )
+        except TranslationQualityError:
+            return None
+        proposal_issue = _translation_segment_issue(
+            segment_number,
+            natural_language_text(source_fragment),
+            natural_language_text(proposal),
+            resolved_source_language,
+            target_language,
+        )
+        return proposal if proposal_issue is None else None
+
+    def localized_page_is_safe(
+        source_part: str,
+        current_part: str,
+        candidate: str,
+        source_block: _RepairableReportBlock,
+    ) -> bool:
+        try:
+            validate_translation_quality(
+                source_part,
+                candidate,
+                source_language=resolved_source_language,
+                target_language=target_language,
+                preserve_paragraphs=False,
+            )
+            validate_translation_quality(
+                current_part,
+                candidate,
+                source_language=target_language,
+                target_language=target_language,
+                preserve_paragraphs=True,
+            )
+        except TranslationQualityError:
+            return False
+        candidate_issue = _translation_segment_issue(
+            source_block.segment_number,
+            source_block.natural_text,
+            natural_language_text(candidate),
+            resolved_source_language,
+            target_language,
+        )
+        return candidate_issue is None
+
+    for source_block, translated_block in zip(source_blocks, translated_blocks, strict=True):
+        issue = _translation_segment_issue(
+            source_block.segment_number,
+            source_block.natural_text,
+            translated_block.natural_text,
+            resolved_source_language,
+            target_language,
+        )
+        if issue is None or issue.kind not in {
+            TranslationIssueKind.SOURCE_TEXT,
+            TranslationIssueKind.FIDELITY,
+        }:
+            continue
+        if attempted >= MAX_AUTOMATIC_SOURCE_TEXT_REPAIRS:
+            break
+
+        source_part = source_parts[source_block.part_index]
+        current = translated_parts[translated_block.part_index]
+        if page_aligned:
+            source_subparts, source_subblocks = _paragraph_repairable_report_blocks(source_part)
+            translated_subparts, translated_subblocks = _paragraph_repairable_report_blocks(current)
+            aligned_subblocks = (
+                len(source_subblocks) == len(translated_subblocks) and len(source_subblocks) > 1
+            )
+            if aligned_subblocks:
+                localized_repairs = 0
+                for source_subblock, translated_subblock in zip(
+                    source_subblocks,
+                    translated_subblocks,
+                    strict=True,
+                ):
+                    subissue = _translation_segment_issue(
+                        source_subblock.segment_number,
+                        source_subblock.natural_text,
+                        translated_subblock.natural_text,
+                        resolved_source_language,
+                        target_language,
+                    )
+                    if subissue is None or subissue.kind not in {
+                        TranslationIssueKind.SOURCE_TEXT,
+                        TranslationIssueKind.FIDELITY,
+                    }:
+                        continue
+                    proposal = propose_repair(
+                        source_subparts[source_subblock.part_index],
+                        translated_subparts[translated_subblock.part_index],
+                        source_block.segment_number,
+                    )
+                    if proposal is None:
+                        continue
+                    translated_subparts[translated_subblock.part_index] = proposal
+                    localized_repairs += 1
+                if localized_repairs:
+                    localized = "".join(translated_subparts)
+                    if localized_page_is_safe(
+                        source_part,
+                        current,
+                        localized,
+                        source_block,
+                    ):
+                        translated_parts[translated_block.part_index] = localized
+                        repaired += localized_repairs
+                        continue
+            elif source_subblocks:
+                localized = current
+                localized_repairs = 0
+                for source_subblock in source_subblocks:
+                    source_fragment = source_subparts[source_subblock.part_index]
+                    occurrence = _unique_prose_occurrence(localized, source_fragment)
+                    if occurrence is None:
+                        continue
+                    subissue = _translation_segment_issue(
+                        source_subblock.segment_number,
+                        source_subblock.natural_text,
+                        source_subblock.natural_text,
+                        resolved_source_language,
+                        target_language,
+                    )
+                    if subissue is None or subissue.kind not in {
+                        TranslationIssueKind.SOURCE_TEXT,
+                        TranslationIssueKind.FIDELITY,
+                    }:
+                        continue
+                    proposal = propose_repair(
+                        source_fragment,
+                        localized[occurrence[0] : occurrence[1]],
+                        source_block.segment_number,
+                    )
+                    if proposal is None:
+                        continue
+                    localized = (
+                        f"{localized[: occurrence[0]]}{proposal}{localized[occurrence[1] :]}"
+                    )
+                    localized_repairs += 1
+                if localized_repairs and localized_page_is_safe(
+                    source_part,
+                    current,
+                    localized,
+                    source_block,
+                ):
+                    translated_parts[translated_block.part_index] = localized
+                    repaired += localized_repairs
+                    continue
+
+        proposal = propose_repair(
+            source_part,
+            current,
+            source_block.segment_number,
+        )
+        if proposal is not None:
+            translated_parts[translated_block.part_index] = proposal
+            repaired += 1
+
+    if repaired == 0:
+        return TranslationRepairResult(translated, attempted, 0)
+
+    candidate = "".join(translated_parts)
+    try:
+        validate_translation_quality(
+            source,
+            candidate,
+            source_language=resolved_source_language,
+            target_language=target_language,
+            preserve_paragraphs=preserve_paragraphs and not page_aligned,
+        )
+        if page_aligned:
+            validate_translation_quality(
+                translated,
+                candidate,
+                source_language=target_language,
+                target_language=target_language,
+                preserve_paragraphs=True,
+            )
+    except TranslationQualityError:
+        return TranslationRepairResult(translated, attempted, 0)
+    return TranslationRepairResult(candidate, attempted, repaired)
+
+
+def find_untranslated_title_lines(
+    source: str,
+    translated: str,
+    source_language: str | None,
+) -> tuple[str, ...]:
+    """Return exact source-language title lines still present in the translation."""
+    if source_language is None:
+        return ()
+    translated_titles = {
+        natural_language_text(line).casefold()
+        for line in translated.splitlines()
+        if _looks_like_title(line)
+    }
+    repeated_uppercase_names = probable_uppercase_person_name_bases(
+        source,
+        source_language,
+    )
+    untranslated: list[str] = []
+    seen: set[str] = set()
+    for line in source.splitlines():
+        stripped = line.strip()
+        if not _looks_like_title(stripped):
+            continue
+        source_text = natural_language_text(stripped)
+        source_words = set(re.findall(r"[^\W\d_]+", source_text.casefold()))
+        detected_source = detect_language_code(
+            stripped,
+            minimum_letters=12,
+            minimum_confidence=0.80,
+        )
+        if (
+            _letter_count(source_text) >= 12
+            and source_text.casefold() in translated_titles
+            and not _looks_like_probable_proper_name(source_text, source_language)
+            and uppercase_person_name_base(stripped, source_language)
+            not in repeated_uppercase_names
+            and (
+                detected_source == source_language
+                or source_words & TITLE_LANGUAGE_HINTS.get(source_language, frozenset())
+            )
+            and stripped not in seen
+        ):
+            untranslated.append(stripped)
+            seen.add(stripped)
+    return tuple(untranslated)
+
+
+def find_titles_with_source_language_residue(
+    source: str,
+    translated: str,
+    source_language: str | None,
+) -> tuple[tuple[str, str], ...]:
+    """Return titles that retain characteristic source-language words."""
+    if source_language is None:
+        return ()
+    source_lines = source.splitlines()
+    translated_lines = translated.splitlines()
+    hints = TITLE_LANGUAGE_HINTS.get(source_language, frozenset())
+    residues: list[tuple[str, str]] = []
+    if len(source_lines) == len(translated_lines):
+        for source_line, translated_line in zip(source_lines, translated_lines, strict=True):
+            source_title = source_line.strip()
+            translated_title = translated_line.strip()
+            if not _looks_like_title(source_title) or not translated_title:
+                continue
+            source_words = set(
+                re.findall(r"[^\W\d_]+", natural_language_text(source_title).casefold())
+            )
+            translated_words = set(
+                re.findall(r"[^\W\d_]+", natural_language_text(translated_title).casefold())
+            )
+            if source_words & hints and translated_words & hints:
+                residues.append((source_title, translated_title))
+        return tuple(residues)
+
+    source_titles: list[tuple[str, Counter[str]]] = []
+    for source_line in source_lines:
+        source_title = source_line.strip()
+        if not _looks_like_title(source_title):
+            continue
+        source_words = set(re.findall(r"[^\W\d_]+", natural_language_text(source_title).casefold()))
+        if source_words & hints:
+            source_titles.append((source_title, Counter(NUMBER_PATTERN.findall(source_title))))
+    if not source_titles:
+        return ()
+
+    for translated_line in translated_lines:
+        translated_title = translated_line.strip()
+        if not _looks_like_title(translated_title):
+            continue
+        translated_words = set(
+            re.findall(r"[^\W\d_]+", natural_language_text(translated_title).casefold())
+        )
+        if (
+            not translated_words & hints
+            or is_probable_organization_name_line(translated_title)
+            or _looks_like_probable_proper_name(translated_title, source_language)
+        ):
+            continue
+        translated_numbers = Counter(NUMBER_PATTERN.findall(translated_title))
+        numbered_matches = [
+            candidate
+            for candidate, numbers in source_titles
+            if numbers and numbers == translated_numbers
+        ]
+        source_title = numbered_matches[0] if len(numbered_matches) == 1 else translated_title
+        residues.append((source_title, translated_title))
+    return tuple(residues)
+
+
+def find_untranslated_source_sentences(
+    source: str,
+    translated: str,
+    source_language: str | None,
+) -> tuple[str, ...]:
+    """Return exact prose sentences that still occur unchanged in a translation."""
+    if source_language is None:
+        return ()
+    normalized_translation = translated.casefold()
+    untranslated: list[str] = []
+    for raw_candidate in SENTENCE_SPLIT_PATTERN.split(source):
+        candidate = _strip_boundary_markup(raw_candidate.strip())
+        natural_candidate = natural_language_text(candidate)
+        if _letter_count(natural_candidate) < 12:
+            continue
+        if not _contains_standalone_text(normalized_translation, candidate.casefold()):
+            continue
+        if _likely_language(natural_candidate, source_language):
+            untranslated.append(candidate)
+    return tuple(untranslated)
+
+
+def is_unmarked_title_line(line: str) -> bool:
+    """Return whether one line looks like an all-caps title without Markdown heading marks."""
+    stripped = line.strip()
+    return ATX_HEADING_PATTERN.match(stripped) is None and _looks_like_title(stripped)
+
+
+def is_probable_organization_name_line(line: str) -> bool:
+    """Recognize compact publisher and company names that should remain literal."""
+    words = re.findall(r"[^\W\d_]+", natural_language_text(line))
+    if not 2 <= len(words) <= 10:
+        return False
+    normalized = tuple(word.casefold() for word in words)
+    has_organization_suffix = normalized[-1] in ORGANIZATION_NAME_SUFFIXES or normalized[-2:] == (
+        "university",
+        "press",
+    )
+    name_like_casing = all(word.isupper() or word[:1].isupper() for word in words)
+    return has_organization_suffix and name_like_casing
+
+
+def uppercase_person_name_base(line: str, source_language: str | None) -> str | None:
+    """Return a conservative key for a short, uppercase person-name candidate."""
+    if source_language is None:
+        return None
+    words = re.findall(r"[^\W\d_]+", natural_language_text(line))
+    if not 2 <= len(words) <= 4 or not all(word.isupper() for word in words):
+        return None
+    normalized = {word.casefold() for word in words}
+    if normalized & TITLE_LANGUAGE_HINTS.get(source_language, frozenset()):
+        return None
+    return " ".join(word.casefold() for word in words)
+
+
+def probable_uppercase_person_name_bases(
+    markdown: str,
+    source_language: str | None,
+) -> frozenset[str]:
+    """Recognize repeated uppercase bylines without treating every uppercase title as a name."""
+    counts: Counter[str] = Counter()
+    has_lifespan: set[str] = set()
+    for line in markdown.splitlines():
+        base = uppercase_person_name_base(line, source_language)
+        if base is None:
+            continue
+        counts[base] += 1
+        if re.search(r"\(\s*\d{4}\s*[-–—]\s*\d{4}\s*\)", line):
+            has_lifespan.add(base)
+    return frozenset(base for base, count in counts.items() if count >= 2 or base in has_lifespan)
+
+
+def natural_language_text(markdown: str) -> str:
+    """Return prose suitable for language and coverage checks, excluding code and URLs."""
+    visible_lines: list[str] = []
+    fence_character: str | None = None
+    fence_length = 0
+    for line in markdown.splitlines():
+        fence = FENCE_PATTERN.match(line)
+        if fence_character is not None:
+            if fence is not None:
+                marker = fence.group(1)
+                if marker[0] == fence_character and len(marker) >= fence_length:
+                    fence_character = None
+                    fence_length = 0
+            continue
+        if fence is not None:
+            marker = fence.group(1)
+            fence_character = marker[0]
+            fence_length = len(marker)
+            continue
+        visible_lines.append(line)
+
+    text = "\n".join(visible_lines)
+    text = HTML_COMMENT_PATTERN.sub(" ", text)
+    text = REFERENCE_DEFINITION_LINE_PATTERN.sub(" ", text)
+    text = INLINE_CODE_PATTERN.sub(" ", text)
+    text = MARKDOWN_LINK_PATTERN.sub(lambda match: match.group(1), text)
+    text = HTML_TAG_PATTERN.sub(" ", text)
+    text = RAW_URL_PATTERN.sub(" ", text)
+    text = re.sub(r"[\\`*_~#>\[\]{}|]", " ", text)
+    text = NUMBER_PATTERN.sub(" ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _unique_prose_occurrence(container: str, fragment: str) -> tuple[int, int] | None:
+    if (
+        not fragment.strip()
+        or "\n\n" in fragment
+        or ATX_HEADING_PATTERN.search(fragment)
+        or LIST_ITEM_PATTERN.search(fragment)
+        or TABLE_DIVIDER_PATTERN.search(fragment)
+        or IMAGE_PATTERN.search(fragment)
+        or HTML_COMMENT_PATTERN.search(fragment)
+    ):
+        return None
+    if container.count(fragment) == 1:
+        start = container.index(fragment)
+        return start, start + len(fragment)
+    tokens = fragment.split()
+    if not tokens:
+        return None
+    flexible = re.compile(
+        r"(?<!\S)" + r"\s+".join(re.escape(token) for token in tokens) + r"(?!\S)"
+    )
+    matches = tuple(flexible.finditer(container))
+    if len(matches) != 1:
+        return None
+    return matches[0].start(), matches[0].end()
+
+
+@dataclass(frozen=True, slots=True)
+class _RepairableReportBlock:
+    part_index: int
+    segment_number: int
+    natural_text: str
+
+
+def _repairable_report_blocks(
+    document: str,
+) -> tuple[list[str], tuple[_RepairableReportBlock, ...]]:
+    page_markers = tuple(PDF_PAGE_MARKER_PATTERN.finditer(document))
+    if page_markers:
+        parts: list[str] = []
+        blocks: list[_RepairableReportBlock] = []
+        if page_markers[0].start() > 0:
+            prefix = document[: page_markers[0].start()]
+            parts.append(prefix)
+            prefix_text = natural_language_text(prefix)
+            if prefix_text:
+                blocks.append(_RepairableReportBlock(0, 1, prefix_text))
+        for marker_index, marker in enumerate(page_markers):
+            end = (
+                page_markers[marker_index + 1].start()
+                if marker_index + 1 < len(page_markers)
+                else len(document)
+            )
+            part_index = len(parts)
+            part = document[marker.start() : end]
+            parts.append(part)
+            natural_text = natural_language_text(part)
+            if natural_text:
+                blocks.append(
+                    _RepairableReportBlock(
+                        part_index=part_index,
+                        segment_number=len(blocks) + 1,
+                        natural_text=natural_text,
+                    )
+                )
+        return parts, tuple(blocks)
+
+    return _paragraph_repairable_report_blocks(document)
+
+
+def _paragraph_repairable_report_blocks(
+    document: str,
+) -> tuple[list[str], tuple[_RepairableReportBlock, ...]]:
+    parts = re.split(r"((?:\r?\n)[ \t]*(?:\r?\n)+)", document)
+    blocks: list[_RepairableReportBlock] = []
+    for part_index in range(0, len(parts), 2):
+        natural_text = natural_language_text(parts[part_index])
+        if not natural_text:
+            continue
+        blocks.append(
+            _RepairableReportBlock(
+                part_index=part_index,
+                segment_number=len(blocks) + 1,
+                natural_text=natural_text,
+            )
+        )
+    return parts, tuple(blocks)
+
+
+def _report_blocks(document: str) -> tuple[str, ...]:
+    _parts, blocks = _repairable_report_blocks(document)
+    return tuple(block.natural_text for block in blocks)
+
+
+def _translation_segment_issue(
+    segment_number: int,
+    source: str,
+    translated: str,
+    source_language: str | None,
+    target_language: str,
+) -> TranslationQualityIssue | None:
+    source_letters = _letter_count(source)
+    source_words = {word.casefold() for word in re.findall(r"[^\W\d_]+", source)}
+    has_source_language_hint = bool(
+        source_words & TITLE_LANGUAGE_HINTS.get(source_language or "", frozenset())
+    )
+    unchanged = (
+        _unchanged_source_sentence(source, translated, source_language)
+        if source_language is not None and source_language != target_language
+        else None
+    )
+    if (
+        unchanged is not None
+        and source_language is not None
+        and _looks_like_probable_proper_name(source, source_language)
+    ):
+        unchanged = None
+    if (
+        source_language is not None
+        and source_language != target_language
+        and (
+            unchanged is not None
+            or source_letters >= MIN_SOURCE_TEXT_REPORT_LETTERS
+            or has_source_language_hint
+        )
+    ):
+        if unchanged is not None:
+            return _report_issue(
+                segment_number,
+                TranslationIssueKind.SOURCE_TEXT,
+                "Parece conservar una frase en el idioma original.",
+                source,
+                translated,
+            )
+        similarity = SequenceMatcher(
+            None,
+            source.casefold(),
+            translated.casefold(),
+            autojunk=False,
+        ).ratio()
+        if similarity >= 0.92 and _likely_language(source, source_language):
+            return _report_issue(
+                segment_number,
+                TranslationIssueKind.SOURCE_TEXT,
+                "El fragmento cambió muy poco y podría no estar traducido.",
+                source,
+                translated,
+            )
+
+    if _has_critical_polarity_reversal(
+        source,
+        translated,
+        source_language=source_language,
+        target_language=target_language,
+    ):
+        return _report_issue(
+            segment_number,
+            TranslationIssueKind.FIDELITY,
+            "La traducción podría haber invertido una relación de certeza o ambigüedad.",
+            source,
+            translated,
+        )
+
+    translated_letters = _letter_count(translated)
+    if source_letters >= 80:
+        ratio = translated_letters / source_letters
+        if ratio < MIN_CONTENT_RATIO:
+            return _report_issue(
+                segment_number,
+                TranslationIssueKind.LENGTH,
+                "La traducción es mucho más corta que el fragmento original.",
+                source,
+                translated,
+            )
+        if ratio > MAX_CONTENT_RATIO:
+            return _report_issue(
+                segment_number,
+                TranslationIssueKind.LENGTH,
+                "La traducción es mucho más larga que el fragmento original.",
+                source,
+                translated,
+            )
+    return None
+
+
+def _has_critical_polarity_reversal(
+    source: str,
+    translated: str,
+    *,
+    source_language: str | None,
+    target_language: str | None,
+) -> bool:
+    """Detect only explicit, aligned reversals between ambiguous and unambiguous wording."""
+
+    supported_codes = frozenset(TARGET_LANGUAGE_CODES.values())
+    if (
+        source_language not in supported_codes
+        or target_language not in supported_codes
+        or source_language == target_language
+    ):
+        return False
+    source_sentences = tuple(
+        sentence.strip()
+        for sentence in SENTENCE_SPLIT_PATTERN.split(natural_language_text(source))
+        if sentence.strip()
+    )
+    translated_sentences = tuple(
+        sentence.strip()
+        for sentence in SENTENCE_SPLIT_PATTERN.split(natural_language_text(translated))
+        if sentence.strip()
+    )
+    if not source_sentences or len(source_sentences) != len(translated_sentences):
+        return False
+    for source_sentence, translated_sentence in zip(
+        source_sentences,
+        translated_sentences,
+        strict=True,
+    ):
+        source_state = _ambiguity_state(source_sentence, source_language)
+        translated_state = _ambiguity_state(translated_sentence, target_language)
+        if (
+            source_state is not None
+            and translated_state is not None
+            and source_state != translated_state
+        ):
+            return True
+    return False
+
+
+def _ambiguity_state(text: str, language: str) -> str | None:
+    normalized = text.casefold()
+    unambiguous_patterns = {
+        "en": r"\b(?:unambiguous|unequivocal|unmistakable)\b|\bnot\s+ambiguous\b|"
+        r"\bwithout\s+ambiguity\b",
+        "es": r"\b(?:inequívoc\w*|indudable\w*)\b|\bsin\s+ambigüedad\b|"
+        r"\bno\s+(?:es\s+)?ambigu\w*\b",
+        "fr": r"\b(?:sans\s+ambiguïté|sans\s+équivoque|non\s+ambigu\w*|univoque\w*)\b",
+        "de": r"\b(?:eindeutig\w*|unmissverständlich\w*|zweifelsfrei\w*|"
+        r"nicht\s+mehrdeutig\w*)\b",
+        "it": r"\b(?:inequivoc\w*|senza\s+ambiguità|non\s+ambigu\w*)\b",
+        "pt": r"\b(?:inequívoc\w*|sem\s+ambiguidade|não\s+ambígu\w*)\b",
+    }
+    ambiguous_patterns = {
+        "en": r"\b(?:ambiguous|equivocal)\b",
+        "es": r"\bambigu\w*\b",
+        "fr": r"\b(?:ambigu\w*|équivoque\w*)\b",
+        "de": r"\b(?:mehrdeutig\w*|unklar\w*)\b",
+        "it": r"\bambigu\w*\b",
+        "pt": r"\bambígu\w*\b",
+    }
+    if pattern := unambiguous_patterns.get(language):
+        if re.search(pattern, normalized):
+            return "unambiguous"
+    if pattern := ambiguous_patterns.get(language):
+        if re.search(pattern, normalized):
+            return "ambiguous"
+    return None
+
+
+def _unchanged_source_sentence(
+    source: str,
+    translated: str,
+    source_language: str,
+) -> str | None:
+    normalized_translation = translated.casefold()
+    for sentence in SENTENCE_SPLIT_PATTERN.split(source):
+        candidate = sentence.strip()
+        if _letter_count(candidate) < 12:
+            continue
+        if not _contains_standalone_text(normalized_translation, candidate.casefold()):
+            continue
+        if _likely_language(candidate, source_language):
+            return candidate
+    return None
+
+
+def _likely_language(text: str, language: str) -> bool:
+    detected = detect_language_code(
+        text,
+        minimum_letters=12,
+        minimum_confidence=0.85,
+    )
+    if detected == language:
+        return True
+    original_words = re.findall(r"[^\W\d_]+", text)
+    words = {word.casefold() for word in original_words}
+    if words & TITLE_LANGUAGE_HINTS.get(language, frozenset()):
+        return True
+    return len(original_words) >= 2 and any(word[:1].islower() for word in original_words)
+
+
+def _strip_boundary_markup(text: str) -> str:
+    previous = None
+    stripped = text
+    while stripped != previous:
+        previous = stripped
+        stripped = re.sub(r"^(?:<!--[^>]*-->|</?[A-Za-z][^>]*>)\s*", "", stripped)
+        stripped = re.sub(r"\s*</?[A-Za-z][^>]*>$", "", stripped)
+    return stripped.strip()
+
+
+def _contains_standalone_text(container: str, candidate: str) -> bool:
+    position = container.find(candidate)
+    while position >= 0:
+        before = container[position - 1] if position else ""
+        end = position + len(candidate)
+        after = container[end] if end < len(container) else ""
+        before_is_boundary = not before or before.isspace() or before in ">\"'([{"
+        after_is_boundary = not after or after.isspace() or after in "<\"')]}.,;:!?"
+        if before_is_boundary and after_is_boundary:
+            return True
+        position = container.find(candidate, position + 1)
+    return False
+
+
+def _report_issue(
+    segment_number: int,
+    kind: TranslationIssueKind,
+    message: str,
+    source: str,
+    translated: str,
+) -> TranslationQualityIssue:
+    identifier = sha256(
+        f"translation\0{segment_number}\0{kind.value}\0{source}\0{translated}".encode()
+    ).hexdigest()[:24]
+    return TranslationQualityIssue(
+        segment_number=segment_number,
+        kind=kind,
+        message=message,
+        original_excerpt=_excerpt(source),
+        translated_excerpt=_excerpt(translated),
+        identifier=identifier,
+    )
+
+
+def _excerpt(text: str) -> str:
+    compact = re.sub(r"\s+", " ", text).strip()
+    if len(compact) <= MAX_REPORT_EXCERPT_CHARACTERS:
+        return compact
+    return f"{compact[: MAX_REPORT_EXCERPT_CHARACTERS - 1].rstrip()}…"
+
+
+def link_destination_spans(markdown: str) -> list[tuple[int, int, str]]:
+    """Return ordered link destinations with their source positions."""
+    spans: list[tuple[int, int, str]] = []
+    for pattern in (INLINE_LINK_PATTERN, REFERENCE_LINK_PATTERN):
+        for match in pattern.finditer(markdown):
+            group = 1 if match.group(1) is not None else 2
+            spans.append((match.start(group), match.end(group), match.group(group)))
+    return sorted(spans)
+
+
+def _validate_structure(source: str, translated: str, *, preserve_paragraphs: bool) -> None:
+    if Counter(NUMBER_PATTERN.findall(source)) != Counter(NUMBER_PATTERN.findall(translated)):
+        raise TranslationQualityError("La traducción cambió u omitió números o fechas.")
+    if Counter(TITLE_ROMAN_REFERENCE_PATTERN.findall(source)) != Counter(
+        TITLE_ROMAN_REFERENCE_PATTERN.findall(translated)
+    ):
+        raise TranslationQualityError("La traducción cambió números romanos de un título o índice.")
+    if markdown_link_destinations(source) != markdown_link_destinations(translated):
+        raise TranslationQualityError("La traducción cambió u omitió destinos de enlaces.")
+    if Counter(INLINE_CODE_PATTERN.findall(source)) != Counter(
+        INLINE_CODE_PATTERN.findall(translated)
+    ):
+        raise TranslationQualityError("La traducción cambió u omitió código en línea.")
+    if _fenced_code_blocks(source) != _fenced_code_blocks(translated):
+        raise TranslationQualityError("La traducción cambió bloques de código.")
+    if markdown_heading_levels(source) != markdown_heading_levels(translated):
+        raise TranslationQualityError("La traducción cambió la estructura de encabezados.")
+    if markdown_table_shapes(source) != markdown_table_shapes(translated):
+        raise TranslationQualityError("La traducción cambió la estructura de una tabla.")
+    if _list_structure(source) != _list_structure(translated):
+        raise TranslationQualityError("La traducción cambió la estructura de las listas.")
+    if _blockquote_structure(source) != _blockquote_structure(translated):
+        raise TranslationQualityError("La traducción cambió la estructura de las citas.")
+    if len(IMAGE_PATTERN.findall(source)) != len(IMAGE_PATTERN.findall(translated)):
+        raise TranslationQualityError("La traducción cambió imágenes Markdown.")
+    if Counter(HTML_COMMENT_PATTERN.findall(source)) != Counter(
+        HTML_COMMENT_PATTERN.findall(translated)
+    ):
+        raise TranslationQualityError("La traducción cambió comentarios HTML protegidos.")
+    if preserve_paragraphs and _block_count(source) != _block_count(translated):
+        raise TranslationQualityError("La traducción cambió la separación de párrafos.")
+
+
+def _validate_content_coverage(source: str, translated: str) -> None:
+    source_letters = _letter_count(natural_language_text(source))
+    if source_letters < 80:
+        return
+    translated_letters = _letter_count(natural_language_text(translated))
+    ratio = translated_letters / source_letters
+    if ratio < MIN_CONTENT_RATIO:
+        raise TranslationQualityError("La traducción parece haber omitido parte del contenido.")
+    if ratio > MAX_CONTENT_RATIO:
+        raise TranslationQualityError("La traducción parece haber duplicado o añadido contenido.")
+
+
+def _validate_target_language(
+    source: str,
+    translated: str,
+    source_language: str | None,
+    target_language: str,
+) -> None:
+    if source_language is not None and source_language != target_language:
+        _validate_short_titles(source, translated, source_language)
+
+    natural_text = natural_language_text(translated)
+    total_letters = _letter_count(natural_text)
+    if total_letters < MIN_LANGUAGE_VALIDATION_LETTERS:
+        if (
+            source_language is not None
+            and source_language != target_language
+            and total_letters >= 40
+            and _natural_text_similarity(source, translated) >= 0.95
+            and not _looks_like_probable_proper_name(
+                natural_language_text(source),
+                source_language,
+            )
+            and not _is_translated_short_label_collection(
+                source,
+                translated,
+                source_language=source_language,
+            )
+        ):
+            raise TranslationQualityError("La traducción no quedó en el idioma solicitado.")
+        return
+    detected = detect_language_code(
+        translated,
+        minimum_letters=MIN_LANGUAGE_VALIDATION_LETTERS,
+    )
+    translated_short_labels = _is_translated_short_label_collection(
+        source,
+        translated,
+        source_language=source_language,
+    )
+    translated_around_foreign_citation = (
+        source_language is not None
+        and source_language != target_language
+        and _has_target_language_change_evidence(
+            source,
+            translated,
+            source_language=source_language,
+            target_language=target_language,
+        )
+    )
+    if (
+        detected != target_language
+        and not translated_short_labels
+        and not translated_around_foreign_citation
+    ):
+        raise TranslationQualityError("La traducción no quedó en el idioma solicitado.")
+    if source_language is None or source_language == target_language:
+        return
+
+    source_residue_letters = 0
+    for block in re.split(r"\n\s*\n", translated.strip()):
+        block_text = natural_language_text(block)
+        block_letters = _letter_count(block_text)
+        if block_letters < MIN_BLOCK_LANGUAGE_LETTERS:
+            continue
+        block_language = detect_language_code(
+            block,
+            minimum_letters=MIN_BLOCK_LANGUAGE_LETTERS,
+            minimum_confidence=0.90,
+        )
+        if block_language == source_language:
+            source_residue_letters += block_letters
+
+    if source_residue_letters >= max(240, int(total_letters * 0.20)):
+        raise TranslationQualityError(
+            "La traducción dejó un bloque importante en el idioma original."
+        )
+
+
+def _has_target_language_change_evidence(
+    source: str,
+    translated: str,
+    *,
+    source_language: str,
+    target_language: str,
+) -> bool:
+    """Accept target prose around a conserved citation written in a third language.
+
+    Whole-fragment language detection can be dominated by a long work title or bibliographic
+    citation that legitimately remains in French, Latin or another language. Diffing words lets
+    us validate the newly written prose while still rejecting sizeable unchanged runs in the
+    actual source language.
+    """
+
+    source_words = re.findall(r"[^\W\d_]+", natural_language_text(source))
+    translated_words = re.findall(r"[^\W\d_]+", natural_language_text(translated))
+    if not source_words or not translated_words:
+        return False
+
+    changed_words: list[str] = []
+    source_residue_letters = 0
+    matcher = SequenceMatcher(
+        None,
+        [word.casefold() for word in source_words],
+        [word.casefold() for word in translated_words],
+        autojunk=False,
+    )
+    for tag, _source_start, _source_end, translated_start, translated_end in matcher.get_opcodes():
+        words = translated_words[translated_start:translated_end]
+        if tag != "equal":
+            changed_words.extend(words)
+            continue
+        unchanged = " ".join(words)
+        unchanged_letters = _letter_count(unchanged)
+        if unchanged_letters < 40:
+            continue
+        unchanged_language = detect_language_code(
+            unchanged,
+            minimum_letters=40,
+            minimum_confidence=0.80,
+        )
+        if unchanged_language == source_language:
+            source_residue_letters += unchanged_letters
+
+    changed_text = " ".join(changed_words)
+    changed_letters = _letter_count(changed_text)
+    if changed_letters < 40:
+        return False
+    changed_language = detect_language_code(
+        changed_text,
+        minimum_letters=40,
+        minimum_confidence=0.80,
+    )
+    if changed_language != target_language:
+        return False
+    total_letters = _letter_count(natural_language_text(translated))
+    return source_residue_letters < max(80, int(total_letters * 0.20))
+
+
+def _is_translated_short_label_collection(
+    source: str,
+    translated: str,
+    *,
+    source_language: str | None = None,
+) -> bool:
+    blocks = [
+        natural_language_text(block)
+        for block in re.split(r"\n\s*\n", translated.strip())
+        if block.strip()
+    ]
+    if len(blocks) < 4:
+        blocks = [
+            natural_language_text(line)
+            for line in translated.splitlines()
+            if natural_language_text(line)
+        ]
+    if len(blocks) < 4 or any(
+        _letter_count(block) >= MIN_BLOCK_LANGUAGE_LETTERS for block in blocks
+    ):
+        return False
+    if _natural_text_similarity(source, translated) < 0.90:
+        return True
+    source_words = {
+        word.casefold() for word in re.findall(r"[^\W\d_]+", natural_language_text(source))
+    }
+    language_hints = (
+        TITLE_LANGUAGE_HINTS.get(source_language, frozenset())
+        if source_language is not None
+        else frozenset().union(*TITLE_LANGUAGE_HINTS.values())
+    )
+    detected_source = detect_language_code(source)
+    lacks_source_language_evidence = detected_source is None or (
+        source_language is not None and detected_source != source_language
+    )
+    return lacks_source_language_evidence and not source_words & language_hints
+
+
+def _looks_like_probable_proper_name(text: str, source_language: str) -> bool:
+    if is_probable_organization_name_line(text):
+        return True
+    words = re.findall(r"[^\W\d_]+", text)
+    normalized = {word.casefold() for word in words}
+    if normalized & TITLE_LANGUAGE_HINTS.get(source_language, frozenset()):
+        return False
+    return 2 <= len(words) <= 4 and all(word[:1].isupper() and not word.isupper() for word in words)
+
+
+def _natural_text_similarity(source: str, translated: str) -> float:
+    return SequenceMatcher(
+        None,
+        natural_language_text(source).casefold(),
+        natural_language_text(translated).casefold(),
+        autojunk=False,
+    ).ratio()
+
+
+def _validate_short_titles(
+    source: str,
+    translated: str,
+    source_language: str,
+) -> None:
+    if find_untranslated_title_lines(source, translated, source_language):
+        raise TranslationQualityError(
+            "La traducción dejó un título o encabezado en el idioma original."
+        )
+    if find_titles_with_source_language_residue(source, translated, source_language):
+        raise TranslationQualityError(
+            "La traducción dejó parte de un título o encabezado en el idioma original."
+        )
+
+
+def _looks_like_title(block: str) -> bool:
+    stripped = block.strip()
+    if not stripped or "\n" in stripped:
+        return False
+    if ATX_HEADING_PATTERN.match(stripped) is not None:
+        return True
+    letters = [character for character in stripped if character.isalpha()]
+    if not letters or len(stripped.split()) > 12:
+        return False
+    uppercase_ratio = sum(character.isupper() for character in letters) / len(letters)
+    return uppercase_ratio >= 0.80
+
+
+def markdown_link_destinations(markdown: str) -> Counter[str]:
+    """Return conserved link targets independently of visible labels."""
+
+    return Counter(value for _start, _end, value in link_destination_spans(markdown))
+
+
+def markdown_heading_levels(markdown: str) -> tuple[int, ...]:
+    """Return the ordered ATX heading hierarchy."""
+
+    return tuple(len(match.group(1)) for match in ATX_HEADING_PATTERN.finditer(markdown))
+
+
+def markdown_table_shapes(markdown: str) -> tuple[tuple[int, int], ...]:
+    """Return row and column counts for every Markdown table."""
+
+    lines = markdown.splitlines()
+    shapes: list[tuple[int, int]] = []
+    for index, line in enumerate(lines):
+        if TABLE_DIVIDER_PATTERN.fullmatch(line) is None:
+            continue
+        start = index - 1
+        while start >= 0 and _is_table_row(lines[start]):
+            start -= 1
+        end = index + 1
+        while end < len(lines) and _is_table_row(lines[end]):
+            end += 1
+        shapes.append((end - start - 1, _table_column_count(line)))
+    return tuple(shapes)
+
+
+def _is_table_row(line: str) -> bool:
+    return bool(line.strip()) and UNESCAPED_PIPE_PATTERN.search(line) is not None
+
+
+def _table_column_count(line: str) -> int:
+    content = line.strip()
+    if content.startswith("|"):
+        content = content[1:]
+    if content.endswith("|") and not content.endswith(r"\|"):
+        content = content[:-1]
+    return len(UNESCAPED_PIPE_PATTERN.split(content))
+
+
+def _fenced_code_blocks(markdown: str) -> tuple[str, ...]:
+    blocks: list[str] = []
+    current: list[str] | None = None
+    fence_character: str | None = None
+    fence_length = 0
+    for line in markdown.splitlines(keepends=True):
+        fence = FENCE_PATTERN.match(line)
+        if current is None:
+            if fence is None:
+                continue
+            marker = fence.group(1)
+            fence_character = marker[0]
+            fence_length = len(marker)
+            current = [line]
+            continue
+        current.append(line)
+        if fence is not None:
+            marker = fence.group(1)
+            if marker[0] == fence_character and len(marker) >= fence_length:
+                blocks.append("".join(current))
+                current = None
+                fence_character = None
+                fence_length = 0
+    if current is not None:
+        blocks.append("".join(current))
+    return tuple(blocks)
+
+
+def _list_structure(markdown: str) -> tuple[tuple[int, str], ...]:
+    return tuple(
+        (
+            len(match.group(1).expandtabs(4)),
+            "ordered" if match.group(2)[0].isdigit() else "unordered",
+        )
+        for match in LIST_ITEM_PATTERN.finditer(markdown)
+    )
+
+
+def _blockquote_structure(markdown: str) -> tuple[int, ...]:
+    return tuple(
+        len(match.group(1).replace(" ", "")) for match in BLOCKQUOTE_PATTERN.finditer(markdown)
+    )
+
+
+def _block_count(markdown: str) -> int:
+    return len([block for block in re.split(r"\n\s*\n", markdown.strip()) if block.strip()])
+
+
+def _letter_count(text: str) -> int:
+    return sum(character.isalpha() for character in text)

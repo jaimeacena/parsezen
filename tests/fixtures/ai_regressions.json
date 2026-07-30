@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "cases": [
+    {
+      "name": "structure_accepts_bold_title_promoted_to_heading",
+      "mode": "review_structure",
+      "source": "**Chapter One**\n\nThe complete paragraph keeps exactly the same visible words.",
+      "responses": [
+        "PZL1=1"
+      ],
+      "expected": "# **Chapter One**\n\nThe complete paragraph keeps exactly the same visible words."
+    },
+    {
+      "name": "structure_preserves_chunk_after_invalid_directive",
+      "mode": "review_structure",
+      "source": "**Chapter Two**\n\nThe original paragraph must remain complete and in this order.",
+      "responses": [
+        "PZL999=1"
+      ],
+      "expected": "**Chapter Two**\n\nThe original paragraph must remain complete and in this order."
+    },
+    {
+      "name": "content_preserves_chunk_when_model_changes_a_link",
+      "mode": "review_content",
+      "source": "Read the [complete guide](https://example.com/original) before continuing.",
+      "responses": [
+        "Read the [complete guide](https://example.com/changed) before continuing.",
+        "Read the [complete guide](https://example.com/changed) before continuing."
+      ],
+      "expected": "Read the [complete guide](https://example.com/original) before continuing."
+    }
+  ]
+}

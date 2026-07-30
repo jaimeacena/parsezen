@@ -1,0 +1,202 @@
+"""Encrypted, immutable artifacts used between stages and during reviews."""
+
+from __future__ import annotations
+
+import hashlib
+import os
+import re
+import secrets
+from collections.abc import Callable, Iterable
+from dataclasses import dataclass
+from pathlib import Path
+from tempfile import mkstemp
+
+from parsezen.epub_checkpoints import (
+    _protect_for_current_user,
+    _unprotect_for_current_user,
+)
+
+_SAFE_IDENTIFIER = re.compile(r"[a-zA-Z0-9_-]{1,128}\Z")
+_ARTIFACT_MAGIC = b"PARSEZEN-ARTIFACT-V1\0"
+_DIGEST_BYTES = 32
+Protect = Callable[[bytes], bytes]
+
+
+@dataclass(frozen=True, slots=True)
+class ArtifactRecord:
+    id: str
+    job_id: str
+    media_type: str
+    size_bytes: int
+    sha256: str
+
+
+class ArtifactStore:
+    """Write-once DPAPI-protected content addressed by opaque identifiers."""
+
+    def __init__(
+        self,
+        root: Path,
+        *,
+        protect: Protect = _protect_for_current_user,
+        unprotect: Protect = _unprotect_for_current_user,
+    ) -> None:
+        self.root = root
+        self._protect = protect
+        self._unprotect = unprotect
+
+    def put(
+        self,
+        *,
+        job_id: str,
+        payload: bytes,
+        media_type: str,
+        artifact_id: str | None = None,
+    ) -> ArtifactRecord:
+        _validate_identifier(job_id)
+        identifier = artifact_id or secrets.token_hex(16)
+        _validate_identifier(identifier)
+        if not media_type or any(character in media_type for character in "\r\n\0"):
+            raise ValueError("Artifact media type is invalid.")
+
+        destination = self._path(job_id, identifier)
+        if destination.exists():
+            raise FileExistsError("Artifact ids are immutable.")
+        digest = hashlib.sha256(payload).digest()
+        protected = self._protect(_ARTIFACT_MAGIC + digest + payload)
+        temporary: Path | None = None
+        try:
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            descriptor, temporary_name = mkstemp(
+                dir=destination.parent,
+                prefix=".artifact-",
+                suffix=".tmp",
+            )
+            temporary = Path(temporary_name)
+            with os.fdopen(descriptor, "wb") as output:
+                output.write(protected)
+                output.flush()
+                os.fsync(output.fileno())
+            os.replace(temporary, destination)
+            temporary = None
+        finally:
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
+        return ArtifactRecord(
+            id=identifier,
+            job_id=job_id,
+            media_type=media_type,
+            size_bytes=len(payload),
+            sha256=hashlib.sha256(payload).hexdigest(),
+        )
+
+    def put_text(
+        self,
+        *,
+        job_id: str,
+        text: str,
+        media_type: str = "text/plain; charset=utf-8",
+        artifact_id: str | None = None,
+    ) -> ArtifactRecord:
+        return self.put(
+            job_id=job_id,
+            payload=text.encode("utf-8"),
+            media_type=media_type,
+            artifact_id=artifact_id,
+        )
+
+    def read(self, job_id: str, artifact_id: str) -> bytes:
+        source = self._path(job_id, artifact_id)
+        envelope = self._unprotect(source.read_bytes())
+        minimum_size = len(_ARTIFACT_MAGIC) + _DIGEST_BYTES
+        if len(envelope) < minimum_size or not envelope.startswith(_ARTIFACT_MAGIC):
+            raise ValueError("The artifact envelope is invalid.")
+        digest_start = len(_ARTIFACT_MAGIC)
+        digest = envelope[digest_start : digest_start + _DIGEST_BYTES]
+        payload = envelope[digest_start + _DIGEST_BYTES :]
+        if not secrets.compare_digest(digest, hashlib.sha256(payload).digest()):
+            raise ValueError("The artifact failed its integrity check.")
+        return payload
+
+    def read_text(self, job_id: str, artifact_id: str) -> str:
+        return self.read(job_id, artifact_id).decode("utf-8")
+
+    def remove_artifact(self, job_id: str, artifact_id: str) -> None:
+        """Remove one exact artifact without touching sibling review material."""
+
+        path = self._path(job_id, artifact_id)
+        path.unlink(missing_ok=True)
+        try:
+            path.parent.rmdir()
+        except OSError:
+            # Other artifacts, an active temporary write or a transient lock
+            # legitimately keeps the job directory in place.
+            pass
+
+    def remove_job(self, job_id: str) -> None:
+        """Remove only one validated job directory and its encrypted contents."""
+
+        _validate_identifier(job_id)
+        directory = (self.root / job_id).resolve(strict=False)
+        root = self.root.resolve(strict=False)
+        if directory.parent != root or not directory.is_dir():
+            return
+        for child in directory.iterdir():
+            if child.is_file() and (
+                child.suffix == ".pza"
+                or child.name.startswith(".artifact-")
+                and child.suffix == ".tmp"
+            ):
+                child.unlink()
+        directory.rmdir()
+
+    def prune_orphaned_jobs(self, retained_job_ids: Iterable[str]) -> tuple[str, ...]:
+        """Remove encrypted review data that cannot belong to a recoverable job.
+
+        Unknown files and directories are never removed. Temporary files inside
+        retained job directories are safe to discard at application startup,
+        before any writer can be active.
+        """
+
+        retained = frozenset(retained_job_ids)
+        for job_id in retained:
+            _validate_identifier(job_id)
+        root = self.root.resolve(strict=False)
+        if not root.is_dir():
+            return ()
+
+        removed: list[str] = []
+        for candidate in root.iterdir():
+            if not candidate.is_dir() or candidate.is_symlink():
+                continue
+            try:
+                _validate_identifier(candidate.name)
+            except ValueError:
+                continue
+            if candidate.name in retained:
+                self._remove_temporary_files(candidate)
+                continue
+            try:
+                self.remove_job(candidate.name)
+            except OSError:
+                # A foreign file or a transient Windows lock keeps the
+                # directory in place; a later startup can retry safely.
+                continue
+            removed.append(candidate.name)
+        return tuple(sorted(removed))
+
+    @staticmethod
+    def _remove_temporary_files(directory: Path) -> None:
+        for child in directory.iterdir():
+            if child.is_file() and child.name.startswith(".artifact-") and child.suffix == ".tmp":
+                child.unlink()
+
+    def _path(self, job_id: str, artifact_id: str) -> Path:
+        _validate_identifier(job_id)
+        _validate_identifier(artifact_id)
+        return self.root / job_id / f"{artifact_id}.pza"
+
+
+def _validate_identifier(value: str) -> None:
+    if _SAFE_IDENTIFIER.fullmatch(value) is None:
+        raise ValueError("Artifact identifiers must be compact and path-safe.")

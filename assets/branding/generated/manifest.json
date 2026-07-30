@@ -1,0 +1,63 @@
+{
+  "source": "assets/branding/masters/parsezen-light-master.png",
+  "source_sha256": "6d2509d650766caaa263a4c0b8d95c0e89b8b867741511da1f03aa7f0a03a78b",
+  "dark_reference": "assets/branding/masters/parsezen-dark-reference.png",
+  "dark_reference_sha256": "19625b64e85d54f49044303c0438eee8e116573749ddacbaf27e6ee2f169772b",
+  "alpha_threshold": 8,
+  "background_extraction": {
+    "transparent_delta": 10,
+    "opaque_delta": 72,
+    "sampling": "scanline-edge-median"
+  },
+  "outputs": {
+    "parsezen-logo-light.png": {
+      "sha256": "d693d8203bf20cef61044ba243af7bffe5fa93776ba0d3fc30033c92db27e097",
+      "size": [
+        495,
+        96
+      ]
+    },
+    "parsezen-logo-light@2x.png": {
+      "sha256": "21e049fef2a4820364cdb9af546c84724f8c63011a0a3c92f871adec08f08b8b",
+      "size": [
+        990,
+        192
+      ]
+    },
+    "parsezen-logo-dark.png": {
+      "sha256": "8d2331483bc151285121d3d8f1fbe3942ddad96500963b1aa8a77dd87fa0e144",
+      "size": [
+        477,
+        96
+      ]
+    },
+    "parsezen-logo-dark@2x.png": {
+      "sha256": "b30b1925cc7f1d2b77d45e8498c864851b3763b88bc1ab82b44aee89692f14ea",
+      "size": [
+        955,
+        192
+      ]
+    },
+    "parsezen-readme.png": {
+      "sha256": "338f1bf9f1807109c0b0c603011d1f044fe2a4cb3e7f5efd81d9c91aabe97fd8",
+      "size": [
+        480,
+        93
+      ]
+    },
+    "parsezen-symbol-1024.png": {
+      "sha256": "e206b78b66602cf5ee1d4c41304cf5715b4583e0304ec7736543e4bb065c08d8",
+      "size": [
+        1024,
+        1024
+      ]
+    },
+    "parsezen-app-icon.ico": {
+      "sha256": "0d846be7dee81283bc757dd2cdf11d5c69baf87b9e628e62c6e5d905f82e5310",
+      "size": [
+        256,
+        256
+      ]
+    }
+  }
+}

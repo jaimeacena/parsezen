@@ -1,0 +1,78 @@
+name: Calidad
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Python 3.12 en Windows
+    runs-on: windows-latest
+    env:
+      QT_QPA_PLATFORM: offscreen
+      OLLAMA_NO_CLOUD: "1"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements.lock
+      - name: Instalar el entorno bloqueado
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          python -m pip install --upgrade pip
+          python -m pip install --require-hashes -r requirements.lock
+          python -m pip install -e . --no-deps --no-build-isolation
+      - name: Validar estilo y formato
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          python scripts/sync_version.py --check
+          python -m ruff check .
+          python -m ruff format --check .
+      - name: Validar tipos
+        run: python -m mypy src/parsezen
+      - name: Ejecutar pruebas
+        run: python -m pytest --cov=parsezen --cov-report=term-missing --cov-fail-under=88
+      - name: Verificar dependencias
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          python -m pip check
+          python -m pip_audit -r requirements.lock --no-deps --disable-pip --ignore-vuln CVE-2026-54499
+
+  epubcheck:
+    name: EPUBCheck 5.3.0
+    runs-on: windows-latest
+    env:
+      QT_QPA_PLATFORM: offscreen
+      OLLAMA_NO_CLOUD: "1"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements.lock
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "17"
+      - name: Instalar el entorno bloqueado
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          python -m pip install --upgrade pip
+          python -m pip install --require-hashes -r requirements.lock
+          python -m pip install -e . --no-deps --no-build-isolation
+      - name: Preparar EPUBCheck
+        shell: pwsh
+        run: |
+          Invoke-WebRequest -Uri "https://github.com/w3c/epubcheck/releases/download/v5.3.0/epubcheck-5.3.0.zip" -OutFile "$env:RUNNER_TEMP\epubcheck.zip"
+          Expand-Archive "$env:RUNNER_TEMP\epubcheck.zip" "$env:RUNNER_TEMP\epubcheck"
+          "EPUBCHECK_JAR=$env:RUNNER_TEMP\epubcheck\epubcheck-5.3.0\epubcheck.jar" | Out-File -FilePath $env:GITHUB_ENV -Append
+      - name: Validar reconstrucción EPUB
+        run: python -m pytest -m epubcheck

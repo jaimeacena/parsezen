@@ -1,0 +1,101 @@
+[build-system]
+requires = ["setuptools==83.0.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "parsezen"
+version = "1.1.0"
+description = "Aplicación local para convertir, revisar y traducir documentos en Markdown y EPUB"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "argostranslate==1.11.0",
+    "defusedxml==0.7.1",
+    "docling-slim[convert-core,feat-ocr-easyocr,format-pdf-docling,models-local]==2.113.0",
+    "httpx>=0.28.1,<0.29",
+    "langdetect==1.0.9",
+    "lxml==6.1.1",
+    "mammoth==1.11.0",
+    "markdown-it-py>=4.0,<5",
+    "markitdown[docx]==0.1.6",
+    "pdfplumber==0.11.10",
+    "platformdirs>=4.10,<5",
+    "PySide6>=6.11,<7",
+]
+
+[project.optional-dependencies]
+dev = [
+    "mypy>=1.19,<2",
+    "Pillow>=12.3,<13",
+    "pip-audit>=2.10,<3",
+    "pip-tools==7.6.0",
+    "pytest>=9.1,<10",
+    "pytest-cov>=7,<8",
+    "pytest-qt>=4.5,<5",
+    "ruff>=0.15,<1",
+]
+packaging = [
+    "pyinstaller==6.21.0",
+]
+
+[project.gui-scripts]
+parsezen = "parsezen.__main__:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.data-files]
+"share/parsezen/assets/branding/generated" = [
+    "assets/branding/generated/parsezen-logo-light.png",
+    "assets/branding/generated/parsezen-logo-light@2x.png",
+    "assets/branding/generated/parsezen-logo-dark.png",
+    "assets/branding/generated/parsezen-logo-dark@2x.png",
+    "assets/branding/generated/parsezen-symbol-1024.png",
+    "assets/branding/generated/parsezen-app-icon.ico",
+]
+"share/parsezen/assets/fonts" = [
+    "assets/fonts/Inter.ttf",
+    "assets/fonts/Inter-OFL.txt",
+]
+
+[tool.pytest.ini_options]
+addopts = "-ra --strict-config --strict-markers"
+testpaths = ["tests"]
+pythonpath = ["src"]
+markers = [
+    "acceptance: recorridos esenciales del MVP que deben pasar antes de publicar una versión",
+    "epubcheck: validación editorial interna con EPUBCheck 5.3.0 y Java externos",
+    "live_ollama: recorrido real y optativo con un modelo local de Ollama",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["B", "E", "F", "I", "UP"]
+
+[tool.mypy]
+python_version = "3.12"
+check_untyped_defs = true
+disallow_incomplete_defs = true
+disallow_untyped_defs = true
+ignore_missing_imports = true
+no_implicit_optional = true
+show_error_codes = true
+strict_equality = true
+warn_redundant_casts = true
+warn_return_any = true
+warn_unreachable = true
+warn_unused_ignores = true
+
+[tool.coverage.run]
+source = ["parsezen"]
+
+[tool.coverage.report]
+fail_under = 88
+show_missing = true
+skip_covered = true
