@@ -8,6 +8,16 @@ texto o libros EPUB sin depender de servicios documentales remotos.
 
 **Versión 1.1.0 · Windows x64 · Python 3.12 · licencia MIT**
 
+## Descargar
+
+Descarga la versión estable desde
+[Releases → Parsezen 1.1.0](https://github.com/jaimeacena/parsezen/releases/latest).
+Ejecuta `Parsezen-Setup-1.1.0.exe`; no necesitas instalar Python.
+
+Parsezen es gratuito y esta versión no incluye una firma comercial de Authenticode, por lo que
+Windows puede mostrar **Editor desconocido**. Comprueba que la descarga procede de este repositorio
+y, si quieres verificarla, compara su SHA-256 con el archivo `.sha256` incluido en la Release.
+
 ## Cómo se usa
 
 1. Arrastra uno o varios documentos a la zona discontinua situada bajo la cola, o púlsala para
