@@ -26,7 +26,7 @@ La presentación activa se organiza así:
 ParsezenMainWindow
 └── ParsezenWorkspace
     ├── cola de documentos + destino + acción contextual
-    ├── configuración: Resultado / Traducir / Corregir / Personalizar
+    ├── hoja modal de configuración: Resultado / Traducción / Más opciones
     ├── IA local y modelos
     ├── glosario
     ├── revisión por fase
@@ -45,10 +45,10 @@ Piezas principales:
 - `presentation/workspace.py`: layout, navegación interna, foco y reflow global.
 - `presentation/job_table.py`: proyección responsive de la cola.
 - `presentation/job_configuration_dialog.py`: transacción de configuración por documento.
-- `presentation/phase_review_dialog.py`, `revision_dialog.py` y `markdown_review.py`: decisiones y
-  comparaciones.
+- `presentation/phase_review_dialog.py`, `presentation/revision_dialog.py` y
+  `presentation/markdown_review.py`: decisiones y comparaciones.
 - `presentation/book_editor_dialog.py`: metadatos, portada, estructura y contenido EPUB.
-- `model_manager.py`: estado, búsqueda y selección de IA local.
+- `presentation/model_manager.py`: estado, búsqueda y selección de IA local.
 
 La lógica de aplicación y dominio no importa PySide6. Los widgets reciben proyecciones y emiten
 intenciones; no inventan estados de cola, revisión o publicación.
@@ -110,7 +110,8 @@ Las capturas iniciales se conservaron fuera del repositorio en
 4. Los formularios mantienen etiquetas visibles y validación junto al contenido que debe corregirse.
 5. Las revisiones conservan siempre la comparación y la elección; en compacto pasan de dos columnas
    a una secuencia vertical.
-6. La configuración sigue siendo una transacción; la refactorización visual no crea pasos nuevos.
+6. La configuración sigue siendo una transacción compacta sobre la cola: resultado y traducción son
+   las únicas decisiones principales; las excepciones se revelan de forma progresiva.
 
 ## Densidad y elevación
 
@@ -236,7 +237,7 @@ Desde 320 px:
 - la cabecera pasa a tres filas y conserva IA, destino, apariencia y acción principal;
 - la cola combina Documento + Flujo y mantiene la acción contextual y eliminar;
 - la zona de añadir documentos apila icono, instrucción, enlace y formatos;
-- la configuración sustituye la barra de pestañas por un selector compacto;
+- la configuración apila las dos tarjetas de resultado y mantiene un único selector de traducción;
 - los formularios envuelven etiqueta y campo;
 - las acciones de imágenes se apilan;
 - los comparadores y el editor EPUB cambian a orientación vertical;

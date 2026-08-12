@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from parsezen.application.artifact_repository import ArtifactRepository
 from parsezen.domain.reviews import (
     ReviewChoice,
     ReviewKind,
@@ -10,13 +11,14 @@ from parsezen.domain.reviews import (
     ReviewUnit,
 )
 from parsezen.domain.stages import StageKind
-from parsezen.infrastructure.artifact_store import ArtifactStore
+from parsezen.errors import ImprovementError
 from parsezen.revision import (
     RevisionChange,
     RevisionDecision,
     RevisionDraft,
     RevisionKind,
     split_markdown_blocks,
+    validate_review_content_candidate,
 )
 
 
@@ -26,18 +28,35 @@ def create_revision_review(
     revision_kind: RevisionKind,
     job_id: str,
     configuration_revision: int,
-    artifacts: ArtifactStore,
+    artifacts: ArtifactRepository,
 ) -> ReviewSession | None:
     changes = tuple(change for change in draft.changes if change.kind is revision_kind)
     if not changes:
         return None
+    safe_changes: list[RevisionChange] = []
+    for change in changes:
+        if not change.proposal_selectable:
+            continue
+        if revision_kind is RevisionKind.CONTENT:
+            try:
+                validate_review_content_candidate(
+                    change.original_markdown,
+                    change.proposed_markdown,
+                )
+            except ImprovementError:
+                # Revalidate old drafts and caches before making a proposal visible.
+                continue
+        safe_changes.append(change)
+    if not safe_changes:
+        return None
+
     source = artifacts.put_text(
         job_id=job_id,
         text=draft.original_markdown,
         media_type="text/markdown; charset=utf-8",
     )
     units: list[ReviewUnit] = []
-    for change in changes:
+    for change in safe_changes:
         original = artifacts.put_text(
             job_id=job_id,
             text=change.original_markdown,
@@ -90,7 +109,7 @@ def _revision_severity(change: RevisionChange) -> ReviewSeverity:
 def render_revision_reviews(
     draft: RevisionDraft,
     reviews: tuple[ReviewSession, ...],
-    artifacts: ArtifactStore,
+    artifacts: ArtifactRepository,
 ) -> str:
     """Render original/proposed/manual choices across every draft change."""
 
@@ -111,7 +130,7 @@ def render_revision_reviews(
     return "".join(output)
 
 
-def _unit_text(job_id: str, unit: ReviewUnit, artifacts: ArtifactStore) -> str:
+def _unit_text(job_id: str, unit: ReviewUnit, artifacts: ArtifactRepository) -> str:
     if unit.choice is ReviewChoice.EDITED:
         if unit.edited_artifact_id is None:
             raise ValueError("An edited revision is missing its artifact.")

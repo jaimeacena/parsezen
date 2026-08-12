@@ -1,3 +1,4 @@
+import sqlite3
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -15,6 +16,8 @@ from parsezen.domain.jobs import (
     DocumentSource,
     JobConfiguration,
     OutputConfiguration,
+    ReviewRecommendation,
+    ReviewSignal,
     TranslationConfiguration,
     TranslationMethod,
 )
@@ -45,10 +48,10 @@ def make_job(identifier: str, order: int) -> DocumentJob:
             ai=AIProfileConfiguration(
                 model="qwen3:4b",
                 context_window=8192,
-                is_custom=True,
             ),
             translation=TranslationConfiguration(
                 enabled=True,
+                method=TranslationMethod.LOCAL_AI,
                 target_language="es",
                 glossary=(("source", "destino"),),
             ),
@@ -72,29 +75,88 @@ def test_state_store_round_trips_independent_jobs(tmp_path: Path) -> None:
     assert loaded[0].configuration.ai == AIProfileConfiguration(
         model="qwen3:4b",
         context_window=8192,
-        is_custom=True,
     )
     assert loaded[0].configuration.translation.glossary == (("source", "destino"),)
+    assert loaded[0].configuration.translation.method is TranslationMethod.LOCAL_AI
 
 
-def test_legacy_job_payload_without_shared_ai_profile_remains_readable() -> None:
+def test_state_store_persists_content_free_review_recommendation(tmp_path: Path) -> None:
+    store = StateStore(tmp_path / "state.db")
+    job = replace(
+        make_job("recommended", 0),
+        review_recommendation=ReviewRecommendation(
+            ((ReviewSignal.SOURCE_TEXT_RESIDUE, 2),),
+            (1, 4),
+            "a" * 64,
+            ("b" * 64, "c" * 64),
+        ),
+    )
+
+    store.replace_jobs((job,))
+
+    assert store.load_jobs()[0].review_recommendation == job.review_recommendation
+    payload = state_store_module._job_to_json(job)
+    assert payload["review_recommendation"] == {
+        "signal_counts": [["source_text_residue", 2]],
+        "block_positions": [1, 4],
+        "scope_fingerprint": "a" * 64,
+        "block_fingerprints": ["b" * 64, "c" * 64],
+    }
+
+
+def test_saved_recommendation_without_scope_fingerprint_remains_readable() -> None:
+    job = replace(
+        make_job("older-recommendation", 0),
+        review_recommendation=ReviewRecommendation(
+            ((ReviewSignal.CONVERSION_DAMAGE, 1),),
+            (0,),
+        ),
+    )
+    payload = state_store_module._job_to_json(job)
+    payload["review_recommendation"].pop("scope_fingerprint")
+
+    restored = state_store_module._job_from_json(payload)
+
+    assert restored.review_recommendation == job.review_recommendation
+
+
+def test_legacy_job_payload_without_shared_ai_profile_is_rejected() -> None:
     original = make_job("legacy", 0)
     payload = state_store_module._job_to_json(original)
     payload["configuration"].pop("ai")
 
-    restored = state_store_module._job_from_json(payload)
+    with pytest.raises(KeyError):
+        state_store_module._job_from_json(payload)
 
-    assert restored.configuration.ai == AIProfileConfiguration()
 
-
-def test_legacy_shared_ai_profile_inherits_the_global_default() -> None:
+def test_legacy_job_payload_without_a_product_plan_is_rejected() -> None:
     original = make_job("legacy-ai", 0)
     payload = state_store_module._job_to_json(original)
-    payload["configuration"]["ai"].pop("is_custom")
+    payload["configuration"].pop("plan")
 
-    restored = state_store_module._job_from_json(payload)
+    with pytest.raises(KeyError):
+        state_store_module._job_from_json(payload)
 
-    assert not restored.configuration.ai.is_custom
+
+def test_previous_schema_is_reset_without_touching_source_documents(tmp_path: Path) -> None:
+    source = tmp_path / "source.pdf"
+    source.write_bytes(b"original")
+    database = tmp_path / "state.db"
+    store = StateStore(database)
+    stored = DocumentJob.create(
+        DocumentSource.inspect(source),
+        JobConfiguration(),
+        order=0,
+        job_id="legacy",
+    )
+    store.replace_jobs((stored,))
+    with sqlite3.connect(database) as connection:
+        connection.execute("UPDATE metadata SET value = '5' WHERE key = 'schema_version'")
+
+    reopened = StateStore(database)
+
+    assert reopened.load_jobs() == ()
+    assert source.read_bytes() == b"original"
 
 
 def test_state_store_preserves_previous_queue_after_invalid_replacement(tmp_path: Path) -> None:
@@ -246,7 +308,13 @@ def test_state_store_round_trips_normalized_book(tmp_path: Path) -> None:
     job = make_job("book", 0)
     store.replace_jobs((job,))
     book = BookDocument(
-        BookMetadata("Title", "es"),
+        BookMetadata(
+            "Title",
+            "es",
+            identifiers=("primary-id", "secondary-id"),
+            publisher="Editorial local",
+            publication_date="2024-03-14",
+        ),
         (
             BookSection(
                 "chapter",

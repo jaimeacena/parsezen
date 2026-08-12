@@ -49,6 +49,10 @@ def _selected_artifact(unit: ReviewUnit) -> str:
         if unit.proposed_artifact_id is None:
             raise ValueError("A proposed review unit is missing its artifact.")
         return unit.proposed_artifact_id
+    if unit.choice is ReviewChoice.NO_TEXT:
+        if unit.proposed_artifact_id is None:
+            raise ValueError("An OCR review unit is missing its proposed artifact.")
+        return unit.proposed_artifact_id
     return unit.original_artifact_id
 
 

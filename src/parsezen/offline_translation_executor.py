@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import logging
 import os
 import queue
@@ -108,7 +109,12 @@ class OfflineTranslationSession:
             )
             self._release_worker()
             raise
-        except TranslationError:
+        except TranslationError as exc:
+            LOGGER.warning(
+                "translation_worker_rejected error_fingerprint=%s duration_ms=%d",
+                hashlib.sha256(str(exc).encode("utf-8")).hexdigest()[:12],
+                _elapsed_milliseconds(started_at),
+            )
             raise
         except (BrokenPipeError, EOFError, OSError, OfflineTranslationProtocolError) as exc:
             LOGGER.warning(

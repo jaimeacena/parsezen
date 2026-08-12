@@ -67,6 +67,10 @@ class PhaseReviewSequenceCoordinator:
                 return PhaseReviewProgress(job, None, step)
             review = saved.get(step.kind)
             if review is None or review.status is not ReviewStatus.APPLIED:
+                next_step = self._next_step(steps, saved)
+                if next_step is not None and next_step.kind is not step.kind:
+                    job = self._align_to_pending_step(job, steps, saved, next_step)
+                    return PhaseReviewProgress(job, None, next_step)
                 return PhaseReviewProgress(job, None, step)
             if blocked.review_id != review.id:
                 job = self._execution.bind_review(job_id, step.stage, review.id)
@@ -79,11 +83,7 @@ class PhaseReviewSequenceCoordinator:
 
         next_step = self._next_step(steps, saved)
         if next_step is not None:
-            job = self._execution.block_completed_result_for_review(
-                job_id,
-                next_step.stage,
-                review_id=self._gate_id(job, next_step),
-            )
+            job = self._align_to_pending_step(job, steps, saved, next_step)
         return PhaseReviewProgress(job, None, next_step)
 
     def prepare(
@@ -146,12 +146,41 @@ class PhaseReviewSequenceCoordinator:
         )
         if not completed:
             return job
-        step, review = completed[-1]
-        assert review is not None
+        step, _review = completed[-1]
+        return self.reopen_review(job_id, result, kind=step.kind)
+
+    def reopen_review(
+        self,
+        job_id: str,
+        result: ProcessResult,
+        *,
+        kind: ReviewKind,
+    ) -> DocumentJob:
+        """Reopen one phase and invalidate all dependent review material."""
+
+        job = self._require(job_id)
+        steps = self.steps(job_id, result)
+        target_index = next(
+            (index for index, step in enumerate(steps) if step.kind is kind),
+            None,
+        )
+        if target_index is None:
+            raise ValueError("This review phase is not part of the current result.")
+        saved = self._saved_by_kind(job)
+        target = saved.get(kind)
+        if target is None or target.status is not ReviewStatus.APPLIED:
+            raise ValueError("Only an applied review can be reopened.")
+
+        for later_step in steps[target_index + 1 :]:
+            later = saved.get(later_step.kind)
+            if later is not None:
+                self._reviews.save_review(later.dismiss())
+        reopened = target.reopen()
+        self._reviews.save_review(reopened)
         return self._execution.block_completed_result_for_review(
             job_id,
-            step.stage,
-            review_id=review.id,
+            reopened.stage,
+            review_id=reopened.id,
         )
 
     def _require_current_step(
@@ -173,6 +202,32 @@ class PhaseReviewSequenceCoordinator:
             if review.input_version == job.configuration_revision
             and review.status in {ReviewStatus.PENDING, ReviewStatus.APPLIED}
         }
+
+    def _align_to_pending_step(
+        self,
+        job: DocumentJob,
+        steps: tuple[ReviewStep, ...],
+        saved: dict[ReviewKind, ReviewSession],
+        next_step: ReviewStep,
+    ) -> DocumentJob:
+        """Rewind a stale later gate to the earliest durable pending review."""
+
+        target_index = steps.index(next_step)
+        for later_step in steps[target_index + 1 :]:
+            later = saved.get(later_step.kind)
+            if later is not None:
+                self._reviews.save_review(later.dismiss())
+        pending = saved.get(next_step.kind)
+        review_id = (
+            pending.id
+            if pending is not None and pending.status is ReviewStatus.PENDING
+            else self._gate_id(job, next_step)
+        )
+        return self._execution.block_completed_result_for_review(
+            job.id,
+            next_step.stage,
+            review_id=review_id,
+        )
 
     @staticmethod
     def _next_step(

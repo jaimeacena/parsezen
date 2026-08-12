@@ -158,6 +158,15 @@ def _windows_archive() -> bytes:
     return destination.getvalue()
 
 
+def _trusted_test_archives(archive: bytes) -> dict[tuple[str, str], str]:
+    return {
+        (
+            "1.2.3",
+            "x86_64-pc-windows-msvc",
+        ): hashlib.sha256(archive).hexdigest()
+    }
+
+
 def test_selects_balanced_fast_and_capacity_profiles_for_the_discrete_gpu() -> None:
     generated_at = datetime(2026, 7, 21, 10, tzinfo=UTC)
 
@@ -444,6 +453,7 @@ def test_managed_llmfit_install_is_hash_checked_atomic_and_reused(
         now=now,
         platform_name="win32",
         machine_name="AMD64",
+        trusted_archives=_trusted_test_archives(archive),
     )
 
     assert component.version == "1.2.3"
@@ -452,6 +462,8 @@ def test_managed_llmfit_install_is_hash_checked_atomic_and_reused(
     assert checked_versions and checked_versions[0][1] == "1.2.3"
     metadata = json.loads((tmp_path / "component.json").read_text(encoding="utf-8"))
     assert metadata["repository"] == "AlexsJones/llmfit"
+    assert metadata["target"] == "x86_64-pc-windows-msvc"
+    assert metadata["archive_sha256"] == hashlib.sha256(archive).hexdigest()
     assert metadata["executable_sha256"] == component.executable_sha256
     assert metadata["license_sha256"] == component.license_sha256
 
@@ -464,6 +476,7 @@ def test_managed_llmfit_install_is_hash_checked_atomic_and_reused(
         now=now + timedelta(days=1),
         platform_name="win32",
         machine_name="AMD64",
+        trusted_archives=_trusted_test_archives(archive),
     )
     assert reused == component
 
@@ -478,12 +491,14 @@ def test_incomplete_latest_release_falls_back_to_latest_usable_release(
         lambda _path, _version: None,
     )
 
+    archive = _windows_archive()
     component = ensure_llmfit(
         component_directory=tmp_path,
-        transport=_release_transport(_windows_archive(), include_incomplete_latest=True),
+        transport=_release_transport(archive, include_incomplete_latest=True),
         now=datetime(2026, 7, 21, 10, tzinfo=UTC),
         platform_name="win32",
         machine_name="AMD64",
+        trusted_archives=_trusted_test_archives(archive),
     )
 
     assert component.version == "1.2.3"
@@ -500,12 +515,14 @@ def test_existing_verified_llmfit_remains_available_while_offline(
         lambda _path, _version: None,
     )
     now = datetime(2026, 7, 21, 10, tzinfo=UTC)
+    archive = _windows_archive()
     installed = ensure_llmfit(
         component_directory=tmp_path,
-        transport=_release_transport(_windows_archive()),
+        transport=_release_transport(archive),
         now=now,
         platform_name="win32",
         machine_name="AMD64",
+        trusted_archives=_trusted_test_archives(archive),
     )
 
     def offline(request: httpx.Request) -> httpx.Response:
@@ -517,6 +534,7 @@ def test_existing_verified_llmfit_remains_available_while_offline(
         now=now + timedelta(days=8),
         platform_name="win32",
         machine_name="AMD64",
+        trusted_archives=_trusted_test_archives(archive),
     )
 
     assert reused.executable == installed.executable
@@ -533,15 +551,41 @@ def test_unverified_llmfit_download_is_never_installed(
         lambda _path, _version: None,
     )
 
+    archive = _windows_archive()
     with pytest.raises(ModelRecommendationError, match="recomendador automático"):
         ensure_llmfit(
             component_directory=tmp_path,
-            transport=_release_transport(_windows_archive(), digest="0" * 64),
+            transport=_release_transport(archive, digest="0" * 64),
+            now=datetime(2026, 7, 21, 10, tzinfo=UTC),
+            platform_name="win32",
+            machine_name="AMD64",
+            trusted_archives=_trusted_test_archives(archive),
+        )
+
+    assert not (tmp_path / "llmfit.exe").exists()
+
+
+def test_a_github_digest_without_parsezen_pinned_trust_is_never_executed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    executions: list[Path] = []
+    monkeypatch.setattr(
+        recommendations_module,
+        "_validate_downloaded_executable",
+        lambda path, _version: executions.append(path),
+    )
+
+    with pytest.raises(ModelRecommendationError, match="recomendador automático"):
+        ensure_llmfit(
+            component_directory=tmp_path,
+            transport=_release_transport(_windows_archive()),
             now=datetime(2026, 7, 21, 10, tzinfo=UTC),
             platform_name="win32",
             machine_name="AMD64",
         )
 
+    assert executions == []
     assert not (tmp_path / "llmfit.exe").exists()
 
 
@@ -656,6 +700,7 @@ def test_llmfit_runner_disables_the_dashboard_and_remote_benchmark_key(
         return subprocess.CompletedProcess(command, 0, stdout=_llmfit_output(), stderr="")
 
     monkeypatch.setenv("LOCALMAXXING_API_KEY", "must-not-be-forwarded")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "must-not-be-forwarded-either")
     monkeypatch.setattr(recommendations_module.subprocess, "run", run)
 
     output = recommendations_module._run_llmfit(executable)
@@ -675,6 +720,7 @@ def test_llmfit_runner_disables_the_dashboard_and_remote_benchmark_key(
     environment = options["env"]
     assert isinstance(environment, dict)
     assert "LOCALMAXXING_API_KEY" not in environment
+    assert "AWS_SECRET_ACCESS_KEY" not in environment
     assert environment["LLMFIT_DASHBOARD_HOST"] == "127.0.0.1"
 
 

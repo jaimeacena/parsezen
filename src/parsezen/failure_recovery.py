@@ -1,4 +1,4 @@
-"""Classify processing failures into concrete, safe recovery actions."""
+"""Neutral policy for classifying failures into safe recovery actions."""
 
 from __future__ import annotations
 
@@ -40,7 +40,7 @@ class RecoveryAction(StrEnum):
 
 @dataclass(frozen=True, slots=True)
 class ProcessingFailure:
-    """Content-free failure information safe to pass between worker and UI."""
+    """Ephemeral failure details passed from a worker to the current UI session."""
 
     kind: FailureKind
     message: str

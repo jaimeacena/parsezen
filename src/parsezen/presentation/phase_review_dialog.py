@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
 
-from PySide6.QtCore import QRectF, Qt
+from PySide6.QtCore import QRectF, Qt, QTimer
 from PySide6.QtGui import (
     QColor,
     QKeySequence,
@@ -26,13 +26,14 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
-    QRadioButton,
     QScrollArea,
+    QSizePolicy,
     QSplitter,
     QVBoxLayout,
     QWidget,
 )
 
+from parsezen.application.artifact_repository import ArtifactRepository
 from parsezen.domain.reviews import (
     ReviewChoice,
     ReviewKind,
@@ -40,8 +41,8 @@ from parsezen.domain.reviews import (
     ReviewSeverity,
     ReviewUnit,
 )
-from parsezen.infrastructure.artifact_store import ArtifactStore
 from parsezen.presentation.design_system import BREAKPOINTS, COLORS, SPACING, back_icon
+from parsezen.review_projection import ReviewProjection, project_review_text
 
 _PHASE_TITLES = {
     ReviewKind.OCR: "Revisar reconocimiento de página",
@@ -56,6 +57,20 @@ _PHASE_LABELS = {
     ReviewKind.TRANSLATION: "Traducción",
     ReviewKind.REFINEMENT: "Corrección",
     ReviewKind.STRUCTURE: "Estructura",
+}
+_PHASE_PANE_LABELS = {
+    ReviewKind.OCR: ("Página original · Solo contexto", "Texto reconocido"),
+    ReviewKind.CONVERSION_WARNING: ("Página original · Solo contexto", "Conversión propuesta"),
+    ReviewKind.TRANSLATION: ("Extracto original · Contexto", "Resultado actual · Editable"),
+    ReviewKind.REFINEMENT: ("Versión actual", "Corrección propuesta"),
+    ReviewKind.STRUCTURE: ("Versión actual", "Propuesta de estructura"),
+}
+_PHASE_FINAL_LABELS = {
+    ReviewKind.OCR: "Aplicar OCR revisado",
+    ReviewKind.CONVERSION_WARNING: "Aplicar conversión revisada",
+    ReviewKind.TRANSLATION: "Confirmar traducción",
+    ReviewKind.REFINEMENT: "Aplicar correcciones",
+    ReviewKind.STRUCTURE: "Aplicar estructura",
 }
 
 
@@ -77,6 +92,35 @@ _SEVERITY_LABELS = {
 }
 
 
+def _recommendation_text(unit: ReviewUnit) -> str:
+    if unit.recommended_choice is ReviewChoice.ORIGINAL and unit.original_selectable:
+        return "Recomendación provisional: conservar el resultado actual; necesita confirmación"
+    if unit.recommended_choice is ReviewChoice.PROPOSED:
+        return "Recomendación provisional: usar la propuesta; necesita confirmación"
+    return "Necesita confirmación"
+
+
+def _phase_instruction(
+    kind: ReviewKind,
+    *,
+    translation_follows_ocr: bool = False,
+) -> str:
+    if kind is ReviewKind.OCR and translation_follows_ocr:
+        return (
+            "El texto ya aparece en el idioma del resultado. Corrígelo tal como debe quedar; "
+            "no necesitas traducirlo de nuevo. La página original es solo una referencia."
+        )
+    if kind is ReviewKind.TRANSLATION:
+        return (
+            "Parsezen ha detectado un posible problema en este fragmento. "
+            "Corrige el resultado en el idioma solicitado o confírmalo sin cambios "
+            "solo si es correcto."
+        )
+    if kind is ReviewKind.OCR:
+        return "Corrige el texto reconocido o indica que no hay texto que añadir."
+    return "Elige una versión y confirma la decisión; la recomendación es provisional."
+
+
 @dataclass(frozen=True, slots=True)
 class _PhaseWeight:
     kind: ReviewKind
@@ -89,9 +133,11 @@ class PhaseReviewDialog(QDialog):
     def __init__(
         self,
         review: ReviewSession,
-        artifacts: ArtifactStore,
+        artifacts: ArtifactRepository,
         *,
         phase_plan: tuple[ReviewKind | tuple[ReviewKind, int], ...] = (),
+        translation_follows_ocr: bool = False,
+        previous_phase_callback: Callable[[], bool] | None = None,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
@@ -99,14 +145,25 @@ class PhaseReviewDialog(QDialog):
             raise ValueError("A review must contain at least one unit.")
         self._review = review
         self._artifacts = artifacts
+        self._translation_follows_ocr = translation_follows_ocr
+        self._previous_phase_callback = previous_phase_callback
+        self._context_only_original = review.kind in {
+            ReviewKind.OCR,
+            ReviewKind.TRANSLATION,
+        }
         self._phase_plan = _normalize_phase_plan(
             phase_plan or (review.kind,),
             current_kind=review.kind,
             current_count=len(review.units),
         )
         self._index = review.first_unresolved_index() or 0
-        self._manual_navigation = False
-        self.setWindowTitle(f"{_PHASE_TITLES[review.kind]} · Parsezen")
+        self._manual_navigation = review.complete
+        self._loading_unit = False
+        self._active_case_dirty = False
+        self._focus_timer = QTimer(self)
+        self._focus_timer.setSingleShot(True)
+        self._focus_timer.timeout.connect(self._focus_pending_decision_now)
+        self.setWindowTitle("Revisión del documento · Parsezen")
         self.resize(1240, 780)
 
         layout = QVBoxLayout(self)
@@ -119,16 +176,33 @@ class PhaseReviewDialog(QDialog):
             self._phase_plan,
             review.kind,
             self,
+            total_units=len(review.units),
         )
         layout.addWidget(self.progress_indicator)
+        self.case_summary = QLabel("", self)
+        self.case_summary.setObjectName("reviewCaseSummary")
+        self.case_summary.setWordWrap(True)
+        self.case_summary.setMaximumHeight(48)
+        self.case_summary.setAccessibleName("Síntesis del caso")
+        layout.addWidget(self.case_summary)
+        self.instruction_label = QLabel(
+            _phase_instruction(
+                review.kind,
+                translation_follows_ocr=translation_follows_ocr,
+            ),
+            self,
+        )
+        self.instruction_label.setObjectName("reviewInstruction")
+        self.instruction_label.setWordWrap(True)
+        layout.addWidget(self.instruction_label)
         self.priority_summary = QLabel("", self)
         self.priority_summary.setObjectName("reviewPrioritySummary")
         self.priority_summary.setWordWrap(True)
-        layout.addWidget(self.priority_summary)
         self.unit_summary = QLabel("", self)
         self.unit_summary.setObjectName("reviewUnitSummary")
         self.unit_summary.setWordWrap(True)
-        layout.addWidget(self.unit_summary)
+        self.priority_summary.hide()
+        self.unit_summary.hide()
         self.unit_warning = QLabel("", self)
         self.unit_warning.setObjectName("reviewWarning")
         self.unit_warning.setWordWrap(True)
@@ -137,18 +211,30 @@ class PhaseReviewDialog(QDialog):
 
         splitter = QSplitter(Qt.Orientation.Horizontal, self)
         self.splitter = splitter
+        splitter.setAccessibleName("Comparación de original y propuesta")
         splitter.setChildrenCollapsible(False)
         splitter.setHandleWidth(1)
+        original_title, proposed_title = _PHASE_PANE_LABELS[review.kind]
         self.original_pane = _ReviewPane(
-            "Original",
+            original_title,
             editable=False,
-            selection_text="Conservar original",
+            selection_text="Conservar esta versión",
             parent=splitter,
         )
         self.proposed_pane = _ReviewPane(
-            "Corrección propuesta",
+            proposed_title,
             editable=True,
-            selection_text="Usar esta versión",
+            selection_text=(
+                "Confirmar sin cambios"
+                if review.kind is ReviewKind.TRANSLATION
+                else "Usar esta versión"
+            ),
+            restore_text=(
+                "Restaurar resultado"
+                if review.kind is ReviewKind.TRANSLATION
+                else "Restaurar propuesta"
+            ),
+            allow_no_text=review.kind is ReviewKind.OCR,
             parent=splitter,
         )
         splitter.addWidget(self.original_pane)
@@ -160,7 +246,15 @@ class PhaseReviewDialog(QDialog):
         self.selection_group.setExclusive(True)
         self.selection_group.addButton(self.original_pane.selector)
         self.selection_group.addButton(self.proposed_pane.selector)
+        if self.proposed_pane.no_text_button is not None:
+            self.selection_group.addButton(self.proposed_pane.no_text_button)
+        self.original_pane.selector.toggled.connect(self._selection_changed)
+        self.proposed_pane.selector.toggled.connect(self._selection_changed)
+        if self.proposed_pane.no_text_button is not None:
+            self.proposed_pane.no_text_button.toggled.connect(self._selection_changed)
         self.proposed_pane.editor.textChanged.connect(self._proposal_edited)
+        if self._context_only_original:
+            self.original_pane.selector.hide()
 
         footer = QGridLayout()
         self.footer_layout = footer
@@ -171,32 +265,27 @@ class PhaseReviewDialog(QDialog):
         self.previous_button.clicked.connect(self._previous)
         footer.addWidget(self.previous_button, 0, 0)
         footer.setColumnStretch(1, 1)
-        self.approve_all_button = QPushButton("Aprobar todas las propuestas", self)
-        self.approve_all_button.setAccessibleName("Aprobar todas las propuestas seguras")
+        self.approve_all_button = QPushButton("Aplicar recomendaciones seguras", self)
+        self.approve_all_button.setAccessibleName("Aplicar recomendaciones seguras")
         self.approve_all_button.setToolTip(
-            "Usar todas las correcciones propuestas sin revisarlas una por una"
+            "Aplicar recomendaciones seguras y dejar visibles las incidencias importantes"
         )
         self.approve_all_button.clicked.connect(self._approve_all)
-        if review.kind is ReviewKind.TRANSLATION:
-            self.approve_all_button.setText("Aprobar todas las traducciones")
-        elif review.kind is ReviewKind.REFINEMENT:
-            if any(unit.recommended_choice is ReviewChoice.ORIGINAL for unit in review.units):
-                self.approve_all_button.setText("Aplicar correcciones seguras")
-                self.approve_all_button.setToolTip(
-                    "Usar las propuestas conservadoras y mantener el original en los cambios "
-                    "marcados para revisión especial"
-                )
-            else:
-                self.approve_all_button.setText("Aprobar todas las correcciones")
-        else:
+        if review.kind is not ReviewKind.REFINEMENT:
             self.approve_all_button.hide()
         footer.addWidget(self.approve_all_button, 0, 2)
-        self.save_later_button = QPushButton("Guardar y continuar después", self)
-        self.save_later_button.setAccessibleName("Guardar y continuar después")
+        self.save_later_button = QPushButton("Guardar y salir", self)
+        self.save_later_button.setAccessibleName("Guardar y salir")
+        self.save_later_button.setAccessibleDescription(
+            "Guarda la edición o decisión actual para poder reanudar esta revisión después."
+        )
+        self.save_later_button.setToolTip(
+            "Guardar la edición o decisión actual y reanudar la revisión después"
+        )
         self.save_later_button.clicked.connect(self.reject)
         footer.addWidget(self.save_later_button, 0, 3)
-        self.next_button = QPushButton("Siguiente", self)
-        self.next_button.setAccessibleName("Siguiente revisión o aplicar todos los cambios")
+        self.next_button = QPushButton("Confirmar y siguiente", self)
+        self.next_button.setAccessibleName("Confirmar y siguiente")
         self.next_button.setObjectName("primaryAction")
         self.next_button.clicked.connect(self._next)
         footer.addWidget(self.next_button, 0, 4)
@@ -205,10 +294,17 @@ class PhaseReviewDialog(QDialog):
         self._shortcuts = (
             self._shortcut("Alt+O", self._choose_original),
             self._shortcut("Alt+P", self._choose_proposed),
+            self._shortcut("Alt+N", self._choose_no_text),
             self._shortcut("Ctrl+Return", self._next),
         )
-        self.original_pane.selector.setToolTip("Conservar original (Alt+O)")
-        self.proposed_pane.selector.setToolTip("Usar esta versión (Alt+P)")
+        self.original_pane.selector.setToolTip("Conservar esta versión (Alt+O)")
+        self.proposed_pane.selector.setToolTip(
+            "Confirmar sin cambios (Alt+P)"
+            if review.kind is ReviewKind.TRANSLATION
+            else "Usar esta versión (Alt+P)"
+        )
+        if self.proposed_pane.no_text_button is not None:
+            self.proposed_pane.no_text_button.setToolTip("No hay texto que añadir (Alt+N)")
         self.next_button.setToolTip("Guardar esta decisión y continuar (Ctrl+Intro)")
 
         self._compact = False
@@ -262,33 +358,65 @@ class PhaseReviewDialog(QDialog):
             return
         if not self.approve_all_button.isHidden():
             self.approve_all_button.setText("Aplicar seguras")
-        self.save_later_button.setText("Guardar para después")
-        if self._review.remaining_count <= 1:
-            self.next_button.setText("Aplicar")
+        self.save_later_button.setText("Guardar y salir")
+        if self._next_case_index() is None:
+            self.next_button.setText(_PHASE_FINAL_LABELS[self._review.kind])
+
+    @property
+    def internal_page_title(self) -> str:
+        return "Revisión del documento"
 
     @property
     def review(self) -> ReviewSession:
         return self._review
+
+    def reject(self) -> None:  # noqa: D401
+        """Save an interacted active case before the shared workflow closes."""
+
+        if not self._save_active_case_if_dirty():
+            return
+        self._focus_timer.stop()
+        super().reject()
+
+    def accept(self) -> None:  # noqa: D401
+        """Stop deferred focus work before the dialog is closed."""
+
+        self._focus_timer.stop()
+        super().accept()
 
     def _unit(self) -> ReviewUnit:
         return self._review.units[self._index]
 
     def _load_unit(self) -> None:
         unit = self._unit()
+        self._loading_unit = True
+        self._active_case_dirty = False
         summary_parts = [
             f"Caso {self._index + 1} de {len(self._review.units)}",
             _SEVERITY_LABELS[unit.severity],
         ]
         if unit.label:
             summary_parts.append(unit.label)
-        self.unit_summary.setText(" · ".join(summary_parts))
+        if not unit.resolved:
+            summary_parts.append(_recommendation_text(unit))
         pending = self._review.remaining_count
         priority = self._review.priority_remaining_count
-        priority_text = (
-            f" · {priority} de prioridad alta"
-            if priority
-            else " · sin casos de prioridad alta pendientes"
+        recommendation = (
+            _recommendation_text(unit).replace("Recomendación provisional: ", "Provisional · ")
+            if not unit.resolved
+            else "Decisión confirmada"
         )
+        summary = [
+            f"{_PHASE_LABELS[self._review.kind]} · Caso {self._index + 1}/"
+            f"{len(self._review.units)} · {unit.label or 'Contenido'}",
+            f"Pendientes {pending}",
+        ]
+        if priority:
+            summary.append(f"{priority} importantes")
+        summary.append(recommendation)
+        self.case_summary.setText(" · ".join(summary))
+        self.unit_summary.setText(" · ".join(summary_parts))
+        priority_text = f" · {priority} importantes" if priority else ""
         self.priority_summary.setText(
             f"{pending} {'decisión pendiente' if pending == 1 else 'decisiones pendientes'}"
             f"{priority_text}"
@@ -299,13 +427,23 @@ class PhaseReviewDialog(QDialog):
         self.unit_warning.setText(unit.warning or "")
         self.unit_warning.setVisible(bool(unit.warning))
         self.progress_indicator.set_progress(self._review.resolved_count)
-        self.previous_button.setEnabled(self._index > 0)
+        self.previous_button.setEnabled(
+            self._index > 0 or self._previous_phase_callback is not None
+        )
+        has_next_case = self._next_case_index() is not None
         self.next_button.setText(
-            "Aplicar todos los cambios" if self._review.remaining_count <= 1 else "Siguiente"
+            "Confirmar y siguiente" if has_next_case else _PHASE_FINAL_LABELS[self._review.kind]
+        )
+        self.next_button.setAccessibleName(self.next_button.text())
+        self.next_button.setToolTip(
+            "Guardar esta decisión y continuar (Ctrl+Intro)"
+            if has_next_case
+            else "Guardar esta decisión y terminar la revisión (Ctrl+Intro)"
         )
         self._refresh_compact_labels()
         self.original_pane.set_payload(
-            self._artifacts.read(self._review.job_id, unit.original_artifact_id)
+            self._artifacts.read(self._review.job_id, unit.original_artifact_id),
+            project_private=True,
         )
         proposed_id = unit.edited_artifact_id or unit.proposed_artifact_id
         proposed = (
@@ -313,35 +451,87 @@ class PhaseReviewDialog(QDialog):
             if proposed_id is not None
             else self._artifacts.read(self._review.job_id, unit.original_artifact_id)
         )
-        self.proposed_pane.set_payload(proposed)
+        self.proposed_pane.set_payload(
+            proposed,
+            project_private=True,
+        )
         self.original_pane.selector.setEnabled(unit.original_selectable)
-        if unit.choice is ReviewChoice.ORIGINAL:
+        self.proposed_pane.selector.setEnabled(unit.proposed_selectable)
+        if self.proposed_pane.no_text_button is not None:
+            self.proposed_pane.no_text_button.setEnabled(
+                unit.proposed_selectable and unit.proposed_artifact_id is not None
+            )
+        if unit.original_selectable:
+            self.original_pane.selector.setAccessibleDescription(
+                "Puedes conservar el resultado actual como reemplazo."
+            )
+        else:
+            self.original_pane.selector.setAccessibleDescription(
+                "Solo contexto de referencia; no se puede conservar como reemplazo."
+            )
+            self.original_pane.selector.setToolTip(
+                "Solo contexto; no se puede usar para reemplazar el resultado."
+            )
+        buttons = [self.original_pane.selector, self.proposed_pane.selector]
+        if self.proposed_pane.no_text_button is not None:
+            buttons.append(self.proposed_pane.no_text_button)
+        self.selection_group.setExclusive(False)
+        for button in buttons:
+            button.setChecked(False)
+        self.selection_group.setExclusive(True)
+        if unit.choice is ReviewChoice.ORIGINAL and unit.original_selectable:
             self.original_pane.selector.setChecked(True)
         elif unit.choice in {ReviewChoice.PROPOSED, ReviewChoice.EDITED}:
             self.proposed_pane.selector.setChecked(True)
-        else:
-            self.selection_group.setExclusive(False)
-            self.original_pane.selector.setChecked(False)
-            self.proposed_pane.selector.setChecked(False)
-            self.selection_group.setExclusive(True)
-            if unit.recommended_choice is ReviewChoice.ORIGINAL and unit.original_selectable:
-                self.original_pane.selector.setChecked(True)
-            else:
-                self.proposed_pane.selector.setChecked(True)
+        elif unit.choice is ReviewChoice.NO_TEXT and self.proposed_pane.no_text_button is not None:
+            self.proposed_pane.no_text_button.setChecked(True)
+        self._refresh_pane_selection()
+        self._loading_unit = False
+        self._focus_pending_decision()
 
     def _save_unit(self) -> bool:
         unit = self._unit()
+        if (
+            self.proposed_pane.no_text_button is not None
+            and self.proposed_pane.no_text_button.isChecked()
+        ):
+            self._review = self._review.decide(unit.id, ReviewChoice.NO_TEXT)
+            self._active_case_dirty = False
+            return True
         if self.original_pane.selector.isChecked():
+            if not unit.original_selectable:
+                QMessageBox.information(
+                    self,
+                    "Este contenido es solo de referencia",
+                    "El texto de origen sirve para comparar y no puede sustituir a la traducción.",
+                )
+                return False
             self._review = self._review.decide(unit.id, ReviewChoice.ORIGINAL)
+            self._active_case_dirty = False
             return True
         if not self.proposed_pane.selector.isChecked():
             QMessageBox.information(
                 self,
                 "Elige una versión",
-                "Marca el original o la versión corregida para continuar.",
+                "Elige una versión o indica que no hay texto que añadir para continuar.",
             )
             return False
-        proposed_text = self.proposed_pane.text()
+        if not unit.proposed_selectable:
+            QMessageBox.information(
+                self,
+                "Propuesta no disponible",
+                "Esta propuesta no se puede seleccionar y se conservará el original.",
+            )
+            return False
+        try:
+            proposed_text = self.proposed_pane.restored_text()
+        except ValueError:
+            QMessageBox.warning(
+                self,
+                "Edición no válida",
+                "La edición contiene sintaxis privada y no se puede guardar.",
+            )
+            return False
         original_proposal = (
             self._artifacts.read_text(self._review.job_id, unit.proposed_artifact_id)
             if unit.proposed_artifact_id is not None
@@ -349,6 +539,7 @@ class PhaseReviewDialog(QDialog):
         )
         if proposed_text == original_proposal:
             self._review = self._review.decide(unit.id, ReviewChoice.PROPOSED)
+            self._active_case_dirty = False
             return True
         if unit.edited_artifact_id is not None and proposed_text == self._artifacts.read_text(
             self._review.job_id, unit.edited_artifact_id
@@ -358,6 +549,7 @@ class PhaseReviewDialog(QDialog):
                 ReviewChoice.EDITED,
                 edited_artifact_id=unit.edited_artifact_id,
             )
+            self._active_case_dirty = False
             return True
         edited = self._artifacts.put_text(
             job_id=self._review.job_id,
@@ -369,13 +561,79 @@ class PhaseReviewDialog(QDialog):
             ReviewChoice.EDITED,
             edited_artifact_id=edited.id,
         )
+        self._active_case_dirty = False
         return True
 
+    def _save_active_case_if_dirty(self) -> bool:
+        if not self._active_case_dirty:
+            return True
+        return self._save_unit()
+
+    def _next_case_index(self) -> int | None:
+        next_unresolved = self._review.next_unresolved_index(self._index)
+        if next_unresolved is not None:
+            return next_unresolved
+        if self._manual_navigation and self._index < len(self._review.units) - 1:
+            return self._index + 1
+        return None
+
+    def _focus_pending_decision(self) -> None:
+        self._focus_timer.start(0)
+
+    def _focus_pending_decision_now(self) -> None:
+        if self._unit().resolved:
+            return
+        target = (
+            self.original_pane.selector
+            if self.original_pane.selector.isVisible()
+            and self.original_pane.selector.isEnabled()
+            and self.original_pane.selector.isChecked()
+            else (
+                self.proposed_pane.no_text_button
+                if self.proposed_pane.no_text_button is not None
+                and self.proposed_pane.no_text_button.isChecked()
+                else self.proposed_pane.selector
+            )
+        )
+        target.setFocus()
+
+    def _selection_changed(self, _checked: bool) -> None:
+        self._refresh_pane_selection()
+        if not self._loading_unit:
+            self._active_case_dirty = True
+
+    def _refresh_pane_selection(self) -> None:
+        self.original_pane.set_selected(self.original_pane.selector.isChecked())
+        self.proposed_pane.set_selected(
+            self.proposed_pane.selector.isChecked()
+            or bool(
+                self.proposed_pane.no_text_button is not None
+                and self.proposed_pane.no_text_button.isChecked()
+            )
+        )
+
     def _proposal_edited(self) -> None:
-        if self.proposed_pane.editor.hasFocus():
+        if not self._loading_unit:
+            self._active_case_dirty = True
             self.proposed_pane.selector.setChecked(True)
 
     def _previous(self) -> None:
+        if self._index <= 0:
+            if self._previous_phase_callback is None:
+                return
+            if not self._save_active_case_if_dirty():
+                return
+            confirmation = QMessageBox.question(
+                self,
+                "Volver a la fase anterior",
+                "Se volverá a abrir la fase anterior para editarla. Las revisiones posteriores "
+                "se recalcularán con tus decisiones conservadas como punto de partida. ¿Continuar?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if confirmation == QMessageBox.StandardButton.Yes and self._previous_phase_callback():
+                self.reject()
+            return
         if not self._save_unit():
             return
         self._manual_navigation = True
@@ -385,13 +643,9 @@ class PhaseReviewDialog(QDialog):
     def _next(self) -> None:
         if not self._save_unit():
             return
-        next_index = self._review.next_unresolved_index(self._index)
+        next_index = self._next_case_index()
         if next_index is not None:
             self._index = next_index
-            self._load_unit()
-            return
-        if self._manual_navigation and self._index < len(self._review.units) - 1:
-            self._index += 1
             self._load_unit()
             return
         self.accept()
@@ -410,11 +664,30 @@ class PhaseReviewDialog(QDialog):
         if self.proposed_pane.selector.isEnabled():
             self.proposed_pane.selector.setChecked(True)
 
+    def _choose_no_text(self) -> None:
+        if (
+            self.proposed_pane.no_text_button is not None
+            and self.proposed_pane.no_text_button.isEnabled()
+        ):
+            self.proposed_pane.no_text_button.setChecked(True)
+
     def _approve_all(self) -> None:
         """Apply conservative proposals without overriding high-risk originals."""
 
+        if not self._save_active_case_if_dirty():
+            return
         review = self._review
+        important_left = False
         for unit in review.units:
+            if unit.resolved:
+                continue
+            if (
+                review.kind is ReviewKind.TRANSLATION
+                and not unit.original_selectable
+                and unit.severity in {ReviewSeverity.CRITICAL, ReviewSeverity.HIGH}
+            ):
+                important_left = True
+                continue
             if unit.recommended_choice is ReviewChoice.ORIGINAL and unit.original_selectable:
                 review = review.decide(unit.id, ReviewChoice.ORIGINAL)
             elif unit.proposed_artifact_id is not None:
@@ -429,6 +702,17 @@ class PhaseReviewDialog(QDialog):
                 )
                 return
         self._review = review
+        if important_left:
+            next_index = self._review.first_unresolved_index()
+            if next_index is not None:
+                self._index = next_index
+                self._load_unit()
+            QMessageBox.information(
+                self,
+                "Revisión pendiente",
+                "Las incidencias importantes siguen visibles para confirmarlas una a una.",
+            )
+            return
         self.accept()
 
 
@@ -439,6 +723,8 @@ class _ReviewPane(QFrame):
         *,
         editable: bool,
         selection_text: str,
+        restore_text: str = "Restaurar propuesta",
+        allow_no_text: bool = False,
         parent: QWidget,
     ) -> None:
         super().__init__(parent)
@@ -450,16 +736,26 @@ class _ReviewPane(QFrame):
         self.top_layout = top
         self.heading = QLabel(title, self)
         self.heading.setObjectName("reviewPaneTitle")
+        self.heading.setAccessibleName(title)
         top.addWidget(self.heading, 0, 0)
         top.setColumnStretch(1, 1)
-        self.selector = QRadioButton(selection_text, self)
-        self.selector.setMinimumWidth(self.selector.sizeHint().width() + 18)
+        self.selector = QPushButton(selection_text, self)
+        self.selector.setObjectName("reviewChoiceButton")
+        self.selector.setCheckable(True)
+        self.selector.setAutoDefault(False)
+        self.selector.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        self.selector.setAccessibleName(f"{selection_text}: {title}")
+        self.selector.setMinimumWidth(self.selector.sizeHint().width())
         top.addWidget(self.selector, 0, 2)
         layout.addLayout(top)
         self.editor = QPlainTextEdit(self)
         self.editor.setReadOnly(not editable)
         self.editor.setLineWrapMode(QPlainTextEdit.LineWrapMode.WidgetWidth)
+        self.editor.setAccessibleName(
+            f"{title}; {'edición propuesta' if editable else 'texto de referencia'}"
+        )
         self.image = QLabel(self)
+        self.image.setAccessibleName(f"{title}; imagen de referencia")
         self.image.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.image.setVisible(False)
         self.image_scroll = QScrollArea(self)
@@ -478,16 +774,32 @@ class _ReviewPane(QFrame):
         actions.addWidget(self.locate_button, 0, 1)
         self.restore_button: QPushButton | None
         if editable:
-            self.restore_button = QPushButton("Restaurar propuesta", self)
-            self.restore_button.setAccessibleName("Restaurar propuesta")
-            self.restore_button.setToolTip("Restaurar propuesta")
+            self.restore_button = QPushButton(restore_text, self)
+            self.restore_button.setAccessibleName(restore_text)
+            self.restore_button.setToolTip(restore_text)
             self.restore_button.clicked.connect(self._restore)
             actions.addWidget(self.restore_button, 0, 2)
         else:
             self.restore_button = None
+        self.no_text_button: QPushButton | None = None
+        if allow_no_text:
+            self.no_text_button = QPushButton("No hay texto que añadir", self)
+            self.no_text_button.setObjectName("reviewChoiceButton")
+            self.no_text_button.setCheckable(True)
+            self.no_text_button.setAutoDefault(False)
+            self.no_text_button.setAccessibleName(
+                "No hay texto que añadir; conservar recursos privados"
+            )
+            self.no_text_button.setSizePolicy(
+                QSizePolicy.Policy.Expanding,
+                QSizePolicy.Policy.Preferred,
+            )
+            actions.addWidget(self.no_text_button, 0, 3)
         layout.addLayout(actions)
         self._payload = b""
         self._initial_text = ""
+        self._projection: ReviewProjection | None = None
+        self.set_selected(False)
 
     def set_compact_mode(self, compact: bool) -> None:
         for widget in (self.heading, self.selector):
@@ -495,6 +807,8 @@ class _ReviewPane(QFrame):
         self.actions_layout.removeWidget(self.locate_button)
         if self.restore_button is not None:
             self.actions_layout.removeWidget(self.restore_button)
+        if self.no_text_button is not None:
+            self.actions_layout.removeWidget(self.no_text_button)
         if compact:
             self.selector.setMinimumWidth(0)
             self.top_layout.addWidget(self.heading, 0, 0)
@@ -502,8 +816,10 @@ class _ReviewPane(QFrame):
             self.actions_layout.addWidget(self.locate_button, 0, 0)
             if self.restore_button is not None:
                 self.actions_layout.addWidget(self.restore_button, 1, 0)
+            if self.no_text_button is not None:
+                self.actions_layout.addWidget(self.no_text_button, 2, 0)
         else:
-            self.selector.setMinimumWidth(self.selector.sizeHint().width() + 18)
+            self.selector.setMinimumWidth(0)
             self.top_layout.addWidget(self.heading, 0, 0)
             self.top_layout.setColumnStretch(1, 1)
             self.top_layout.addWidget(self.selector, 0, 2)
@@ -511,9 +827,12 @@ class _ReviewPane(QFrame):
             self.actions_layout.addWidget(self.locate_button, 0, 1)
             if self.restore_button is not None:
                 self.actions_layout.addWidget(self.restore_button, 0, 2)
+            if self.no_text_button is not None:
+                self.actions_layout.addWidget(self.no_text_button, 0, 3)
 
-    def set_payload(self, payload: bytes) -> None:
+    def set_payload(self, payload: bytes, *, project_private: bool = False) -> None:
         self._payload = payload
+        self._projection = None
         try:
             text = payload.decode("utf-8")
         except UnicodeDecodeError:
@@ -525,6 +844,9 @@ class _ReviewPane(QFrame):
                 self._initial_text = ""
                 return
             text = "Este elemento no puede mostrarse, pero se conservará sin cambios."
+        if project_private:
+            self._projection = project_review_text(text)
+            text = self._projection.visible_text
         self.image_scroll.setVisible(False)
         self.editor.setVisible(True)
         self._initial_text = text
@@ -535,6 +857,15 @@ class _ReviewPane(QFrame):
 
     def text(self) -> str:
         return self.editor.toPlainText()
+
+    def restored_text(self) -> str:
+        text = self.editor.toPlainText()
+        return self._projection.restore(text) if self._projection is not None else text
+
+    def set_selected(self, selected: bool) -> None:
+        self.setProperty("selected", selected)
+        self.style().unpolish(self)
+        self.style().polish(self)
 
     def _locate(self) -> None:
         if self.editor.isVisible():
@@ -553,106 +884,114 @@ class _ReviewPane(QFrame):
 
 
 class _ReviewProgressIndicator(QWidget):
-    """Weighted overview of every real review unit in the document."""
+    """Show current-phase and global progress using only real review units."""
 
     def __init__(
         self,
         phases: tuple[_PhaseWeight, ...],
         current: ReviewKind,
         parent: QWidget,
+        *,
+        total_units: int | None = None,
     ) -> None:
         super().__init__(parent)
-        self._phases = phases
+        normalized = list(phases)
+        current_index = next(
+            (index for index, phase in enumerate(normalized) if phase.kind is current),
+            None,
+        )
+        if current_index is None:
+            normalized.append(_PhaseWeight(current, max(1, total_units or 1)))
+            current_index = len(normalized) - 1
+        elif total_units is not None:
+            normalized[current_index] = _PhaseWeight(current, max(1, total_units))
+        self._phases = tuple(phase for phase in normalized if phase.unit_count > 0)
+        self._current_index = next(
+            index for index, phase in enumerate(self._phases) if phase.kind is current
+        )
+        self._current_count = self._phases[self._current_index].unit_count
+        self._previous_units = sum(
+            phase.unit_count for phase in self._phases[: self._current_index]
+        )
+        self._total_units = max(1, sum(phase.unit_count for phase in self._phases))
         self._current = current
         self._resolved_count = 0
         self.setMinimumHeight(62)
-        self.setAccessibleName("Progreso de revisión")
+        self.setAccessibleName("Progreso global de revisión")
 
     def set_progress(self, resolved_count: int) -> None:
-        current_count = next(
-            phase.unit_count for phase in self._phases if phase.kind is self._current
-        )
-        self._resolved_count = max(0, min(resolved_count, current_count))
-        total = sum(phase.unit_count for phase in self._phases)
-        current_index = next(
-            index for index, candidate in enumerate(self._phases) if candidate.kind is self._current
-        )
-        completed_before = sum(phase.unit_count for phase in self._phases[:current_index])
+        self._resolved_count = max(0, min(resolved_count, self._current_count))
+        global_resolved = self._previous_units + self._resolved_count
         self.setAccessibleDescription(
-            f"{completed_before + self._resolved_count} de {total} revisiones resueltas."
+            f"Fase {_PHASE_LABELS[self._current]}: {self._resolved_count} de "
+            f"{self._current_count} decisiones confirmadas. "
+            f"Progreso global: {global_resolved} de {self._total_units}. "
+            f"Quedan {self._current_count - self._resolved_count} en esta fase."
         )
         self.update()
 
     @property
     def phase_fractions(self) -> tuple[tuple[ReviewKind, float], ...]:
-        total = sum(phase.unit_count for phase in self._phases)
-        return tuple((phase.kind, phase.unit_count / total) for phase in self._phases)
+        current_fraction = self._resolved_count / self._current_count
+        return tuple(
+            (
+                phase.kind,
+                1.0
+                if index < self._current_index
+                else current_fraction
+                if index == self._current_index
+                else 0.0,
+            )
+            for index, phase in enumerate(self._phases)
+        )
+
+    @property
+    def global_fraction(self) -> float:
+        return (self._previous_units + self._resolved_count) / self._total_units
 
     def paintEvent(self, _event: QPaintEvent) -> None:  # noqa: N802
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        current_index = next(
-            index for index, phase in enumerate(self._phases) if phase.kind is self._current
-        )
-        total_units = sum(phase.unit_count for phase in self._phases)
-        completed_before = sum(phase.unit_count for phase in self._phases[:current_index])
-        completed_units = completed_before + self._resolved_count
-        percent = round(100 * completed_units / total_units)
+        global_resolved = self._previous_units + self._resolved_count
+        percent = round(100 * global_resolved / self._total_units)
         painter.setPen(QColor(COLORS.text_primary))
-        progress_label = f"Progreso de revisión · {percent} %"
+        if self.width() < 420:
+            progress_label = (
+                f"Global {global_resolved}/{self._total_units} · "
+                f"{_PHASE_LABELS[self._current]} {self._resolved_count}/{self._current_count}"
+            )
+        else:
+            progress_label = (
+                f"Fase {_PHASE_LABELS[self._current]} · {self._resolved_count}/"
+                f"{self._current_count} · Global {global_resolved}/{self._total_units} · "
+                f"{percent} %"
+            )
         painter.drawText(
             QRectF(0, 0, self.width(), 22),
             Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
             progress_label,
         )
 
-        legend_x = self.width()
-        metrics = painter.fontMetrics()
-        legend_width = sum(
-            metrics.horizontalAdvance(f"{_PHASE_LABELS[phase.kind]} {phase.unit_count}") + 27
-            for phase in self._phases
-        )
-        phases_to_draw = (
-            self._phases
-            if legend_width <= self.width() - metrics.horizontalAdvance(progress_label) - SPACING.lg
-            else ()
-        )
-        for phase in reversed(phases_to_draw):
-            label = f"{_PHASE_LABELS[phase.kind]} {phase.unit_count}"
-            label_width = metrics.horizontalAdvance(label)
-            legend_x -= label_width
-            painter.setPen(QColor(COLORS.text_muted))
-            painter.drawText(
-                QRectF(legend_x, 0, label_width, 22),
-                Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
-                label,
-            )
-            legend_x -= 13
-            painter.setPen(Qt.PenStyle.NoPen)
-            painter.setBrush(QColor(_phase_color(phase.kind)))
-            painter.drawEllipse(QRectF(legend_x, 8, 6, 6))
-            legend_x -= 14
-
-        gap = 4.0
-        available = max(1.0, self.width() - gap * (len(self._phases) - 1))
-        x = 0.0
+        available = max(1.0, float(self.width()))
         painter.setPen(Qt.PenStyle.NoPen)
+        segment = QRectF(0, 38, available, 9)
+        painter.setBrush(QColor(COLORS.progress_track))
+        painter.drawRoundedRect(segment, 4.5, 4.5)
+        offset = 0.0
         for index, phase in enumerate(self._phases):
-            width = available * phase.unit_count / total_units
-            segment = QRectF(x, 38, width, 9)
-            painter.setBrush(QColor(COLORS.progress_track))
-            painter.drawRoundedRect(segment, 4.5, 4.5)
-            if index < current_index:
-                fill_fraction = 1.0
-            elif index == current_index:
-                fill_fraction = self._resolved_count / phase.unit_count
-            else:
-                fill_fraction = 0.0
-            if fill_fraction:
+            width = segment.width() * phase.unit_count / self._total_units
+            fraction = (
+                1.0
+                if index < self._current_index
+                else self._resolved_count / self._current_count
+                if index == self._current_index
+                else 0.0
+            )
+            if fraction:
                 painter.setBrush(QColor(_phase_color(phase.kind)))
-                fill = QRectF(segment.x(), segment.y(), segment.width() * fill_fraction, 9)
-                painter.drawRoundedRect(fill, 4.5, 4.5)
-            x += width + gap
+                fill = QRectF(segment.x() + offset, segment.y(), width * fraction, 9)
+                painter.drawRect(fill)
+            offset += width
         painter.end()
 
 

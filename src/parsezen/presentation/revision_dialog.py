@@ -1,4 +1,4 @@
-"""Local review UI for AI-proposed content and structure changes."""
+"""Presentation dialog for AI-proposed content and structure changes."""
 
 from __future__ import annotations
 
@@ -49,9 +49,9 @@ from PySide6.QtWidgets import (
 from parsezen.document_model import ConvertedResource
 from parsezen.epub_builder import EpubPlan
 from parsezen.epub_structure import EditableEpubStructure
-from parsezen.markdown_review import LocalMarkdownView, _PdfPagePreview
 from parsezen.pdf_conversion import PdfQualityReport, PdfReviewIssue
 from parsezen.presentation.design_system import BREAKPOINTS, COLORS, SPACING
+from parsezen.presentation.markdown_review import LocalMarkdownView, _PdfPagePreview
 from parsezen.revision import (
     RevisionChange,
     RevisionDecision,

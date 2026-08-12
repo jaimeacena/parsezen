@@ -13,7 +13,7 @@ from parsezen.domain.jobs import (
     DocumentSource,
     JobConfiguration,
     JobStatus,
-    RefinementConfiguration,
+    ProcessingPlan,
 )
 from parsezen.domain.reviews import (
     ReviewChoice,
@@ -54,7 +54,7 @@ def blocked_review(
 ) -> tuple[str, ReviewSession]:
     job = queue.add(
         DocumentSource(Path("book.md"), DocumentFormat.MARKDOWN, 100, 1),
-        JobConfiguration(refinement=RefinementConfiguration(enabled=True)),
+        JobConfiguration(plan=ProcessingPlan.LOCAL_AI_REVIEWED),
         job_id="job",
     )
     review = ReviewSession.create(

@@ -1,3 +1,4 @@
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -9,6 +10,8 @@ from parsezen.domain.jobs import (
     DocumentSource,
     JobConfiguration,
     OutputConfiguration,
+    ReviewRecommendation,
+    ReviewSignal,
     TranslationConfiguration,
 )
 from parsezen.domain.outcomes import EarlyCheckReport
@@ -33,7 +36,6 @@ def test_outcome_summary_keeps_integrity_incidents_and_review_separate() -> None
             translation=TranslationConfiguration(
                 enabled=True,
                 target_language="es",
-                manual_review=True,
             ),
         ),
         order=0,
@@ -103,3 +105,21 @@ def test_outcome_summary_keeps_integrity_incidents_and_review_separate() -> None
     assert summary.review_originals == 1
     assert summary.early_check_pages == 3
     assert summary.early_check_warnings == 1
+
+
+def test_outcome_summary_exposes_only_content_free_ai_recommendation_counts() -> None:
+    source = DocumentSource(Path("book.pdf"), DocumentFormat.PDF, 100, 1)
+    job = replace(
+        DocumentJob.create(source, JobConfiguration(), order=0, job_id="recommended"),
+        review_recommendation=ReviewRecommendation(
+            ((ReviewSignal.CONVERSION_DAMAGE, 2),),
+            (1, 3),
+            "a" * 64,
+        ),
+    )
+
+    summary = build_outcome_summary(job, ProcessResult(Path("book.md")))
+
+    assert summary.ai_review_recommended
+    assert summary.ai_review_blocks == 2
+    assert summary.ai_review_signals == 2

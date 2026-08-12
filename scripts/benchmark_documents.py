@@ -27,6 +27,7 @@ SCHEMA_VERSION = 1
 BENCHMARK_REVISION = "pdf-regression-v2"
 MAX_MANIFEST_BYTES = 2 * 1024 * 1024
 MAX_DOCUMENTS = 100
+MAX_RECORDING_RUNS = 10
 _HEADING_PATTERN = re.compile(r"^#{1,6}\s+", re.MULTILINE)
 _LINK_PATTERN = re.compile(r"\[[^\]]+\]\((?:<[^>]+>|[^)]+)\)")
 
@@ -146,14 +147,20 @@ def record_manifest(
     *,
     page_range: PdfPageRange | None = None,
     force_ocr: bool = False,
+    runs: int = 1,
 ) -> tuple[PdfBaseline, ...]:
     """Measure private PDFs and atomically write only their paths, hashes and metrics."""
     if not sources or len(sources) > MAX_DOCUMENTS:
         raise ValueError("El banco debe contener entre 1 y 100 documentos.")
+    if isinstance(runs, bool) or not 1 <= runs <= MAX_RECORDING_RUNS:
+        raise ValueError(f"Las repeticiones deben estar entre 1 y {MAX_RECORDING_RUNS}.")
     baselines: list[PdfBaseline] = []
     for source in sources:
         resolved = source.resolve(strict=True)
-        metrics = measure_pdf(resolved, page_range=page_range, force_ocr=force_ocr)
+        samples = tuple(
+            measure_pdf(resolved, page_range=page_range, force_ocr=force_ocr) for _ in range(runs)
+        )
+        metrics = _aggregate_recording_samples(samples)
         baselines.append(
             PdfBaseline(
                 source_path=resolved,
@@ -173,6 +180,44 @@ def record_manifest(
         )
     _write_manifest(destination, tuple(baselines))
     return tuple(baselines)
+
+
+def _aggregate_recording_samples(samples: tuple[PdfMetrics, ...]) -> PdfMetrics:
+    """Require stable output and retain the worst observed resource measurements."""
+    if not samples:
+        raise ValueError("La referencia necesita al menos una medición.")
+    reference = samples[0]
+    reference_structure = _structural_metrics(reference)
+    if any(_structural_metrics(sample) != reference_structure for sample in samples[1:]):
+        raise RuntimeError(
+            "La conversión no produjo una salida estructural estable entre repeticiones."
+        )
+    memory_samples = tuple(
+        sample.peak_incremental_mib for sample in samples if sample.peak_incremental_mib is not None
+    )
+    return PdfMetrics(
+        markdown_sha256=reference.markdown_sha256,
+        characters=reference.characters,
+        headings=reference.headings,
+        links=reference.links,
+        warnings=reference.warnings,
+        processed_pages=reference.processed_pages,
+        ocr_pages=reference.ocr_pages,
+        elapsed_seconds=max(sample.elapsed_seconds for sample in samples),
+        peak_incremental_mib=max(memory_samples) if memory_samples else None,
+    )
+
+
+def _structural_metrics(metrics: PdfMetrics) -> tuple[str | int, ...]:
+    return (
+        metrics.markdown_sha256,
+        metrics.characters,
+        metrics.headings,
+        metrics.links,
+        metrics.warnings,
+        metrics.processed_pages,
+        metrics.ocr_pages,
+    )
 
 
 def check_manifest(path: Path) -> tuple[RegressionCheck, ...]:
@@ -370,7 +415,17 @@ def _metrics_from_json(raw: object) -> PdfMetrics:
             "ocr_pages",
         )
     ]
-    return PdfMetrics(digest, *counts, elapsed_seconds=0, peak_incremental_mib=None)
+    return PdfMetrics(
+        markdown_sha256=digest,
+        characters=counts[0],
+        headings=counts[1],
+        links=counts[2],
+        warnings=counts[3],
+        processed_pages=counts[4],
+        ocr_pages=counts[5],
+        elapsed_seconds=0,
+        peak_incremental_mib=None,
+    )
 
 
 def _page_range_from_json(raw: object) -> PdfPageRange | None:
@@ -461,6 +516,12 @@ def _parser() -> argparse.ArgumentParser:
     record.add_argument("sources", type=Path, nargs="+")
     record.add_argument("--pages", nargs=2, type=int, metavar=("INICIO", "FIN"))
     record.add_argument("--force-ocr", action="store_true")
+    record.add_argument(
+        "--runs",
+        type=int,
+        default=1,
+        help="Repite cada conversión y usa el peor consumo observado (máximo 10).",
+    )
     check = subparsers.add_parser("check", help="Comprobar una referencia local")
     check.add_argument("manifest", type=Path)
     return parser
@@ -476,6 +537,7 @@ def main(argv: list[str] | None = None) -> int:
                 tuple(arguments.sources),
                 page_range=page_range,
                 force_ocr=arguments.force_ocr,
+                runs=arguments.runs,
             )
             for baseline in baselines:
                 print(

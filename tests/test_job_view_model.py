@@ -8,8 +8,7 @@ from parsezen.domain.jobs import (
     DocumentSource,
     JobConfiguration,
     OutputConfiguration,
-    RefinementConfiguration,
-    StructureConfiguration,
+    ProcessingPlan,
     TranslationConfiguration,
 )
 from parsezen.domain.stages import StageKind, StageStatus
@@ -99,8 +98,7 @@ def test_current_activity_follows_the_canonical_flow_order() -> None:
         JobConfiguration(
             output=OutputConfiguration(format=DocumentFormat.EPUB),
             translation=TranslationConfiguration(enabled=True, target_language="es"),
-            refinement=RefinementConfiguration(enabled=True),
-            structure=StructureConfiguration(enabled=True),
+            plan=ProcessingPlan.LOCAL_AI_REVIEWED,
         ),
         order=0,
         job_id="flow",

@@ -10,7 +10,7 @@ from parsezen.domain.jobs import (
     DocumentJob,
     DocumentSource,
     JobConfiguration,
-    RefinementConfiguration,
+    ProcessingPlan,
 )
 from parsezen.domain.stages import StageKind, StageStatus
 
@@ -28,7 +28,7 @@ def test_job_queue_owns_unique_identity_configuration_and_order() -> None:
         second.id,
         replace(
             second.configuration,
-            refinement=RefinementConfiguration(enabled=True, model="qwen3:4b"),
+            plan=ProcessingPlan.LOCAL_AI_REVIEWED,
         ),
     )
     queue.move(second.id, 0)
@@ -38,7 +38,7 @@ def test_job_queue_owns_unique_identity_configuration_and_order() -> None:
     assert tuple(job.order for job in queue.jobs) == (0, 1)
     assert configured.configuration_revision == 2
     assert queue.get(second.id) is not None
-    assert queue.get(second.id).configuration.refinement.enabled
+    assert queue.get(second.id).configuration.plan is ProcessingPlan.LOCAL_AI_REVIEWED
     assert queue.for_source(Path("two.pdf")).id == second.id
 
 

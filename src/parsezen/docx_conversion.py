@@ -9,8 +9,6 @@ from typing import cast
 from zipfile import BadZipFile
 
 import mammoth
-from markitdown import MarkItDown, MarkItDownException
-from markitdown.converter_utils.docx.pre_process import pre_process_docx
 
 from parsezen.document_model import (
     RESOURCE_REFERENCE_PREFIX,
@@ -31,9 +29,39 @@ _IMAGE_MEDIA_TYPES = {
     "image/webp": ".webp",
 }
 
+# Kept as patchable compatibility seams while their heavy implementations stay lazy.
+MarkItDown: object | None = None
+pre_process_docx: object | None = None
+
+
+class _DeferredMarkItDownException(Exception):
+    pass
+
+
+MarkItDownException: type[Exception] = _DeferredMarkItDownException
+
+
+def _load_markitdown() -> tuple[object, object]:
+    global MarkItDown, MarkItDownException, pre_process_docx
+    if MarkItDown is None:
+        from markitdown import MarkItDown as converter_type
+        from markitdown import MarkItDownException as converter_error
+
+        MarkItDown = converter_type
+        MarkItDownException = converter_error
+    if pre_process_docx is None:
+        from markitdown.converter_utils.docx.pre_process import (
+            pre_process_docx as preprocess,
+        )
+
+        pre_process_docx = preprocess
+    return MarkItDown, pre_process_docx
+
 
 def convert_docx(source_path: Path) -> ConvertedDocument:
     """Convert a validated DOCX while retaining common embedded images in reading order."""
+    converter_type, preprocess = _load_markitdown()
+
     resources: list[ConvertedResource] = []
     content_to_reference: dict[str, str] = {}
     total_bytes = 0
@@ -83,12 +111,12 @@ def convert_docx(source_path: Path) -> ConvertedDocument:
 
     try:
         with source_path.open("rb") as source_stream:
-            prepared_stream = pre_process_docx(source_stream)
+            prepared_stream = preprocess(source_stream)  # type: ignore[operator]
         html_result = mammoth.convert_to_html(
             prepared_stream,
             convert_image=collect_image,
         )
-        markdown_result = MarkItDown(enable_plugins=False).convert_stream(
+        markdown_result = converter_type(enable_plugins=False).convert_stream(  # type: ignore[operator]
             BytesIO(html_result.value.encode("utf-8")),
             file_extension=".html",
             strict=True,

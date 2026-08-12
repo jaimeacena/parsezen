@@ -9,6 +9,7 @@ from threading import RLock
 from typing import Any
 
 from parsezen.document_model import ConvertedResource
+from parsezen.domain.jobs import MarkdownOrganization
 from parsezen.epub_builder import EpubBookMetadata
 from parsezen.final_integrity import (
     FinalIntegrityReport,
@@ -212,12 +213,13 @@ def _result_to_json(result: ProcessResult) -> dict[str, Any]:
                     if metadata.cover_resource is not None
                     else None
                 ),
+                "identifiers": list(metadata.identifiers),
+                "publisher": metadata.publisher,
+                "publication_date": metadata.publication_date,
             }
             if metadata is not None
             else None
         ),
-        "revision_docx_original_paragraphs": list(result.revision_docx_original_paragraphs),
-        "revision_docx_proposed_paragraphs": list(result.revision_docx_proposed_paragraphs),
         "review_markdown": result.review_markdown,
         "review_required": result.review_required,
         "revision_approved": result.revision_approved,
@@ -225,6 +227,10 @@ def _result_to_json(result: ProcessResult) -> dict[str, Any]:
         "front_matter_blocks": result.front_matter_blocks,
         "toc_blocks": result.toc_blocks,
         "terminology_terms": result.terminology_terms,
+        "markdown_organization": result.markdown_organization.value,
+        "markdown_include_metadata": result.markdown_include_metadata,
+        "markdown_include_page_references": result.markdown_include_page_references,
+        "markdown_source_name": result.markdown_source_name,
         "telemetry": (
             {
                 "total_duration_ms": result.telemetry.total_duration_ms,
@@ -270,6 +276,9 @@ def _result_from_json(
                 if metadata_raw.get("cover_resource")
                 else None
             ),
+            identifiers=tuple(str(value) for value in metadata_raw.get("identifiers", ())),
+            publisher=metadata_raw.get("publisher"),
+            publication_date=metadata_raw.get("publication_date"),
         )
         if isinstance(metadata_raw, dict)
         else None
@@ -295,12 +304,6 @@ def _result_from_json(
         revision_draft=draft,
         revision_resources=resources,
         revision_epub_metadata=metadata,
-        revision_docx_original_paragraphs=tuple(
-            str(value) for value in raw.get("revision_docx_original_paragraphs", ())
-        ),
-        revision_docx_proposed_paragraphs=tuple(
-            str(value) for value in raw.get("revision_docx_proposed_paragraphs", ())
-        ),
         review_markdown=raw.get("review_markdown"),
         review_required=bool(raw.get("review_required", False)),
         revision_approved=bool(raw.get("revision_approved", False)),
@@ -309,6 +312,12 @@ def _result_from_json(
         front_matter_blocks=max(0, int(raw.get("front_matter_blocks", 0))),
         toc_blocks=max(0, int(raw.get("toc_blocks", 0))),
         terminology_terms=max(0, int(raw.get("terminology_terms", 0))),
+        markdown_organization=MarkdownOrganization(
+            raw.get("markdown_organization", MarkdownOrganization.SINGLE_FILE.value)
+        ),
+        markdown_include_metadata=bool(raw.get("markdown_include_metadata", False)),
+        markdown_include_page_references=bool(raw.get("markdown_include_page_references", False)),
+        markdown_source_name=raw.get("markdown_source_name"),
     )
 
 
@@ -463,6 +472,7 @@ def _translation_report_to_json(
         "source_characters": report.source_characters,
         "translated_characters": report.translated_characters,
         "total_issues": report.total_issues,
+        "issue_totals": {kind.value: count for kind, count in report.issue_totals},
         "issues": [
             {
                 "segment_number": issue.segment_number,
@@ -498,5 +508,9 @@ def _translation_report_from_json(raw: object) -> TranslationQualityReport | Non
                 identifier=str(issue.get("identifier", "")),
             )
             for issue in raw.get("issues", ())
+        ),
+        issue_totals=tuple(
+            (TranslationIssueKind(kind), int(count))
+            for kind, count in raw.get("issue_totals", {}).items()
         ),
     )

@@ -10,13 +10,17 @@ from parsezen.application.preflight import (
     analyze_preflight,
     combine_preflights,
 )
+from parsezen.application.run_validation import (
+    BatchValidationIssue,
+    validate_independent_batch_requests,
+)
 from parsezen.application.runtime_mapping import request_and_settings_from_job
 from parsezen.application.scheduler import (
     QueueRunPlan,
     plan_queue_run,
     validate_queue_run_plan,
 )
-from parsezen.batch import BatchValidationIssue, validate_independent_batch_requests
+from parsezen.cancellation import CancellationToken, check_cancelled
 from parsezen.domain.estimates import ProcessingMetric, WorkloadProfile
 from parsezen.domain.jobs import DocumentJob
 from parsezen.processing import ProcessRequest
@@ -51,6 +55,7 @@ def prepare_queue_run(
     checkpoint_retention_days: int = 30,
     metrics: tuple[ProcessingMetric, ...] = (),
     plan: QueueRunPlan | None = None,
+    cancellation: CancellationToken | None = None,
 ) -> PreparedQueueRun:
     """Map only eligible jobs to physical requests and validate them together."""
 
@@ -58,24 +63,26 @@ def prepare_queue_run(
     if plan is not None:
         validate_queue_run_plan(jobs, plan)
     jobs_by_id = {job.id: job for job in jobs}
-    mapped_items = tuple(
-        PreparedRunItem(
-            job_id,
-            *request_and_settings_from_job(
-                jobs_by_id[job_id],
-                timeout_seconds=timeout_seconds,
-                checkpoint_retention_days=checkpoint_retention_days,
-            ),
+    mapped_items: list[PreparedRunItem] = []
+    for job_id in selected_plan.job_ids:
+        check_cancelled(cancellation)
+        mapped_items.append(
+            PreparedRunItem(
+                job_id,
+                *request_and_settings_from_job(
+                    jobs_by_id[job_id],
+                    timeout_seconds=timeout_seconds,
+                    checkpoint_retention_days=checkpoint_retention_days,
+                ),
+            )
         )
-        for job_id in selected_plan.job_ids
-    )
     issues = validate_independent_batch_requests(
         tuple((item.request, item.settings) for item in mapped_items)
     )
     if issues:
         return PreparedQueueRun(
             selected_plan,
-            mapped_items,
+            tuple(mapped_items),
             issues,
             explicit_plan=plan is not None,
         )
@@ -83,11 +90,13 @@ def prepare_queue_run(
     items: list[PreparedRunItem] = []
     analyses: list[DocumentPreflight] = []
     for item in mapped_items:
+        check_cancelled(cancellation)
         analysis, profile = analyze_preflight(
             jobs_by_id[item.job_id],
             item.request,
             item.settings,
             metrics,
+            cancellation=cancellation,
         )
         analyses.append(analysis)
         items.append(

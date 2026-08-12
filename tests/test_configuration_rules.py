@@ -1,5 +1,7 @@
 from pathlib import Path
 
+import pytest
+
 from parsezen.application.configuration_rules import (
     ConfigurationSection,
     configuration_issues,
@@ -13,8 +15,7 @@ from parsezen.domain.jobs import (
     JobConfiguration,
     OutputConfiguration,
     PageRangeConfiguration,
-    RefinementConfiguration,
-    StructureConfiguration,
+    ProcessingPlan,
     TranslationConfiguration,
     TranslationMethod,
 )
@@ -29,7 +30,7 @@ def test_unconfigured_result_is_the_only_initial_blocker() -> None:
         source(),
         JobConfiguration(
             output=OutputConfiguration(configured=False),
-            refinement=RefinementConfiguration(enabled=True),
+            plan=ProcessingPlan.LOCAL_AI_REVIEWED,
         ),
     )
 
@@ -37,47 +38,63 @@ def test_unconfigured_result_is_the_only_initial_blocker() -> None:
     assert issues[0].section is ConfigurationSection.RESULT
 
 
-def test_shared_ai_profile_satisfies_every_ai_backed_phase() -> None:
+def test_reviewed_plan_uses_the_single_global_ai_profile() -> None:
     configuration = JobConfiguration(
         output=OutputConfiguration(format=DocumentFormat.EPUB),
         ai=AIProfileConfiguration(model="qwen3:4b", context_window=8192),
-        translation=TranslationConfiguration(
-            enabled=True,
-            method=TranslationMethod.LOCAL_AI,
-            target_language="Español",
-        ),
-        refinement=RefinementConfiguration(enabled=True),
-        structure=StructureConfiguration(enabled=True),
+        translation=TranslationConfiguration(enabled=True, target_language="es"),
+        plan=ProcessingPlan.LOCAL_AI_REVIEWED,
     )
 
     assert requires_ai(configuration)
     assert configuration_issues(source(), configuration) == ()
 
 
-def test_validation_groups_actionable_errors_by_their_configuration_section() -> None:
+def test_standard_plan_never_requires_ai() -> None:
     configuration = JobConfiguration(
-        output=OutputConfiguration(
-            format=DocumentFormat.MARKDOWN,
-            directory_is_custom=True,
-        ),
+        output=OutputConfiguration(format=DocumentFormat.MARKDOWN),
+        translation=TranslationConfiguration(enabled=True),
+    )
+
+    issues = configuration_issues(source(DocumentFormat.TEXT), configuration)
+
+    assert not requires_ai(configuration)
+    assert {issue.section for issue in issues} == {ConfigurationSection.TRANSLATION}
+
+
+def test_reviewed_plan_requires_a_global_model() -> None:
+    configuration = JobConfiguration(
+        output=OutputConfiguration(format=DocumentFormat.MARKDOWN),
+        plan=ProcessingPlan.LOCAL_AI_REVIEWED,
+    )
+
+    issues = configuration_issues(source(DocumentFormat.TEXT), configuration)
+
+    assert any(issue.section is ConfigurationSection.AI for issue in issues)
+
+
+def test_ai_translation_requires_the_global_model_even_in_standard_plan() -> None:
+    configuration = JobConfiguration(
         translation=TranslationConfiguration(
             enabled=True,
             method=TranslationMethod.LOCAL_AI,
-        ),
-        structure=StructureConfiguration(enabled=True),
+            target_language="es",
+        )
     )
 
-    issues = configuration_issues(
-        source(DocumentFormat.TEXT),
-        configuration,
+    issues = configuration_issues(source(DocumentFormat.TEXT), configuration)
+
+    assert requires_ai(configuration)
+    assert any(
+        issue.section is ConfigurationSection.AI
+        and issue.message.endswith("antes de traducir con IA local.")
+        for issue in issues
     )
 
-    assert {issue.section for issue in issues} == {
-        ConfigurationSection.RESULT,
-        ConfigurationSection.TRANSLATION,
-        ConfigurationSection.STRUCTURE,
-        ConfigurationSection.AI,
-    }
+
+def test_product_outputs_are_limited_to_markdown_and_epub() -> None:
+    with pytest.raises(ValueError, match="Markdown or EPUB"):
+        OutputConfiguration(format=DocumentFormat.TEXT)
 
 
 def test_custom_epub_cover_requires_an_image() -> None:
@@ -95,30 +112,16 @@ def test_custom_epub_cover_requires_an_image() -> None:
     assert any("portada" in issue.message for issue in issues)
 
 
-def test_legacy_same_format_noop_can_be_loaded_but_not_newly_saved() -> None:
-    configuration = JobConfiguration(
-        output=OutputConfiguration(format=DocumentFormat.TEXT),
-    )
-    document = source(DocumentFormat.TEXT)
+def test_markdown_same_format_requires_translation_or_reviewed_plan() -> None:
+    configuration = JobConfiguration(output=OutputConfiguration(format=DocumentFormat.MARKDOWN))
+    document = source(DocumentFormat.MARKDOWN)
 
-    assert any(
-        "Activa al menos" in issue.message
-        for issue in configuration_issues(document, configuration)
-    )
-    assert (
-        configuration_issues(
-            document,
-            configuration,
-            allow_noop_same_format=True,
-        )
-        == ()
-    )
+    assert configuration_issues(document, configuration)
+    assert configuration_issues(document, configuration, allow_noop_same_format=True) == ()
 
 
-def test_epub_same_format_is_valid_because_final_personalization_is_an_operation() -> None:
-    configuration = JobConfiguration(
-        output=OutputConfiguration(format=DocumentFormat.EPUB),
-    )
+def test_epub_same_format_is_valid_because_final_confirmation_is_an_operation() -> None:
+    configuration = JobConfiguration(output=OutputConfiguration(format=DocumentFormat.EPUB))
 
     assert configuration_issues(source(DocumentFormat.EPUB), configuration) == ()
 

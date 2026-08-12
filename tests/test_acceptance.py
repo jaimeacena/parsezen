@@ -9,7 +9,12 @@ import pytest
 
 import parsezen.pdf_conversion as pdf_conversion_module
 import parsezen.processing as processing_module
-from parsezen.domain.jobs import DocumentFormat, JobConfiguration, OutputConfiguration
+from parsezen.domain.jobs import (
+    DocumentFormat,
+    JobConfiguration,
+    JobStatus,
+    OutputConfiguration,
+)
 from parsezen.improvement import ImprovementMode
 from parsezen.pdf_conversion import PdfPageRange
 from parsezen.presentation.main_window import ParsezenMainWindow
@@ -272,12 +277,17 @@ def test_acceptance_window_processes_a_document_in_the_background(
     window._sync_workspace()
 
     window.parsezen_workspace.primary_button.click()
-    qtbot.waitUntil(lambda: not window.is_processing, timeout=3_000)
+    runtime = window._runtime_by_job[job.id]
+    qtbot.waitUntil(
+        lambda: (
+            runtime.result is not None or window._job_queue.get(job.id).status is JobStatus.FAILED
+        ),
+        timeout=3_000,
+    )
 
-    entry = window._batch_entries[0]
-    assert entry.result is not None
-    assert entry.result.final_path == output_directory / "window.md"
-    assert entry.result.final_path.read_text(encoding="utf-8") == "# Window acceptance"
+    assert runtime.result is not None
+    assert runtime.result.final_path == output_directory / "window.md"
+    assert runtime.result.final_path.read_text(encoding="utf-8") == "# Window acceptance"
 
 
 def _write_minimal_docx(destination: Path) -> None:

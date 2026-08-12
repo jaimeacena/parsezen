@@ -4,9 +4,10 @@ import pytest
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QPainter, QPdfWriter
 
-import parsezen.markdown_review as review_module
+import parsezen.presentation.markdown_review as review_module
 from parsezen.errors import ReviewUnavailableError
-from parsezen.markdown_review import (
+from parsezen.pdf_conversion import PdfQualityReport, PdfReviewIssue
+from parsezen.presentation.markdown_review import (
     LocalMarkdownView,
     MarkdownReviewDialog,
     PdfQualityReviewDialog,
@@ -14,7 +15,6 @@ from parsezen.markdown_review import (
     read_markdown_for_review,
     read_markdown_preview,
 )
-from parsezen.pdf_conversion import PdfQualityReport, PdfReviewIssue
 from parsezen.translation_quality import (
     TranslationIssueKind,
     TranslationQualityIssue,

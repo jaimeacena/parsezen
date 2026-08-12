@@ -1,13 +1,12 @@
 from dataclasses import replace
 from pathlib import Path
 
-from PySide6.QtCore import QEvent, QMimeData, QPointF, QSize, Qt, QUrl
+from PySide6.QtCore import QMimeData, QPointF, Qt, QUrl
 from PySide6.QtGui import QDropEvent
-from PySide6.QtWidgets import QApplication, QLabel, QPushButton
+from PySide6.QtWidgets import QApplication, QLabel, QPushButton, QScrollArea
 
 from parsezen.application.planner import activate_next_stage
 from parsezen.application.preflight import DocumentPreflight, combine_preflights
-from parsezen.application.recovery import RecoveryAction, RecoveryPlan
 from parsezen.domain.estimates import DurationEstimate
 from parsezen.domain.jobs import (
     DocumentFormat,
@@ -17,8 +16,11 @@ from parsezen.domain.jobs import (
     OutputConfiguration,
 )
 from parsezen.domain.stages import StageKind, StageStatus
+from parsezen.failure_recovery import RecoveryAction, RecoveryPlan
 from parsezen.final_integrity import FinalIntegrityReport, IntegrityLedger
 from parsezen.local_models import OllamaStatus
+from parsezen.presentation.activity_view import ActivityView
+from parsezen.presentation.design_system import COLORS
 from parsezen.presentation.job_table import CELL_PRESENTATION_ROLE
 from parsezen.presentation.workspace import ParsezenWorkspace
 
@@ -70,6 +72,16 @@ def test_workspace_header_reflects_running_document(qtbot) -> None:
     assert modes == ["pause"]
     assert workspace.primary_button.text() == "Pausando…"
     assert not workspace.primary_button.isEnabled()
+
+
+def test_document_drop_area_uses_a_constant_two_pixel_primary_border(qtbot) -> None:
+    workspace = ParsezenWorkspace()
+    qtbot.addWidget(workspace)
+
+    stylesheet = workspace.styleSheet()
+
+    assert stylesheet.count(f"border: 2px dashed {COLORS.action_primary};") >= 2
+    assert "border: 1px dashed" not in stylesheet
 
 
 def test_workspace_header_prioritizes_real_reviews(qtbot) -> None:
@@ -282,52 +294,21 @@ def test_workspace_exposes_verified_final_integrity(qtbot) -> None:
     assert "Contenido aprobado conservado" in index.data(Qt.ItemDataRole.ToolTipRole)
 
 
-def test_workspace_integrates_and_closes_phase_configuration(qtbot) -> None:
-    workspace = ParsezenWorkspace()
-    qtbot.addWidget(workspace)
-    editor = QLabel("Opciones de Resultado")
-
-    workspace.show_configuration_panel(editor)
-
-    assert not workspace.configuration_scroll.isHidden()
-    assert workspace.content_stack.currentWidget() is workspace.configuration_page
-    assert workspace.configuration_layout.itemAt(0).widget() is editor
-    workspace.close_configuration_panel()
-    assert workspace.configuration_scroll.isHidden()
-    assert workspace.configuration_layout.count() == 0
-    assert workspace.content_stack.currentWidget() is workspace.queue_pane
-    assert workspace.configuration_back_button.isFlat()
-
-
-def test_internal_back_button_grows_without_a_hover_frame(qtbot) -> None:
-    workspace = ParsezenWorkspace()
-    qtbot.addWidget(workspace)
-    button = workspace.configuration_back_button
-    button.clearFocus()
-    QApplication.sendEvent(button, QEvent(QEvent.Type.Leave))
-
-    assert button.iconSize() == QSize(20, 20)
-
-    QApplication.sendEvent(button, QEvent(QEvent.Type.Enter))
-
-    assert button.iconSize() == QSize(24, 24)
-
-
 def test_workspace_internal_views_return_to_the_page_that_opened_them(qtbot) -> None:
     workspace = ParsezenWorkspace()
     qtbot.addWidget(workspace)
     editor = QLabel("Configuración")
     review = QLabel("Revisión")
-    workspace.show_configuration_panel(editor)
+    workspace.show_internal_view(editor, "Editor")
 
     workspace.show_internal_view(review, "Revisar")
 
     assert workspace.current_internal_widget is review
-    assert workspace.content_stack.currentWidget() is not workspace.configuration_page
+    assert workspace.current_internal_widget is review
 
     workspace.close_internal_view(review)
 
-    assert workspace.content_stack.currentWidget() is workspace.configuration_page
+    assert workspace.content_stack.currentWidget() is workspace._internal_pages[editor][0]  # noqa: SLF001
     assert workspace.current_internal_widget is editor
 
 
@@ -338,8 +319,7 @@ def test_nested_internal_views_restore_focus_at_each_navigation_level(qtbot) -> 
     qtbot.waitExposed(workspace)
     workspace.local_ai_button.setFocus()
     editor = QPushButton("Modelo específico")
-    workspace.show_configuration_panel(editor)
-    qtbot.waitUntil(workspace.configuration_back_button.hasFocus)
+    workspace.show_internal_view(editor, "Editor")
     editor.setFocus()
 
     manager = QLabel("Modelos")
@@ -347,7 +327,7 @@ def test_nested_internal_views_restore_focus_at_each_navigation_level(qtbot) -> 
     workspace.close_internal_view(manager)
 
     qtbot.waitUntil(editor.hasFocus)
-    workspace.close_configuration_panel()
+    workspace.close_internal_view(editor)
     qtbot.waitUntil(workspace.local_ai_button.hasFocus)
 
 
@@ -471,12 +451,18 @@ def test_workspace_reflows_at_320_without_horizontal_overflow(qtbot) -> None:
     assert workspace.local_ai_button.y() > workspace.logo.y()
     assert workspace.primary_button.minimumWidth() == 0
     assert workspace.job_table.horizontalScrollBarPolicy() == Qt.ScrollBarPolicy.ScrollBarAlwaysOff
-    assert workspace.configuration_scroll.horizontalScrollBar().maximum() == 0
     assert workspace.drop_area.primary_label.width() > 0
     assert workspace.drop_area.secondary_label.width() > 0
 
-    workspace.show_configuration_panel(QLabel("Opciones"), "Configurar · one.pdf")
-    qtbot.wait(10)
 
-    assert workspace.configuration_title.width() > 0
-    assert workspace.configuration_title.text() == "Configurar · one.pdf"
+def test_internal_activity_view_uses_vertical_scroll_without_horizontal_overflow(qtbot) -> None:
+    workspace = ParsezenWorkspace()
+    qtbot.addWidget(workspace)
+    activity = ActivityView(())
+
+    workspace.show_internal_view(activity, "Actividad reciente", scroll=True)
+
+    page = workspace._internal_pages[activity][0]  # noqa: SLF001
+    viewport = page.findChild(QScrollArea)
+    assert viewport is not None
+    assert viewport.horizontalScrollBarPolicy() is Qt.ScrollBarPolicy.ScrollBarAlwaysOff

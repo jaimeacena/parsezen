@@ -1,9 +1,12 @@
 from pathlib import Path
 
+import pytest
+
 from parsezen.application.job_execution import JobExecutionController
 from parsezen.application.job_queue import JobQueue
 from parsezen.application.run_preparation import prepare_queue_run
 from parsezen.application.scheduler import QueueRunPlan, RunMode
+from parsezen.cancellation import CancellationToken
 from parsezen.domain.jobs import (
     DocumentFormat,
     DocumentSource,
@@ -11,6 +14,7 @@ from parsezen.domain.jobs import (
     OutputConfiguration,
 )
 from parsezen.domain.stages import StageKind
+from parsezen.errors import ProcessingCancelledError
 
 
 def test_preparation_maps_and_validates_only_the_planned_jobs(tmp_path: Path) -> None:
@@ -97,3 +101,19 @@ def test_explicit_retry_prepares_only_the_failed_document(tmp_path: Path) -> Non
     assert prepared.plan == plan
     assert tuple(item.job_id for item in prepared.items) == (failed_job.id,)
     assert execution.start_next_available().id == failed_job.id
+
+
+def test_preparation_honours_cancellation_before_reading_a_document(tmp_path: Path) -> None:
+    source = tmp_path / "cancelled.txt"
+    source.write_text("Cancelled", encoding="utf-8")
+    queue = JobQueue()
+    queue.add(DocumentSource.inspect(source), JobConfiguration(), job_id="cancelled")
+    cancellation = CancellationToken()
+    cancellation.cancel()
+
+    with pytest.raises(ProcessingCancelledError):
+        prepare_queue_run(
+            queue.jobs,
+            timeout_seconds=45,
+            cancellation=cancellation,
+        )

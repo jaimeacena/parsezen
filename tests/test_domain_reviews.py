@@ -1,3 +1,5 @@
+import pytest
+
 from parsezen.domain.reviews import (
     ReviewChoice,
     ReviewKind,
@@ -7,6 +9,32 @@ from parsezen.domain.reviews import (
     ReviewUnit,
 )
 from parsezen.domain.stages import StageKind
+
+
+@pytest.mark.parametrize(
+    "unit",
+    [
+        ReviewUnit("missing-proposal", "original"),
+        ReviewUnit(
+            "quarantined-proposal",
+            "original",
+            "proposal",
+            proposed_selectable=False,
+        ),
+    ],
+)
+def test_no_text_requires_a_selectable_proposed_artifact(unit: ReviewUnit) -> None:
+    review = ReviewSession.create(
+        job_id="job",
+        stage=StageKind.PREPARE,
+        kind=ReviewKind.OCR,
+        input_artifact_id="source",
+        input_version=1,
+        units=(unit,),
+    )
+
+    with pytest.raises(ValueError, match="propuesta seleccionable"):
+        review.decide(unit.id, ReviewChoice.NO_TEXT)
 
 
 def test_review_preserves_manual_decisions_until_apply() -> None:

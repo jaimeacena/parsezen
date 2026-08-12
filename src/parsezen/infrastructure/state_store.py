@@ -20,10 +20,12 @@ from parsezen.domain.jobs import (
     DocumentJob,
     DocumentSource,
     JobConfiguration,
+    MarkdownOrganization,
     OutputConfiguration,
     PageRangeConfiguration,
-    RefinementConfiguration,
-    StructureConfiguration,
+    ProcessingPlan,
+    ReviewRecommendation,
+    ReviewSignal,
     TranslationConfiguration,
     TranslationMethod,
 )
@@ -42,7 +44,7 @@ from parsezen.domain.stages import (
     StageStatus,
 )
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 6
 
 
 class StateStoreError(RuntimeError):
@@ -158,7 +160,12 @@ class StateStore:
                 )
             else:
                 current_version = int(current["value"])
-                if current_version in {1, 2, 3}:
+                if current_version < SCHEMA_VERSION:
+                    # Product configuration v5 is an intentional clean break:
+                    # discard only Parsezen's rebuildable metadata, never source files.
+                    connection.execute("DELETE FROM jobs")
+                    connection.execute("DELETE FROM job_events")
+                    connection.execute("DELETE FROM processing_metrics")
                     connection.execute(
                         "UPDATE metadata SET value = ? WHERE key = 'schema_version'",
                         (str(SCHEMA_VERSION),),
@@ -545,6 +552,9 @@ def _book_to_json(book: BookDocument) -> dict[str, Any]:
             "language": book.metadata.language,
             "author": book.metadata.author,
             "identifier": book.metadata.identifier,
+            "identifiers": list(book.metadata.identifiers),
+            "publisher": book.metadata.publisher,
+            "publication_date": book.metadata.publication_date,
         },
         "sections": [section_json(section) for section in book.sections],
         "spine": list(book.spine),
@@ -581,6 +591,9 @@ def _book_from_json(value: dict[str, Any]) -> BookDocument:
             language=str(metadata.get("language", "und")),
             author=metadata.get("author"),
             identifier=metadata.get("identifier"),
+            identifiers=tuple(str(value) for value in metadata.get("identifiers", ())),
+            publisher=metadata.get("publisher"),
+            publication_date=metadata.get("publication_date"),
         ),
         sections=tuple(section_from_json(section) for section in value["sections"]),
         spine=tuple(str(identifier) for identifier in value["spine"]),
@@ -617,10 +630,14 @@ def _job_to_json(job: DocumentJob) -> dict[str, Any]:
                 "configured": configuration.output.configured,
                 "format": configuration.output.format.value,
                 "directory": _optional_path(configuration.output.directory),
-                "directory_is_custom": configuration.output.directory_is_custom,
                 "include_images": configuration.output.include_images,
                 "image_directory": _optional_path(configuration.output.image_directory),
                 "preserve_styles": configuration.output.preserve_styles,
+                "markdown_organization": configuration.output.markdown_organization.value,
+                "markdown_include_metadata": configuration.output.markdown_include_metadata,
+                "markdown_include_page_references": (
+                    configuration.output.markdown_include_page_references
+                ),
                 "title": configuration.output.title,
                 "author": configuration.output.author,
                 "cover_strategy": configuration.output.cover_strategy.value,
@@ -629,27 +646,14 @@ def _job_to_json(job: DocumentJob) -> dict[str, Any]:
             "ai": {
                 "model": configuration.ai.model,
                 "context_window": configuration.ai.context_window,
-                "is_custom": configuration.ai.is_custom,
             },
             "translation": {
                 "enabled": configuration.translation.enabled,
                 "method": configuration.translation.method.value,
                 "target_language": configuration.translation.target_language,
-                "model": configuration.translation.model,
-                "context_window": configuration.translation.context_window,
                 "glossary": [list(item) for item in configuration.translation.glossary],
-                "manual_review": configuration.translation.manual_review,
             },
-            "refinement": {
-                "enabled": configuration.refinement.enabled,
-                "model": configuration.refinement.model,
-                "context_window": configuration.refinement.context_window,
-                "manual_review": configuration.refinement.manual_review,
-            },
-            "structure": {
-                "enabled": configuration.structure.enabled,
-                "manual_review": configuration.structure.manual_review,
-            },
+            "plan": configuration.plan.value,
             "page_range": (
                 {
                     "first_page": configuration.page_range.first_page,
@@ -663,6 +667,19 @@ def _job_to_json(job: DocumentJob) -> dict[str, Any]:
         "stages": [_stage_to_json(stage) for stage in job.stages],
         "result_path": _optional_path(job.result_path),
         "warnings": list(job.warnings),
+        "review_recommendation": (
+            {
+                "signal_counts": [
+                    [signal.value, count]
+                    for signal, count in job.review_recommendation.signal_counts
+                ],
+                "block_positions": list(job.review_recommendation.block_positions),
+                "scope_fingerprint": job.review_recommendation.scope_fingerprint,
+                "block_fingerprints": list(job.review_recommendation.block_fingerprints),
+            }
+            if job.review_recommendation is not None
+            else None
+        ),
     }
 
 
@@ -674,13 +691,10 @@ def _job_from_json(raw: object) -> DocumentJob:
     if not isinstance(source_raw, dict) or not isinstance(configuration_raw, dict):
         raise TypeError
     output_raw = configuration_raw["output"]
-    ai_raw = configuration_raw.get("ai", {})
+    ai_raw = configuration_raw["ai"]
     translation_raw = configuration_raw["translation"]
-    refinement_raw = configuration_raw["refinement"]
-    structure_raw = configuration_raw["structure"]
     if not isinstance(ai_raw, dict) or not all(
-        isinstance(value, dict)
-        for value in (output_raw, translation_raw, refinement_raw, structure_raw)
+        isinstance(value, dict) for value in (output_raw, translation_raw)
     ):
         raise TypeError
     page_range_raw = configuration_raw["page_range"]
@@ -694,46 +708,33 @@ def _job_from_json(raw: object) -> DocumentJob:
     )
     configuration = JobConfiguration(
         output=OutputConfiguration(
-            # States written before per-column configuration already described
-            # intentional, runnable outputs.
-            configured=bool(output_raw.get("configured", True)),
+            configured=bool(output_raw["configured"]),
             format=DocumentFormat(output_raw["format"]),
             directory=Path(output_raw["directory"]) if output_raw["directory"] else None,
-            directory_is_custom=bool(output_raw.get("directory_is_custom", False)),
             include_images=bool(output_raw["include_images"]),
             image_directory=(
                 Path(output_raw["image_directory"]) if output_raw["image_directory"] else None
             ),
             preserve_styles=bool(output_raw["preserve_styles"]),
+            markdown_organization=MarkdownOrganization(output_raw["markdown_organization"]),
+            markdown_include_metadata=bool(output_raw["markdown_include_metadata"]),
+            markdown_include_page_references=bool(output_raw["markdown_include_page_references"]),
             title=output_raw["title"],
             author=output_raw["author"],
             cover_strategy=CoverStrategy(output_raw["cover_strategy"]),
             cover_path=Path(output_raw["cover_path"]) if output_raw["cover_path"] else None,
         ),
         ai=AIProfileConfiguration(
-            model=ai_raw.get("model"),
-            context_window=ai_raw.get("context_window"),
-            is_custom=bool(ai_raw.get("is_custom", False)),
+            model=ai_raw["model"],
+            context_window=ai_raw["context_window"],
         ),
         translation=TranslationConfiguration(
             enabled=bool(translation_raw["enabled"]),
             method=TranslationMethod(translation_raw["method"]),
             target_language=translation_raw["target_language"],
-            model=translation_raw["model"],
-            context_window=translation_raw["context_window"],
             glossary=tuple(tuple(item) for item in translation_raw["glossary"]),
-            manual_review=bool(translation_raw["manual_review"]),
         ),
-        refinement=RefinementConfiguration(
-            enabled=bool(refinement_raw["enabled"]),
-            model=refinement_raw["model"],
-            context_window=refinement_raw["context_window"],
-            manual_review=bool(refinement_raw["manual_review"]),
-        ),
-        structure=StructureConfiguration(
-            enabled=bool(structure_raw["enabled"]),
-            manual_review=bool(structure_raw["manual_review"]),
-        ),
+        plan=ProcessingPlan(configuration_raw["plan"]),
         page_range=page_range,
         force_pdf_ocr=bool(configuration_raw["force_pdf_ocr"]),
     )
@@ -742,6 +743,24 @@ def _job_from_json(raw: object) -> DocumentJob:
         format=DocumentFormat(source_raw["format"]),
         size_bytes=int(source_raw["size_bytes"]),
         modified_ns=int(source_raw["modified_ns"]),
+    )
+    recommendation_raw = raw.get("review_recommendation")
+    recommendation = (
+        ReviewRecommendation(
+            tuple(
+                (ReviewSignal(signal), int(count))
+                for signal, count in recommendation_raw["signal_counts"]
+            ),
+            tuple(int(position) for position in recommendation_raw["block_positions"]),
+            (
+                str(recommendation_raw["scope_fingerprint"])
+                if recommendation_raw.get("scope_fingerprint") is not None
+                else None
+            ),
+            tuple(str(value) for value in recommendation_raw.get("block_fingerprints", ())),
+        )
+        if isinstance(recommendation_raw, dict)
+        else None
     )
     return DocumentJob(
         id=str(raw["id"]),
@@ -752,6 +771,7 @@ def _job_from_json(raw: object) -> DocumentJob:
         stages=tuple(_stage_from_json(stage) for stage in raw["stages"]),
         result_path=Path(raw["result_path"]) if raw["result_path"] else None,
         warnings=tuple(str(item) for item in raw["warnings"]),
+        review_recommendation=recommendation,
     )
 
 
@@ -824,6 +844,7 @@ def _review_to_json(review: ReviewSession) -> dict[str, Any]:
                 ),
                 "warning": unit.warning,
                 "severity": unit.severity.value,
+                "proposed_selectable": unit.proposed_selectable,
             }
             for unit in review.units
         ],
@@ -851,6 +872,7 @@ def _review_from_json(raw: object) -> ReviewSession:
             ),
             warning=unit.get("warning"),
             severity=ReviewSeverity(unit.get("severity", ReviewSeverity.MEDIUM.value)),
+            proposed_selectable=bool(unit.get("proposed_selectable", True)),
         )
         for unit in raw["units"]
     )

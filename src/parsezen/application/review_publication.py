@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from typing import Protocol
 
+from parsezen.application.artifact_repository import ArtifactRepository
 from parsezen.application.book_editor import (
     create_book_from_markdown,
     publish_book,
@@ -18,7 +19,6 @@ from parsezen.domain.reviews import ReviewSession
 from parsezen.epub_builder import validate_epub_file
 from parsezen.errors import RequestValidationError
 from parsezen.final_integrity import IntegrityLedger, binary_integrity_capture
-from parsezen.infrastructure.artifact_store import ArtifactStore
 from parsezen.output import replace_binary_output
 from parsezen.pdf_conversion import strip_pdf_page_markers
 from parsezen.processing import ProcessResult, apply_reviewed_revision
@@ -42,7 +42,7 @@ class ReviewPublicationCoordinator:
     def __init__(
         self,
         books: BookDraftRepository,
-        artifacts: ArtifactStore,
+        artifacts: ArtifactRepository,
         finalization: ReviewFinalizationCoordinator,
     ) -> None:
         self._books = books

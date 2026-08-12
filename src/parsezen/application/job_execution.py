@@ -14,8 +14,14 @@ from parsezen.application.scheduler import (
     start_selected_stage,
     validate_queue_run_plan,
 )
-from parsezen.domain.jobs import DocumentJob
-from parsezen.domain.stages import STAGE_ORDER, StageKind, StageStatus
+from parsezen.domain.jobs import DocumentJob, JobStatus
+from parsezen.domain.stages import (
+    STAGE_ORDER,
+    StageAvailability,
+    StageKind,
+    StageState,
+    StageStatus,
+)
 
 
 class JobExecutionController:
@@ -153,11 +159,18 @@ class JobExecutionController:
             if later.status is StageStatus.RUNNING:
                 job = job.replace_stage(later.transition(StageStatus.COMPLETED))
                 later = job.stage(later.kind)
+            if later.status is StageStatus.BLOCKED_FOR_REVIEW:
+                job = job.replace_stage(later.transition(StageStatus.CANCELLED))
+                later = job.stage(later.kind).transition(StageStatus.READY)
+                job = job.replace_stage(later)
             if later.status in {StageStatus.READY, StageStatus.COMPLETED}:
                 job = job.replace_stage(later.invalidate_cached_result())
         target = job.stage(stage_kind)
         if target.status is StageStatus.BLOCKED_FOR_REVIEW:
             return self.bind_review(job_id, stage_kind, review_id)
+        if target.status is StageStatus.RUNNING:
+            job = job.replace_stage(target.transition(StageStatus.COMPLETED))
+            target = job.stage(stage_kind)
         return self._queue.replace(
             job.replace_stage(target.require_cached_result_review(review_id))
         )
@@ -230,6 +243,36 @@ class JobExecutionController:
             if stage.participates and stage.status is not StageStatus.COMPLETED:
                 job = self._complete_stage(job, stage.kind, allow_review=True)
         return self._queue.replace(replace(job, result_path=result_path))
+
+    def begin_targeted_review(self, job_id: str) -> DocumentJob:
+        """Enable one late refinement over a completed result without rerunning the job."""
+
+        job = self._require(job_id)
+        if job.status is not JobStatus.COMPLETED or job.review_recommendation is None:
+            raise ValueError("Only a completed recommended result can start targeted review.")
+        refinement = job.stage(StageKind.REFINE)
+        if refinement.participates:
+            raise ValueError("The result already contains a refinement phase.")
+        enabled = StageState(
+            kind=StageKind.REFINE,
+            availability=StageAvailability.ENABLED,
+            status=StageStatus.READY,
+        )
+        return self._queue.replace(job.replace_stage(enabled))
+
+    def abort_targeted_review(self, job_id: str) -> DocumentJob:
+        """Restore a completed result after an optional late review stops safely."""
+
+        job = self._require(job_id)
+        refinement = job.stage(StageKind.REFINE)
+        if not refinement.participates:
+            return job
+        disabled = StageState(
+            kind=StageKind.REFINE,
+            availability=StageAvailability.DISABLED,
+        )
+        restored = job.replace_stage(disabled)
+        return self._queue.replace(restored)
 
     def reset_paused(self, job_id: str) -> DocumentJob:
         job = self._require(job_id)

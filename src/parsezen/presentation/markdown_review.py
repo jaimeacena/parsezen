@@ -1,4 +1,4 @@
-"""Small, local and read-only review surface for generated Markdown."""
+"""Presentation surface for local, read-only generated-Markdown review."""
 
 from __future__ import annotations
 

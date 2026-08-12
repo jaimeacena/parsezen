@@ -18,9 +18,6 @@ from parsezen.workflow import (
         (["docx"], OutputFormat.EPUB, True, False, False, True),
         ([".epub"], OutputFormat.EPUB, True, True, False, False),
         ([".epub", ".txt"], OutputFormat.EPUB, False, False, False, False),
-        ([".txt"], OutputFormat.TEXT, True, False, False, False),
-        ([".docx"], OutputFormat.DOCX, True, False, False, False),
-        ([".txt", ".docx"], OutputFormat.DOCX, False, False, False, False),
         ([], OutputFormat.EPUB, False, False, False, False),
     ],
 )
@@ -117,34 +114,6 @@ def test_plan_rejects_an_untyped_output_format() -> None:
         plan_workflow([".txt"], "markdown")  # type: ignore[arg-type]
 
 
-@pytest.mark.parametrize(
-    ("extension", "output_format", "format_name"),
-    [
-        (".txt", OutputFormat.TEXT, "TXT"),
-        (".docx", OutputFormat.DOCX, "Word"),
-    ],
-)
-def test_same_format_outputs_require_a_real_transformation(
-    extension: str,
-    output_format: OutputFormat,
-    format_name: str,
-) -> None:
-    idle = plan_workflow([extension], output_format)
-    active = plan_workflow(
-        [extension],
-        output_format,
-        options=WorkflowOptions(improvement_enabled=True, clean=True),
-    )
-
-    assert idle.semantic_issue == (
-        "Activa Traducir o Corregir errores y ruido para crear un resultado nuevo."
-    )
-    assert active.semantic_issue is None
-    assert active.same_format_transformation
-    assert not active.convert_to_markdown_for(extension)
-    assert active.action_text(1) == f"Mejorar {format_name}"
-
-
 def test_convert_mode_redirects_an_already_markdown_document_to_improve() -> None:
     plan = plan_workflow(
         [".md"],
@@ -173,17 +142,22 @@ def test_epub_revision_is_rebuilt_after_approval() -> None:
     )
 
 
-def test_structure_review_requires_a_structured_output() -> None:
+def test_translated_epub_uses_package_preserving_route_before_full_review() -> None:
     plan = plan_workflow(
-        [".docx"],
-        OutputFormat.DOCX,
+        [".epub"],
+        OutputFormat.EPUB,
         options=WorkflowOptions(
             mode=WorkflowMode.IMPROVE,
+            improvement_enabled=True,
+            translate=True,
+            review_content=True,
             review_structure=True,
         ),
     )
 
-    assert plan.semantic_issue == "Para usar Organizar estructura, elige Markdown o EPUB."
+    assert plan.direct_epub_translation
+    assert not plan.convert_to_markdown_for(".epub")
+    assert "conserva la estructura" in plan.epub_tooltip
 
 
 def test_blank_extensions_are_ignored() -> None:

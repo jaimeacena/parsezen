@@ -703,7 +703,7 @@ def test_model_without_tag_matches_the_latest_id_returned_by_ollama() -> None:
     [
         ("qwen3:4b", True),
         ("qwen3:4b-q8_0", True),
-        ("vendor/qwen3.5:9b", True),
+        ("vendor/qwen3.5:9b", False),
         ("deepseek-r1:8b", True),
         ("qwq:32b", True),
         ("phi4-reasoning:14b", True),

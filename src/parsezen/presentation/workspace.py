@@ -44,10 +44,10 @@ from parsezen.application.preflight import (
     RuntimeEstimate,
     format_duration_range,
 )
-from parsezen.application.recovery import RecoveryAction, RecoveryPlan
 from parsezen.branding import BRAND_DARK_LOGO_PATH, BRAND_LOGO_PATH
 from parsezen.domain.jobs import DocumentJob
 from parsezen.domain.stages import StageKind
+from parsezen.failure_recovery import RecoveryAction, RecoveryPlan
 from parsezen.final_integrity import FinalIntegrityReport
 from parsezen.local_models import OllamaStatus
 from parsezen.presentation.components import StatusMessage
@@ -234,6 +234,16 @@ class DocumentDropArea(QFrame):
         super().keyPressEvent(event)
 
 
+def _stage_label(stage: StageKind) -> str:
+    return {
+        StageKind.PREPARE: "preparación",
+        StageKind.TRANSLATE: "traducción",
+        StageKind.REFINE: "corrección",
+        StageKind.STRUCTURE: "personalización",
+        StageKind.PUBLISH: "publicación",
+    }[stage]
+
+
 class ParsezenWorkspace(QWidget):
     add_requested = Signal()
     files_dropped = Signal(object)
@@ -242,6 +252,7 @@ class ParsezenWorkspace(QWidget):
     theme_toggle_requested = Signal()
     configure_requested = Signal(str, object)
     review_requested = Signal(str, object)
+    ai_review_requested = Signal(str)
     error_requested = Signal(str, object)
     open_result_requested = Signal(str)
     open_folder_requested = Signal(str)
@@ -276,7 +287,6 @@ class ParsezenWorkspace(QWidget):
         self._message_primary_action: RecoveryAction | None = None
         self._message_secondary_action: RecoveryAction | None = None
         self._compact_layout: bool | None = None
-        self._configuration_focus_target: QWidget | None = None
 
         layout = QVBoxLayout(self)
         self.root_layout = layout
@@ -368,6 +378,7 @@ class ParsezenWorkspace(QWidget):
         self.job_table = JobTableView(self.table_panel)
         self.job_table.configure_requested.connect(self.configure_requested)
         self.job_table.review_requested.connect(self.review_requested)
+        self.job_table.ai_review_requested.connect(self.ai_review_requested)
         self.job_table.error_requested.connect(self.error_requested)
         self.job_table.open_result_requested.connect(self.open_result_requested)
         self.job_table.open_folder_requested.connect(self.open_folder_requested)
@@ -396,50 +407,6 @@ class ParsezenWorkspace(QWidget):
         queue_layout.addStretch(1)
         self.content_stack.addWidget(self.queue_pane)
 
-        self.configuration_page = QWidget(self.content_stack)
-        configuration_page_layout = QVBoxLayout(self.configuration_page)
-        configuration_page_layout.setContentsMargins(0, 0, 0, 0)
-        configuration_page_layout.setSpacing(0)
-        configuration_header = QFrame(self.configuration_page)
-        configuration_header.setObjectName("internalPageHeader")
-        configuration_header_layout = QHBoxLayout(configuration_header)
-        configuration_header_layout.setContentsMargins(8, 6, 8, 10)
-        self.configuration_back_button = InternalBackButton(configuration_header)
-        self.configuration_back_button.setAccessibleName(
-            "Volver a la cola y guardar la configuración"
-        )
-        self.configuration_back_button.setToolTip("Volver a la cola y guardar la configuración")
-        self.configuration_back_button.setIcon(back_icon())
-        self.configuration_back_button.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.configuration_back_button.clicked.connect(
-            lambda: self.internal_back_requested.emit(self.current_internal_widget)
-        )
-        configuration_header_layout.addWidget(self.configuration_back_button)
-        self.configuration_title = QLabel("Configurar documento", configuration_header)
-        self.configuration_title.setObjectName("internalPageTitle")
-        self.configuration_title.setWordWrap(True)
-        self.configuration_title.setMinimumWidth(0)
-        self.configuration_title.setSizePolicy(
-            QSizePolicy.Policy.Expanding,
-            QSizePolicy.Policy.Preferred,
-        )
-        configuration_header_layout.addWidget(self.configuration_title, 1)
-        configuration_page_layout.addWidget(configuration_header)
-
-        self.configuration_scroll = QScrollArea(self.configuration_page)
-        self.configuration_scroll.setObjectName("configurationInspector")
-        self.configuration_scroll.setWidgetResizable(True)
-        self.configuration_scroll.setFrameShape(QFrame.Shape.NoFrame)
-        self.configuration_scroll.setHorizontalScrollBarPolicy(
-            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
-        )
-        self.configuration_host = QWidget(self.configuration_scroll)
-        self.configuration_layout = QVBoxLayout(self.configuration_host)
-        self.configuration_layout.setContentsMargins(24, 16, 24, 20)
-        self.configuration_layout.setSpacing(12)
-        self.configuration_scroll.setWidget(self.configuration_host)
-        configuration_page_layout.addWidget(self.configuration_scroll, 1)
-        self.content_stack.addWidget(self.configuration_page)
         self.content_stack.setCurrentWidget(self.queue_pane)
         self._internal_pages: dict[
             QWidget,
@@ -458,7 +425,6 @@ class ParsezenWorkspace(QWidget):
         self.local_ai_button.setIcon(local_ai_icon())
         self.output_directory_button.setIcon(folder_icon())
         self.theme_button.setIcon(theme_toggle_icon())
-        self.configuration_back_button.setIcon(back_icon())
         self.drop_area.refresh_theme()
         self._apply_local_styles()
         self._refresh_header()
@@ -621,7 +587,8 @@ class ParsezenWorkspace(QWidget):
         self._message_primary_action = plan.primary_action
         self._message_secondary_action = plan.secondary_action
         self.job_message.show_message(
-            f"{plan.title}. {plan.explanation} {plan.preserved_work}",
+            f"Error en {_stage_label(stage)}. {plan.title}. "
+            f"{plan.explanation} {plan.preserved_work}",
             tone="error",
             action_label=plan.primary_label,
             secondary_action_label=plan.secondary_label,
@@ -644,49 +611,6 @@ class ParsezenWorkspace(QWidget):
             self.local_ai_requested.emit()
         elif action is RecoveryAction.CONFIGURE:
             self.configure_requested.emit(self._message_job_id, self._message_stage)
-
-    def show_configuration_panel(
-        self,
-        panel: QWidget,
-        title: str = "Configurar documento",
-    ) -> None:
-        """Open the complete document configuration as an internal page."""
-
-        self.close_configuration_panel()
-        self._configuration_focus_target = self.focusWidget()
-        panel.setParent(self.configuration_host)
-        self.configuration_layout.addWidget(panel)
-        panel.show()
-        self.configuration_title.setText(title)
-        self.current_internal_widget = panel
-        self.configuration_scroll.show()
-        self.content_stack.setCurrentWidget(self.configuration_page)
-        if hasattr(panel, "set_compact_mode"):
-            panel.set_compact_mode(bool(self._compact_layout))
-        QTimer.singleShot(0, self.configuration_back_button.setFocus)
-
-    def close_configuration_panel(self) -> None:
-        had_configuration = (
-            self.configuration_layout.count() > 0
-            or self.content_stack.currentWidget() is self.configuration_page
-        )
-        while self.configuration_layout.count():
-            item = self.configuration_layout.takeAt(0)
-            if item is None:
-                continue
-            widget = item.widget()
-            if widget is not None:
-                widget.hide()
-                widget.setParent(None)
-                widget.deleteLater()
-        if self.content_stack.currentWidget() is self.configuration_page:
-            self.content_stack.setCurrentWidget(self.queue_pane)
-        self.configuration_scroll.hide()
-        self.current_internal_widget = None
-        if had_configuration:
-            target = self._configuration_focus_target
-            self._configuration_focus_target = None
-            self._restore_workflow_focus(target)
 
     def show_internal_view(
         self,
@@ -724,6 +648,7 @@ class ParsezenWorkspace(QWidget):
             viewport = QScrollArea(page)
             viewport.setWidgetResizable(True)
             viewport.setFrameShape(QFrame.Shape.NoFrame)
+            viewport.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
             widget.setParent(viewport)
             viewport.setWidget(widget)
             page_layout.addWidget(viewport, 1)
@@ -760,11 +685,15 @@ class ParsezenWorkspace(QWidget):
         page.deleteLater()
         if replaced_header:
             self.app_header.show()
-        if previous is self.configuration_page:
-            item = self.configuration_layout.itemAt(0)
-            self.current_internal_widget = item.widget() if item is not None else None
-        else:
-            self.current_internal_widget = None
+        previous_internal = next(
+            (
+                candidate
+                for candidate, (candidate_page, *_rest) in self._internal_pages.items()
+                if candidate_page is previous
+            ),
+            None,
+        )
+        self.current_internal_widget = previous_internal
         self._restore_workflow_focus(focus_target)
 
     def _restore_workflow_focus(self, target: QWidget | None) -> None:
@@ -859,12 +788,6 @@ class ParsezenWorkspace(QWidget):
             self.drop_area.text_host.setMinimumWidth(0)
             self.drop_area.primary_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
             self.drop_area.secondary_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            self.configuration_layout.setContentsMargins(
-                SPACING.md,
-                SPACING.sm,
-                SPACING.md,
-                SPACING.md,
-            )
         else:
             self.root_layout.setContentsMargins(24, 16, 24, 20)
             self.header_layout.setContentsMargins(8, 2, 0, 2)
@@ -897,7 +820,6 @@ class ParsezenWorkspace(QWidget):
             self.drop_area.secondary_label.setAlignment(
                 Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter
             )
-            self.configuration_layout.setContentsMargins(24, 16, 24, 20)
         self.job_table.set_compact_mode(compact)
         self.batch_message.set_compact_mode(compact)
         self.job_message.set_compact_mode(compact)
@@ -978,12 +900,12 @@ class ParsezenWorkspace(QWidget):
             QFrame#documentDropArea {{
                 color: {COLORS.text_primary};
                 background-color: {COLORS.surface_subtle};
-                border: 1px dashed {COLORS.border};
+                border: 2px dashed {COLORS.action_primary};
                 border-radius: 8px;
             }}
             QFrame#documentDropArea:hover,
             QFrame#documentDropArea:focus {{
-                border-color: {COLORS.action_primary};
+                border-color: {COLORS.action_primary_hover};
                 background-color: {COLORS.action_primary_soft};
             }}
             QFrame#documentDropArea[dragActive="true"] {{

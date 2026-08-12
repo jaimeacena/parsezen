@@ -9,6 +9,11 @@ from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
 
+from parsezen.application.processing_explanation import (
+    processing_flow_steps,
+    processing_pass_summary,
+)
+from parsezen.cancellation import CancellationToken, check_cancelled
 from parsezen.domain.estimates import (
     DurationEstimate,
     ProcessingMetric,
@@ -17,6 +22,7 @@ from parsezen.domain.estimates import (
 from parsezen.domain.jobs import (
     DocumentFormat,
     DocumentJob,
+    ProcessingPlan,
     TranslationMethod,
 )
 from parsezen.pdf_conversion import PdfPageRange, resolve_pdf_page_range
@@ -54,6 +60,7 @@ class DocumentPreflight:
     expected_reviews: tuple[str, ...]
     findings: tuple[PreflightFinding, ...]
     early_check_recommended: bool = False
+    flow_steps: tuple[str, ...] = ()
 
     @property
     def severity(self) -> PreflightSeverity:
@@ -92,12 +99,18 @@ def build_workload_profile(
     job: DocumentJob,
     request: ProcessRequest,
     settings: AppSettings,
+    *,
+    cancellation: CancellationToken | None = None,
 ) -> tuple[WorkloadProfile, str]:
     """Describe comparable work without retaining a path or any document text."""
 
     if job.source.format is DocumentFormat.PDF:
         requested = request.pdf_page_range or PdfPageRange(1, 2_147_483_647)
-        resolved = resolve_pdf_page_range(request.source_path, requested)
+        resolved = resolve_pdf_page_range(
+            request.source_path,
+            requested,
+            cancellation=cancellation,
+        )
         work_units = resolved.last_page - resolved.first_page + 1
         workload_label = f"{work_units} {'página' if work_units == 1 else 'páginas'}"
     else:
@@ -119,11 +132,11 @@ def build_workload_profile(
     translation_method = (
         job.configuration.translation.method if job.configuration.translation.enabled else None
     )
+    reviewed = job.configuration.plan is ProcessingPlan.LOCAL_AI_REVIEWED
+    structure_reviewed = reviewed and job.configuration.output.format is DocumentFormat.EPUB
     model_key = (
         _model_key(settings.model)
-        if translation_method is TranslationMethod.LOCAL_AI
-        or job.configuration.refinement.enabled
-        or job.configuration.structure.enabled
+        if reviewed or translation_method is TranslationMethod.LOCAL_AI
         else None
     )
     profile = WorkloadProfile(
@@ -132,8 +145,8 @@ def build_workload_profile(
         work_units=work_units,
         force_pdf_ocr=job.configuration.force_pdf_ocr,
         translation_method=translation_method,
-        refinement_enabled=job.configuration.refinement.enabled,
-        structure_enabled=job.configuration.structure.enabled,
+        refinement_enabled=reviewed,
+        structure_enabled=structure_reviewed,
         include_images=job.configuration.output.include_images,
         preserve_styles=job.configuration.output.preserve_styles,
         model_key=model_key,
@@ -146,8 +159,17 @@ def analyze_preflight(
     request: ProcessRequest,
     settings: AppSettings,
     metrics: tuple[ProcessingMetric, ...] = (),
+    *,
+    cancellation: CancellationToken | None = None,
 ) -> tuple[DocumentPreflight, WorkloadProfile]:
-    profile, workload_label = build_workload_profile(job, request, settings)
+    check_cancelled(cancellation)
+    profile, workload_label = build_workload_profile(
+        job,
+        request,
+        settings,
+        cancellation=cancellation,
+    )
+    check_cancelled(cancellation)
     early_check_recommended = should_run_early_check(profile)
     estimate = estimate_duration(profile, metrics)
     if early_check_recommended:
@@ -161,6 +183,7 @@ def analyze_preflight(
             expected_reviews=_expected_reviews(job),
             findings=findings,
             early_check_recommended=early_check_recommended,
+            flow_steps=processing_flow_steps(job.source.format, job.configuration),
         ),
         profile,
     )
@@ -268,9 +291,9 @@ def _include_early_check_time(
     estimate: DurationEstimate,
     work_units: int,
 ) -> DurationEstimate:
-    """Account for three real sample pages without pretending they are free."""
+    """Account for a bounded diverse sample without pretending it is free."""
 
-    sample_ratio = min(0.15, 3 / max(work_units, 1))
+    sample_ratio = min(0.15, 5 / max(work_units, 1))
     lower_overhead = max(20, round(estimate.lower_seconds * sample_ratio * 0.6))
     likely_overhead = max(45, round(estimate.likely_seconds * sample_ratio))
     upper_overhead = max(90, round(estimate.upper_seconds * sample_ratio * 1.4))
@@ -369,14 +392,17 @@ def _expected_reviews(job: DocumentJob) -> tuple[str, ...]:
     reviews: list[str] = []
     if job.source.format is DocumentFormat.PDF:
         reviews.append("OCR o conversión si se detectan páginas dudosas")
-    if job.configuration.translation.enabled and job.configuration.translation.manual_review:
-        reviews.append("traducción")
-    if job.configuration.refinement.enabled and job.configuration.refinement.manual_review:
-        reviews.append("corrección")
-    if job.configuration.structure.enabled and job.configuration.structure.manual_review:
-        reviews.append("estructura")
+    if job.configuration.translation.enabled:
+        reviews.append("incidencias de traducción, si aparecen")
+    if job.configuration.plan is ProcessingPlan.LOCAL_AI_REVIEWED:
+        reviews.append("texto revisado por IA local")
+    if (
+        job.configuration.plan is ProcessingPlan.LOCAL_AI_REVIEWED
+        and job.configuration.output.format is DocumentFormat.EPUB
+    ):
+        reviews.append("estructura revisada por IA local")
     if job.configuration.output.format is DocumentFormat.EPUB:
-        reviews.append("editor EPUB final")
+        reviews.append("confirmación EPUB final")
     return tuple(reviews)
 
 
@@ -386,7 +412,14 @@ def _findings(
     *,
     early_check_recommended: bool,
 ) -> tuple[PreflightFinding, ...]:
-    findings: list[PreflightFinding] = []
+    findings: list[PreflightFinding] = [
+        PreflightFinding(
+            "processing-passes",
+            PreflightSeverity.INFO,
+            "Trabajo previsto",
+            processing_pass_summary(job.configuration),
+        )
+    ]
     if profile.force_pdf_ocr:
         severity = (
             PreflightSeverity.HIGH if profile.work_units >= 50 else PreflightSeverity.ATTENTION
@@ -405,8 +438,8 @@ def _findings(
                 "pdf-to-epub",
                 PreflightSeverity.ATTENTION,
                 "El diseño se reconstruirá",
-                "Un PDF no contiene estructura EPUB; revisa capítulos, tablas y elementos visuales "
-                "en el editor final.",
+                "Un PDF no contiene estructura EPUB; confirma capítulos, tablas y elementos "
+                "visuales antes de publicar.",
             )
         )
     if profile.translation_method is TranslationMethod.LOCAL_AI and profile.work_units >= 80:
@@ -419,34 +452,13 @@ def _findings(
                 "varias horas.",
             )
         )
-    if (
-        profile.translation_method is TranslationMethod.LOCAL_AI
-        and not job.configuration.translation.manual_review
-    ):
-        findings.append(
-            PreflightFinding(
-                "translation-without-review",
-                PreflightSeverity.HIGH,
-                "Traducción sin revisión de contenido",
-                "Las propuestas de traducción no se comprobarán una a una antes del resultado.",
-            )
-        )
-    if profile.refinement_enabled and not job.configuration.refinement.manual_review:
-        findings.append(
-            PreflightFinding(
-                "refinement-without-review",
-                PreflightSeverity.HIGH,
-                "Corrección sin revisión de contenido",
-                "Las correcciones propuestas se aplicarán sin una comparación manual previa.",
-            )
-        )
     if profile.translation_method is TranslationMethod.OFFLINE and profile.refinement_enabled:
         findings.append(
             PreflightFinding(
                 "two-language-passes",
                 PreflightSeverity.INFO,
                 "Dos pasadas sobre el texto",
-                "Primero se traducirá y después se corregirá el resultado.",
+                "Primero se traducirá sin IA y después la IA local revisará el resultado.",
             )
         )
     elif profile.translation_method is TranslationMethod.LOCAL_AI and profile.refinement_enabled:
@@ -464,8 +476,10 @@ def _findings(
                 "early-check",
                 PreflightSeverity.INFO,
                 "Comprobación temprana",
-                "Antes del recorrido completo se comprobarán tres páginas representativas. "
-                "Si no aparece un riesgo material, el procesamiento continuará automáticamente.",
+                "Antes del recorrido completo se comprobará una muestra breve con inicio, final "
+                "y páginas de contenido denso, visual o tabular. La extracción y el OCR se "
+                "reutilizarán después. Si no aparece un riesgo material, el procesamiento "
+                "continuará automáticamente.",
             )
         )
     return tuple(findings)

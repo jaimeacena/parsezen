@@ -1,14 +1,16 @@
 """Generate deterministic Parsezen brand derivatives from the official masters.
 
-The supplied light and dark masters contain presentation backgrounds. This
-script removes those backgrounds without redrawing the logo, crops transparent
-margins and resizes the exact remaining pixels with a high-quality filter.
+The official icon source keeps the user's white protective outline over a black
+presentation background. This script removes only the exterior background,
+combines the unchanged icon with the existing light/dark wordmarks and creates
+all runtime and distribution derivatives deterministically.
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
+from collections import deque
 from pathlib import Path
 from statistics import median
 
@@ -16,12 +18,16 @@ from PIL import Image
 
 ROOT = Path(__file__).resolve().parents[1]
 BRANDING_ROOT = ROOT / "assets" / "branding"
-MASTER_PATH = BRANDING_ROOT / "masters" / "parsezen-light-master.png"
-DARK_REFERENCE_PATH = BRANDING_ROOT / "masters" / "parsezen-dark-reference.png"
+ICON_SOURCE_PATH = BRANDING_ROOT / "masters" / "parsezen-icon-source.jpg"
+LIGHT_WORDMARK_REFERENCE_PATH = BRANDING_ROOT / "masters" / "parsezen-light-master.png"
+DARK_WORDMARK_REFERENCE_PATH = BRANDING_ROOT / "masters" / "parsezen-dark-reference.png"
 GENERATED_ROOT = BRANDING_ROOT / "generated"
 ALPHA_THRESHOLD = 8
 BACKGROUND_TRANSPARENT_DELTA = 10
 BACKGROUND_OPAQUE_DELTA = 72
+ICON_BACKGROUND_FLOOD_LIMIT = 224
+ICON_BACKGROUND_TRANSPARENT_DELTA = 12
+ICON_BACKGROUND_OPAQUE_DELTA = 220
 LOGO_HEIGHTS = {
     "parsezen-logo-light.png": 96,
     "parsezen-logo-light@2x.png": 192,
@@ -101,13 +107,74 @@ def _remove_baked_background(image: Image.Image) -> Image.Image:
     return output
 
 
+def _remove_icon_background(image: Image.Image) -> Image.Image:
+    """Remove only the black exterior connected to the icon canvas.
+
+    Connectivity is important: the dark document strokes remain fully opaque,
+    while the JPEG antialiasing around the thick white border becomes a clean
+    alpha matte that works on both light and dark surfaces.
+    """
+
+    source = image.convert("RGB")
+    width, height = source.size
+    pixels = source.load()
+    exterior = bytearray(width * height)
+    pending: deque[tuple[int, int]] = deque()
+
+    def enqueue(x: int, y: int) -> None:
+        index = y * width + x
+        if exterior[index] or max(pixels[x, y]) > ICON_BACKGROUND_FLOOD_LIMIT:
+            return
+        exterior[index] = 1
+        pending.append((x, y))
+
+    for x in range(width):
+        enqueue(x, 0)
+        enqueue(x, height - 1)
+    for y in range(1, height - 1):
+        enqueue(0, y)
+        enqueue(width - 1, y)
+
+    while pending:
+        x, y = pending.popleft()
+        if x:
+            enqueue(x - 1, y)
+        if x + 1 < width:
+            enqueue(x + 1, y)
+        if y:
+            enqueue(x, y - 1)
+        if y + 1 < height:
+            enqueue(x, y + 1)
+
+    output = Image.new("RGBA", source.size, (0, 0, 0, 0))
+    output_pixels = output.load()
+    alpha_range = ICON_BACKGROUND_OPAQUE_DELTA - ICON_BACKGROUND_TRANSPARENT_DELTA
+    for y in range(height):
+        for x in range(width):
+            pixel = pixels[x, y]
+            if not exterior[y * width + x]:
+                output_pixels[x, y] = (*pixel, 255)
+                continue
+            intensity = max(pixel)
+            if intensity <= ICON_BACKGROUND_TRANSPARENT_DELTA:
+                continue
+            alpha = min(
+                255,
+                round(255 * (intensity - ICON_BACKGROUND_TRANSPARENT_DELTA) / alpha_range),
+            )
+            opacity = alpha / 255
+            foreground = tuple(max(0, min(255, round(channel / opacity))) for channel in pixel)
+            output_pixels[x, y] = (*foreground, alpha)
+    return output
+
+
 def _resize_to_height(image: Image.Image, height: int) -> Image.Image:
     width = max(1, round(image.width * height / image.height))
     return image.resize((width, height), Image.Resampling.LANCZOS)
 
 
-def _extract_symbol(logo: Image.Image) -> Image.Image:
-    """Extract the exact symbol using the transparent gap before the wordmark."""
+def _logo_separator(logo: Image.Image) -> tuple[int, int]:
+    """Find the transparent gap between a legacy symbol and its wordmark."""
 
     alpha = logo.getchannel("A")
     occupied_columns = []
@@ -129,8 +196,37 @@ def _extract_symbol(logo: Image.Image) -> Image.Image:
     ]
     if not candidates:
         raise ValueError("The separator between the symbol and wordmark was not found.")
-    separator_start, _separator_end = max(candidates, key=lambda gap: gap[1] - gap[0])
-    return logo.crop((0, 0, separator_start, logo.height))
+    return max(candidates, key=lambda gap: gap[1] - gap[0])
+
+
+def _compose_logo(icon: Image.Image, wordmark_reference: Image.Image) -> Image.Image:
+    """Replace the legacy symbol while preserving the supplied wordmark pixels."""
+
+    separator_start, separator_end = _logo_separator(wordmark_reference)
+    available_width = separator_start
+    scale = min(available_width / icon.width, wordmark_reference.height / icon.height)
+    resized_icon = icon.resize(
+        (
+            max(1, round(icon.width * scale)),
+            max(1, round(icon.height * scale)),
+        ),
+        Image.Resampling.LANCZOS,
+    )
+    canvas = Image.new("RGBA", wordmark_reference.size, (0, 0, 0, 0))
+    canvas.alpha_composite(
+        resized_icon,
+        (
+            (available_width - resized_icon.width) // 2,
+            (wordmark_reference.height - resized_icon.height) // 2,
+        ),
+    )
+    canvas.alpha_composite(
+        wordmark_reference.crop(
+            (separator_end, 0, wordmark_reference.width, wordmark_reference.height)
+        ),
+        (separator_end, 0),
+    )
+    return _clean_visible_image(canvas)
 
 
 def _square_symbol(symbol: Image.Image, size: int = 1024) -> Image.Image:
@@ -159,9 +255,16 @@ def _sha256(path: Path) -> str:
 
 def generate() -> None:
     GENERATED_ROOT.mkdir(parents=True, exist_ok=True)
-    logo = _clean_visible_image(_remove_baked_background(Image.open(MASTER_PATH)))
-    dark_logo = _clean_visible_image(_remove_baked_background(Image.open(DARK_REFERENCE_PATH)))
-    symbol = _square_symbol(_extract_symbol(logo))
+    icon = _clean_visible_image(_remove_icon_background(Image.open(ICON_SOURCE_PATH)))
+    light_reference = _clean_visible_image(
+        _remove_baked_background(Image.open(LIGHT_WORDMARK_REFERENCE_PATH))
+    )
+    dark_reference = _clean_visible_image(
+        _remove_baked_background(Image.open(DARK_WORDMARK_REFERENCE_PATH))
+    )
+    logo = _compose_logo(icon, light_reference)
+    dark_logo = _compose_logo(icon, dark_reference)
+    symbol = _square_symbol(icon)
 
     generated_paths: list[Path] = []
     for filename, height in LOGO_HEIGHTS.items():
@@ -191,15 +294,29 @@ def generate() -> None:
 
     manifest_path = GENERATED_ROOT / "manifest.json"
     manifest = {
-        "source": str(MASTER_PATH.relative_to(ROOT)).replace("\\", "/"),
-        "source_sha256": _sha256(MASTER_PATH),
-        "dark_reference": str(DARK_REFERENCE_PATH.relative_to(ROOT)).replace("\\", "/"),
-        "dark_reference_sha256": _sha256(DARK_REFERENCE_PATH),
+        "source": str(ICON_SOURCE_PATH.relative_to(ROOT)).replace("\\", "/"),
+        "source_sha256": _sha256(ICON_SOURCE_PATH),
+        "light_wordmark_reference": str(LIGHT_WORDMARK_REFERENCE_PATH.relative_to(ROOT)).replace(
+            "\\", "/"
+        ),
+        "light_wordmark_reference_sha256": _sha256(LIGHT_WORDMARK_REFERENCE_PATH),
+        "dark_wordmark_reference": str(DARK_WORDMARK_REFERENCE_PATH.relative_to(ROOT)).replace(
+            "\\", "/"
+        ),
+        "dark_wordmark_reference_sha256": _sha256(DARK_WORDMARK_REFERENCE_PATH),
         "alpha_threshold": ALPHA_THRESHOLD,
         "background_extraction": {
-            "transparent_delta": BACKGROUND_TRANSPARENT_DELTA,
-            "opaque_delta": BACKGROUND_OPAQUE_DELTA,
-            "sampling": "scanline-edge-median",
+            "icon": {
+                "transparent_delta": ICON_BACKGROUND_TRANSPARENT_DELTA,
+                "opaque_delta": ICON_BACKGROUND_OPAQUE_DELTA,
+                "flood_limit": ICON_BACKGROUND_FLOOD_LIMIT,
+                "sampling": "border-connected-black",
+            },
+            "wordmarks": {
+                "transparent_delta": BACKGROUND_TRANSPARENT_DELTA,
+                "opaque_delta": BACKGROUND_OPAQUE_DELTA,
+                "sampling": "scanline-edge-median",
+            },
         },
         "outputs": {
             path.name: {

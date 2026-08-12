@@ -1,4 +1,4 @@
-"""Map stable document jobs to and from the physical processing runtime."""
+"""Map stable product plans to and from the physical processing runtime."""
 
 from __future__ import annotations
 
@@ -12,11 +12,9 @@ from parsezen.domain.jobs import (
     JobConfiguration,
     OutputConfiguration,
     PageRangeConfiguration,
-    RefinementConfiguration,
-    StructureConfiguration,
+    ProcessingPlan,
     TranslationConfiguration,
     TranslationMethod,
-    effective_ai_profile,
 )
 from parsezen.domain.stages import StageKind
 from parsezen.glossary import GlossaryEntry
@@ -64,25 +62,34 @@ def configuration_from_request(
     request: ProcessRequest,
     settings: AppSettings,
 ) -> JobConfiguration:
+    """Normalize a low-level request into the product's two-plan configuration."""
+
     translation_enabled = (
         request.target_language is not None
         or request.offline_translation_language is not None
         or request.improvement_mode
         in {ImprovementMode.TRANSLATE, ImprovementMode.CLEAN_AND_TRANSLATE}
     )
-    refinement_enabled = request.review_content or request.improvement_mode in {
-        ImprovementMode.CLEAN,
-        ImprovementMode.CLEAN_AND_TRANSLATE,
-    }
+    reviewed = (
+        request.review_content
+        or request.review_structure
+        or request.improvement_mode
+        in {
+            ImprovementMode.CLEAN,
+            ImprovementMode.CLEAN_AND_TRANSLATE,
+        }
+    )
     return JobConfiguration(
         output=OutputConfiguration(
             configured=True,
             format=_document_format(request.output_format),
             directory=request.output_directory,
-            directory_is_custom=request.output_directory is not None,
             include_images=request.include_images,
             image_directory=request.image_output_directory,
             preserve_styles=request.preserve_styles,
+            markdown_organization=request.markdown_organization,
+            markdown_include_metadata=request.markdown_include_metadata,
+            markdown_include_page_references=request.markdown_include_page_references,
             title=request.epub_title,
             author=request.epub_author,
             cover_strategy=(
@@ -103,22 +110,16 @@ def configuration_from_request(
         translation=TranslationConfiguration(
             enabled=translation_enabled,
             method=(
-                TranslationMethod.OFFLINE
-                if request.offline_translation_language is not None
-                else TranslationMethod.LOCAL_AI
+                TranslationMethod.LOCAL_AI
+                if request.target_language is not None
+                or request.improvement_mode
+                in {ImprovementMode.TRANSLATE, ImprovementMode.CLEAN_AND_TRANSLATE}
+                else TranslationMethod.OFFLINE
             ),
             target_language=request.offline_translation_language or request.target_language,
             glossary=tuple((entry.source, entry.target) for entry in request.glossary),
-            manual_review=True,
         ),
-        refinement=RefinementConfiguration(
-            enabled=refinement_enabled,
-            manual_review=request.review_content,
-        ),
-        structure=StructureConfiguration(
-            enabled=request.review_structure,
-            manual_review=request.review_structure,
-        ),
+        plan=(ProcessingPlan.LOCAL_AI_REVIEWED if reviewed else ProcessingPlan.STANDARD),
         page_range=(
             PageRangeConfiguration(
                 request.pdf_page_range.first_page,
@@ -138,32 +139,23 @@ def request_and_settings_from_job(
     checkpoint_retention_days: int = 30,
 ) -> tuple[ProcessRequest, AppSettings]:
     configuration = job.configuration
-    issues = configuration_issues(
-        job.source,
-        configuration,
-        allow_noop_same_format=True,
-    )
+    issues = configuration_issues(job.source, configuration, allow_noop_same_format=True)
     if issues:
         raise ValueError(issues[0].message)
     output_format = _process_output_format(configuration.output.format)
-    options = WorkflowOptions(
-        improvement_enabled=(
-            configuration.translation.enabled
-            or configuration.refinement.enabled
-            or configuration.structure.enabled
-        ),
-        translate=configuration.translation.enabled,
-        review_content=configuration.refinement.enabled,
-        review_structure=configuration.structure.enabled,
-    )
-    plan = plan_workflow((job.source.path.suffix,), output_format, options=options)
-    improvement_mode = None
-    if (
+    reviewed = configuration.plan is ProcessingPlan.LOCAL_AI_REVIEWED
+    ai_translation = (
         configuration.translation.enabled
         and configuration.translation.method is TranslationMethod.LOCAL_AI
-    ):
-        improvement_mode = ImprovementMode.TRANSLATE
-
+    )
+    review_structure = reviewed and configuration.output.format is DocumentFormat.EPUB
+    options = WorkflowOptions(
+        improvement_enabled=configuration.translation.enabled or reviewed,
+        translate=configuration.translation.enabled,
+        review_content=reviewed,
+        review_structure=review_structure,
+    )
+    plan = plan_workflow((job.source.path.suffix,), output_format, options=options)
     glossary = tuple(
         GlossaryEntry(source, target) for source, target in configuration.translation.glossary
     )
@@ -171,17 +163,11 @@ def request_and_settings_from_job(
         source_path=job.source.path,
         convert_to_markdown=plan.convert_to_markdown_for(job.source.path.suffix),
         output_directory=configuration.output.directory,
-        improvement_mode=improvement_mode,
-        target_language=(
-            configuration.translation.target_language
-            if configuration.translation.enabled
-            and configuration.translation.method is TranslationMethod.LOCAL_AI
-            else None
-        ),
+        improvement_mode=(ImprovementMode.TRANSLATE if ai_translation else None),
+        target_language=(configuration.translation.target_language if ai_translation else None),
         offline_translation_language=(
             configuration.translation.target_language
-            if configuration.translation.enabled
-            and configuration.translation.method is TranslationMethod.OFFLINE
+            if configuration.translation.enabled and not ai_translation
             else None
         ),
         pdf_page_range=(
@@ -201,15 +187,17 @@ def request_and_settings_from_job(
         glossary=glossary,
         include_images=configuration.output.include_images,
         preserve_styles=configuration.output.preserve_styles,
+        markdown_organization=configuration.output.markdown_organization,
+        markdown_include_metadata=configuration.output.markdown_include_metadata,
+        markdown_include_page_references=configuration.output.markdown_include_page_references,
         epub_first_page_cover=(configuration.output.cover_strategy is CoverStrategy.FIRST_PAGE),
         epub_remove_cover=(configuration.output.cover_strategy is CoverStrategy.REMOVE),
-        review_content=configuration.refinement.enabled,
-        review_structure=configuration.structure.enabled,
+        review_content=reviewed,
+        review_structure=review_structure,
     )
-    ai_profile = effective_ai_profile(configuration)
     settings = AppSettings(
-        model=ai_profile.model,
-        context_window=ai_profile.context_window,
+        model=configuration.ai.model,
+        context_window=configuration.ai.context_window,
         output_directory=configuration.output.directory,
         image_output_directory=configuration.output.image_directory,
         timeout_seconds=timeout_seconds,
@@ -220,18 +208,12 @@ def request_and_settings_from_job(
 
 def _document_format(output_format: OutputFormat) -> DocumentFormat:
     return {
-        OutputFormat.TEXT: DocumentFormat.TEXT,
         OutputFormat.MARKDOWN: DocumentFormat.MARKDOWN,
-        OutputFormat.DOCX: DocumentFormat.DOCX,
         OutputFormat.EPUB: DocumentFormat.EPUB,
     }[output_format]
 
 
 def _process_output_format(document_format: DocumentFormat) -> OutputFormat:
-    return {
-        DocumentFormat.TEXT: OutputFormat.TEXT,
-        DocumentFormat.MARKDOWN: OutputFormat.MARKDOWN,
-        DocumentFormat.DOCX: OutputFormat.DOCX,
-        DocumentFormat.EPUB: OutputFormat.EPUB,
-        DocumentFormat.PDF: OutputFormat.MARKDOWN,
-    }[document_format]
+    if document_format is DocumentFormat.EPUB:
+        return OutputFormat.EPUB
+    return OutputFormat.MARKDOWN

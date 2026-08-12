@@ -14,6 +14,7 @@ class JobAction(StrEnum):
     REVIEW = "review"
     OPEN_RESULT = "open_result"
     SHOW_ERROR = "show_error"
+    REVIEW_WITH_AI = "review_with_ai"
 
 
 @dataclass(frozen=True, slots=True)
@@ -78,6 +79,14 @@ def next_step_view(job: DocumentJob) -> NextStepView:
             StageKind.PUBLISH,
         )
     if job.status is JobStatus.COMPLETED:
+        if job.review_recommendation is not None:
+            return NextStepView(
+                "Revisión sugerida",
+                "review",
+                JobAction.REVIEW_WITH_AI,
+                "Revisar con IA",
+                StageKind.REFINE,
+            )
         return NextStepView(
             "Listo",
             "completed",

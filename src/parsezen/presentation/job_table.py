@@ -48,10 +48,10 @@ from parsezen.application.preflight import (
     RuntimeEstimate,
     format_duration_range,
 )
-from parsezen.domain.jobs import DocumentFormat, DocumentJob, JobStatus
+from parsezen.domain.jobs import DocumentFormat, DocumentJob, JobStatus, ProcessingPlan
 from parsezen.domain.stages import StageKind
 from parsezen.final_integrity import FinalIntegrityReport
-from parsezen.presentation.design_system import COLORS
+from parsezen.presentation.design_system import COLORS, SPACING
 from parsezen.presentation.job_view_model import focus_stage, next_step_view
 
 CELL_PRESENTATION_ROLE = Qt.ItemDataRole.UserRole + 1
@@ -128,10 +128,8 @@ def _flow_operations(job: DocumentJob) -> tuple[str, ...]:
     operations: list[str] = []
     if job.configuration.translation.enabled:
         operations.append("Traducir")
-    if job.configuration.refinement.enabled:
-        operations.append("Corregir")
-    if job.configuration.structure.enabled:
-        operations.append("Personalizar")
+    if job.configuration.plan is ProcessingPlan.LOCAL_AI_REVIEWED:
+        operations.append("Revisar con IA")
     return tuple(operations)
 
 
@@ -201,6 +199,12 @@ def cell_presentation(
                 "Integridad final comprobada"
                 if integrity_report.verified
                 else "Control final no disponible"
+            )
+        if job.status is JobStatus.COMPLETED and job.review_recommendation is not None:
+            block_count = len(job.review_recommendation.block_positions)
+            estimate = (
+                f"{block_count} {'bloque señalado' if block_count == 1 else 'bloques señalados'} "
+                "· el resultado ya está disponible"
             )
         return CellPresentation(
             next_step.label,
@@ -731,7 +735,7 @@ class JobCellDelegate(QStyledItemDelegate):
             painter.setPen(QColor(border))
             painter.drawText(button_rect, Qt.AlignmentFlag.AlignCenter, presentation.action)
         if presentation.progress is not None and presentation.tone == "running":
-            track = QRectF(left, option.rect.center().y() + 16, min(190, width), 5)
+            track = cls._progress_track_rect(option, presentation)
             painter.setPen(Qt.PenStyle.NoPen)
             painter.setBrush(QColor(COLORS.progress_track))
             painter.drawRoundedRect(track, 2.5, 2.5)
@@ -741,6 +745,27 @@ class JobCellDelegate(QStyledItemDelegate):
                 2.5,
                 2.5,
             )
+
+    @classmethod
+    def _progress_track_rect(
+        cls,
+        option: QStyleOptionViewItem,
+        presentation: CellPresentation,
+    ) -> QRectF:
+        """Place the running track below the remaining-time line in the row."""
+
+        left = option.rect.left() + 14
+        width = max(0, option.rect.width() - 28)
+        has_secondary_line = bool(presentation.subtitle)
+        label_top = option.rect.center().y() - (
+            29 if presentation.action else 20 if has_secondary_line else 10
+        )
+        line_bottom = label_top + (40 if has_secondary_line else 21)
+        track_top = min(
+            line_bottom + SPACING.xs,
+            option.rect.bottom() - 5,
+        )
+        return QRectF(left, track_top, min(190, width), 5)
 
     @staticmethod
     def _paint_operation_chips(
@@ -934,6 +959,7 @@ class JobTableView(QTableView):
     MAX_VISIBLE_ROWS = 6
     configure_requested = Signal(str, object)
     review_requested = Signal(str, object)
+    ai_review_requested = Signal(str)
     error_requested = Signal(str, object)
     open_result_requested = Signal(str)
     open_folder_requested = Signal(str)
@@ -1055,6 +1081,9 @@ class JobTableView(QTableView):
         presentation = index.data(CELL_PRESENTATION_ROLE)
         if isinstance(presentation, CellPresentation) and presentation.action == "Revisar":
             self.review_requested.emit(str(index.data(JOB_ID_ROLE)), index.data(STAGE_KIND_ROLE))
+            return
+        if isinstance(presentation, CellPresentation) and presentation.action == "Revisar con IA":
+            self.ai_review_requested.emit(str(index.data(JOB_ID_ROLE)))
             return
         if isinstance(presentation, CellPresentation) and presentation.action == "Ver error":
             self.error_requested.emit(str(index.data(JOB_ID_ROLE)), index.data(STAGE_KIND_ROLE))
@@ -1182,8 +1211,15 @@ class JobTableView(QTableView):
             open_result = menu.addAction("Abrir resultado")
             open_folder = menu.addAction("Abrir carpeta")
             result_summary = menu.addAction("Ver resumen")
+            targeted_review = (
+                menu.addAction("Revisar señales con IA")
+                if job.review_recommendation is not None
+                else None
+            )
             menu.addSeparator()
-        elif job.status is JobStatus.WAITING_REVIEW:
+        else:
+            targeted_review = None
+        if job.status is JobStatus.WAITING_REVIEW:
             review = menu.addAction("Revisar")
             menu.addSeparator()
         elif job.status in {JobStatus.QUEUED, JobStatus.FAILED, JobStatus.CANCELLED}:
@@ -1210,6 +1246,8 @@ class JobTableView(QTableView):
             self.open_folder_requested.emit(job_id)
         elif result_summary is not None and selected is result_summary:
             self.result_summary_requested.emit(job_id)
+        elif targeted_review is not None and selected is targeted_review:
+            self.ai_review_requested.emit(job_id)
         elif remove is not None and selected is remove:
             self.remove_requested.emit(job_id)
 
@@ -1230,7 +1268,8 @@ class JobTableView(QTableView):
         presentation = index.data(CELL_PRESENTATION_ROLE)
         return bool(index.data(CONFIGURABLE_ROLE)) or (
             isinstance(presentation, CellPresentation)
-            and presentation.action in {"Revisar", "Ver error", "Abrir resultado", "Configurar"}
+            and presentation.action
+            in {"Revisar", "Revisar con IA", "Ver error", "Abrir resultado", "Configurar"}
         )
 
     def _resize_columns(self) -> None:

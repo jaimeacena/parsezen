@@ -6,6 +6,7 @@ import pytest
 
 import parsezen.output as output
 from parsezen.document_model import ConvertedResource
+from parsezen.domain.jobs import MarkdownOrganization
 from parsezen.errors import FinalIntegrityError, OutputWriteError
 
 
@@ -13,23 +14,16 @@ def _resource(path: str, content: bytes = b"image") -> ConvertedResource:
     return ConvertedResource(PurePosixPath(path), content, "image/png")
 
 
-def test_same_format_outputs_are_atomic_and_collision_free(tmp_path: Path) -> None:
-    text_source = tmp_path / "notes.txt"
-    text_source.write_text("original", encoding="utf-8")
-    (tmp_path / "notes.mended.txt").write_text("existing", encoding="utf-8")
-    docx_source = tmp_path / "book.docx"
-    docx_source.write_bytes(b"original-docx")
-    (tmp_path / "book.mended.docx").write_bytes(b"existing-docx")
+def test_epub_output_is_atomic_and_collision_free(tmp_path: Path) -> None:
+    source = tmp_path / "book.md"
+    source.write_text("original", encoding="utf-8")
+    (tmp_path / "book.epub").write_bytes(b"existing")
 
-    text_result = output.write_text_output(text_source, "improved")
-    docx_result = output.write_docx_output(docx_source, b"improved-docx")
+    result = output.write_epub_output(source, b"complete-epub")
 
-    assert text_result.name == "notes-2.mended.txt"
-    assert text_result.read_text(encoding="utf-8") == "improved"
-    assert docx_result.name == "book-2.mended.docx"
-    assert docx_result.read_bytes() == b"improved-docx"
-    assert text_source.read_text(encoding="utf-8") == "original"
-    assert docx_source.read_bytes() == b"original-docx"
+    assert result.name == "book-2.epub"
+    assert result.read_bytes() == b"complete-epub"
+    assert source.read_text(encoding="utf-8") == "original"
 
 
 def test_conversion_rejects_duplicate_or_unsafe_resource_paths_without_partial_output(
@@ -146,7 +140,14 @@ def test_review_replacements_are_atomic_and_report_failures(
     text_path.write_text("before", encoding="utf-8")
     binary_path.write_bytes(b"before")
 
-    output.replace_text_output(text_path, "after")
+    output.replace_markdown_output(
+        text_path,
+        "after",
+        organization=MarkdownOrganization.SINGLE_FILE,
+        source_name=text_path.name,
+        include_metadata=False,
+        include_page_references=False,
+    )
     output.replace_binary_output(binary_path, b"after")
 
     assert text_path.read_text(encoding="utf-8") == "after"
@@ -158,7 +159,14 @@ def test_review_replacements_are_atomic_and_report_failures(
         lambda *_args: (_ for _ in ()).throw(OSError("locked")),
     )
     with pytest.raises(OutputWriteError, match="actualizar"):
-        output.replace_text_output(text_path, "blocked")
+        output.replace_markdown_output(
+            text_path,
+            "blocked",
+            organization=MarkdownOrganization.SINGLE_FILE,
+            source_name=text_path.name,
+            include_metadata=False,
+            include_page_references=False,
+        )
     with pytest.raises(OutputWriteError, match="actualizar"):
         output.replace_binary_output(binary_path, b"blocked")
 
@@ -168,15 +176,15 @@ def test_staging_validation_runs_before_publication_and_leaves_no_partial_result
 ) -> None:
     source = tmp_path / "notes.txt"
     source.write_text("source", encoding="utf-8")
-    destination = tmp_path / "notes.mended.txt"
+    destination = tmp_path / "notes.epub"
 
     def reject(staged: Path) -> None:
-        assert staged.read_text(encoding="utf-8") == "candidate"
+        assert staged.read_bytes() == b"candidate"
         assert not destination.exists()
         raise FinalIntegrityError("Control final fallido")
 
     with pytest.raises(FinalIntegrityError, match="Control final"):
-        output.write_text_output(source, "candidate", validate_staged=reject)
+        output.write_epub_output(source, b"candidate", validate_staged=reject)
 
     assert not destination.exists()
     assert not tuple(tmp_path.glob(".parsezen-*.tmp"))

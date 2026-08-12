@@ -13,7 +13,7 @@ import re
 import subprocess
 import sys
 import zipfile
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
@@ -57,6 +57,36 @@ MAX_OLLAMA_MODEL_BYTES = 10**13
 MAX_RECOMMENDATION_MODELS = 3
 LLMFIT_QUERY_LIMIT = 500
 LLMFIT_USE_CASE = "chat"
+_TRUSTED_LLMFIT_ARCHIVES = {
+    (
+        "1.1.9",
+        "x86_64-pc-windows-msvc",
+    ): "a030269d7cc8a5bf40383f526a481655d698ec71dd792a25b06510cef9f8b738",
+    (
+        "1.1.9",
+        "aarch64-pc-windows-msvc",
+    ): "638df46706c2f632d77ae7c3780f279ae7037732412373ee1cce5d582e5b96f4",
+}
+_LLMFIT_ENVIRONMENT_ALLOWLIST = frozenset(
+    {
+        "APPDATA",
+        "LOCALAPPDATA",
+        "NUMBER_OF_PROCESSORS",
+        "PATH",
+        "PATHEXT",
+        "PROCESSOR_ARCHITECTURE",
+        "PROCESSOR_IDENTIFIER",
+        "PROGRAMDATA",
+        "PROGRAMFILES",
+        "PROGRAMFILES(X86)",
+        "SYSTEMDRIVE",
+        "SYSTEMROOT",
+        "TEMP",
+        "TMP",
+        "USERPROFILE",
+        "WINDIR",
+    }
+)
 
 _VERSION_PATTERN = re.compile(r"^v?(\d+\.\d+\.\d+)$")
 _SHA256_PATTERN = re.compile(r"^[a-f0-9]{64}$")
@@ -132,6 +162,8 @@ class LlmfitComponent:
 
     executable: Path
     version: str
+    target: str
+    archive_sha256: str
     executable_sha256: str
     license_path: Path
     license_sha256: str
@@ -169,11 +201,14 @@ def ensure_llmfit(
     now: datetime | None = None,
     platform_name: str | None = None,
     machine_name: str | None = None,
+    trusted_archives: Mapping[tuple[str, str], str] | None = None,
 ) -> LlmfitComponent:
     """Install or refresh llmfit, retaining a verified existing copy if the network fails."""
     current_time = _as_utc(now or datetime.now(UTC))
     directory = component_directory or get_llmfit_component_directory()
-    installed = _load_installed_component(directory)
+    target = _release_target(platform_name or sys.platform, machine_name or platform.machine())
+    trusted = _TRUSTED_LLMFIT_ARCHIVES if trusted_archives is None else trusted_archives
+    installed = _load_installed_component(directory, target=target, trusted_archives=trusted)
     if installed is not None and _is_recent(
         installed.checked_at, current_time, LLMFIT_UPDATE_INTERVAL
     ):
@@ -182,8 +217,8 @@ def ensure_llmfit(
     try:
         asset = _fetch_latest_release(
             transport=transport,
-            platform_name=platform_name or sys.platform,
-            machine_name=machine_name or platform.machine(),
+            target=target,
+            trusted_archives=trusted,
         )
         if installed is not None and _version_tuple(installed.version) >= _version_tuple(
             asset.version
@@ -197,6 +232,8 @@ def ensure_llmfit(
             directory,
             package,
             version=asset.version,
+            target=target,
+            archive_sha256=asset.archive_sha256,
             checked_at=current_time,
         )
         return component
@@ -342,10 +379,9 @@ def parse_llmfit_recommendations(
 def _fetch_latest_release(
     *,
     transport: httpx.BaseTransport | None,
-    platform_name: str,
-    machine_name: str,
+    target: str,
+    trusted_archives: Mapping[tuple[str, str], str],
 ) -> _ReleaseAsset:
-    target = _release_target(platform_name, machine_name)
     with httpx.Client(
         timeout=15.0,
         follow_redirects=False,
@@ -366,7 +402,11 @@ def _fetch_latest_release(
     if not isinstance(payload, list):
         raise ModelRecommendationError("La actualización de llmfit no es válida.")
     for release in payload:
-        candidate = _compatible_release_asset(release, target=target)
+        candidate = _compatible_release_asset(
+            release,
+            target=target,
+            trusted_archives=trusted_archives,
+        )
         if candidate is not None:
             return candidate
     raise ModelRecommendationError(
@@ -374,7 +414,12 @@ def _fetch_latest_release(
     )
 
 
-def _compatible_release_asset(release: object, *, target: str) -> _ReleaseAsset | None:
+def _compatible_release_asset(
+    release: object,
+    *,
+    target: str,
+    trusted_archives: Mapping[tuple[str, str], str],
+) -> _ReleaseAsset | None:
     """Return a verifiable asset, ignoring drafts and partially published releases."""
     if (
         not isinstance(release, dict)
@@ -409,7 +454,10 @@ def _compatible_release_asset(release: object, *, target: str) -> _ReleaseAsset 
     ):
         return None
     archive_sha256 = digest.removeprefix("sha256:").casefold()
-    if not _SHA256_PATTERN.fullmatch(archive_sha256):
+    if (
+        not _SHA256_PATTERN.fullmatch(archive_sha256)
+        or trusted_archives.get((version, target)) != archive_sha256
+    ):
         return None
     try:
         _validate_release_url(url, version, expected_name)
@@ -593,6 +641,8 @@ def _install_llmfit_executable(
     package: _LlmfitPackage,
     *,
     version: str,
+    target: str,
+    archive_sha256: str,
     checked_at: datetime,
 ) -> LlmfitComponent:
     temporary_path: Path | None = None
@@ -617,6 +667,8 @@ def _install_llmfit_executable(
         component = LlmfitComponent(
             executable=executable,
             version=version,
+            target=target,
+            archive_sha256=archive_sha256,
             executable_sha256=hashlib.sha256(package.executable).hexdigest(),
             license_path=license_path,
             license_sha256=hashlib.sha256(package.license_text).hexdigest(),
@@ -680,9 +732,13 @@ def _run_llmfit(executable: Path) -> str:
 
 
 def _private_llmfit_environment() -> dict[str, str]:
-    environment = dict(os.environ)
-    environment.pop("LOCALMAXXING_API_KEY", None)
+    environment = {
+        key: value
+        for key, value in os.environ.items()
+        if key.upper() in _LLMFIT_ENVIRONMENT_ALLOWLIST
+    }
     environment["LLMFIT_DASHBOARD_HOST"] = "127.0.0.1"
+    environment["NO_PROXY"] = "127.0.0.1,localhost"
     return environment
 
 
@@ -1184,7 +1240,12 @@ def _hardware_summary(system: object) -> str:
     return " · ".join(parts) if parts else "Recomendaciones calculadas en este equipo"
 
 
-def _load_installed_component(directory: Path) -> LlmfitComponent | None:
+def _load_installed_component(
+    directory: Path,
+    *,
+    target: str,
+    trusted_archives: Mapping[tuple[str, str], str],
+) -> LlmfitComponent | None:
     metadata_path = directory / LLMFIT_METADATA_FILENAME
     executable = directory / LLMFIT_EXECUTABLE_NAME
     license_path = directory / LLMFIT_LICENSE_FILENAME
@@ -1195,11 +1256,16 @@ def _load_installed_component(directory: Path) -> LlmfitComponent | None:
         if not isinstance(payload, dict):
             return None
         version = _normalize_version(payload.get("version"))
+        stored_target = payload.get("target")
+        archive_sha256 = payload.get("archive_sha256")
         executable_sha256 = payload.get("executable_sha256")
         license_sha256 = payload.get("license_sha256")
         checked_at = _parse_datetime(payload.get("checked_at"))
         if (
-            not isinstance(executable_sha256, str)
+            stored_target != target
+            or not isinstance(archive_sha256, str)
+            or trusted_archives.get((version, target)) != archive_sha256
+            or not isinstance(executable_sha256, str)
             or not _SHA256_PATTERN.fullmatch(executable_sha256)
             or not isinstance(license_sha256, str)
             or not _SHA256_PATTERN.fullmatch(license_sha256)
@@ -1217,6 +1283,8 @@ def _load_installed_component(directory: Path) -> LlmfitComponent | None:
         return LlmfitComponent(
             executable,
             version,
+            target,
+            archive_sha256,
             executable_sha256,
             license_path,
             license_sha256,
@@ -1229,6 +1297,8 @@ def _load_installed_component(directory: Path) -> LlmfitComponent | None:
 def _write_component_metadata(directory: Path, component: LlmfitComponent) -> None:
     payload = {
         "version": component.version,
+        "target": component.target,
+        "archive_sha256": component.archive_sha256,
         "executable_sha256": component.executable_sha256,
         "license_sha256": component.license_sha256,
         "checked_at": component.checked_at.isoformat(),

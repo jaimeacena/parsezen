@@ -9,7 +9,7 @@ from parsezen.domain.jobs import (
     DocumentFormat,
     DocumentSource,
     JobConfiguration,
-    RefinementConfiguration,
+    ProcessingPlan,
     TranslationConfiguration,
 )
 from parsezen.domain.reviews import (
@@ -21,6 +21,7 @@ from parsezen.domain.reviews import (
 )
 from parsezen.domain.stages import StageKind, StageStatus
 from parsezen.infrastructure.state_store import StateStore
+from parsezen.pdf_conversion import PdfQualityReport, PdfReviewIssue
 from parsezen.processing import ProcessResult
 from parsezen.revision import RevisionChange, RevisionDraft, RevisionKind
 from parsezen.translation_quality import (
@@ -43,9 +44,18 @@ class ReviewRepository:
         )
 
 
-def review_result() -> ProcessResult:
+def review_result(*, include_ocr: bool = False) -> ProcessResult:
     return ProcessResult(
         Path("book.md"),
+        pdf_quality_report=(
+            PdfQualityReport(
+                processed_pages=(1,),
+                ocr_pages=(1,),
+                issues=(PdfReviewIssue(1, "Revisar", "Texto"),),
+            )
+            if include_ocr
+            else None
+        ),
         translation_quality_report=TranslationQualityReport(
             source_language="en",
             target_language="es",
@@ -114,7 +124,7 @@ def prepared_sequence() -> tuple[
         DocumentSource(Path("book.md"), DocumentFormat.MARKDOWN, 100, 1),
         JobConfiguration(
             translation=TranslationConfiguration(enabled=True, target_language="es"),
-            refinement=RefinementConfiguration(enabled=True),
+            plan=ProcessingPlan.LOCAL_AI_REVIEWED,
         ),
         job_id="job",
     )
@@ -209,6 +219,47 @@ def test_pending_review_survives_reconcile_without_advancing() -> None:
     assert recovered.next_step.kind is ReviewKind.TRANSLATION
 
 
+def test_reconcile_rewinds_a_later_gate_when_an_applied_candidate_becomes_pending() -> None:
+    queue, _execution, repository, sequence, job_id, result = prepared_sequence()
+    job = queue.get(job_id)
+    assert job is not None
+    translation = review(
+        job_id,
+        job.configuration_revision,
+        stage=StageKind.TRANSLATE,
+        kind=ReviewKind.TRANSLATION,
+    )
+    first = sequence.apply(job_id, result, translation)
+    refinement = review(
+        job_id,
+        first.job.configuration_revision,
+        stage=StageKind.REFINE,
+        kind=ReviewKind.REFINEMENT,
+    )
+    sequence.prepare(job_id, result, refinement)
+    refreshed_translation = ReviewSession.create(
+        job_id=job_id,
+        stage=StageKind.TRANSLATE,
+        kind=ReviewKind.TRANSLATION,
+        input_artifact_id="refreshed-input",
+        input_version=job.configuration_revision,
+        units=(ReviewUnit("refreshed", "source", "current"),),
+    )
+    repository.save_review(refreshed_translation)
+    attempts = {stage.kind: stage.attempt for stage in queue.get(job_id).stages}
+
+    recovered = sequence.reconcile(job_id, result)
+    saved = {item.kind: item for item in repository.load_reviews(job_id=job_id)}
+
+    assert recovered.next_step is not None
+    assert recovered.next_step.kind is ReviewKind.TRANSLATION
+    assert recovered.job.stage(StageKind.TRANSLATE).status is StageStatus.BLOCKED_FOR_REVIEW
+    assert recovered.job.stage(StageKind.TRANSLATE).review_id == refreshed_translation.id
+    assert recovered.job.stage(StageKind.REFINE).status is StageStatus.INVALIDATED
+    assert saved[ReviewKind.REFINEMENT].status is ReviewStatus.DISMISSED
+    assert {stage.kind: stage.attempt for stage in recovered.job.stages} == attempts
+
+
 def test_out_of_order_or_stale_review_is_rejected() -> None:
     queue, _execution, _repository, sequence, job_id, result = prepared_sequence()
     job = queue.get(job_id)
@@ -248,6 +299,72 @@ def test_finalization_failure_can_reopen_the_last_applied_gate() -> None:
     assert reopened.stage(StageKind.REFINE).status is StageStatus.BLOCKED_FOR_REVIEW
     assert reopened.stage(StageKind.REFINE).review_id == refinement.id
     assert reopened.stage(StageKind.PUBLISH).status is StageStatus.INVALIDATED
+
+
+def test_reopen_review_preserves_choices_dismisses_downstream_and_does_not_retry() -> None:
+    queue = JobQueue()
+    job = queue.add(
+        DocumentSource(Path("book.pdf"), DocumentFormat.PDF, 100, 1),
+        JobConfiguration(
+            translation=TranslationConfiguration(enabled=True, target_language="es"),
+            plan=ProcessingPlan.LOCAL_AI_REVIEWED,
+        ),
+        job_id="job",
+    )
+    execution = JobExecutionController(queue)
+    execution.start_next(job.id)
+    result = review_result(include_ocr=True)
+    execution.block_for_review(
+        job.id,
+        StageKind.PREPARE,
+        review_id="initial-gate",
+    )
+    repository = ReviewRepository()
+    sequence = PhaseReviewSequenceCoordinator(queue, execution, repository)
+
+    current = sequence.apply(
+        job.id,
+        result,
+        review(job.id, job.configuration_revision, stage=StageKind.PREPARE, kind=ReviewKind.OCR),
+    )
+    current = sequence.apply(
+        job.id,
+        result,
+        review(
+            job.id,
+            job.configuration_revision,
+            stage=StageKind.TRANSLATE,
+            kind=ReviewKind.TRANSLATION,
+        ),
+    )
+    current = sequence.apply(
+        job.id,
+        result,
+        review(
+            job.id,
+            job.configuration_revision,
+            stage=StageKind.REFINE,
+            kind=ReviewKind.REFINEMENT,
+        ),
+    )
+    attempts = {stage.kind: stage.attempt for stage in current.job.stages}
+    applied_choices = {
+        review.kind: review.units[0].choice for review in repository.load_reviews(job_id=job.id)
+    }
+
+    reopened_job = sequence.reopen_review(job.id, result, kind=ReviewKind.OCR)
+    saved = {review.kind: review for review in repository.load_reviews(job_id=job.id)}
+
+    assert saved[ReviewKind.OCR].status is ReviewStatus.PENDING
+    assert saved[ReviewKind.OCR].units[0].choice is applied_choices[ReviewKind.OCR]
+    assert saved[ReviewKind.TRANSLATION].status is ReviewStatus.DISMISSED
+    assert saved[ReviewKind.REFINEMENT].status is ReviewStatus.DISMISSED
+    assert sum(stage.status is StageStatus.BLOCKED_FOR_REVIEW for stage in reopened_job.stages) == 1
+    assert reopened_job.stage(StageKind.PREPARE).status is StageStatus.BLOCKED_FOR_REVIEW
+    assert reopened_job.stage(StageKind.TRANSLATE).status is StageStatus.INVALIDATED
+    assert reopened_job.stage(StageKind.REFINE).status is StageStatus.INVALIDATED
+    assert reopened_job.stage(StageKind.PUBLISH).status is StageStatus.INVALIDATED
+    assert {stage.kind: stage.attempt for stage in reopened_job.stages} == attempts
 
 
 def test_pending_phase_review_resumes_from_sqlite_after_restart(tmp_path: Path) -> None:

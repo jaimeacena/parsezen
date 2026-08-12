@@ -8,9 +8,13 @@ from parsezen.translation_quality import (
     NUMBER_PATTERN,
     TranslationIssueKind,
     TranslationQualityError,
+    build_aligned_translation_quality_report,
     build_translation_quality_report,
     detect_language_code,
+    find_untranslated_source_sentences,
+    is_literal_work_title_translation,
     natural_language_text,
+    numeric_tokens_are_conserved,
     repair_untranslated_source_text,
     resolve_language_code,
     restore_changed_third_language_headings,
@@ -54,6 +58,55 @@ def test_accepts_a_complete_translation_with_preserved_markdown() -> None:
     )
 
 
+def test_rejects_a_raw_html_table_that_drops_an_empty_cell_and_its_column() -> None:
+    source = (
+        "<table><thead><tr><th>DECAN</th><th>QUALITY</th><th>IMAGE</th></tr></thead>"
+        "<tbody><tr><td>Aries I</td><td></td><td>A complete figure description.</td></tr>"
+        "</tbody></table>"
+    )
+    translated = (
+        "<table><thead><tr><th>DECANO</th><th>IMAGEN</th></tr></thead>"
+        "<tbody><tr><td>Aries I</td><td>Una descripción completa de la figura.</td></tr>"
+        "</tbody></table>"
+    )
+
+    with pytest.raises(TranslationQualityError, match="tabla HTML"):
+        validate_translation_quality(
+            source,
+            translated,
+            source_language="en",
+            target_language="es",
+            preserve_paragraphs=True,
+        )
+
+
+def test_raw_html_table_structure_allows_equivalent_self_closing_break_syntax() -> None:
+    source = "<table><tbody><tr><td>First line<br>second line</td></tr></tbody></table>"
+    translated = "<table><tbody><tr><td>Primera línea<br />segunda línea</td></tr></tbody></table>"
+
+    validate_translation_quality(
+        source,
+        translated,
+        source_language="en",
+        target_language="es",
+        preserve_paragraphs=True,
+    )
+
+
+def test_rejects_a_toc_folio_moved_away_from_the_end_of_its_list_entry() -> None:
+    source = "- Appendices 258\n- Tables of Correspondence 266\n"
+    translated = "- 258 Apéndices\n- Tablas de correspondencia 266\n"
+
+    with pytest.raises(TranslationQualityError, match="referencias finales"):
+        validate_translation_quality(
+            source,
+            translated,
+            source_language="en",
+            target_language="es",
+            preserve_paragraphs=True,
+        )
+
+
 def test_rejects_text_that_did_not_reach_the_requested_language() -> None:
     with pytest.raises(TranslationQualityError, match="idioma solicitado"):
         validate_translation_quality(
@@ -65,29 +118,46 @@ def test_rejects_text_that_did_not_reach_the_requested_language() -> None:
         )
 
 
-def test_rejects_a_short_title_left_in_the_source_language() -> None:
+def test_reports_a_short_title_left_in_the_source_language() -> None:
     source = SOURCE.replace("# Contract", "# IMPORTANT CONTRACT")
     translated = SPANISH.replace("# Contrato", "# IMPORTANT CONTRACT")
 
-    with pytest.raises(TranslationQualityError, match="título o encabezado"):
-        validate_translation_quality(
-            source,
-            translated,
-            source_language="en",
-            target_language="es",
-            preserve_paragraphs=True,
-        )
+    validate_translation_quality(
+        source,
+        translated,
+        source_language="en",
+        target_language="es",
+        preserve_paragraphs=True,
+    )
+    report = build_translation_quality_report(
+        source,
+        translated,
+        source_language="en",
+        target_language="es",
+    )
+
+    assert report.total_issues > 0
 
 
-def test_rejects_an_untranslated_title_below_the_general_language_threshold() -> None:
-    with pytest.raises(TranslationQualityError, match="título o encabezado"):
-        validate_translation_quality(
-            "30 DAY MILLIONAIRE CHALLENGE\n\nShort English text.",
-            "30 DAY MILLIONAIRE CHALLENGE\n\nTexto breve en español.",
-            source_language="en",
-            target_language="es",
-            preserve_paragraphs=True,
-        )
+def test_reports_an_untranslated_title_below_the_general_language_threshold() -> None:
+    source = "30 DAY MILLIONAIRE CHALLENGE\n\nShort English text."
+    translated = "30 DAY MILLIONAIRE CHALLENGE\n\nTexto breve en español."
+
+    validate_translation_quality(
+        source,
+        translated,
+        source_language="en",
+        target_language="es",
+        preserve_paragraphs=True,
+    )
+    report = build_translation_quality_report(
+        source,
+        translated,
+        source_language="en",
+        target_language="es",
+    )
+
+    assert report.total_issues > 0
 
 
 def test_accepts_a_changed_short_work_title_despite_unreliable_language_detection() -> None:
@@ -130,15 +200,25 @@ def test_accepts_a_repeated_uppercase_person_name_used_as_headings() -> None:
     )
 
 
-def test_rejects_an_unchanged_uppercase_subject_heading() -> None:
-    with pytest.raises(TranslationQualityError, match="título o encabezado"):
-        validate_translation_quality(
-            "# PLANETARY CONDITION\n\nA sufficiently long English paragraph explains the source.",
-            "# PLANETARY CONDITION\n\nUn párrafo suficientemente largo explica la fuente.",
-            source_language="en",
-            target_language="es",
-            preserve_paragraphs=True,
-        )
+def test_reports_an_unchanged_uppercase_subject_heading() -> None:
+    source = "# PLANETARY CONDITION\n\nA sufficiently long English paragraph explains the source."
+    translated = "# PLANETARY CONDITION\n\nUn párrafo suficientemente largo explica la fuente."
+
+    validate_translation_quality(
+        source,
+        translated,
+        source_language="en",
+        target_language="es",
+        preserve_paragraphs=True,
+    )
+    report = build_translation_quality_report(
+        source,
+        translated,
+        source_language="en",
+        target_language="es",
+    )
+
+    assert report.total_issues > 0
 
 
 def test_accepts_an_unchanged_publisher_name() -> None:
@@ -151,29 +231,46 @@ def test_accepts_an_unchanged_publisher_name() -> None:
     )
 
 
-def test_rejects_a_partially_untranslated_short_title() -> None:
-    with pytest.raises(TranslationQualityError, match="parte de un título"):
-        validate_translation_quality(
-            "30 DAY MILLIONAIRE CHALLENGE",
-            "30 días MILLIONAIRE CHALLENGE",
-            source_language="en",
-            target_language="es",
-            preserve_paragraphs=True,
-        )
+def test_reports_a_partially_untranslated_short_title() -> None:
+    source = "30 DAY MILLIONAIRE CHALLENGE"
+    translated = "30 días MILLIONAIRE CHALLENGE"
+
+    validate_translation_quality(
+        source,
+        translated,
+        source_language="en",
+        target_language="es",
+        preserve_paragraphs=True,
+    )
+    report = build_translation_quality_report(
+        source,
+        translated,
+        source_language="en",
+        target_language="es",
+    )
+
+    assert report.total_issues > 0
 
 
-def test_rejects_partially_untranslated_short_titles_in_a_dense_index() -> None:
+def test_reports_partially_untranslated_short_titles_in_a_dense_index() -> None:
     source = "SCORPIO III 186\nSAGITTARIUS I 192\nPISCES I 244\nAPPENDICES 258"
     translated = "SCORPION III 186\n\nSAGITARIO I 192\nPISCIS I 244\nAPÉNDICES 258"
 
-    with pytest.raises(TranslationQualityError, match="parte de un título"):
-        validate_translation_quality(
-            source,
-            translated,
-            source_language="en",
-            target_language="es",
-            preserve_paragraphs=False,
-        )
+    validate_translation_quality(
+        source,
+        translated,
+        source_language="en",
+        target_language="es",
+        preserve_paragraphs=False,
+    )
+    report = build_translation_quality_report(
+        source,
+        translated,
+        source_language="en",
+        target_language="es",
+    )
+
+    assert report.total_issues > 0
 
 
 def test_rejects_a_translation_that_omits_most_content() -> None:
@@ -200,6 +297,28 @@ print("This code remains in English")
 
 def test_numeric_tokens_are_detected_even_when_adjacent_to_letters() -> None:
     assert NUMBER_PATTERN.findall("DAYS6+7 and H2O") == ["6", "7", "2"]
+
+
+def test_does_not_treat_a_prefixed_translation_as_an_unchanged_sentence() -> None:
+    source = "Read the complete guide before continuing with the workflow."
+
+    assert (
+        find_untranslated_source_sentences(
+            source,
+            f"ES:{source}",
+            "en",
+        )
+        == ()
+    )
+
+
+def test_accepts_a_written_number_converted_to_digits_without_duplication() -> None:
+    assert numeric_tokens_are_conserved("ten and ten", "diez y 10")
+
+
+def test_rejects_an_ungrounded_or_duplicated_new_digit() -> None:
+    assert not numeric_tokens_are_conserved("ordinary text", "texto ordinario 10")
+    assert not numeric_tokens_are_conserved("ten", "diez 10")
 
 
 def test_rejects_a_changed_roman_numeral_in_an_index_reference() -> None:
@@ -588,6 +707,401 @@ def test_translation_report_does_not_flag_a_tiny_unchanged_person_name() -> None
     assert report.total_issues == 0
 
 
+def test_translation_report_does_not_treat_a_name_catalogue_as_untranslated_prose() -> None:
+    source = "\n".join(
+        (
+            "| DECAN | EGYPTIAN NAME | DEITY |",
+            "| --- | --- | --- |",
+            "| Virgo | Thoptius | Osiris |",
+            "| Libra | Serecuth | Zeuda |",
+            "| Scorpio | Sentacer | Arimanius |",
+            "| Sagittarius | Eregbuo | Tolmophta |",
+            "| Capricorn | Themeso | Soda |",
+            "| Aquarius | Oroasoer | Brondeus |",
+            "| Pisces | Archatapias | Rephan |",
+        )
+    )
+
+    report = build_aligned_translation_quality_report(
+        (source,),
+        (source,),
+        source_language="en",
+        target_language="es",
+    )
+
+    assert TranslationIssueKind.SOURCE_TEXT not in report.issues_by_kind
+
+
+def test_translation_report_does_not_treat_a_bibliography_as_untranslated_prose() -> None:
+    source = (
+        "BIBLIOGRAPHY. Ada Author. The Complete Book of Stars, translated by Bea Editor, "
+        "University Press. Carla Writer. Ancient Astronomy, edited by Dan Scholar, London "
+        "Academic Press. Eva Researcher. The Planetary Journal, revised edition, Cambridge "
+        "University Press."
+    )
+
+    report = build_aligned_translation_quality_report(
+        (source,),
+        (source,),
+        source_language="en",
+        target_language="es",
+    )
+
+    assert TranslationIssueKind.SOURCE_TEXT not in report.issues_by_kind
+
+
+def test_translation_report_does_not_hide_a_long_uppercase_title() -> None:
+    source = "THE COMPLETE PRACTICAL GUIDE TO PLANETARY CONDITIONS AND THEIR EFFECTS ON DAILY LIFE"
+
+    report = build_aligned_translation_quality_report(
+        (source,),
+        (source,),
+        source_language="en",
+        target_language="es",
+    )
+
+    assert TranslationIssueKind.SOURCE_TEXT in report.issues_by_kind
+
+
+def test_translation_report_checks_prose_after_an_index_heading() -> None:
+    source = (
+        "INDEX\n\n"
+        "The following section explains how planetary conditions influence every daily decision."
+    )
+
+    report = build_aligned_translation_quality_report(
+        (source,),
+        (source,),
+        source_language="en",
+        target_language="es",
+    )
+
+    assert TranslationIssueKind.SOURCE_TEXT in report.issues_by_kind
+
+
+def test_translation_report_does_not_count_repeated_citation_hints_as_distinct() -> None:
+    source = (
+        "London appears in this ordinary sentence because London shaped the account and London "
+        "remains essential to its conclusion."
+    )
+
+    report = build_aligned_translation_quality_report(
+        (source,),
+        (source,),
+        source_language="en",
+        target_language="es",
+    )
+
+    assert TranslationIssueKind.SOURCE_TEXT in report.issues_by_kind
+
+
+def test_translation_report_checks_prose_mixed_with_bibliographic_entries() -> None:
+    source = (
+        "BIBLIOGRAPHY. The Complete Book of Stars, translated by Bea Editor, University Press. "
+        "Ancient Astronomy, edited by Dan Scholar, London Academic Press. "
+        "This ordinary explanatory sentence still needs a complete Spanish translation."
+    )
+
+    report = build_aligned_translation_quality_report(
+        (source,),
+        (source,),
+        source_language="en",
+        target_language="es",
+    )
+
+    assert TranslationIssueKind.SOURCE_TEXT in report.issues_by_kind
+
+
+def test_translation_report_accepts_a_simple_press_citation() -> None:
+    source = "The Quiet Path Through Inner Freedom, Meridian Press."
+
+    report = build_aligned_translation_quality_report(
+        (source,),
+        (source,),
+        source_language="en",
+        target_language="es",
+    )
+
+    assert TranslationIssueKind.SOURCE_TEXT not in report.issues_by_kind
+
+
+def test_translation_report_accepts_a_lowercase_index_entry_with_a_folio() -> None:
+    source = "INDEX\n- planetary conditions and daily decisions 142"
+
+    report = build_aligned_translation_quality_report(
+        (source,),
+        (source,),
+        source_language="en",
+        target_language="es",
+    )
+
+    assert TranslationIssueKind.SOURCE_TEXT not in report.issues_by_kind
+
+
+def test_translation_report_accepts_collapsed_index_entries_with_folios() -> None:
+    source = "planetary conditions 142; daily decisions 148; practical examples 153"
+
+    report = build_aligned_translation_quality_report(
+        (source,),
+        (source,),
+        source_language="en",
+        target_language="es",
+    )
+
+    assert TranslationIssueKind.SOURCE_TEXT not in report.issues_by_kind
+
+
+def test_translation_report_accepts_prefixed_collapsed_index_entries() -> None:
+    source = "INDEX. planetary conditions 142; daily decisions 148; practical examples 153"
+
+    report = build_aligned_translation_quality_report(
+        (source,),
+        (source,),
+        source_language="en",
+        target_language="es",
+    )
+
+    assert TranslationIssueKind.SOURCE_TEXT not in report.issues_by_kind
+
+
+def test_translation_report_accepts_one_compact_bibliography_entry() -> None:
+    source = (
+        "BIBLIOGRAPHY. Smith, John. a history of practical astronomy. "
+        "New York: Meridian Press, 2020."
+    )
+
+    report = build_aligned_translation_quality_report(
+        (source,),
+        (source,),
+        source_language="en",
+        target_language="es",
+    )
+
+    assert TranslationIssueKind.SOURCE_TEXT not in report.issues_by_kind
+
+
+def test_translation_report_checks_prose_after_a_compact_bibliography_entry() -> None:
+    source = (
+        "BIBLIOGRAPHY. Smith, John. a history of practical astronomy. "
+        "New York: Meridian Press, 2020. "
+        "This explanatory sentence after the citation still needs translation."
+    )
+
+    report = build_aligned_translation_quality_report(
+        (source,),
+        (source,),
+        source_language="en",
+        target_language="es",
+    )
+
+    assert TranslationIssueKind.SOURCE_TEXT in report.issues_by_kind
+
+
+def test_translation_report_does_not_treat_a_numbered_title_as_an_index_entry() -> None:
+    heading = "THE COMPLETE PRACTICAL GUIDE TO PERSONAL FREEDOM 2024"
+    source = f"{heading}\n\nThis paragraph explains the guide."
+    translated = f"{heading}\n\nEste párrafo explica la guía."
+
+    report = build_aligned_translation_quality_report(
+        (source,),
+        (translated,),
+        source_language="en",
+        target_language="es",
+    )
+
+    assert TranslationIssueKind.SOURCE_TEXT in report.issues_by_kind
+
+
+def test_translation_report_does_not_treat_a_bulleted_year_as_an_index_folio() -> None:
+    residual = "- This agreement remains fully effective until 2024"
+    source = f"{residual}\n\nThis paragraph explains the agreement."
+    translated = f"{residual}\n\nEste párrafo explica el acuerdo."
+
+    report = build_aligned_translation_quality_report(
+        (source,),
+        (translated,),
+        source_language="en",
+        target_language="es",
+    )
+
+    assert TranslationIssueKind.SOURCE_TEXT in report.issues_by_kind
+
+
+def test_translation_report_does_not_treat_a_numbered_bullet_as_an_index_entry() -> None:
+    residual = "- Read the complete agreement before page 42"
+    source = f"{residual}\n\nThis paragraph explains the agreement."
+    translated = f"{residual}\n\nEste párrafo explica el acuerdo."
+
+    report = build_aligned_translation_quality_report(
+        (source,),
+        (translated,),
+        source_language="en",
+        target_language="es",
+    )
+
+    assert TranslationIssueKind.SOURCE_TEXT in report.issues_by_kind
+
+
+def test_translation_report_does_not_treat_prose_table_cells_as_a_name_catalogue() -> None:
+    source = (
+        "| The artisan makes a useful instrument | The traveller crosses the river | "
+        "The teacher explains every symbol |"
+    )
+    translated = (
+        "| The artisan makes a useful instrument | El viajero cruza el río | "
+        "El profesor explica cada símbolo |"
+    )
+
+    report = build_aligned_translation_quality_report(
+        (source,),
+        (translated,),
+        source_language="en",
+        target_language="es",
+    )
+
+    assert TranslationIssueKind.SOURCE_TEXT in report.issues_by_kind
+
+
+def test_translation_report_does_not_treat_title_case_prose_as_a_name_catalogue() -> None:
+    source = (
+        "| Practical Guidance For Daily Life | Careful Choices Create Better Results | "
+        "Every Person Can Change Today |"
+    )
+    translated = (
+        "| Practical Guidance For Daily Life | "
+        "Las decisiones cuidadosas crean mejores resultados | "
+        "Cada persona puede cambiar hoy |"
+    )
+
+    report = build_aligned_translation_quality_report(
+        (source,),
+        (translated,),
+        source_language="en",
+        target_language="es",
+    )
+
+    assert TranslationIssueKind.SOURCE_TEXT in report.issues_by_kind
+
+
+def test_translation_report_finds_a_long_heading_on_an_otherwise_translated_page() -> None:
+    heading = (
+        "THE COMPLETE PRACTICAL GUIDE TO PLANETARY CONDITIONS AND THEIR MANY EFFECTS ON "
+        "EVERY IMPORTANT DECISION THROUGHOUT ORDINARY DAILY LIFE AND WORK"
+    )
+    source = f"{heading}\n\nThis paragraph explains the first practical consequence."
+    translated = f"{heading}\n\nEste párrafo explica la primera consecuencia práctica."
+
+    report = build_aligned_translation_quality_report(
+        (source,),
+        (translated,),
+        source_language="en",
+        target_language="es",
+    )
+
+    assert TranslationIssueKind.SOURCE_TEXT in report.issues_by_kind
+
+
+def test_translation_report_still_flags_untranslated_prose_inside_a_table() -> None:
+    source = (
+        "DECAN IMAGE POWER. Capricorn. A woman carries a sealed letter across the city. "
+        "Aquarius. A careful artisan makes a useful instrument for the community. "
+        "Pisces. A traveller crosses the river and returns safely before night."
+    )
+    translated = (
+        "DECANO IMAGEN PODER. Capricornio. Una mujer lleva una carta sellada por la ciudad. "
+        "Acuario. A careful artisan makes a useful instrument for the community. "
+        "Piscis. Un viajero cruza el río y regresa sano y salvo antes de la noche."
+    )
+
+    report = build_aligned_translation_quality_report(
+        (source,),
+        (translated,),
+        source_language="en",
+        target_language="es",
+    )
+
+    assert TranslationIssueKind.SOURCE_TEXT in report.issues_by_kind
+
+
+def test_aligned_translation_report_ignores_a_bare_web_identifier() -> None:
+    report = build_aligned_translation_quality_report(
+        ("publisher.example.com .",),
+        ("publisher.example.com .",),
+        source_language="en",
+        target_language="es",
+    )
+
+    assert not any(issue.kind is TranslationIssueKind.SOURCE_TEXT for issue in report.issues)
+
+
+def test_aligned_translation_report_ignores_text_already_in_the_target_language() -> None:
+    spanish = "La vida se abre cuando aceptamos plenamente este momento."
+
+    report = build_aligned_translation_quality_report(
+        (spanish,),
+        (spanish,),
+        source_language="en",
+        target_language="es",
+    )
+
+    assert not any(issue.kind is TranslationIssueKind.SOURCE_TEXT for issue in report.issues)
+
+
+def test_translation_report_accepts_a_translated_connector_between_names() -> None:
+    source = "Morganfield by Michael A. Singer"
+    unchanged = build_aligned_translation_quality_report(
+        (source,),
+        (source,),
+        source_language="en",
+        target_language="es",
+    )
+    translated = build_aligned_translation_quality_report(
+        (source,),
+        ("Morganfield por Michael A. Singer",),
+        source_language="en",
+        target_language="es",
+    )
+
+    assert any(issue.kind is TranslationIssueKind.SOURCE_TEXT for issue in unchanged.issues)
+    assert not any(issue.kind is TranslationIssueKind.SOURCE_TEXT for issue in translated.issues)
+
+
+def test_aligned_report_can_preserve_a_literal_emphasized_work_title() -> None:
+    source = "THE QUIET PATH THROUGH INNER FREEDOM"
+    translated = source
+
+    assert is_literal_work_title_translation(
+        source,
+        translated,
+        source_language="en",
+        target_language="es",
+    )
+    report = build_aligned_translation_quality_report(
+        (source,),
+        (translated,),
+        source_language="en",
+        target_language="es",
+        literal_work_title_segments=(1,),
+    )
+
+    assert TranslationIssueKind.SOURCE_TEXT not in report.issues_by_kind
+
+
+def test_literal_work_title_accepts_only_a_localized_leading_article() -> None:
+    assert is_literal_work_title_translation(
+        "The Quiet Mountain Beyond Thought",
+        "El Quiet Mountain Beyond Thought",
+        source_language="en",
+        target_language="es",
+    )
+    assert not is_literal_work_title_translation(
+        "The Quiet Mountain Beyond Thought",
+        "El Quiet Montaña Beyond Thought",
+        source_language="en",
+        target_language="es",
+    )
+
+
 def test_rejects_and_reports_an_explicit_ambiguity_reversal() -> None:
     source = "Small conversion errors may be corrected only when their meaning is unambiguous."
     reversed_translation = (
@@ -673,9 +1187,34 @@ def test_translation_report_bounds_excerpts_and_visible_issue_count() -> None:
 
     assert report.total_issues > len(report.issues)
     assert len(report.issues) == 20
+    assert sum(report.issues_by_kind.values()) == report.total_issues
+    assert report.issues_by_kind[TranslationIssueKind.SOURCE_TEXT] >= 20
     assert all(
         len(issue.original_excerpt) <= MAX_REPORT_EXCERPT_CHARACTERS for issue in report.issues
     )
+
+
+def test_aligned_translation_report_does_not_shift_after_an_internal_blank_line() -> None:
+    source_segments = (
+        "The first substantial source segment contains enough language for a reliable review.",
+        "The second substantial source segment also remains independently aligned for review.",
+    )
+    translated_segments = (
+        "El primer segmento traducido contiene suficiente lenguaje.\n\n"
+        "Su segunda frase continúa dentro de la misma unidad estructural.",
+        "El segundo segmento traducido también permanece alineado de forma independiente.",
+    )
+
+    report = build_aligned_translation_quality_report(
+        source_segments,
+        translated_segments,
+        source_language="en",
+        target_language="es",
+    )
+
+    assert report.checked_segments == 2
+    assert TranslationIssueKind.ALIGNMENT not in report.issues_by_kind
+    assert TranslationIssueKind.LENGTH not in report.issues_by_kind
 
 
 def test_repairs_only_an_aligned_block_with_source_language_residue() -> None:
@@ -865,6 +1404,59 @@ def test_pdf_repair_ignores_soft_line_wrap_differences_in_residual_prose() -> No
     assert "The cover image" not in repair.translated
 
 
+def test_pdf_repair_keeps_a_safe_sentence_fix_when_another_page_still_needs_review() -> None:
+    first = "The first residual sentence can be translated safely and completely."
+    second = "The second residual sentence still requires a human decision."
+    source = f"<!-- PZDOC PDF PAGE 1 -->\n\n{first}\n\n<!-- PZDOC PDF PAGE 2 -->\n\n{second}"
+    translated = source
+
+    repair = repair_untranslated_source_text(
+        source,
+        translated,
+        source_language="en",
+        target_language="es",
+        translate_segment=lambda source_fragment, current_fragment: (
+            "La primera frase residual puede traducirse de forma segura y completa."
+            if first in source_fragment
+            else current_fragment
+        ),
+    )
+
+    assert repair.attempted_segments == 2
+    assert repair.repaired_segments == 1
+    assert first not in repair.translated
+    assert second in repair.translated
+
+
+def test_pdf_repair_can_target_one_residual_sentence_inside_a_mixed_page() -> None:
+    residual = "This sentence was preserved in English after a failed chunk."
+    source = (
+        "<!-- PZDOC PDF PAGE 1 -->\n\n"
+        f"{residual} A second source sentence also contains useful context."
+    )
+    translated = (
+        "<!-- PZDOC PDF PAGE 1 -->\n\n"
+        f"{residual} Una segunda frase ya se tradujo correctamente al español."
+    )
+    calls: list[tuple[str, str]] = []
+
+    repair = repair_untranslated_source_text(
+        source,
+        translated,
+        source_language="en",
+        target_language="es",
+        translate_segment=lambda source_fragment, current_fragment: (
+            calls.append((source_fragment, current_fragment))
+            or "Esta frase se conservó en inglés tras fallar un fragmento."
+        ),
+    )
+
+    assert calls == [(residual, residual)]
+    assert repair.repaired_segments == 1
+    assert residual not in repair.translated
+    assert "Una segunda frase ya se tradujo" in repair.translated
+
+
 def test_repairs_a_short_unchanged_source_sentence() -> None:
     calls: list[tuple[str, str]] = []
 
@@ -882,6 +1474,101 @@ def test_repairs_a_short_unchanged_source_sentence() -> None:
     assert repair.translated == "Contenido EPUB moderno."
     assert repair.attempted_segments == 1
     assert repair.repaired_segments == 1
+
+
+def test_repairs_one_residual_sentence_inside_a_non_pdf_paragraph() -> None:
+    residual = "The second complete sentence still needs a focused translation."
+    source = f"The first sentence is already handled. {residual}"
+    translated = f"La primera frase ya está resuelta. {residual}"
+    calls: list[tuple[str, str]] = []
+
+    repair = repair_untranslated_source_text(
+        source,
+        translated,
+        source_language="en",
+        target_language="es",
+        translate_segment=lambda source_fragment, current_fragment: (
+            calls.append((source_fragment, current_fragment))
+            or "La segunda frase completa aún necesita una traducción específica."
+        ),
+    )
+
+    assert calls == [(residual, residual)]
+    assert repair.attempted_segments == 1
+    assert repair.repaired_segments == 1
+    assert "La primera frase ya está resuelta." in repair.translated
+    assert residual not in repair.translated
+
+
+def test_repairs_a_residual_sentence_between_protected_xml_markers() -> None:
+    opening = "<!-- PZDOC_EPUB_XML_A_A_XZQ -->"
+    closing = "<!-- PZDOC_EPUB_XML_A_B_XZQ -->"
+    residual = "The second complete sentence still needs a focused translation."
+    source = f"{opening}The first sentence is already handled. {residual}{closing}"
+    translated = f"{opening}La primera frase ya está resuelta. {residual}{closing}"
+    calls: list[tuple[str, str]] = []
+
+    repair = repair_untranslated_source_text(
+        source,
+        translated,
+        source_language="en",
+        target_language="es",
+        translate_segment=lambda source_fragment, current_fragment: (
+            calls.append((source_fragment, current_fragment))
+            or "La segunda frase completa recibe una traducción localizada."
+        ),
+    )
+
+    assert calls == [(residual, residual)]
+    assert repair.repaired_segments == 1
+    assert residual not in repair.translated
+    assert opening in repair.translated
+    assert closing in repair.translated
+
+
+def test_repairs_a_residual_sentence_after_whitespace_normalization() -> None:
+    residual_source = "The  second complete sentence still needs a focused translation."
+    residual_current = "The second complete sentence still needs a focused translation."
+    source = f"The first sentence is already handled. {residual_source}"
+    translated = f"La primera frase ya está resuelta. {residual_current}"
+    calls: list[tuple[str, str]] = []
+
+    repair = repair_untranslated_source_text(
+        source,
+        translated,
+        source_language="en",
+        target_language="es",
+        translate_segment=lambda source_fragment, current_fragment: (
+            calls.append((source_fragment, current_fragment))
+            or "La segunda frase completa recibe una traducción localizada."
+        ),
+    )
+
+    assert calls == [(residual_current, residual_current)]
+    assert repair.repaired_segments == 1
+    assert residual_current not in repair.translated
+
+
+def test_repairs_whitespace_around_a_protected_epub_marker() -> None:
+    marker = "<!-- PZDOC_EPUB_XML_A_B_XZQ -->"
+    residual_source = f"The  second {marker} complete sentence still needs translation."
+    residual_current = f"The second {marker} complete sentence still needs translation."
+    source = f"The first sentence is already handled. {residual_source}"
+    translated = f"La primera frase ya está resuelta. {residual_current}"
+
+    repair = repair_untranslated_source_text(
+        source,
+        translated,
+        source_language="en",
+        target_language="es",
+        translate_segment=lambda _source, _current: (
+            f"La segunda {marker} frase completa recibe una traducción localizada."
+        ),
+    )
+
+    assert repair.repaired_segments == 1
+    assert residual_current not in repair.translated
+    assert repair.translated.count(marker) == 1
 
 
 def test_rejects_an_unsafe_automatic_repair_and_keeps_the_review_warning() -> None:

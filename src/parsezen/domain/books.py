@@ -18,6 +18,9 @@ class BookMetadata:
     language: str = "und"
     author: str | None = None
     identifier: str | None = None
+    identifiers: tuple[str, ...] = ()
+    publisher: str | None = None
+    publication_date: str | None = None
 
     def __post_init__(self) -> None:
         if not self.title.strip() or "\0" in self.title or len(self.title) > 500:
@@ -28,6 +31,18 @@ class BookMetadata:
             raise ValueError("Book author must be a bounded string.")
         if self.identifier is not None:
             UUID(self.identifier)
+        if len(self.identifiers) > 50 or any(
+            not value.strip() or "\0" in value or len(value) > 500 for value in self.identifiers
+        ):
+            raise ValueError("Book publication identifiers must be bounded strings.")
+        if len(self.identifiers) != len(set(self.identifiers)):
+            raise ValueError("Book publication identifiers must be unique.")
+        if self.publisher is not None and ("\0" in self.publisher or len(self.publisher) > 500):
+            raise ValueError("Book publisher must be a bounded string.")
+        if self.publication_date is not None and (
+            "\0" in self.publication_date or len(self.publication_date) > 100
+        ):
+            raise ValueError("Book publication date must be a bounded string.")
 
 
 @dataclass(frozen=True, slots=True)

@@ -33,8 +33,66 @@ class DocumentFormat(StrEnum):
 
 
 class TranslationMethod(StrEnum):
+    """The two local translation engines intentionally exposed by the product."""
+
     OFFLINE = "offline"
     LOCAL_AI = "local_ai"
+
+
+class ProcessingPlan(StrEnum):
+    """The two deliberate product-level ways to process a document."""
+
+    STANDARD = "standard"
+    LOCAL_AI_REVIEWED = "local_ai_reviewed"
+
+
+class ReviewSignal(StrEnum):
+    """Content-free evidence that can justify an optional targeted AI review."""
+
+    CONVERSION_DAMAGE = "conversion_damage"
+    SOURCE_TEXT_RESIDUE = "source_text_residue"
+    TRANSLATION_INCONSISTENCY = "translation_inconsistency"
+
+
+@dataclass(frozen=True, slots=True)
+class ReviewRecommendation:
+    """Bounded late-review scope derived without retaining document excerpts."""
+
+    signal_counts: tuple[tuple[ReviewSignal, int], ...]
+    block_positions: tuple[int, ...]
+    scope_fingerprint: str | None = None
+    block_fingerprints: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if not self.signal_counts or not self.block_positions:
+            raise ValueError("A review recommendation requires evidence and target blocks.")
+        if any(count < 1 for _signal, count in self.signal_counts):
+            raise ValueError("Review signal counts must be positive.")
+        if len({signal for signal, _count in self.signal_counts}) != len(self.signal_counts):
+            raise ValueError("Review signals must be unique.")
+        if tuple(sorted(set(self.block_positions))) != self.block_positions:
+            raise ValueError("Review target blocks must be sorted and unique.")
+        if any(position < 0 for position in self.block_positions):
+            raise ValueError("Review target block positions cannot be negative.")
+        if len(self.block_positions) > 64:
+            raise ValueError("A targeted review cannot contain more than 64 blocks.")
+        if self.scope_fingerprint is not None and (
+            len(self.scope_fingerprint) != 64
+            or any(character not in "0123456789abcdef" for character in self.scope_fingerprint)
+        ):
+            raise ValueError("The review scope fingerprint must be a SHA-256 digest.")
+        if self.block_fingerprints and len(self.block_fingerprints) != len(self.block_positions):
+            raise ValueError("Review block fingerprints must match the target block count.")
+        if any(
+            len(fingerprint) != 64
+            or any(character not in "0123456789abcdef" for character in fingerprint)
+            for fingerprint in self.block_fingerprints
+        ):
+            raise ValueError("Review block fingerprints must be SHA-256 digests.")
+
+    @property
+    def signal_total(self) -> int:
+        return sum(count for _signal, count in self.signal_counts)
 
 
 class CoverStrategy(StrEnum):
@@ -42,6 +100,13 @@ class CoverStrategy(StrEnum):
     FIRST_PAGE = "first_page"
     CUSTOM = "custom"
     REMOVE = "remove"
+
+
+class MarkdownOrganization(StrEnum):
+    """How the final Markdown is arranged without changing its canonical content."""
+
+    SINGLE_FILE = "single_file"
+    BY_CHAPTER = "by_chapter"
 
 
 class JobStatus(StrEnum):
@@ -92,33 +157,15 @@ class TranslationConfiguration:
     enabled: bool = False
     method: TranslationMethod = TranslationMethod.OFFLINE
     target_language: str | None = None
-    model: str | None = None
-    context_window: int | None = None
     glossary: tuple[tuple[str, str], ...] = ()
-    manual_review: bool = True
 
 
 @dataclass(frozen=True, slots=True)
 class AIProfileConfiguration:
-    """Shared local-AI choices for every AI-backed phase of one document."""
+    """Snapshot of the global local-AI profile used by a queued document."""
 
     model: str | None = None
     context_window: int | None = None
-    is_custom: bool = False
-
-
-@dataclass(frozen=True, slots=True)
-class RefinementConfiguration:
-    enabled: bool = False
-    model: str | None = None
-    context_window: int | None = None
-    manual_review: bool = True
-
-
-@dataclass(frozen=True, slots=True)
-class StructureConfiguration:
-    enabled: bool = False
-    manual_review: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -126,14 +173,20 @@ class OutputConfiguration:
     configured: bool = True
     format: DocumentFormat = DocumentFormat.MARKDOWN
     directory: Path | None = None
-    directory_is_custom: bool = False
     include_images: bool = True
     image_directory: Path | None = None
     preserve_styles: bool = True
+    markdown_organization: MarkdownOrganization = MarkdownOrganization.SINGLE_FILE
+    markdown_include_metadata: bool = False
+    markdown_include_page_references: bool = False
     title: str | None = None
     author: str | None = None
     cover_strategy: CoverStrategy = CoverStrategy.NONE
     cover_path: Path | None = None
+
+    def __post_init__(self) -> None:
+        if self.format not in {DocumentFormat.MARKDOWN, DocumentFormat.EPUB}:
+            raise ValueError("Parsezen only publishes Markdown or EPUB outputs.")
 
 
 @dataclass(frozen=True, slots=True)
@@ -141,28 +194,9 @@ class JobConfiguration:
     output: OutputConfiguration = OutputConfiguration()
     ai: AIProfileConfiguration = AIProfileConfiguration()
     translation: TranslationConfiguration = TranslationConfiguration()
-    refinement: RefinementConfiguration = RefinementConfiguration()
-    structure: StructureConfiguration = StructureConfiguration()
+    plan: ProcessingPlan = ProcessingPlan.STANDARD
     page_range: PageRangeConfiguration | None = None
     force_pdf_ocr: bool = False
-
-
-def effective_ai_profile(configuration: JobConfiguration) -> AIProfileConfiguration:
-    """Read the canonical profile, falling back to pre-profile saved jobs."""
-
-    if configuration.ai.model is not None or configuration.ai.context_window is not None:
-        return configuration.ai
-    legacy_model = configuration.refinement.model or configuration.translation.model
-    legacy_context = (
-        configuration.refinement.context_window or configuration.translation.context_window
-    )
-    return AIProfileConfiguration(
-        model=legacy_model,
-        context_window=legacy_context,
-        # Historical per-operation values were explicit document choices;
-        # a completely empty profile still inherits the application default.
-        is_custom=legacy_model is not None or legacy_context is not None,
-    )
 
 
 def initial_stage_states(
@@ -174,7 +208,7 @@ def initial_stage_states(
         structure_availability = StageAvailability.DISABLED
     elif configuration.output.format is not DocumentFormat.EPUB:
         structure_availability = StageAvailability.UNAVAILABLE
-    elif configuration.structure.enabled:
+    elif configuration.plan is ProcessingPlan.LOCAL_AI_REVIEWED:
         structure_availability = StageAvailability.ENABLED
 
     availability = {
@@ -186,7 +220,8 @@ def initial_stage_states(
         ),
         StageKind.REFINE: (
             StageAvailability.ENABLED
-            if configuration.output.configured and configuration.refinement.enabled
+            if configuration.output.configured
+            and configuration.plan is ProcessingPlan.LOCAL_AI_REVIEWED
             else StageAvailability.DISABLED
         ),
         StageKind.STRUCTURE: structure_availability,
@@ -211,6 +246,7 @@ class DocumentJob:
     stages: tuple[StageState, ...]
     result_path: Path | None = None
     warnings: tuple[str, ...] = ()
+    review_recommendation: ReviewRecommendation | None = None
 
     @classmethod
     def create(
@@ -271,6 +307,7 @@ class DocumentJob:
             stages=initial_stage_states(self.source, configuration),
             result_path=None,
             warnings=(),
+            review_recommendation=None,
         )
 
     @property

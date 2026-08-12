@@ -14,9 +14,7 @@ IMAGE_CAPABLE_EXTENSIONS = frozenset({".md", ".markdown", ".docx", ".pdf", ".epu
 class OutputFormat(StrEnum):
     """User-visible format produced by a document workflow."""
 
-    TEXT = "text"
     MARKDOWN = "markdown"
-    DOCX = "docx"
     EPUB = "epub"
 
 
@@ -69,7 +67,6 @@ class WorkflowPlan:
     output_available: bool
     direct_epub_translation: bool
     rebuilds_container: bool
-    same_format_transformation: bool
     image_inclusion_available: bool
     image_options_visible: bool
     guidance: str
@@ -94,16 +91,12 @@ class WorkflowPlan:
         return "No está disponible para esta combinación de documentos."
 
     def convert_to_markdown_for(self, extension: str) -> bool:
-        """Map a source in this plan to the existing processing contract."""
+        """Return false only when an EPUB container is preserved directly."""
         normalized = _normalize_extension(extension)
         return not (
-            (normalized == ".txt" and self.output_format is OutputFormat.TEXT)
-            or (normalized == ".docx" and self.output_format is OutputFormat.DOCX)
-            or (
-                normalized == ".epub"
-                and self.output_format is OutputFormat.EPUB
-                and self.direct_epub_translation
-            )
+            normalized == ".epub"
+            and self.output_format is OutputFormat.EPUB
+            and self.direct_epub_translation
         )
 
     def action_text(self, count: int) -> str:
@@ -114,10 +107,6 @@ class WorkflowPlan:
             return f"Traducir {count} EPUB" if count > 1 else "Traducir EPUB"
         if self.direct_epub_translation:
             return f"Personalizar {count} EPUB" if count > 1 else "Personalizar EPUB"
-        if self.same_format_transformation:
-            format_name = "TXT" if self.output_format is OutputFormat.TEXT else "Word"
-            verb = "Traducir" if self.options.translate and not self.options.clean else "Mejorar"
-            return f"{verb} {count} {format_name}" if count > 1 else f"{verb} {format_name}"
         if self.output_format is OutputFormat.EPUB:
             if self.options.translate:
                 return f"Traducir y crear {count} EPUB" if count > 1 else "Traducir y crear EPUB"
@@ -143,13 +132,6 @@ class WorkflowPlan:
                 f"Listos {count} EPUB para personalizar."
                 if count > 1
                 else "Listo para personalizar el EPUB."
-            )
-        if self.same_format_transformation:
-            format_name = "TXT" if self.output_format is OutputFormat.TEXT else "Word"
-            return (
-                f"Listos {count} documentos para crear sus {format_name}."
-                if count > 1
-                else f"Listo para crear el {format_name} transformado."
             )
         if self.output_format is OutputFormat.EPUB:
             return (
@@ -189,32 +171,27 @@ def plan_workflow(
     epub_rebuildable = has_sources and all(
         extension in EPUB_BUILD_INPUT_EXTENSIONS or extension == ".epub" for extension in normalized
     )
-    all_txt = has_sources and normalized == {".txt"}
-    all_docx = has_sources and normalized == {".docx"}
     all_markdown = has_sources and normalized.issubset({".md", ".markdown"})
-    same_format_transformation = (output_format is OutputFormat.TEXT and all_txt) or (
-        output_format is OutputFormat.DOCX and all_docx
-    )
     wants_rebuild = resolved_options.content_revision or resolved_options.review_structure
-    output_available = (
-        output_format is OutputFormat.MARKDOWN
-        or (
-            output_format is OutputFormat.EPUB
-            and (epub_buildable or all_epub or (wants_rebuild and epub_rebuildable))
-        )
-        or (same_format_transformation and resolved_options.mode is not WorkflowMode.CONVERT)
+    output_available = output_format is OutputFormat.MARKDOWN or (
+        output_format is OutputFormat.EPUB
+        and (epub_buildable or all_epub or (wants_rebuild and epub_rebuildable))
     )
     direct_epub = (
         all_epub
         and output_format is OutputFormat.EPUB
-        and not resolved_options.review_content
-        and not resolved_options.review_structure
+        and (
+            resolved_options.translate
+            or (not resolved_options.review_content and not resolved_options.review_structure)
+        )
     )
     has_image_capable_source = any(
         extension in IMAGE_CAPABLE_EXTENSIONS for extension in normalized
     )
-    generated_epub = output_format is OutputFormat.EPUB and (
-        (epub_buildable and not all_epub) or (wants_rebuild and epub_rebuildable)
+    generated_epub = (
+        output_format is OutputFormat.EPUB
+        and not direct_epub
+        and ((epub_buildable and not all_epub) or (wants_rebuild and epub_rebuildable))
     )
 
     semantic_issue: str | None = None
@@ -239,13 +216,6 @@ def plan_workflow(
         )
     elif resolved_options.improvement_enabled and not resolved_options.any_improvement:
         semantic_issue = "Activa Traducir, Corregir errores y ruido u Organizar estructura."
-    elif same_format_transformation and not resolved_options.any_improvement:
-        semantic_issue = "Activa Traducir o Corregir errores y ruido para crear un resultado nuevo."
-    elif resolved_options.review_structure and output_format in {
-        OutputFormat.TEXT,
-        OutputFormat.DOCX,
-    }:
-        semantic_issue = "Para usar Organizar estructura, elige Markdown o EPUB."
 
     guidance = ""
     if mixed_with_epub and not (
@@ -274,7 +244,6 @@ def plan_workflow(
         direct_epub_translation=direct_epub,
         rebuilds_container=generated_epub
         and any(extension in {".epub", ".docx"} for extension in normalized),
-        same_format_transformation=same_format_transformation,
         image_inclusion_available=(
             has_image_capable_source and (output_format is OutputFormat.MARKDOWN or generated_epub)
         ),
