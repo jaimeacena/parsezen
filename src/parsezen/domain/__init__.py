@@ -8,8 +8,9 @@ from parsezen.domain.jobs import (
     JobConfiguration,
     JobStatus,
     OutputConfiguration,
-    RefinementConfiguration,
-    StructureConfiguration,
+    ProcessingPlan,
+    ReviewRecommendation,
+    ReviewSignal,
     TranslationConfiguration,
 )
 from parsezen.domain.stages import (
@@ -27,11 +28,12 @@ __all__ = [
     "JobConfiguration",
     "JobStatus",
     "OutputConfiguration",
-    "RefinementConfiguration",
+    "ProcessingPlan",
+    "ReviewRecommendation",
+    "ReviewSignal",
     "StageAvailability",
     "StageKind",
     "StageState",
     "StageStatus",
-    "StructureConfiguration",
     "TranslationConfiguration",
 ]

@@ -1,14 +1,22 @@
 from __future__ import annotations
 
+import logging
+import re
+from datetime import UTC
 from pathlib import Path
 from threading import Event
 
 import pytest
 
-from parsezen.application.recovery import FailureKind, ProcessingFailure
 from parsezen.cancellation import CancellationToken
+from parsezen.domain.attempt_activity import (
+    AttemptEventStatus,
+    AttemptPhase,
+    durable_failure_message,
+)
 from parsezen.domain.outcomes import EarlyCheckReport
 from parsezen.errors import ConversionError, ProcessingCancelledError
+from parsezen.failure_recovery import FailureKind, ProcessingFailure
 from parsezen.presentation.processing_runner import ProcessingRunner, ProcessingWorker
 from parsezen.processing import ProcessRequest, ProcessResult, ProcessStage
 from parsezen.settings import AppSettings
@@ -59,6 +67,127 @@ def test_runner_forwards_events_and_releases_the_worker(qtbot, tmp_path: Path) -
     assert runner.cancellation is None
 
 
+def test_runner_ignores_an_invalid_cross_thread_stage_payload() -> None:
+    runner = ProcessingRunner()
+    stages: list[object] = []
+    runner.stage_changed.connect(stages.append)
+
+    runner._worker_stage_changed("reading")  # noqa: SLF001
+
+    assert stages == []
+    assert runner.timeline.events == ()
+
+
+def test_runner_generates_one_opaque_attempt_id_and_retains_timeline(qtbot, tmp_path: Path) -> None:
+    source = tmp_path / "notes.txt"
+    destination = tmp_path / "notes.md"
+    source.write_text("Notes", encoding="utf-8")
+    received_attempt_ids: list[str] = []
+    runner = ProcessingRunner()
+
+    def processor(
+        request,
+        *,
+        on_stage,
+        on_progress,
+        settings,
+        cancellation,
+        attempt_id,
+    ) -> ProcessResult:
+        del request, on_progress, settings, cancellation
+        received_attempt_ids.append(attempt_id)
+        on_stage(ProcessStage.READING)
+        destination.write_text("Converted", encoding="utf-8")
+        return ProcessResult(destination)
+
+    runner.start(
+        ProcessRequest(source, convert_to_markdown=False),
+        AppSettings(),
+        processor=processor,
+    )
+    qtbot.waitUntil(lambda: not runner.is_active, timeout=2_000)
+
+    assert runner.attempt_id is not None
+    assert re.fullmatch(r"[0-9a-f]{32}", runner.attempt_id)
+    assert received_attempt_ids == [runner.attempt_id]
+    assert runner.timeline.events[0].phase is AttemptPhase.PREPARATION
+    assert runner.timeline.events[0].status is AttemptEventStatus.STARTED
+    assert runner.timeline.events[-1].phase is AttemptPhase.COMPLETION
+    assert runner.timeline.events[-1].status is AttemptEventStatus.COMPLETED
+
+
+def test_runner_deduplicates_physical_stages_and_completes_each_phase(
+    qtbot,
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "notes.txt"
+    destination = tmp_path / "notes.md"
+    source.write_text("Notes", encoding="utf-8")
+    runner = ProcessingRunner()
+
+    def processor(_request, *, on_stage, **_arguments) -> ProcessResult:
+        for stage in (
+            ProcessStage.READING,
+            ProcessStage.CONVERTING,
+            ProcessStage.TRANSLATING,
+            ProcessStage.IMPROVING,
+            ProcessStage.ORGANIZING_STRUCTURE,
+            ProcessStage.WRITING,
+            ProcessStage.COMPLETED,
+        ):
+            on_stage(stage)
+        destination.write_text("Converted", encoding="utf-8")
+        return ProcessResult(destination)
+
+    runner.start(
+        ProcessRequest(source, convert_to_markdown=False),
+        AppSettings(),
+        processor=processor,
+    )
+    qtbot.waitUntil(lambda: not runner.is_active, timeout=2_000)
+
+    assert [(event.phase, event.status) for event in runner.timeline.events] == [
+        (AttemptPhase.PREPARATION, AttemptEventStatus.STARTED),
+        (AttemptPhase.PREPARATION, AttemptEventStatus.COMPLETED),
+        (AttemptPhase.TRANSLATION, AttemptEventStatus.STARTED),
+        (AttemptPhase.TRANSLATION, AttemptEventStatus.COMPLETED),
+        (AttemptPhase.CORRECTION, AttemptEventStatus.STARTED),
+        (AttemptPhase.CORRECTION, AttemptEventStatus.COMPLETED),
+        (AttemptPhase.PERSONALIZATION, AttemptEventStatus.STARTED),
+        (AttemptPhase.PERSONALIZATION, AttemptEventStatus.COMPLETED),
+        (AttemptPhase.PUBLICATION, AttemptEventStatus.STARTED),
+        (AttemptPhase.PUBLICATION, AttemptEventStatus.COMPLETED),
+        (AttemptPhase.COMPLETION, AttemptEventStatus.STARTED),
+        (AttemptPhase.COMPLETION, AttemptEventStatus.COMPLETED),
+    ]
+    assert all(event.timestamp.tzinfo is UTC for event in runner.timeline.events)
+
+
+def test_runner_failure_retains_the_real_failed_phase(qtbot, tmp_path: Path) -> None:
+    source = tmp_path / "notes.txt"
+    source.write_text("Notes", encoding="utf-8")
+    runner = ProcessingRunner()
+
+    def processor(_request, *, on_stage, **_arguments) -> ProcessResult:
+        on_stage(ProcessStage.TRANSLATING)
+        raise ConversionError('No se pudo traducir el t\u00e9rmino confidencial "PROYECTO-ALFA".')
+
+    runner.start(
+        ProcessRequest(source, convert_to_markdown=False),
+        AppSettings(),
+        processor=processor,
+    )
+    qtbot.waitUntil(lambda: not runner.is_active, timeout=2_000)
+
+    assert runner.failure_snapshot is not None
+    assert runner.failure_snapshot.phase is AttemptPhase.TRANSLATION
+    assert runner.failure_snapshot.message == durable_failure_message("source")
+    assert "PROYECTO-ALFA" not in runner.failure_snapshot.message
+    assert runner.timeline.events[-1].phase is AttemptPhase.TRANSLATION
+    assert runner.timeline.events[-1].status is AttemptEventStatus.FAILED
+    assert all(event.phase is not AttemptPhase.FAILURE for event in runner.timeline.events)
+
+
 def test_runner_cancels_cooperatively_and_rejects_parallel_start(
     qtbot,
     tmp_path: Path,
@@ -95,6 +224,43 @@ def test_runner_cancels_cooperatively_and_rejects_parallel_start(
     qtbot.waitUntil(lambda: not runner.is_active, timeout=2_000)
 
     assert cancelled == [True]
+    assert runner.timeline.events[-1].phase is AttemptPhase.PREPARATION
+    assert runner.timeline.events[-1].status is AttemptEventStatus.CANCELLED
+
+
+def test_runner_pause_terminates_the_active_phase_as_paused(qtbot, tmp_path: Path) -> None:
+    source = tmp_path / "notes.txt"
+    source.write_text("Notes", encoding="utf-8")
+    started = Event()
+    runner = ProcessingRunner()
+
+    def processor(
+        _request,
+        *,
+        on_stage,
+        on_progress,
+        settings,
+        cancellation,
+    ) -> ProcessResult:
+        del on_progress, settings
+        on_stage(ProcessStage.TRANSLATING)
+        started.set()
+        assert cancellation._event.wait(timeout=2)  # noqa: SLF001
+        cancellation.check()
+        raise AssertionError("Pause must stop the worker.")
+
+    runner.start(
+        ProcessRequest(source, convert_to_markdown=False),
+        AppSettings(),
+        processor=processor,
+    )
+    qtbot.waitUntil(started.is_set, timeout=2_000)
+
+    assert runner.pause()
+    qtbot.waitUntil(lambda: not runner.is_active, timeout=2_000)
+
+    assert runner.timeline.events[-1].phase is AttemptPhase.TRANSLATION
+    assert runner.timeline.events[-1].status is AttemptEventStatus.PAUSED
 
 
 @pytest.mark.parametrize(
@@ -143,7 +309,11 @@ def test_runner_classifies_failures_without_logging_private_details(
     assert "C:/private/document.txt" not in caplog.text
 
 
-def test_blocking_early_check_prevents_the_full_processor(qtbot, tmp_path: Path) -> None:
+def test_blocking_early_check_prevents_the_full_processor(
+    qtbot,
+    tmp_path: Path,
+    caplog,
+) -> None:
     source = tmp_path / "book.pdf"
     source.write_bytes(b"pdf")
     runner = ProcessingRunner()
@@ -165,12 +335,13 @@ def test_blocking_early_check_prevents_the_full_processor(qtbot, tmp_path: Path)
         processor_called.append(True)
         return ProcessResult(tmp_path / "unexpected.md")
 
-    runner.start(
-        ProcessRequest(source, convert_to_markdown=True),
-        AppSettings(),
-        processor=processor,
-        early_check=early_check,
-    )
+    with caplog.at_level(logging.INFO, logger="parsezen.presentation.processing_runner"):
+        runner.start(
+            ProcessRequest(source, convert_to_markdown=True),
+            AppSettings(),
+            processor=processor,
+            early_check=early_check,
+        )
     qtbot.waitUntil(lambda: not runner.is_active, timeout=2_000)
 
     assert started == [True]
@@ -178,6 +349,18 @@ def test_blocking_early_check_prevents_the_full_processor(qtbot, tmp_path: Path)
     assert completed[0].blocking
     assert not processor_called
     assert failures[0].kind is FailureKind.EARLY_CHECK
+    assert runner.failure_snapshot is not None
+    assert runner.failure_snapshot.phase is AttemptPhase.EARLY_CHECK
+    assert runner.timeline.events[-1].phase is AttemptPhase.EARLY_CHECK
+    assert runner.timeline.events[-1].status is AttemptEventStatus.FAILED
+    terminal = [
+        record.message for record in caplog.records if "processing_failed" in record.message
+    ]
+    assert terminal
+    assert f"attempt_id={runner.attempt_id}" in terminal[-1]
+    assert "phase=early_check" in terminal[-1]
+    assert "error_code=early_check" in terminal[-1]
+    assert "error_type=EarlyCheckError" in terminal[-1]
 
 
 def test_safe_early_check_continues_with_the_full_processor(qtbot, tmp_path: Path) -> None:

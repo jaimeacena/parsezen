@@ -10,7 +10,7 @@ from parsezen.domain.jobs import (
     DocumentSource,
     JobConfiguration,
     JobStatus,
-    RefinementConfiguration,
+    ProcessingPlan,
 )
 from parsezen.domain.stages import StageKind, StageStatus
 from parsezen.processing import ProcessResult
@@ -45,7 +45,7 @@ def add_job(queue: JobQueue, identifier: str, *, review: bool = False) -> str:
             1,
         ),
         JobConfiguration(
-            refinement=RefinementConfiguration(enabled=review),
+            plan=ProcessingPlan.LOCAL_AI_REVIEWED if review else ProcessingPlan.STANDARD,
         ),
         job_id=identifier,
     )

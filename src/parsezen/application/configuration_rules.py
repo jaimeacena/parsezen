@@ -10,28 +10,20 @@ from parsezen.domain.jobs import (
     DocumentFormat,
     DocumentSource,
     JobConfiguration,
+    ProcessingPlan,
     TranslationMethod,
-    effective_ai_profile,
 )
 
+# Parsezen deliberately publishes only its two canonical, reviewable formats.
 SUPPORTED_OUTPUTS: dict[DocumentFormat, frozenset[DocumentFormat]] = {
-    DocumentFormat.TEXT: frozenset(
-        {DocumentFormat.TEXT, DocumentFormat.MARKDOWN, DocumentFormat.EPUB}
-    ),
-    DocumentFormat.MARKDOWN: frozenset({DocumentFormat.MARKDOWN, DocumentFormat.EPUB}),
-    DocumentFormat.DOCX: frozenset(
-        {DocumentFormat.DOCX, DocumentFormat.MARKDOWN, DocumentFormat.EPUB}
-    ),
-    DocumentFormat.PDF: frozenset({DocumentFormat.MARKDOWN, DocumentFormat.EPUB}),
-    DocumentFormat.EPUB: frozenset({DocumentFormat.EPUB, DocumentFormat.MARKDOWN}),
+    source: frozenset({DocumentFormat.MARKDOWN, DocumentFormat.EPUB}) for source in DocumentFormat
 }
 
 
 class ConfigurationSection(StrEnum):
     RESULT = "result"
     TRANSLATION = "translation"
-    REFINEMENT = "refinement"
-    STRUCTURE = "structure"
+    PLAN = "plan"
     PERSONALIZATION = "personalization"
     AI = "ai"
 
@@ -43,15 +35,11 @@ class ConfigurationIssue:
 
 
 def requires_ai(configuration: JobConfiguration) -> bool:
-    """Whether at least one enabled phase needs the shared Ollama profile."""
+    """Whether the selected plan or translation engine needs global Ollama."""
 
-    return (
-        (
-            configuration.translation.enabled
-            and configuration.translation.method is TranslationMethod.LOCAL_AI
-        )
-        or configuration.refinement.enabled
-        or configuration.structure.enabled
+    return configuration.plan is ProcessingPlan.LOCAL_AI_REVIEWED or (
+        configuration.translation.enabled
+        and configuration.translation.method is TranslationMethod.LOCAL_AI
     )
 
 
@@ -66,18 +54,17 @@ def configuration_issues(
     output = configuration.output
     issues: list[ConfigurationIssue] = []
     if not output.configured:
-        issues.append(
+        return (
             ConfigurationIssue(
                 ConfigurationSection.RESULT,
                 "Configura el resultado antes de procesar este documento.",
-            )
+            ),
         )
-        return tuple(issues)
     if output.format not in SUPPORTED_OUTPUTS[source.format]:
         issues.append(
             ConfigurationIssue(
                 ConfigurationSection.RESULT,
-                "Selecciona un formato de salida compatible.",
+                "Selecciona Markdown o EPUB como formato de salida.",
             )
         )
     if configuration.page_range is not None and source.format is not DocumentFormat.PDF:
@@ -94,18 +81,18 @@ def configuration_issues(
                 "Elige el idioma al que quieres traducir.",
             )
         )
-    if configuration.structure.enabled and output.format is not DocumentFormat.EPUB:
-        issues.append(
-            ConfigurationIssue(
-                ConfigurationSection.STRUCTURE,
-                "La organización de capítulos solo está disponible para resultados EPUB.",
-            )
+    if requires_ai(configuration) and configuration.ai.model is None:
+        reason = (
+            "traducir con IA local"
+            if configuration.translation.enabled
+            and configuration.translation.method is TranslationMethod.LOCAL_AI
+            and configuration.plan is not ProcessingPlan.LOCAL_AI_REVIEWED
+            else "usar la revisión semántica"
         )
-    if requires_ai(configuration) and effective_ai_profile(configuration).model is None:
         issues.append(
             ConfigurationIssue(
                 ConfigurationSection.AI,
-                "Elige un modelo de IA para las operaciones activadas.",
+                f"Configura un modelo de IA local general antes de {reason}.",
             )
         )
     if (
@@ -114,14 +101,13 @@ def configuration_issues(
         and source.format is not DocumentFormat.EPUB
         and not (
             configuration.translation.enabled
-            or configuration.refinement.enabled
-            or configuration.structure.enabled
+            or configuration.plan is ProcessingPlan.LOCAL_AI_REVIEWED
         )
     ):
         issues.append(
             ConfigurationIssue(
                 ConfigurationSection.RESULT,
-                "Activa al menos una mejora cuando la entrada y la salida tienen el mismo formato.",
+                "Usa el plan revisado o activa la traducción para volver a generar el formato.",
             )
         )
     if (
@@ -133,13 +119,6 @@ def configuration_issues(
             ConfigurationIssue(
                 ConfigurationSection.PERSONALIZATION,
                 "Elige la imagen que se usará como portada.",
-            )
-        )
-    if output.directory_is_custom and output.directory is None:
-        issues.append(
-            ConfigurationIssue(
-                ConfigurationSection.RESULT,
-                "Elige una carpeta personalizada o vuelve al destino general.",
             )
         )
     return tuple(issues)

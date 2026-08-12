@@ -6,11 +6,12 @@ import gc
 import os
 import re
 import shutil
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from contextlib import contextmanager
 from functools import lru_cache
 from io import BytesIO
 from pathlib import Path
+from statistics import median
 from tempfile import TemporaryDirectory
 from typing import Any
 
@@ -23,7 +24,17 @@ from parsezen.errors import ConversionError, ProcessingCancelledError
 _IMAGE_PLACEHOLDER_PATTERN = re.compile(r"<!--\s*image\s*-->", re.IGNORECASE)
 _HEADING_PATTERN = re.compile(r"^(#{1,6}\s+)(.+)$")
 _STANDALONE_PAGE_NUMBER_PATTERN = re.compile(r"(?:\d{1,3}|[ivxlcdm]+)", re.IGNORECASE)
-_MAX_PAGES_PER_BATCH = 4
+_INVALID_XML_CONTROL_PATTERN = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
+_UNESCAPED_PIPE_PATTERN = re.compile(r"(?<!\\)\|")
+_TABLE_DIVIDER_PATTERN = re.compile(r"\s*\|?(?:\s*:?-{3,}:?\s*\|)+\s*:?-{3,}:?\s*\|?\s*")
+_TABLE_CAPTION_PATTERN = re.compile(
+    r"^[*_`\s]*(?:table|tabla|tableau|tabelle|tavola|tabela)\s+"
+    r"(?:\d+|[ivxlcdm]+)\b",
+    re.IGNORECASE,
+)
+# Docling keeps page images and intermediate layout tensors alive for the whole
+# conversion call. Small batches cap the peak without rebuilding the worker model.
+_MAX_PAGES_PER_BATCH = 2
 OCR_LANGUAGES = ("es", "en", "fr", "de", "it", "pt")
 
 
@@ -129,6 +140,12 @@ def _convert_pdf_pages_in_process(
                         image_placeholder="",
                         traverse_pictures=True,
                     )
+                    markdown = _strip_low_prominence_ocr_lines(
+                        markdown,
+                        result,
+                        page_number=page_number,
+                        fallback_index=page_number - first_page,
+                    )
                     cleaned = _clean_ocr_markdown(markdown)
                     if cleaned:
                         markdown_pages[page_number] = cleaned
@@ -195,7 +212,7 @@ def _document_converter() -> Any:
     )
     from docling.document_converter import DocumentConverter, ImageFormatOption, PdfFormatOption
 
-    thread_count = max(1, min(os.cpu_count() or 4, 8))
+    thread_count = max(1, min(os.cpu_count() or 4, 4))
     pdf_pipeline_options = _pipeline_options(
         PdfPipelineOptions,
         AcceleratorOptions,
@@ -327,6 +344,7 @@ def _recover_pages_from_images(
                         image_placeholder="",
                         traverse_pictures=True,
                     )
+                    markdown = _strip_low_prominence_ocr_lines(markdown, result)
                     del result
                     cleaned = _clean_ocr_markdown(markdown)
                     score = _ocr_markdown_score(cleaned)
@@ -344,6 +362,99 @@ def _recover_pages_from_images(
             if on_page_finished is not None:
                 on_page_finished(page_number)
     return recovered
+
+
+def _strip_low_prominence_ocr_lines(
+    markdown: str,
+    conversion_result: Any,
+    *,
+    page_number: int | None = None,
+    fallback_index: int | None = None,
+) -> str:
+    """Drop tiny isolated labels from the matching OCR page only."""
+
+    candidates: set[str] = set()
+    for page in _matching_ocr_pages(
+        conversion_result,
+        page_number=page_number,
+        fallback_index=fallback_index,
+    ):
+        assembled = getattr(page, "assembled", None)
+        elements = getattr(assembled, "elements", ()) if assembled is not None else ()
+        cells_by_identity: dict[int, Any] = {}
+        for element in elements:
+            cluster = getattr(element, "cluster", None)
+            for cell in getattr(cluster, "cells", ()):
+                if getattr(cell, "from_ocr", False):
+                    cells_by_identity[id(cell)] = cell
+        cells = tuple(cells_by_identity.values())
+        heights = [
+            box.height
+            for cell in cells
+            if (text := " ".join(str(getattr(cell, "text", "")).split()))
+            and (box := cell.to_bounding_box()).height > 0
+        ]
+        page_size = getattr(page, "size", None)
+        if len(heights) < 4 or page_size is None or page_size.width <= 0:
+            continue
+        typical_height = median(heights)
+        for cell in cells:
+            text = " ".join(str(getattr(cell, "text", "")).split())
+            words = re.findall(r"[^\W\d_]+(?:['’\-][^\W\d_]+)*", text, re.UNICODE)
+            if len(words) != 1 or len(words[0]) > 4:
+                continue
+            box = cell.to_bounding_box()
+            if box.height < typical_height * 0.34 and box.width / page_size.width < 0.12:
+                candidates.add(text.casefold())
+    if not candidates:
+        return markdown
+
+    kept: list[str] = []
+    for line in markdown.splitlines(keepends=True):
+        visible = line.strip()
+        heading = _HEADING_PATTERN.fullmatch(visible)
+        if heading is not None:
+            visible = heading.group(2).strip()
+        if visible.casefold() in candidates:
+            continue
+        kept.append(line)
+    return "".join(kept)
+
+
+def _matching_ocr_pages(
+    conversion_result: Any,
+    *,
+    page_number: int | None,
+    fallback_index: int | None,
+) -> tuple[Any, ...]:
+    pages = getattr(conversion_result, "pages", None)
+    if pages is None:
+        document = getattr(conversion_result, "document", None)
+        pages = getattr(document, "pages", ()) if document is not None else ()
+    if isinstance(pages, Mapping):
+        if page_number is not None:
+            for key in (page_number, str(page_number)):
+                if key in pages:
+                    return (pages[key],)
+        normalized = tuple(pages.values())
+    else:
+        normalized = tuple(pages) if isinstance(pages, Iterable) else ()
+    if len(normalized) <= 1 or page_number is None:
+        return normalized
+    for page in normalized:
+        candidate_number = next(
+            (
+                getattr(page, attribute)
+                for attribute in ("page_no", "page_number", "number")
+                if getattr(page, attribute, None) is not None
+            ),
+            None,
+        )
+        if candidate_number == page_number:
+            return (page,)
+    if fallback_index is not None and 0 <= fallback_index < len(normalized):
+        return (normalized[fallback_index],)
+    return ()
 
 
 def _recovery_image_candidates(
@@ -448,6 +559,7 @@ def _page_ranges(page_numbers: set[int]) -> list[tuple[int, int]]:
 
 
 def _clean_ocr_markdown(markdown: str) -> str:
+    markdown = _INVALID_XML_CONTROL_PATTERN.sub(" ", markdown)
     cleaned_lines = [
         _collapse_heading_repetitions(line.strip())
         for line in _IMAGE_PLACEHOLDER_PATTERN.sub("", markdown).splitlines()
@@ -469,7 +581,53 @@ def _clean_ocr_markdown(markdown: str) -> str:
         if not line and (not compacted or not compacted[-1]):
             continue
         compacted.append(line)
-    return "\n".join(compacted).strip()
+    return _separate_ocr_table_captions("\n".join(compacted).strip())
+
+
+def _separate_ocr_table_captions(markdown: str) -> str:
+    """Detach a recognized table caption merged into an OCR header row."""
+
+    lines = markdown.splitlines()
+    repaired: list[str] = []
+    index = 0
+    while index < len(lines):
+        if index + 1 >= len(lines) or _TABLE_DIVIDER_PATTERN.fullmatch(lines[index + 1]) is None:
+            repaired.append(lines[index])
+            index += 1
+            continue
+        header_cells = _markdown_row_cells(lines[index])
+        divider_cells = _markdown_row_cells(lines[index + 1])
+        if (
+            len(header_cells) != len(divider_cells) + 1
+            or not header_cells
+            or _TABLE_CAPTION_PATTERN.match(header_cells[0]) is None
+        ):
+            repaired.append(lines[index])
+            index += 1
+            continue
+        repaired.extend(
+            (
+                header_cells[0],
+                "",
+                _markdown_table_row(header_cells[1:]),
+                lines[index + 1],
+            )
+        )
+        index += 2
+    return "\n".join(repaired)
+
+
+def _markdown_row_cells(line: str) -> tuple[str, ...]:
+    content = line.strip()
+    if content.startswith("|"):
+        content = content[1:]
+    if re.search(r"(?<!\\)\|\s*$", content):
+        content = re.sub(r"(?<!\\)\|\s*$", "", content)
+    return tuple(cell.strip() for cell in _UNESCAPED_PIPE_PATTERN.split(content))
+
+
+def _markdown_table_row(cells: tuple[str, ...]) -> str:
+    return "| " + " | ".join(cells) + " |"
 
 
 def _collapse_heading_repetitions(line: str) -> str:

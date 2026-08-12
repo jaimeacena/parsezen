@@ -1,8 +1,9 @@
 from dataclasses import replace
 from pathlib import Path
 
-from PySide6.QtCore import QMimeData, QPointF, Qt
+from PySide6.QtCore import QMimeData, QPointF, QRect, Qt
 from PySide6.QtGui import QDropEvent
+from PySide6.QtWidgets import QStyleOptionViewItem
 
 import parsezen.presentation.job_table as job_table_module
 from parsezen.application.planner import activate_next_stage
@@ -14,8 +15,9 @@ from parsezen.domain.jobs import (
     DocumentSource,
     JobConfiguration,
     OutputConfiguration,
-    RefinementConfiguration,
-    StructureConfiguration,
+    ProcessingPlan,
+    ReviewRecommendation,
+    ReviewSignal,
     TranslationConfiguration,
 )
 from parsezen.domain.stages import StageKind, StageStatus
@@ -27,6 +29,7 @@ from parsezen.presentation.job_table import (
     JOB_RUNNING_ROLE,
     REMOVE_AVAILABLE_ROLE,
     STAGE_KIND_ROLE,
+    JobCellDelegate,
     JobColumn,
     JobHeaderView,
     JobTableModel,
@@ -69,8 +72,7 @@ def make_job() -> DocumentJob:
         JobConfiguration(
             output=OutputConfiguration(format=DocumentFormat.EPUB),
             translation=TranslationConfiguration(enabled=True, target_language="Español"),
-            refinement=RefinementConfiguration(enabled=True, model="qwen3:4b"),
-            structure=StructureConfiguration(enabled=True),
+            plan=ProcessingPlan.LOCAL_AI_REVIEWED,
         ),
         order=0,
         job_id="manual",
@@ -158,13 +160,30 @@ def test_running_progress_explains_the_remaining_time() -> None:
     assert "avance real" in status.data(Qt.ItemDataRole.ToolTipRole)
 
 
+def test_running_progress_track_sits_below_remaining_time_inside_the_row() -> None:
+    option = QStyleOptionViewItem()
+    option.rect = QRect(0, 0, 260, 84)
+    presentation = job_table_module.CellPresentation(
+        "Traduciendo · 25 %",
+        "Quedan aprox. 12 min–20 min",
+        tone="running",
+        progress=0.25,
+    )
+
+    track = JobCellDelegate._progress_track_rect(option, presentation)
+
+    line_bottom = option.rect.center().y() - 20 + 40
+    assert track.top() - line_bottom >= job_table_module.SPACING.xs
+    assert track.bottom() <= option.rect.bottom()
+
+
 def test_configuration_summary_remains_visible_and_accessible() -> None:
     model = JobTableModel((make_job(),))
     index = model.index(0, COLUMNS.index(JobColumn.CONFIGURATION))
     presentation = index.data(CELL_PRESENTATION_ROLE)
 
     assert presentation.title == ""
-    assert presentation.operations == ("Traducir", "Corregir", "Personalizar")
+    assert presentation.operations == ("Traducir", "Revisar con IA")
     assert index.data(Qt.ItemDataRole.AccessibleTextRole).startswith("Flujo")
 
 
@@ -219,6 +238,30 @@ def test_completed_result_exposes_open_action() -> None:
     assert presentation.action == "Abrir resultado"
     assert presentation.title == "Listo"
     assert "Siguiente paso · Listo" in index.data(Qt.ItemDataRole.AccessibleTextRole)
+
+
+def test_completed_result_with_evidence_offers_targeted_ai_review(qtbot) -> None:
+    recommended = replace(
+        make_completed_job(),
+        review_recommendation=ReviewRecommendation(
+            ((ReviewSignal.SOURCE_TEXT_RESIDUE, 1),),
+            (2,),
+        ),
+    )
+    table = JobTableView()
+    qtbot.addWidget(table)
+    table.set_jobs((recommended,))
+    requested: list[str] = []
+    table.ai_review_requested.connect(requested.append)
+    index = table.job_model.index(0, COLUMNS.index(JobColumn.NEXT_STEP))
+
+    presentation = index.data(CELL_PRESENTATION_ROLE)
+    table._cell_clicked(index)
+
+    assert presentation.title == "Revisión sugerida"
+    assert presentation.action == "Revisar con IA"
+    assert presentation.subtitle == "1 bloque señalado · el resultado ya está disponible"
+    assert requested == ["manual"]
 
 
 def test_unconfigured_job_has_one_clear_configuration_gate() -> None:

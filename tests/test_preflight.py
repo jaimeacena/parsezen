@@ -18,7 +18,7 @@ from parsezen.domain.jobs import (
     DocumentSource,
     JobConfiguration,
     OutputConfiguration,
-    RefinementConfiguration,
+    ProcessingPlan,
     TranslationConfiguration,
     TranslationMethod,
 )
@@ -71,11 +71,10 @@ def test_preflight_explains_review_load_and_unsafe_automatic_changes(tmp_path: P
             output=OutputConfiguration(format=DocumentFormat.EPUB),
             translation=TranslationConfiguration(
                 enabled=True,
-                method=TranslationMethod.LOCAL_AI,
+                method=TranslationMethod.OFFLINE,
                 target_language="es",
-                manual_review=False,
             ),
-            refinement=RefinementConfiguration(enabled=True, manual_review=True),
+            plan=ProcessingPlan.LOCAL_AI_REVIEWED,
         ),
         order=0,
         job_id="book",
@@ -84,7 +83,7 @@ def test_preflight_explains_review_load_and_unsafe_automatic_changes(tmp_path: P
         source,
         convert_to_markdown=False,
         output_format=OutputFormat.EPUB,
-        target_language="es",
+        offline_translation_language="es",
     )
 
     analysis, profile = analyze_preflight(
@@ -95,12 +94,22 @@ def test_preflight_explains_review_load_and_unsafe_automatic_changes(tmp_path: P
 
     assert profile.model_key is not None
     assert all(source.name not in finding.detail for finding in analysis.findings)
-    assert analysis.severity is PreflightSeverity.HIGH
-    assert any(finding.code == "combined-language-pass" for finding in analysis.findings)
-    assert all(finding.code != "two-language-passes" for finding in analysis.findings)
-    assert "corrección" in analysis.expected_reviews
-    assert "editor EPUB final" in analysis.expected_reviews
-    assert combine_preflights((analysis,)).requires_confirmation
+    assert analysis.severity is PreflightSeverity.INFO
+    assert any(finding.code == "two-language-passes" for finding in analysis.findings)
+    assert analysis.flow_steps == (
+        "Markdown",
+        "Traducir con Argos a español",
+        "Revisión bilingüe con IA local",
+        "Revisión de estructura con IA local",
+        "EPUB",
+    )
+    assert any(
+        finding.code == "processing-passes" and "3 pasadas" in finding.detail
+        for finding in analysis.findings
+    )
+    assert "texto revisado por IA local" in analysis.expected_reviews
+    assert "confirmación EPUB final" in analysis.expected_reviews
+    assert not combine_preflights((analysis,)).requires_confirmation
 
 
 def test_zero_duration_is_not_saved_as_learning_history() -> None:

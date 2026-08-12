@@ -23,6 +23,10 @@ python -m pip check
 python -m pip_audit -r requirements.lock --no-deps --disable-pip --ignore-vuln CVE-2026-54499
 ```
 
+La excepción `CVE-2026-54499` corresponde a la versión de Stanza fijada por Argos 1.11.0. Parsezen
+fuerza MiniSBD antes de cargar cualquier paquete y no usa ese segmentador, pero la excepción debe
+revisarse en cada release y retirarse en cuanto Argos permita una versión corregida compatible.
+
 La validación editorial con EPUBCheck y el candidato CPU de Windows deben terminar correctamente en
 GitHub Actions. Antes de publicar se prueba el instalador exacto en un perfil limpio, sin Python,
 incluidos instalación, arranque, actualización, desinstalación y conservación de datos.
@@ -36,15 +40,17 @@ El workflow `Paquete de Windows` instala únicamente `requirements-windows-cpu.l
 - `Parsezen-Setup-X.Y.Z.exe.sha256`;
 - `python-environment.json`.
 
-Una ejecución manual crea un candidato. Una etiqueta `vX.Y.Z` añade la atestación de procedencia.
+Una ejecución manual crea un candidato. Una etiqueta `vX.Y.Z` solo se acepta si su commit pertenece
+a `main`; vuelve a auditar el lock CPU, añade la atestación de procedencia y crea o actualiza una
+GitHub Release en borrador con los tres archivos generados por esa misma ejecución.
 
 ## Publicar
 
 1. Integrar la rama validada en `main`.
 2. Crear la etiqueta anotada `vX.Y.Z` sobre el commit integrado.
 3. Esperar a que finalicen Calidad, EPUBCheck y Paquete de Windows.
-4. Descargar el artefacto, verificar checksum, versión y arranque.
-5. Crear una GitHub Release inicialmente en borrador y adjuntar los tres archivos.
+4. Abrir la Release en borrador creada por el workflow y descargar sus tres archivos.
+5. Verificar checksum, versión y arranque del instalador exacto adjunto.
 6. Revisar las notas, publicar y volver a descargar el instalador público para verificarlo.
 
 No se reutilizan binarios locales ni artefactos de otra ejecución. No se reescriben etiquetas

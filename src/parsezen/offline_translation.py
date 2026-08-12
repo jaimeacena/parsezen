@@ -8,26 +8,38 @@ import re
 from collections import Counter
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
+from hashlib import sha256
 from html import unescape
 
 from parsezen.cancellation import CancellationToken, check_cancelled
 from parsezen.errors import TranslationError
 from parsezen.translation_quality import (
+    ATX_HEADING_PATTERN,
     MAX_AUTOMATIC_SOURCE_TEXT_REPAIRS,
     NUMBER_PATTERN,
+    TITLE_ROMAN_REFERENCE_PATTERN,
     TranslationQualityError,
     detect_language_code,
     find_titles_with_source_language_residue,
     find_untranslated_source_sentences,
     find_untranslated_title_lines,
+    is_probable_organization_name_line,
+    is_probable_proper_name_line,
+    link_destination_spans,
+    natural_language_text,
+    numeric_tokens_are_conserved,
     resolve_language_code,
     validate_translation_quality,
 )
 
 MAX_DOCUMENT_CHARACTERS = 1_000_000
 MAX_TRANSLATABLE_PART_CHARACTERS = 4_500
+MAX_TRANSLATION_RETRY_PART_CHARACTERS = 700
+TRANSLATION_RETRY_PART_CHARACTER_LIMITS = (700, 350, 175, 90, 45, 24)
+MAX_OFFLINE_TRANSLATION_WORK_ITEM_CHARACTERS = 60_000
 MAX_OUTPUT_CHARACTERS = 2_000_000
 TRANSLATION_SEGMENT_MARKER = "PZTRANSLATIONSEGMENTV1"
+_OFFLINE_TRANSLATION_CHECKPOINT_REVISION = "offline-translation-work-v5"
 
 LOGGER = logging.getLogger(__name__)
 
@@ -47,15 +59,25 @@ PROTECTED_INLINE_PATTERN = re.compile(
     r"|(?<!\w)[+-](?!\w)"  # list marker or isolated sign
 )
 HTML_ENTITY_PATTERN = re.compile(r"&(?:amp|quot|apos|lt|gt|#\d+|#x[0-9A-Fa-f]+);")
+TRAILING_LIST_FOLIO_PATTERN = re.compile(
+    r"^[ \t]{0,3}(?:[-+*]|\d+[.)])[ \t]+.*?"
+    r"(?P<folio>(?<!\d)\d{1,3}|(?<![A-Za-z])[ivxlcdm]+)"
+    r"(?=[ \t]*(?:\]\((?:\\.|[^)\n])*\))?[ \t]*(?:\r?\n)?$)",
+    re.IGNORECASE,
+)
+HEADING_ROMAN_TOKEN_PATTERN = re.compile(r"(?<![A-Za-z])[IVXLCDM]+(?![A-Za-z])")
 
 TranslationProgressCallback = Callable[[int, int], None]
 TranslationReadyCallback = Callable[[], None]
+TranslationCheckpointLoader = Callable[[str], str | None]
+TranslationCheckpointSaver = Callable[[str, str], bool]
 
 
 @dataclass(frozen=True, slots=True)
 class _MarkdownPart:
     text: str
     should_translate: bool
+    normalize_sentence_start: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -71,19 +93,188 @@ def translate_markdown_offline(
     on_progress: TranslationProgressCallback | None = None,
     on_engine_ready: TranslationReadyCallback | None = None,
     cancellation: CancellationToken | None = None,
+    load_checkpoint: TranslationCheckpointLoader | None = None,
+    save_checkpoint: TranslationCheckpointSaver | None = None,
 ) -> str:
-    """Translate in a short-lived local process so model memory is reclaimed."""
+    """Translate bounded, resumable work items in one private local worker."""
 
     from parsezen.offline_translation_executor import translate_markdown_in_worker
 
-    return translate_markdown_in_worker(
-        markdown,
-        target_language,
-        source_language_code=source_language_code,
-        on_progress=on_progress,
-        on_engine_ready=on_engine_ready,
-        cancellation=cancellation,
+    check_cancelled(cancellation)
+    _validate_document(markdown)
+    target_code = resolve_target_language(target_language)
+    planned_parts = _plan_markdown_parts(markdown)
+    if not any(part.should_translate for part in planned_parts):
+        LOGGER.info("offline_translation_completed engine=argos segments=0")
+        return markdown
+    source_code = _resolve_source_language(
+        source_language_code,
+        " ".join(part.text for part in planned_parts if part.should_translate),
     )
+    if source_code == target_code:
+        return markdown
+
+    work_items = tuple(_offline_translation_work_items(markdown))
+    work_totals = tuple(
+        len(_translation_groups(_plan_markdown_parts(work_item))) for work_item in work_items
+    )
+    total_groups = sum(work_totals)
+    completed_groups = 0
+    engine_announced = False
+    translated_items: list[str] = []
+
+    def announce_engine_once() -> None:
+        nonlocal engine_announced
+        if engine_announced:
+            return
+        engine_announced = True
+        if on_engine_ready is not None:
+            on_engine_ready()
+
+    for work_item, work_total in zip(work_items, work_totals, strict=True):
+        check_cancelled(cancellation)
+        checkpoint = _offline_translation_checkpoint_key(
+            work_item,
+            source_code=source_code,
+            target_code=target_code,
+        )
+        cached = load_checkpoint(checkpoint) if load_checkpoint is not None else None
+        if cached is not None and _valid_offline_translation_work_item(
+            work_item,
+            cached,
+            source_code=source_code,
+            target_code=target_code,
+        ):
+            translated_items.append(cached)
+            completed_groups += work_total
+            if on_progress is not None and total_groups:
+                on_progress(completed_groups, total_groups)
+            continue
+
+        base_completed = completed_groups
+
+        def report_progress(
+            current: int,
+            _total: int,
+            completed_before_item: int = base_completed,
+        ) -> None:
+            if on_progress is not None and total_groups:
+                on_progress(
+                    min(completed_before_item + current, total_groups),
+                    total_groups,
+                )
+
+        translated = translate_markdown_in_worker(
+            work_item,
+            target_language,
+            source_language_code=source_code,
+            on_progress=report_progress,
+            on_engine_ready=announce_engine_once,
+            cancellation=cancellation,
+        )
+        if not _valid_offline_translation_work_item(
+            work_item,
+            translated,
+            source_code=source_code,
+            target_code=target_code,
+        ):
+            raise TranslationError("La traducciÃ³n local de un bloque no superÃ³ las guardas.")
+        translated_items.append(translated)
+        completed_groups += work_total
+        if save_checkpoint is not None and not save_checkpoint(checkpoint, translated):
+            LOGGER.warning("offline_translation_checkpoint_save_failed")
+
+    result = "".join(translated_items)
+    if not result.strip() or "\0" in result or len(result) > MAX_OUTPUT_CHARACTERS:
+        raise TranslationError("La traducciÃ³n recibida no es segura para guardarla.")
+    try:
+        validate_translation_quality(
+            markdown,
+            result,
+            source_language=source_code,
+            target_language=target_code,
+            preserve_paragraphs=True,
+        )
+    except TranslationQualityError as exc:
+        raise TranslationError(str(exc)) from exc
+    return result
+
+
+def _offline_translation_work_items(markdown: str) -> Iterator[str]:
+    pending: list[str] = []
+    pending_characters = 0
+    fence_character: str | None = None
+    fence_length = 0
+
+    for line in markdown.splitlines(keepends=True):
+        if (
+            pending
+            and fence_character is None
+            and pending_characters + len(line) > MAX_OFFLINE_TRANSLATION_WORK_ITEM_CHARACTERS
+        ):
+            yield "".join(pending)
+            pending.clear()
+            pending_characters = 0
+
+        pending.append(line)
+        pending_characters += len(line)
+        fence = FENCE_PATTERN.match(line)
+        if fence is None:
+            continue
+        marker = fence.group(1)
+        if fence_character is None:
+            fence_character = marker[0]
+            fence_length = len(marker)
+        elif marker[0] == fence_character and len(marker) >= fence_length:
+            fence_character = None
+            fence_length = 0
+
+    if pending:
+        yield "".join(pending)
+
+
+def _offline_translation_checkpoint_key(
+    source: str,
+    *,
+    source_code: str,
+    target_code: str,
+) -> str:
+    identity = "\n".join(
+        (
+            _OFFLINE_TRANSLATION_CHECKPOINT_REVISION,
+            source_code,
+            target_code,
+            source,
+        )
+    )
+    return sha256(identity.encode("utf-8")).hexdigest()
+
+
+def _valid_offline_translation_work_item(
+    source: str,
+    translated: str,
+    *,
+    source_code: str,
+    target_code: str,
+) -> bool:
+    if (
+        not isinstance(translated, str)
+        or not translated.strip()
+        or "\0" in translated
+        or len(translated) > MAX_OUTPUT_CHARACTERS
+    ):
+        return False
+    try:
+        validate_translation_quality(
+            source,
+            translated,
+            source_language=source_code,
+            target_language=target_code,
+            preserve_paragraphs=True,
+        )
+    except TranslationQualityError:
+        return False
+    return True
 
 
 def _translate_markdown_offline_in_process(
@@ -210,9 +401,15 @@ def _retry_unchanged_titles(
         return translated
     LOGGER.warning("offline_translation_title_fallback count=%d", len(unique_repairs))
     repaired = translated
+    preserved = 0
     for source_title, current_title in unique_repairs:
-        replacement = _translate_title_case_normalized(source_title, translate_text)
-        repaired = _replace_exact_title_lines(repaired, current_title, replacement)
+        try:
+            replacement = _translate_title_case_normalized(source_title, translate_text)
+            repaired = _replace_exact_title_lines(repaired, current_title, replacement)
+        except TranslationError:
+            preserved += 1
+    if preserved:
+        LOGGER.warning("offline_translation_title_preserved count=%d", preserved)
     return repaired
 
 
@@ -235,7 +432,14 @@ def _retry_unchanged_sentences(
     accepted = 0
     for sentence in sentences:
         try:
-            replacement = _translate_value_safely(translate_text, sentence)
+            replacement = _translate_protected_fragment_safely(translate_text, sentence)
+            natural_sentence = natural_language_text(sentence)
+            if (
+                replacement.casefold() == sentence.casefold()
+                and not is_probable_organization_name_line(natural_sentence)
+                and not is_probable_proper_name_line(natural_sentence, source_language)
+            ):
+                replacement = _translate_sentence_case_normalized(sentence, translate_text)
             if replacement.casefold() == sentence.casefold() and NUMBER_PATTERN.search(sentence):
                 replacement = _translate_around_numbers(sentence, translate_text)
             replacement = _validate_preserved_numbers(sentence, replacement)
@@ -281,8 +485,28 @@ def _translate_text_piece(text: str, translate_text: Callable[[str], str]) -> st
     trailing_length = len(text) - len(text.rstrip())
     end = len(text) - trailing_length if trailing_length else len(text)
     core = text[leading_length:end]
-    translated = _translate_nonempty(translate_text, core).strip()
+    translated = _translate_protected_fragment_safely(translate_text, core).strip()
     return f"{text[:leading_length]}{translated}{text[end:]}"
+
+
+def _translate_protected_fragment_safely(
+    translate_text: Callable[[str], str],
+    fragment: str,
+) -> str:
+    """Retry prose without ever sending adjacent Markdown guards to Argos."""
+
+    parts = _plan_markdown_parts(fragment)
+    translated: list[str] = []
+    for part in parts:
+        translated.append(
+            _translate_value_safely(translate_text, part.text)
+            if part.should_translate
+            else part.text
+        )
+    result = "".join(translated)
+    if not result.strip():
+        raise TranslationError("El reintento offline devolvió un fragmento vacío.")
+    return result
 
 
 def _translate_title_case_normalized(
@@ -292,19 +516,52 @@ def _translate_title_case_normalized(
     heading = re.match(r"^(\s{0,3}#{1,6}[ \t]+)(.*)$", title)
     prefix = heading.group(1) if heading is not None else ""
     content = heading.group(2) if heading is not None else title
-    letters = [character for character in content if character.isalpha()]
+    letters = [character for character in natural_language_text(content) if character.isalpha()]
     was_uppercase = bool(letters) and all(character.isupper() for character in letters)
 
-    normalized = content.casefold()
-    translated = _translate_value_safely(translate_text, normalized)
+    normalized = "".join(
+        part.text.casefold() if part.should_translate else part.text
+        for part in _plan_markdown_parts(content)
+    )
+    translated = _translate_protected_fragment_safely(translate_text, normalized)
     translated = _validate_preserved_numbers(content, translated).strip()
     if translated.casefold() == normalized:
         raise TranslationError("El traductor offline dejó un título en el idioma original.")
     if was_uppercase:
-        translated = translated.upper()
+        translated = _transform_translatable_parts(translated, str.upper)
     else:
-        translated = _capitalize_first_letter(translated)
+        translated = _capitalize_first_translatable_part(translated)
     return f"{prefix}{translated}"
+
+
+def _translate_sentence_case_normalized(
+    sentence: str,
+    translate_text: Callable[[str], str],
+) -> str:
+    normalized = _transform_translatable_parts(sentence, str.casefold)
+    translated = _translate_protected_fragment_safely(translate_text, normalized)
+    translated = _validate_preserved_numbers(sentence, translated)
+    return _capitalize_first_translatable_part(translated)
+
+
+def _transform_translatable_parts(text: str, transform: Callable[[str], str]) -> str:
+    return "".join(
+        transform(part.text) if part.should_translate else part.text
+        for part in _plan_markdown_parts(text)
+    )
+
+
+def _capitalize_first_translatable_part(text: str) -> str:
+    parts = _plan_markdown_parts(text)
+    result: list[str] = []
+    capitalized = False
+    for part in parts:
+        value = part.text
+        if part.should_translate and not capitalized:
+            value = _capitalize_first_letter(value)
+            capitalized = True
+        result.append(value)
+    return "".join(result)
 
 
 def _capitalize_first_letter(text: str) -> str:
@@ -346,7 +603,7 @@ def _decode_new_html_entities(source: str, translated: str) -> str:
 
 
 def _validate_preserved_numbers(source: str, translated: str) -> str:
-    if Counter(NUMBER_PATTERN.findall(source)) != Counter(NUMBER_PATTERN.findall(translated)):
+    if not numeric_tokens_are_conserved(source, translated):
         raise TranslationError("La traducción cambió u omitió números o fechas.")
     return translated
 
@@ -523,7 +780,7 @@ def _translate_group(
     group: _TranslationGroup,
     translate_text: Callable[[str], str],
 ) -> list[str]:
-    source_values = [parts[index].text for index in group.part_indexes]
+    source_values = [_translation_source_value(parts[index]) for index in group.part_indexes]
     if len(source_values) == 1 or any(
         TRANSLATION_SEGMENT_MARKER in value for value in source_values
     ):
@@ -549,6 +806,12 @@ def _translate_group(
     return translated_values
 
 
+def _translation_source_value(part: _MarkdownPart) -> str:
+    if part.normalize_sentence_start:
+        return _capitalize_first_letter(part.text)
+    return part.text
+
+
 def _translate_nonempty(translate_text: Callable[[str], str], text: str) -> str:
     translated = translate_text(text)
     if not isinstance(translated, str) or not translated.strip():
@@ -560,10 +823,75 @@ def _translate_value_safely(
     translate_text: Callable[[str], str],
     text: str,
 ) -> str:
+    return _translate_value_with_retries(translate_text, text, retry_level=0)
+
+
+def _translate_value_with_retries(
+    translate_text: Callable[[str], str],
+    text: str,
+    *,
+    retry_level: int,
+) -> str:
+    try:
+        return _translate_value_once(translate_text, text)
+    except Exception:
+        for next_level in range(
+            retry_level,
+            len(TRANSLATION_RETRY_PART_CHARACTER_LIMITS),
+        ):
+            max_characters = TRANSLATION_RETRY_PART_CHARACTER_LIMITS[next_level]
+            retry_parts = tuple(
+                _split_translation_retry_parts(
+                    text,
+                    max_characters=max_characters,
+                )
+            )
+            if len(retry_parts) < 2:
+                continue
+            LOGGER.warning(
+                "offline_translation_part_retry smaller_parts=%d max_characters=%d",
+                len(retry_parts),
+                max_characters,
+            )
+            return "".join(
+                f"{_translate_value_with_retries(translate_text, part, retry_level=next_level + 1)}"
+                f"{separator}"
+                for part, separator in retry_parts
+            )
+        raise
+
+
+def _translate_value_once(
+    translate_text: Callable[[str], str],
+    text: str,
+) -> str:
     translated = _translate_nonempty(translate_text, text)
     if NUMBER_PATTERN.findall(text) == NUMBER_PATTERN.findall(translated):
         return translated
     return _translate_with_protected_numbers(translate_text, text)
+
+
+def _split_translation_retry_parts(
+    text: str,
+    *,
+    max_characters: int,
+) -> Iterator[tuple[str, str]]:
+    """Split one failed prose span at original whitespace without losing separators."""
+
+    remaining = text
+    while len(remaining) > max_characters:
+        window = remaining[: max_characters + 1]
+        boundaries = tuple(re.finditer(r"\s+", window))
+        if not boundaries:
+            return
+        boundary = boundaries[-1]
+        part = remaining[: boundary.start()]
+        if not part:
+            return
+        yield part, remaining[boundary.start() : boundary.end()]
+        remaining = remaining[boundary.end() :]
+    if remaining:
+        yield remaining, ""
 
 
 def _numbers_match(source_values: list[str], translated_values: list[str]) -> bool:
@@ -603,7 +931,11 @@ def _number_placeholder(index: int) -> str:
             break
         value -= 1
     suffix = "".join(reversed(letters))
-    return f"PZNUMBERTOKEN{suffix}ENDPZ"
+    # Keep the token alphabetic so Argos does not reinterpret an index as a
+    # document number. The deliberately non-linguistic guards also prevent an
+    # ordinal suffix next to the source number (for example ``3rd``) from being
+    # merged into the placeholder by the translation model.
+    return f"PZXQ{suffix}QXZP"
 
 
 def _plan_markdown_parts(markdown: str) -> list[_MarkdownPart]:
@@ -639,12 +971,55 @@ def _plan_markdown_parts(markdown: str) -> list[_MarkdownPart]:
 
 
 def _append_tokenized_line(parts: list[_MarkdownPart], line: str) -> None:
+    first_line_part = len(parts)
     position = 0
-    for match in PROTECTED_INLINE_PATTERN.finditer(line):
-        _append_translatable(parts, line[position : match.start()])
-        parts.append(_MarkdownPart(match.group(0), False))
-        position = match.end()
+    for start, end in _protected_inline_spans(line):
+        _append_translatable(parts, line[position:start])
+        parts.append(_MarkdownPart(line[start:end], False))
+        position = end
     _append_translatable(parts, line[position:])
+    if _starts_with_lowercase_prose(line):
+        for index in range(first_line_part, len(parts)):
+            part = parts[index]
+            if part.should_translate:
+                parts[index] = _MarkdownPart(
+                    part.text,
+                    True,
+                    normalize_sentence_start=True,
+                )
+                break
+
+
+def _starts_with_lowercase_prose(line: str) -> bool:
+    match = re.match(r"^[ \t]*([^\W\d_]+)(?=[ \t])", line, flags=re.UNICODE)
+    return match is not None and match.group(1).islower()
+
+
+def _protected_inline_spans(line: str) -> list[tuple[int, int]]:
+    spans = [(match.start(), match.end()) for match in PROTECTED_INLINE_PATTERN.finditer(line)]
+    spans.extend(
+        (match.start(), match.end()) for match in TITLE_ROMAN_REFERENCE_PATTERN.finditer(line)
+    )
+    if ATX_HEADING_PATTERN.match(line) is not None:
+        spans.extend(
+            (match.start(), match.end()) for match in HEADING_ROMAN_TOKEN_PATTERN.finditer(line)
+        )
+    # Use the exact parser shared by the quality gate. Generic Markdown
+    # punctuation can otherwise consume ``[]`` before the wider ``](...)``
+    # alternative sees an empty-alt image, exposing a relative destination.
+    spans.extend((start, end) for start, end, _value in link_destination_spans(line))
+    trailing_folio = TRAILING_LIST_FOLIO_PATTERN.match(line)
+    if trailing_folio is not None:
+        spans.append((trailing_folio.start("folio"), trailing_folio.end("folio")))
+
+    merged: list[tuple[int, int]] = []
+    for start, end in sorted(spans):
+        if merged and start <= merged[-1][1]:
+            previous_start, previous_end = merged[-1]
+            merged[-1] = (previous_start, max(previous_end, end))
+        else:
+            merged.append((start, end))
+    return merged
 
 
 def _append_translatable(parts: list[_MarkdownPart], candidate: str) -> None:

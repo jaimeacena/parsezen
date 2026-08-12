@@ -1,3 +1,4 @@
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -10,7 +11,9 @@ from parsezen.domain.jobs import (
     DocumentSource,
     JobConfiguration,
     JobStatus,
-    RefinementConfiguration,
+    ProcessingPlan,
+    ReviewRecommendation,
+    ReviewSignal,
     TranslationConfiguration,
 )
 from parsezen.domain.stages import StageKind, StageStatus
@@ -32,7 +35,7 @@ def add_job(
         ),
         JobConfiguration(
             translation=TranslationConfiguration(enabled=translation),
-            refinement=RefinementConfiguration(enabled=refinement),
+            plan=(ProcessingPlan.LOCAL_AI_REVIEWED if refinement else ProcessingPlan.STANDARD),
         ),
         job_id=identifier,
     )
@@ -61,6 +64,30 @@ def test_execution_advances_chronologically_and_preserves_attempts() -> None:
     assert translated.stage(StageKind.PREPARE).started_at is not None
     assert translated.stage(StageKind.PREPARE).finished_at is not None
     assert translated.stage(StageKind.TRANSLATE).status is StageStatus.RUNNING
+
+
+def test_targeted_review_temporarily_enables_only_refinement_on_completed_result() -> None:
+    queue = JobQueue()
+    job_id = add_job(queue, "late")
+    execution = JobExecutionController(queue)
+    completed = execution.complete(job_id, Path("late.md"))
+    queue.replace(
+        replace(
+            completed,
+            review_recommendation=ReviewRecommendation(
+                ((ReviewSignal.CONVERSION_DAMAGE, 1),),
+                (0,),
+            ),
+        )
+    )
+
+    reviewing = execution.begin_targeted_review(job_id)
+    restored = execution.abort_targeted_review(job_id)
+
+    assert reviewing.stage(StageKind.REFINE).status is StageStatus.READY
+    assert reviewing.stage(StageKind.REFINE).participates
+    assert not restored.stage(StageKind.REFINE).participates
+    assert restored.status is JobStatus.COMPLETED
 
 
 def test_review_blocks_only_its_job_and_another_can_start() -> None:

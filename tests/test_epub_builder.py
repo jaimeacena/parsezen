@@ -11,6 +11,7 @@ from parsezen.document_model import ConvertedResource
 from parsezen.epub_builder import (
     EpubBookMetadata,
     build_epub,
+    classify_heading_role,
     iter_epub_text_documents,
     plan_epub,
     validate_epub_archive,
@@ -59,7 +60,11 @@ def test_epub_contains_required_package_navigation_and_reflowable_chapter() -> N
             "EPUB/text/chapter-0001.xhtml",
         ):
             ElementTree.fromstring(archive.read(name))
-        assert archive.read("EPUB/styles/book.css")
+        stylesheet = archive.read("EPUB/styles/book.css").decode("utf-8")
+        assert "break-inside: avoid" in stylesheet
+        assert "overflow-wrap: anywhere" in stylesheet
+        assert "padding-top: 0.5em" in stylesheet
+        assert "page-break-inside: avoid" in stylesheet
         package = archive.read("EPUB/package.opf").decode("utf-8")
         assert "Parsezen" in package
         assert "2026-07-22T00:00:00Z" in package
@@ -67,6 +72,66 @@ def test_epub_contains_required_package_navigation_and_reflowable_chapter() -> N
     assert built.integrity_report is not None
     assert built.integrity_report.verified
     assert built.integrity_report.ledger.headings == 1
+
+
+def test_epub_keeps_dense_numeric_index_references_literal() -> None:
+    built = _build(
+        "# Index\n\n"
+        "259. 295, 304, 310, 317\n"
+        "202. 204, 207, 208, 211, 213\n"
+        "\n10. Read chapter 202.\n"
+    )
+
+    chapter = "\n".join(content for _name, content in iter_epub_text_documents(built.content))
+
+    assert "259. 295, 304, 310, 317" in chapter
+    assert "202. 204, 207, 208, 211, 213" in chapter
+    assert '<ol start="259">' not in chapter
+    assert '<ol start="10">' in chapter
+
+
+def test_epub_replaces_xml_forbidden_controls_in_content_and_metadata() -> None:
+    built = build_epub(
+        "# Main\x1fTitle\n\nFirst\x01Second and third\x0bfourth.",
+        (),
+        EpubBookMetadata("Book\x01Title", "es", "Local\x1fAuthor"),
+        identifier=UUID(int=1),
+        modified_at=datetime(2026, 7, 22, tzinfo=UTC),
+    )
+
+    validate_epub_archive(built.content)
+    with ZipFile(BytesIO(built.content)) as archive:
+        chapter = archive.read("EPUB/text/chapter-0001.xhtml").decode("utf-8")
+        package = archive.read("EPUB/package.opf").decode("utf-8")
+    assert "Main Title" in chapter
+    assert "First Second and third fourth." in chapter
+    assert "Book Title" in package
+    assert "Local Author" in package
+    assert not any(ord(character) in {0x1, 0xB, 0x1F} for character in chapter + package)
+
+
+def test_epub_preserves_extended_publication_metadata() -> None:
+    built = build_epub(
+        "# Chapter\n\nContent.",
+        (),
+        EpubBookMetadata(
+            "Preserved book",
+            "en",
+            "Local Author",
+            identifiers=("primary-id", "secondary-id"),
+            publisher="Local Publisher",
+            publication_date="2024-03-14",
+        ),
+        modified_at=datetime(2026, 7, 22, tzinfo=UTC),
+    )
+
+    with ZipFile(BytesIO(built.content)) as archive:
+        package = archive.read("EPUB/package.opf").decode("utf-8")
+
+    assert '<dc:identifier id="book-id">primary-id</dc:identifier>' in package
+    assert "<dc:identifier>secondary-id</dc:identifier>" in package
+    assert "<dc:publisher>Local Publisher</dc:publisher>" in package
+    assert "<dc:date>2024-03-14</dc:date>" in package
 
 
 def test_epub_file_validation_uses_the_staged_package(tmp_path: Path) -> None:
@@ -145,6 +210,40 @@ def test_epub_renders_github_table_and_preserves_local_image() -> None:
     assert built.resource_count == 1
 
 
+def test_epub_renders_restricted_multiline_pdf_table_html() -> None:
+    markdown = """# Datos
+
+<table>
+<thead><tr><th>Nombre</th><th>Notas</th></tr></thead>
+<tbody><tr><td>Parsezen</td><td>Primera lÃ­nea<br>Segunda lÃ­nea</td></tr></tbody>
+</table>
+"""
+
+    chapter = next(iter_epub_text_documents(_build(markdown).content))[1]
+
+    assert "&lt;table&gt;" not in chapter
+    assert "<table>" in chapter
+    assert "<th>Nombre</th>" in chapter
+    assert "Primera lÃ­nea<br />Segunda lÃ­nea" in chapter
+
+
+def test_epub_keeps_untrusted_raw_table_html_disabled() -> None:
+    markdown = """# Datos
+
+<table>
+<thead><tr><th onclick="alert('no')">Nombre</th></tr></thead>
+<tbody><tr><td><script>alert('no')</script></td></tr></tbody>
+</table>
+"""
+
+    chapter = next(iter_epub_text_documents(_build(markdown).content))[1]
+
+    assert "<table>" not in chapter
+    assert "<script>" not in chapter
+    assert "&lt;table&gt;" in chapter
+    assert "&lt;script&gt;" in chapter
+
+
 def test_epub_disables_raw_html_and_keeps_safe_internal_page_anchors() -> None:
     markdown = (
         '<script>alert("no")</script>\n\n'
@@ -158,6 +257,18 @@ def test_epub_disables_raw_html_and_keeps_safe_internal_page_anchors() -> None:
     assert "&lt;script&gt;" in chapter
     assert 'href="#page-2"' in chapter
     assert 'id="page-2"' in chapter
+
+
+def test_epub_keeps_the_label_when_an_internal_target_is_outside_the_selection() -> None:
+    chapter = next(
+        iter_epub_text_documents(
+            _build("# Partial book\n\n[Chapter outside the selected pages](<#page-99>)").content
+        )
+    )[1]
+
+    assert "Chapter outside the selected pages" in chapter
+    assert 'href="#page-99"' not in chapter
+    assert "<a" not in chapter
 
 
 def test_long_book_splits_at_headings_and_rewrites_cross_chapter_links() -> None:
@@ -218,6 +329,25 @@ def test_epub_clamps_heading_jumps_without_changing_visible_text() -> None:
     ]
     assert levels == [2, 1, 2, 3]
     assert all(title in chapter for title in ("Book", "Opening", "Author", "Section"))
+
+
+@pytest.mark.parametrize(
+    ("title", "expected"),
+    [
+        ("Part II — The journey", "container"),
+        ("Libro 3: La vuelta", "container"),
+        ("Volume IV", "container"),
+        ("Chapter 7 — Arrival", "chapter"),
+        ("Capítulo 8: Regreso", "chapter"),
+        ("Part", None),
+        ("Chapter sevenfold", None),
+    ],
+)
+def test_classifies_only_explicit_numbered_container_and_chapter_titles(
+    title: str,
+    expected: str | None,
+) -> None:
+    assert classify_heading_role(title) == expected
 
 
 def test_epub_plan_uses_toc_titles_to_split_real_chapters_below_level_one() -> None:

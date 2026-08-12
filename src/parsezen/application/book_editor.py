@@ -15,6 +15,7 @@ from zipfile import ZipFile
 
 from lxml import etree, html
 
+from parsezen.application.artifact_repository import ArtifactRepository
 from parsezen.document_model import ConvertedResource
 from parsezen.domain.books import BookDocument, BookMetadata, BookResource, BookSection
 from parsezen.epub_builder import (
@@ -27,7 +28,6 @@ from parsezen.epub_builder import (
     plan_epub,
 )
 from parsezen.errors import ConversionError
-from parsezen.infrastructure.artifact_store import ArtifactStore
 
 _FORBIDDEN_ELEMENTS = frozenset({"applet", "embed", "form", "iframe", "object", "script"})
 _UNSAFE_URL = re.compile(r"^\s*(?:javascript|data:text/html)\s*:", re.IGNORECASE)
@@ -53,7 +53,7 @@ SectionTuple = tuple[BookSection, ...]
 class BookEditor:
     """Safe immutable operations over a normalized reflowable book."""
 
-    def __init__(self, book: BookDocument, artifacts: ArtifactStore, *, job_id: str) -> None:
+    def __init__(self, book: BookDocument, artifacts: ArtifactRepository, *, job_id: str) -> None:
         self.book = book
         self.artifacts = artifacts
         self.job_id = job_id
@@ -83,6 +83,9 @@ class BookEditor:
             language=_clean_language(language),
             author=_clean_optional_text(author),
             identifier=self.book.metadata.identifier,
+            identifiers=self.book.metadata.identifiers,
+            publisher=self.book.metadata.publisher,
+            publication_date=self.book.metadata.publication_date,
         )
         return replace(self.book, metadata=metadata)
 
@@ -255,7 +258,7 @@ def create_book_from_markdown(
     markdown: str,
     resources: tuple[ConvertedResource, ...],
     metadata: EpubBookMetadata,
-    artifacts: ArtifactStore,
+    artifacts: ArtifactRepository,
     *,
     job_id: str,
 ) -> BookDocument:
@@ -295,15 +298,22 @@ def create_book_from_markdown(
                 record.id,
             )
         )
+    nested_sections = _nest_explicit_chapter_sections(
+        tuple(sections),
+        tuple(chapter.role for chapter in plan.chapters),
+    )
     return BookDocument(
         metadata=BookMetadata(
             _clean_title(metadata.title),
             _clean_language(metadata.language),
             _clean_optional_text(metadata.author),
             str(uuid4()),
+            tuple(dict.fromkeys(metadata.identifiers)),
+            _clean_optional_text(metadata.publisher),
+            _clean_optional_text(metadata.publication_date),
         ),
-        sections=tuple(sections),
-        spine=tuple(section.id for section in sections),
+        sections=nested_sections,
+        spine=_spine(nested_sections),
         resources=tuple(book_resources),
         cover_resource_id=next(
             (
@@ -319,7 +329,7 @@ def create_book_from_markdown(
 
 def publish_book(
     book: BookDocument,
-    artifacts: ArtifactStore,
+    artifacts: ArtifactRepository,
     *,
     job_id: str,
 ) -> bytes:
@@ -384,6 +394,9 @@ def publish_book(
             book.metadata.language,
             book.metadata.author,
             cover,
+            identifiers=book.metadata.identifiers,
+            publisher=book.metadata.publisher,
+            publication_date=book.metadata.publication_date,
         ),
         navigation=_navigation(book.sections, filenames),
         identifier=(
@@ -503,13 +516,14 @@ def _validated_xhtml(
     bodies = root.xpath("//*[local-name()='body']")
     if len(bodies) != 1:
         raise ConversionError(f'El capítulo "{title}" no contiene un cuerpo único.')
+    unresolved_links: list[etree._Element] = []
     for element in root.iter():
         local_name = (
             etree.QName(element).localname.casefold() if isinstance(element.tag, str) else ""
         )
         if local_name in _FORBIDDEN_ELEMENTS:
             raise ConversionError(f'El capítulo "{title}" contiene contenido activo no permitido.')
-        for attribute, value in element.attrib.items():
+        for attribute, value in tuple(element.attrib.items()):
             name = etree.QName(attribute).localname.casefold()
             if name.startswith("on") or (name in {"href", "src"} and _UNSAFE_URL.match(value)):
                 raise ConversionError(f'El capítulo "{title}" contiene un enlace no seguro.')
@@ -524,7 +538,7 @@ def _validated_xhtml(
                         f'El capítulo "{title}" referencia una imagen que no está disponible.'
                     )
             if name == "href":
-                element.attrib[attribute] = _rewritten_book_href(
+                rewritten = _rewritten_book_href(
                     value,
                     title=title,
                     section_id=section_id,
@@ -532,7 +546,41 @@ def _validated_xhtml(
                     source_filenames=source_filenames,
                     anchors=anchors,
                 )
+                if rewritten is None:
+                    del element.attrib[attribute]
+                    if local_name == "a":
+                        unresolved_links.append(element)
+                else:
+                    element.attrib[attribute] = rewritten
+    for element in unresolved_links:
+        _unwrap_element(element)
     return cast(str, etree.tostring(root, encoding="unicode", xml_declaration=False))
+
+
+def _unwrap_element(element: etree._Element) -> None:
+    """Remove one inert link element without removing its visible descendants."""
+
+    parent = element.getparent()
+    if parent is None:
+        return
+    previous = element.getprevious()
+    if element.text:
+        if previous is None:
+            parent.text = f"{parent.text or ''}{element.text}"
+        else:
+            previous.tail = f"{previous.tail or ''}{element.text}"
+    insertion_index = parent.index(element)
+    for child in tuple(element):
+        element.remove(child)
+        parent.insert(insertion_index, child)
+        insertion_index += 1
+        previous = child
+    if element.tail:
+        if previous is None:
+            parent.text = f"{parent.text or ''}{element.tail}"
+        else:
+            previous.tail = f"{previous.tail or ''}{element.tail}"
+    parent.remove(element)
 
 
 def _book_anchor_index(
@@ -588,7 +636,7 @@ def _rewritten_book_href(
     filenames: dict[str, str],
     source_filenames: dict[str, str],
     anchors: dict[str, tuple[str, ...]],
-) -> str:
+) -> str | None:
     try:
         parsed = urlsplit(value.strip())
     except ValueError as exc:
@@ -604,9 +652,7 @@ def _rewritten_book_href(
         if not path:
             return value
         if target_from_path is None:
-            raise ConversionError(
-                f'El capítulo "{title}" contiene un enlace a un capítulo desconocido.'
-            )
+            return None
         return filenames[target_from_path]
 
     candidates = anchors.get(fragment, ())
@@ -618,8 +664,7 @@ def _rewritten_book_href(
     elif len(candidates) == 1:
         target_id = candidates[0]
     if target_id is None:
-        reason = "un ancla inexistente" if not candidates else "un ancla ambigua"
-        raise ConversionError(f'El capítulo "{title}" contiene un enlace a {reason}.')
+        return None
     encoded_fragment = quote(fragment, safe="!$&'()*+,;=:@-._~")
     if target_id == section_id:
         return f"#{encoded_fragment}"
@@ -641,7 +686,7 @@ def _book_resource_path(value: str) -> str | None:
 
 def _book_stylesheet(
     book: BookDocument,
-    artifacts: ArtifactStore,
+    artifacts: ArtifactRepository,
     *,
     job_id: str,
 ) -> str | None:
@@ -661,6 +706,34 @@ def _book_stylesheet(
 
 def _spine(sections: tuple[BookSection, ...]) -> tuple[str, ...]:
     return tuple(section.id for root in sections for section in root.walk())
+
+
+def _nest_explicit_chapter_sections(
+    sections: tuple[BookSection, ...],
+    roles: tuple[str | None, ...],
+) -> tuple[BookSection, ...]:
+    """Nest a container only around two or more unambiguous chapter siblings."""
+
+    if len(sections) != len(roles):
+        raise ValueError("Las secciones y sus roles deben tener la misma longitud.")
+    roots: list[BookSection] = []
+    index = 0
+    while index < len(sections):
+        if roles[index] != "container":
+            roots.append(sections[index])
+            index += 1
+            continue
+        end = index + 1
+        while end < len(sections) and roles[end] == "chapter":
+            end += 1
+        child_roles = roles[index + 1 : end]
+        if len(child_roles) >= 2:
+            roots.append(replace(sections[index], children=sections[index + 1 : end]))
+            index = end
+            continue
+        roots.append(sections[index])
+        index += 1
+    return tuple(roots)
 
 
 def _map_section(

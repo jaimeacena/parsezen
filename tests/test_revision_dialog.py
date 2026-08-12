@@ -7,12 +7,12 @@ from PySide6.QtWidgets import QInputDialog, QMessageBox, QPushButton
 from parsezen.epub_builder import plan_epub
 from parsezen.pdf_conversion import PdfQualityReport, PdfReviewIssue
 from parsezen.presentation.design_system import COLORS
-from parsezen.revision import RevisionDecision, RevisionKind, build_revision_draft
-from parsezen.revision_dialog import (
+from parsezen.presentation.revision_dialog import (
     EpubStructureEditor,
     RevisionReviewDialog,
     _StructureActionButton,
 )
+from parsezen.revision import RevisionDecision, RevisionKind, build_revision_draft
 from parsezen.translation_quality import (
     TranslationIssueKind,
     TranslationQualityIssue,

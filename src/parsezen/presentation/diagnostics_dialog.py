@@ -1,4 +1,4 @@
-"""Minimal local diagnostics dialog with a safe copy action."""
+"""Presentation dialog for local diagnostics with a safe copy action."""
 
 from __future__ import annotations
 

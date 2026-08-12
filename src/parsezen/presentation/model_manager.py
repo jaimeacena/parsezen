@@ -1,4 +1,4 @@
-"""Compact model administration for Parsezen's local Ollama integration."""
+"""Presentation dialog for Parsezen's local Ollama model administration."""
 
 from __future__ import annotations
 

@@ -51,3 +51,6 @@ class OutcomeSummary:
     estimate_upper_seconds: int | None = None
     early_check_pages: int = 0
     early_check_warnings: int = 0
+    ai_review_recommended: bool = False
+    ai_review_blocks: int = 0
+    ai_review_signals: int = 0

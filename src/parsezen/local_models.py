@@ -858,7 +858,7 @@ def is_reasoning_model_id(model_id: str) -> bool:
     instruction_variant = any(
         marker in normalized for marker in ("instruct", "instruction", "chat")
     )
-    if re.match(r"^qwen3(?:$|[._-])", model_name):
+    if re.match(r"^qwen3(?:$|[_-])", model_name):
         return not instruction_variant
     return bool(
         re.search(

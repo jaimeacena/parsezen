@@ -126,6 +126,34 @@ def test_book_editor_rewrites_legacy_cross_chapter_links_after_reordering(
     assert 'href="chapter-002.xhtml#destination"' not in origin
 
 
+def test_book_editor_keeps_link_text_when_its_anchor_was_removed(tmp_path: Path) -> None:
+    store = ArtifactStore(tmp_path / "artifacts", protect=reversible, unprotect=reversible)
+    book = create_book_from_markdown(
+        (
+            "# Origin\n\n[Jump to destination](<#destination>)\n\n"
+            f"{EPUB_CHAPTER_MARKER}\n\n"
+            '# Destination\n\n<a id="destination"></a>\n\nReached.'
+        ),
+        (),
+        EpubBookMetadata("Linked book", "en"),
+        store,
+        job_id="job",
+    )
+    destination_id = book.spine[1]
+    edited = BookEditor(book, store, job_id="job").update_content(
+        destination_id,
+        "<h1>Destination</h1><p>Reached.</p>",
+    )
+
+    content = publish_book(edited, store, job_id="job")
+
+    with ZipFile(BytesIO(content)) as archive:
+        origin = archive.read("EPUB/text/chapter-0001.xhtml").decode("utf-8")
+    assert "Jump to destination" in origin
+    assert "#destination" not in origin
+    assert "<a" not in origin
+
+
 def test_book_editor_add_split_move_and_validation_paths(tmp_path: Path) -> None:
     store = ArtifactStore(tmp_path / "artifacts", protect=reversible, unprotect=reversible)
     book = make_book(store)
@@ -239,7 +267,20 @@ def test_book_editor_can_replace_and_remove_the_cover(tmp_path: Path) -> None:
 
 def test_book_editor_preserves_identity_metadata_and_safe_styles(tmp_path: Path) -> None:
     store = ArtifactStore(tmp_path / "artifacts", protect=reversible, unprotect=reversible)
-    book = make_book(store)
+    book = create_book_from_markdown(
+        "# First\n\nFirst body.",
+        (),
+        EpubBookMetadata(
+            "Book",
+            "en",
+            "Author",
+            identifiers=("source-primary", "source-secondary"),
+            publisher="Local Publisher",
+            publication_date="2024-03-14",
+        ),
+        store,
+        job_id="job",
+    )
     stylesheet = store.put_text(
         job_id="job",
         text='@import "https://example.invalid/theme.css";\np { color: teal; }',
@@ -271,6 +312,10 @@ def test_book_editor_preserves_identity_metadata_and_safe_styles(tmp_path: Path)
     assert edited.metadata.identifier in repeated_package
     assert "Edited Book" in package
     assert "New Author" in package
+    assert "source-primary" in package
+    assert "source-secondary" in package
+    assert "Local Publisher" in package
+    assert "2024-03-14" in package
     assert "@import" not in css
     assert "color: teal" in css
 
@@ -333,3 +378,49 @@ def test_book_publication_rejects_missing_local_images(tmp_path: Path) -> None:
 
     with pytest.raises(Exception, match="no está disponible"):
         publish_book(missing_book, store, job_id="job")
+
+
+def test_markdown_book_nests_two_explicit_chapters_and_uses_preorder_spine(
+    tmp_path: Path,
+) -> None:
+    store = ArtifactStore(tmp_path / "artifacts", protect=reversible, unprotect=reversible)
+    markdown = (
+        "# Part II — Origins\n\nContainer text.\n\n"
+        f"{EPUB_CHAPTER_MARKER}\n\n# Chapter 7 — Roots\n\nRoots.\n\n"
+        f"{EPUB_CHAPTER_MARKER}\n\n# Chapter 8 — Branches\n\nBranches.\n\n"
+        f"{EPUB_CHAPTER_MARKER}\n\n# Epilogue\n\nClosing note.\n"
+    )
+
+    book = create_book_from_markdown(
+        markdown,
+        (),
+        EpubBookMetadata("Book", "en", "Author"),
+        store,
+        job_id="job",
+    )
+
+    assert [section.title for section in book.sections] == ["Part II — Origins", "Epilogue"]
+    assert [section.title for section in book.sections[0].children] == [
+        "Chapter 7 — Roots",
+        "Chapter 8 — Branches",
+    ]
+    assert book.spine == ("section-0001", "section-0002", "section-0003", "section-0004")
+
+
+def test_markdown_book_leaves_an_ambiguous_container_flat(tmp_path: Path) -> None:
+    store = ArtifactStore(tmp_path / "artifacts", protect=reversible, unprotect=reversible)
+    markdown = (
+        f"# Parte I\n\nContainer text.\n\n{EPUB_CHAPTER_MARKER}\n\n# Chapter 1\n\nOnly child.\n"
+    )
+
+    book = create_book_from_markdown(
+        markdown,
+        (),
+        EpubBookMetadata("Book", "en", "Author"),
+        store,
+        job_id="job",
+    )
+
+    assert [section.title for section in book.sections] == ["Parte I", "Chapter 1"]
+    assert book.sections[0].children == ()
+    assert book.spine == ("section-0001", "section-0002")

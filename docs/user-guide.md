@@ -1,34 +1,38 @@
 # Guía de uso de Parsezen
 
-Esta guía describe Parsezen 1.1.0.
+Esta guía describe la versión actual de Parsezen.
 
 ## La pantalla principal
 
 Cada documento ocupa una fila. Las columnas muestran el recorrido real:
 
 - **Documento**: origen, tamaño y páginas PDF.
-- **Flujo**: traducción, corrección y personalización activadas.
+- **Flujo**: procesamiento Directo o Revisión completa con IA local y traducción opcional.
 - **Salida**: archivo final y su destino.
 - **Siguiente paso**: fase actual, avance y acción necesaria.
 
-Al añadir un documento, **Salida** pide la configuración imprescindible. La página interna muestra
-arriba el plan efectivo y, a la izquierda, Resultado, Traducir, Corregir y, cuando la salida es EPUB,
-Personalizar. Sus opciones se abren en el panel derecho sin abandonar el documento. Traducir y
-Corregir llevan el interruptor en la propia navegación; dentro de Personalizar, el interruptor
-activa únicamente la pre-organización de capítulos. Si el plan usa Ollama aparece además `IA local`,
-con el estado, las operaciones que lo comparten y la elección heredada o específica. Parsezen valida
-el conjunto al volver a la cola, lo guarda automáticamente
-y evita dependencias circulares o combinaciones sin efecto. Si falta una decisión imprescindible,
-explica cuál es y mantiene abierta la configuración; las opciones de una operación apagada quedan
-inhabilitadas y no bloquean el procesamiento.
+Al añadir un documento, **Salida** pide la configuración imprescindible en una ventana breve sobre
+la cola. La vista inicial contiene una decisión de resultado —Markdown o EPUB— y un único selector
+de traducción —no traducir o idioma de destino—. Un resumen confirma qué se creará, las
+comprobaciones automáticas y la carpeta heredada.
+
+Parsezen aplica **Procesamiento directo**, Argos y detección automática de OCR sin pedirlos. Abre
+`Más opciones` solo para excepciones: revisión completa con IA local, traducción mediante IA,
+glosario, intervalo de páginas u OCR forzado. Las opciones avanzadas ya guardadas se abren visibles
+para que nunca queden ocultas. El detalle del recorrido y sus pasadas también vive ahí.
+
+**Procesamiento directo** convierte o traduce, comprueba la salida y puede recomendar después una
+revisión dirigida si encuentra señales concretas. **Revisar todo con IA** examina proactivamente el
+texto completo y, si el resultado es EPUB, también su estructura. No se pueden combinar corrección
+y estructura por separado.
 
 Cada acción se encuentra en la celda a la que pertenece: configurar el flujo o la salida, revisar,
 ver un error o abrir el archivo. La pantalla principal no añade un inspector lateral ni repite la
 información de la fila.
 
-`Destino:` en la cabecera define el destino general y lo recuerda. Cada documento lo hereda y lo
-muestra en el botón `Destino` de Resultado. Pulsa ese botón para elegir directamente otra carpeta
-solo para ese documento. Las excepciones no cambian cuando se modifica el destino global.
+`Destino:` en la cabecera define el único destino general y lo recuerda. Cada documento lo hereda y
+lo muestra en el resumen. Para cambiarlo usa los ajustes generales; no existen
+excepciones por documento.
 
 Cuando una fila termina, pulsa `Abrir resultado` en **Siguiente paso**. Su menú secundario permite abrir
 el archivo o su carpeta concreta. Las fases omitidas no ocupan columnas ni ofrecen acciones
@@ -67,52 +71,64 @@ comparaciones pasan a orientación vertical.
 
 ### Markdown
 
-Adecuado para texto estructurado y Obsidian. Si activas imágenes, elige una carpeta estable cuando
-vayas a mover el Markdown o a integrarlo en una bóveda. Esta es la única salida que solicita una
-carpeta de recursos externa.
+Adecuado para texto estructurado, Obsidian y sistemas de conocimiento. Parsezen genera un único
+archivo canónico y conserva las imágenes compatibles sin pedir decisiones de organización antes de
+procesar.
 
 ### EPUB
 
-Adecuado para lectores electrónicos. Puedes:
+Adecuado para lectores electrónicos. Integra los recursos compatibles dentro del libro. Antes de
+publicar aparece siempre una confirmación breve con título, autor, idioma, portada y número de
+capítulos. Puedes publicar desde ahí o abrir el editor completo para cambiar portada, estructura y
+contenido.
 
-- incluir o excluir imágenes;
-- integrar las imágenes dentro del propio EPUB, sin elegir otra carpeta;
-- conservar los estilos compatibles del paquete cuando el origen también es EPUB;
-- cambiar título, autor, idioma y portada en el editor final con cualquier formato de origen;
-- revisar los capítulos y el contenido antes de generar el libro definitivo.
+La organización automática es deliberadamente conservadora: reconoce contenedores explícitos como
+`Part`, `Parte`, `Book`, `Libro`, `Volume` o `Volumen` solo cuando les siguen al menos dos títulos
+explícitos de `Chapter`/`Capítulo` contiguos. En ese caso crea un único nivel padre-hijos y mantiene
+el número, las palabras y el orden del origen. Un caso ambiguo, un solo capítulo o un epílogo/apéndice
+posterior se conserva plano; el spine sigue el árbol en preorden.
 
-### TXT y DOCX
-
-TXT→TXT y DOCX→DOCX están disponibles cuando se aplica traducción o corrección. Word conserva el
-paquete original y sus recursos compatibles. Las imágenes de Word se integran dentro del DOCX; una
-traducción de distinta longitud puede cambiar qué fragmento hereda un estilo dentro de un párrafo.
+TXT y DOCX siguen siendo formatos de entrada, pero no añaden salidas paralelas: el resultado siempre
+es Markdown o EPUB.
 
 ## Traducir
 
-Hay dos métodos:
+Al activar **Traducir**, elige uno de dos motores que funcionan dentro del equipo:
 
-- **Algoritmo local**: Argos Translate, offline y sin modelo conversacional.
-- **IA local**: Ollama, útil cuando importa más la fluidez.
+- **Rápida y ligera · Argos**: opción inicial y recomendada para equipos modestos, consumo
+  predecible y traducciones repetibles. No necesita un modelo conversacional.
+- **Contextual · IA local**: usa el modelo general instalado en Ollama. Tarda más, consume más
+  memoria y el resultado depende del modelo elegido; Parsezen no afirma que sea mejor sin comparar
+  antes el modelo y el tipo de documento.
 
-Selecciona el idioma y, si lo necesitas, añade o elimina términos en el glosario integrado en la
-misma pantalla. La traducción ocurre antes de la corrección para que revises el texto en el idioma
-final.
+La elección del traductor es independiente del nivel de revisión. Parsezen no cambia de traductor
+dentro del documento: si eliges Argos y revisión semántica, Argos traduce primero y Ollama revisa
+después. El modelo solo propone
+sustituciones breves: Parsezen las aplica una a una cuando conservan cifras, enlaces, nombres,
+párrafos y estructura. Una propuesta rechazada no elimina otras correcciones seguras ni permite
+reescribir el resto del documento. El idioma y el glosario se comparten entre ambos recorridos.
 
 Si Parsezen puede determinar con suficiente confianza que el contenido ya está en el idioma de
-destino, omite la traducción. En EPUB usa primero el idioma declarado por el propio libro. En ese
-caso no muestra una fase de traducción ni genera un informe de calidad ficticio.
+destino, omite la traducción. En EPUB compara el idioma declarado por el propio libro con una muestra
+suficiente de su texto; si se contradicen, confía en el contenido y evita omitir una traducción
+necesaria. Cuando la coincidencia es segura no muestra una fase de traducción ni genera un informe de
+calidad ficticio.
 
-La IA trabaja en fragmentos verificables. Si una propuesta pierde contenido, cambia valores
-protegidos o no parece estar en el idioma solicitado, Parsezen la divide y vuelve a intentar solo
+Cada motor trabaja en fragmentos verificables. Si una propuesta pierde contenido, cambia
+valores protegidos o no parece estar en el idioma solicitado, Parsezen vuelve a intentar solo
 las partes necesarias. Cuando ninguna alternativa es segura, conserva ese fragmento original y lo
 incluye en la revisión en vez de publicar silenciosamente una transformación dudosa. El informe de
-traducción corresponde a la traducción en sí, no a cambios de bloques introducidos después por
-Corregir o Personalizar. En títulos, conserva localmente la sintaxis estructural mientras traduce
+traducción corresponde a la traducción en sí, no a cambios introducidos después por el plan
+Revisado. En títulos, conserva localmente la sintaxis estructural mientras traduce
 solo las palabras; los nombres editoriales se mantienen como nombres propios. Una cita en otro
 idioma puede permanecer intacta si el resto de su frase se ha traducido. Si un encabezado pertenece
 claramente a un tercer idioma y el modelo lo deforma, Parsezen recupera automáticamente el texto
 original sin deshacer su nivel. Si un mismo término aparece traducido de formas parecidas pero
 incompatibles, lo muestra en la revisión en lugar de elegir una por semejanza.
+
+Si una corrección parcial deja repetido el complemento de un título, Parsezen revisa de nuevo solo
+esa línea completa y conserva la versión anterior cuando la alternativa no supera todos los
+controles. No amplía esa reparación al autor ni a los párrafos contiguos.
 
 Antes de traducir, Parsezen construye una memoria terminológica conservadora para todo el
 documento. Protege firmas atribuidas, organizaciones y nombres propios que se repiten; el glosario
@@ -126,14 +142,13 @@ vista inicial cuando ya existen modelos y permite elegir el predeterminado. `Añ
 búsqueda por nombre, el enlace al catálogo y las recomendaciones apropiadas para el equipo. La
 misma página permite ajustar el contexto y explica cuántos trabajos pendientes heredan sus valores.
 
-Un documento usa el predeterminado salvo que elijas `Usar otro modelo` en su sección contextual.
-Los cambios globales solo actualizan trabajos pendientes que continúan heredando; las elecciones
-específicas y cualquier trabajo ya iniciado permanecen estables. Parsezen impide eliminar un modelo
-del que todavía depende un trabajo sin terminar.
+Todos los documentos usan el modelo y contexto generales. Los cambios actualizan los trabajos que
+aún se pueden editar; un trabajo iniciado conserva su instantánea. Parsezen impide eliminar un
+modelo del que todavía depende un trabajo sin terminar.
 
-## Corregir errores y ruido
+## Revisión semántica con IA local
 
-`Corregir errores y ruido` prepara una propuesta conservadora:
+La revisión semántica es una pasada proactiva y opcional que prepara una propuesta conservadora:
 
 - corrige errores gramaticales o de conversión;
 - retira ruido evidente;
@@ -146,25 +161,43 @@ defecto. La aprobación masiva aplica las correcciones conservadoras, pero no su
 originales arriesgados. Si varios fragmentos son válidos por separado pero su combinación no lo es,
 Parsezen conserva los fragmentos que siguen siendo seguros en lugar de descartar toda la propuesta.
 
-Con **IA local**, si Traducir y Corregir están activados, ambas tareas se realizan en una única
-transformación validada. Después solo se corrigen de nuevo los bloques pertenecientes a páginas que
-el análisis PDF/OCR marcó como dudosas o que contienen daño de conversión inequívoco. Con el
-algoritmo offline, Corregir continúa siendo una pasada separada.
+Con Argos, el traductor termina primero y la revisión bilingüe trabaja después sobre el resultado en
+el idioma final. Con traducción por IA, traducción y corrección se combinan en una pasada principal;
+esa corrección no constituye una segunda versión independiente. En EPUB, la estructura añade otra
+pasada. Las guardas de contenido siguen siendo las mismas.
 
-## Personalizar
+La revisión completa no se activa automáticamente porque su coste puede ser varias veces mayor y una
+propuesta segura no demuestra por sí sola que el texto sea mejor. Es útil cuando el documento es
+especialmente valioso, la conversión presenta ruido o quieres comprobar una traducción de Argos;
+para el uso normal, Procesamiento directo sigue siendo la opción recomendada. Su recorrido y sus
+pasadas se pueden consultar en `Más opciones` antes de guardar.
 
-La pestaña aparece únicamente cuando el resultado es EPUB. Su único interruptor permite
-**pre-organizar capítulos y jerarquías** antes de abrir el editor.
+### Revisión recomendada después del modo directo
 
-Todo EPUB recibe la estructura técnica mínima necesaria para ser válido. La organización de capítulos
-no borra contenido. Todo resultado EPUB abre el editor final, aunque no se haya activado esa
-pre-organización. El desplegable **Metadatos** reúne título, autor, idioma y portada. El resto del
-editor permite separar una división desde el cursor, unirla con la anterior sin borrar texto,
-reordenar jerarquías y editar encabezados, énfasis, listas, alineación y enlaces.
+Al terminar un procesamiento directo, Parsezen usa sus comprobaciones locales para buscar indicios
+acotables: daño de conversión, incidencias PDF repetidas, texto original residual o varias
+incoherencias de traducción. Una advertencia aislada y débil no basta. Si las señales se pueden
+asociar a bloques concretos, la fila cambia a `Revisión sugerida` y ofrece `Revisar con IA`.
 
-EPUB→EPUB puede abrir directamente Personalizar sin exigir traducción ni corrección. Al publicar
-desde el editor, Parsezen reconstruye un libro normalizado: conserva el contenido y los recursos
-seleccionados, pero puede simplificar estilos complejos.
+La sugerencia solo guarda tipos, cantidades, posiciones y huellas no reversibles del resultado;
+no guarda extractos del documento. No
+inicia Ollama, no cambia el resultado y no impide abrirlo. Si aceptas, Parsezen envía al modelo local
+un máximo de 64 bloques afectados, excluye código, imágenes y metadatos internos y conserva el resto
+exactamente como estaba. En una traducción, compara cada bloque con su original cuando puede
+alinearlos. Los cambios se presentan como propuesta antes de sustituir el resultado.
+
+Puedes ignorar la recomendación. Si cancelas la revisión o Ollama falla, el trabajo vuelve a
+`Completado` y el archivo anterior permanece intacto. La recomendación también se conserva al cerrar
+Parsezen; al retomarla, el texto se reconstruye desde los archivos locales y sus huellas se vuelven
+a validar. Los bloques se pueden volver a localizar tras el empaquetado EPUB, pero si su contenido
+cambió fuera de Parsezen deberá procesarse de nuevo.
+
+## EPUB y estructura
+
+Todo EPUB recibe la estructura técnica mínima necesaria para ser válido. Con procesamiento directo no
+se decide nada más antes de procesar. Con revisión semántica, Ollama revisa también capítulos y jerarquías
+sin borrar contenido. La confirmación final es siempre ligera; el editor completo solo se abre por
+petición o cuando un bloqueo impide publicar. EPUB→EPUB también sigue esta misma ruta.
 
 La planificación inicial distingue portada editorial, preliminares, índice y cuerpo. Para decidir
 los capítulos combina los títulos encontrados en el índice con los niveles derivados de la
@@ -177,13 +210,21 @@ la acción global disponible. Antes de empezar, la cola muestra un intervalo apr
 trabajo automático. Esta estimación mejora con ejecuciones similares realizadas en el equipo y no
 guarda nombres, rutas ni contenido. Los planes largos o con una decisión de riesgo alto muestran un
 resumen final de carga, revisiones previstas y aspectos que conviene comprobar.
+Ese resumen muestra primero el documento, el recorrido, la duración redondeada y lo que necesitará
+tu atención. Las explicaciones internas de la estimación, la comprobación y las fases de revisión
+permanecen disponibles en **Ver detalles técnicos**, sin recargar la confirmación principal.
+
+Un documento que llega a revisión queda pendiente, pero no detiene los demás: Parsezen continúa con
+el siguiente trabajo elegible y reúne las decisiones en una única superficie `Revisión del
+documento` cuando vuelves a revisarlo.
 
 En PDFs de 120 páginas o más —o desde 60 cuando el flujo incluye OCR forzado, IA local o EPUB—,
-Parsezen comprueba primero la primera página, una central y la última del intervalo solicitado. Las
-tres pasan por el mismo flujo real y sus salidas de muestra se eliminan. Si las señales materiales se
-repiten en al menos dos páginas, el trabajo completo no comienza y la fila explica qué configuración
-conviene revisar. Si la muestra es segura, continúa automáticamente. La extracción y el OCR válidos
-de esas páginas se reutilizan al procesar el documento completo; cambiar el archivo o su
+Parsezen examina hasta nueve candidatos baratos y elige como máximo cinco páginas distintas: inicio,
+final y ejemplos de contenido denso, visual o tabular. La muestra pasa por el mismo flujo real,
+incluidas las transformaciones activadas, y sus salidas temporales se eliminan. Si una señal
+material se repite en varias páginas, el trabajo completo no comienza y la fila explica qué
+configuración conviene revisar. Si la muestra es segura, continúa automáticamente. La extracción y
+el OCR válidos se reutilizan al procesar el documento completo; cambiar el archivo o su
 configuración obliga a comprobarlo otra vez.
 
 La fila activa conserva el documento, la fase y el progreso medible. Tras diez segundos con progreso
@@ -199,7 +240,9 @@ revisión, su fase muestra `Revisar` y la cola continúa con otro. Un error tamb
 celda muestra `Ver error` y abre su explicación completa sin perder los resultados anteriores.
 Según la causa, ofrece `Reintentar esta fase`, `Revisar configuración`, `Revisar destino` o
 `Abrir IA local`. El reintento actúa solo sobre ese documento y conserva las fases, decisiones y
-checkpoints ya válidos.
+checkpoints ya válidos. La explicación indica qué fase falló, qué trabajo sigue siendo reutilizable
+y mantiene las acciones de recuperación en la propia pantalla; Parsezen no abre un modal ni muestra
+trazas técnicas automáticamente.
 
 Antes de exponer un resultado, Parsezen vuelve a comprobar el archivo temporal. En texto verifica
 codificación, contenido y estructura; en DOCX y EPUB comprueba además que el paquete sea válido e
@@ -231,42 +274,77 @@ volver a abrir su resumen, resultado o carpeta. Es una lista privada y acotada, 
 guarda rutas, estado, fecha y conteos técnicos, pero no texto documental. `Borrar actividad` elimina
 solo ese historial; nunca elimina originales ni resultados.
 
+Una fila fallida se identifica como `Error en preparación`, `Error en comprobación temprana`,
+`Error en traducción`, `Error en corrección`, `Error en personalización` o `Error en publicación`,
+con su hora local. Al seleccionarla
+puedes leer **Qué ocurrió**, **Tu trabajo** y el **Recorrido** de fases, estados y horas. Si el
+documento fallido todavía está en la cola aparece `Volver al documento`, que devuelve a la fila actual
+para usar `Reintentar esta fase` o la acción secundaria adecuada. Si solo queda en el historial, la vista
+lo explica y no ofrece un reintento ficticio. `Copiar diagnóstico` proporciona un texto técnico breve
+con la versión, fase, código, horas y referencias opacas del intento; no incluye nombre, ruta,
+mensaje del fallo, contenido, prompts, respuestas, trazas ni secretos de configuración.
+
 ## Revisar
 
-La revisión se divide por fase. No se muestran pestañas que no correspondan al problema actual.
+La revisión se divide por fase y solo muestra los casos dudosos de la sesión actual. No se muestran
+pestañas que no correspondan al problema actual.
 
 1. Compara el original de la izquierda con la propuesta de la derecha.
-2. Marca una versión. Si editas la derecha, se selecciona automáticamente.
-3. Usa `Restaurar propuesta` si quieres descartar tu edición.
-4. Pulsa `Siguiente`.
-5. En el último elemento, pulsa `Aplicar todos los cambios`.
+2. Lee la recomendación provisional; ninguna opción aparece elegida por adelantado.
+3. Pulsa el botón de la versión que quieras confirmar. Si editas la derecha, confirma la edición.
+4. Usa `Restaurar propuesta` si quieres descartar tu edición.
+5. Pulsa `Confirmar y siguiente`. En el último elemento, pulsa `Terminar revisión`.
 
-La propuesta aparece seleccionada al abrir cada caso. Si confías en todas las propuestas de la fase
-actual, `Aprobar todas las traducciones` o `Aprobar todas las correcciones` resuelve únicamente esa
-fase sin recorrerla caso por caso; nunca aprueba la estructura. La barra superior distribuye el
-ancho de cada color según el número real de elementos de OCR, traducción, corrección y estructura, y
-muestra el avance total de la secuencia.
+La cabecera compacta muestra la síntesis del caso, la recomendación provisional, la fase actual y el
+progreso global real. Cuenta únicamente unidades de sesiones realmente materializadas: las fases
+anteriores completas, la fase actual parcial y las futuras a cero. No suma cambios estructurales
+futuros ni incidencias del informe que no pudieron convertirse en una decisión; en ventanas estrechas
+usa una versión corta como `Global 3/12 · OCR 1/2`.
 
 Dentro de cada fase, Parsezen presenta primero las incidencias críticas y altas, mantiene estable el
-orden entre elementos de la misma gravedad y muestra esa prioridad sobre la comparación. El orden
-entre fases continúa siendo OCR, traducción, corrección y estructura para respetar sus dependencias.
-La cabecera indica cuántas decisiones y prioridades altas quedan. Si guardaste una revisión a
-medias, se abre directamente el primer caso pendiente; las decisiones ya tomadas siguen disponibles
-al volver con `Anterior`, pero no se recorren de nuevo de forma obligatoria. `Alt+O` conserva el
-original, `Alt+P` elige la propuesta y `Ctrl+Intro` guarda la decisión y avanza.
+orden entre elementos de la misma gravedad y muestra esa prioridad sobre la comparación. La cabecera
+indica cuántas decisiones quedan y cuántas son importantes. Si guardaste una revisión a medias, se
+abre directamente el primer caso pendiente; las decisiones ya tomadas siguen disponibles al volver
+con `Anterior`, pero no se recorren de nuevo de forma obligatoria. `Alt+O` conserva el resultado
+actual cuando esa opción es válida, `Alt+P` elige la propuesta y `Ctrl+Intro` guarda la decisión y
+avanza.
 
-Para OCR, la izquierda muestra la página y no puede elegirse como texto. Corrige o acepta el texto de
-la derecha.
+Las etiquetas cambian con la fase: OCR muestra `Página original · Solo contexto` y `Texto
+reconocido`; traducción, `Extracto original · Contexto` y `Resultado actual · Editable`; corrección,
+`Versión actual` y `Corrección propuesta`. En OCR, si después habrá traducción, la ayuda indica que
+el texto ya aparece en el idioma del resultado y no necesitas traducirlo otra vez: corrígelo tal
+como debe quedar publicado. OCR también ofrece `No hay texto que añadir`: conserva recursos y
+anclas, pero no publica un falso texto reconocido. El origen de OCR y traducción es solo contexto y
+no tiene botón para seleccionarlo.
 
-`Guardar y continuar después` cifra el material de la revisión, incluidos recursos y ediciones. Al
-abrir de nuevo Parsezen, la misma fila vuelve a `Revisar` sin repetir la conversión o la IA.
+`Guardar y salir` cifra el material de la revisión, incluidos recursos y ediciones. Abrir un caso no
+lo resuelve por sí solo: una elección cambiada o una edición se guarda al salir. Al abrir de nuevo
+Parsezen, la misma fila vuelve a `Revisar` y continúa en la siguiente decisión pendiente, sin repetir
+la conversión o la IA.
+
+En traducción, cada panel muestra únicamente el fragmento dudoso: no presenta el resultado actual
+como una sugerencia fiable ni permite aprobarlo en bloque. Debes corregirlo en el idioma solicitado
+o usar `Confirmar sin cambios` solo si realmente es correcto. `Aplicar recomendaciones seguras`
+queda reservado a las correcciones que sí tienen una propuesta validada.
 
 Cuando un documento requiere varias revisiones, Parsezen las presenta en el orden en que se generó
 el contenido: OCR, traducción, corrección y estructura. Cada paso queda aplicado antes de mostrar el
 siguiente. Puedes cerrar tras cualquiera de ellos y continuar desde el paso pendiente; las
 decisiones ya aceptadas no vuelven a preguntarse ni relanzan el procesamiento automático.
 
-## Editor EPUB
+Antes de publicar, Parsezen vuelve a comprobar la combinación completa de elecciones. Si mezclar
+originales y propuestas duplicara, inventara o perdiera una cifra que ninguna de las dos versiones
+permite, la publicación se detiene y conserva el archivo anterior para que revises esa decisión.
+
+`Anterior` dentro de la primera unidad de una fase vuelve a la fase previa real. Parsezen pide una
+confirmación breve, conserva sus decisiones como punto de partida, invalida y recalcula solo las
+revisiones posteriores sin aumentar intentos y no vuelve a ejecutar OCR, traducción ni IA.
+
+## Confirmación y editor EPUB
+
+Todo resultado EPUB abre primero una confirmación ligera. Revisa título, autor, idioma, presencia de
+portada y número de capítulos. `Publicar EPUB` termina sin añadir pasos; `Abrir editor completo`
+entra en las herramientas avanzadas y `Guardar y salir` conserva el borrador.
 
 El panel izquierdo contiene la estructura y el derecho el contenido editable.
 
@@ -279,13 +357,14 @@ El panel izquierdo contiene la estructura y el derecho el contenido editable.
 - Los controles `−`, porcentaje y `+` ajustan la escala visual del editor entre 70 % y 160 % sin
   modificar el contenido ni el tamaño tipográfico guardado en el libro.
 
-`Guardar y continuar después` conserva el libro cifrado. `Generar EPUB definitivo` valida y publica
-el archivo antes de mostrarlo como completado.
+`Guardar y salir` conserva metadatos, portada, estructura y el capítulo actual en el borrador cifrado
+para reanudar después. `Descartar cambios` es una acción destructiva secundaria y pide confirmación
+si hay cambios. `Generar EPUB definitivo` valida y publica el archivo antes de mostrarlo como
+completado.
 
-Si activaste la revisión manual de estructura, el editor aparece aunque Parsezen no haya encontrado
-ningún cambio automático que proponer. Cancelar no publica nada; guardar conserva el punto exacto
-para continuar después. El documento solo cambia a `Completado` cuando el EPUB definitivo ya se ha
-validado y sustituido de forma segura.
+El editor no aparece por defecto: solo se abre si lo solicitas desde la confirmación o si una
+condición bloqueante necesita revisión avanzada. El documento solo cambia a `Completado` cuando el
+EPUB definitivo ya se ha validado y sustituido de forma segura.
 
 ## IA por primera vez
 
@@ -336,9 +415,30 @@ puede abrirse, Parsezen la aísla junto con sus revisiones cifradas en una carpe
 
 ### Error de OCR
 
-Compara la página original. Tipografía decorativa, rotación, manuscritos y tablas complejas pueden
+Compara la página original. Las tablas sencillas se publican como Markdown y las que necesitan más
+fidelidad como HTML compatible. Si una tabla es demasiado compleja para reconstruirla con seguridad,
+Parsezen conserva sus celdas como texto estructurado, la marca para revisión y, cuando incluyes
+imágenes, añade también un recorte visual de respaldo. Los títulos, notas y unidades situados junto
+a la tabla permanecen en el orden de lectura. Tipografía decorativa, rotación y manuscritos pueden
 necesitar edición manual. Un OCR vacío en una página visual es un resultado válido, no un bloqueo del
-documento completo.
+documento completo. En una página formada por una imagen completa, Parsezen puede retirar del texto
+una marca aislada mucho más pequeña que la tipografía reconocida, pero la imagen original siempre se
+mantiene y las etiquetas cortas de tamaño uniforme no se filtran. Si el OCR pega el rótulo de una
+tabla a su primera fila, Parsezen lo separa automáticamente para conservar ambos y publicar una tabla
+real. Si las líneas de una tabla están dibujadas dentro de la imagen pero el texto sigue siendo
+seleccionable, Parsezen combina ambas capas localmente y solo publica la cuadrícula cuando todas las
+letras, cifras y signos quedan conservados. Al reanudar, una caché OCR de una versión anterior se
+recalcula sin mostrar sus marcadores
+técnicos como parte del libro. En una portada gráfica, un título repetido en una página preliminar
+nativa puede corregir un único término corto introducido por OCR, pero solo si la coincidencia es
+inequívoca; si existen variantes, la aplicación mantiene el texto reconocido para revisión.
+
+En los índices, Parsezen reconoce una columna derecha de folios y vuelve a unir cada número con la
+entrada situada en la misma fila. Las entradas se publican como una lista legible y conservan el
+orden de sus columnas, en lugar de agrupar primero todos los títulos y después todos los números.
+Durante la traducción y la corrección, cada folio sigue unido al final de su entrada y una propuesta
+que lo desplace se descarta sin perder las demás correcciones seguras. Los rótulos internos que no
+tienen página propia aparecen separados de la entrada anterior.
 
 ### El EPUB no abre
 

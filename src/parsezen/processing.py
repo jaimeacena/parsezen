@@ -2,14 +2,16 @@
 
 from __future__ import annotations
 
+import hashlib
 import inspect
 import logging
 import os
 import re
 import secrets
 import shutil
-from collections.abc import Callable
-from contextlib import AbstractContextManager, nullcontext
+from collections.abc import Callable, Iterator
+from contextlib import AbstractContextManager, contextmanager, nullcontext
+from contextvars import ContextVar
 from dataclasses import dataclass, replace
 from enum import StrEnum
 from pathlib import Path, PurePosixPath
@@ -24,14 +26,14 @@ from parsezen.conversion import (
     SUPPORTED_EXTENSIONS,
     convert_document,
     materialize_converted_markdown,
-    validate_docx_container,
 )
-from parsezen.document_model import ConvertedResource
-from parsezen.docx_preservation import (
-    rebuild_docx_with_paragraphs,
-    split_docx_payload,
-    transform_docx,
+from parsezen.document_model import ConvertedDocument, ConvertedResource
+from parsezen.domain.attempt_activity import (
+    AttemptPhase,
+    is_safe_token,
+    phase_for_process_stage,
 )
+from parsezen.domain.jobs import MarkdownOrganization, ReviewRecommendation
 from parsezen.epub_builder import (
     EpubBookMetadata,
     build_epub,
@@ -49,12 +51,14 @@ from parsezen.epub_conversion import (
     translate_epub,
 )
 from parsezen.errors import (
+    ImprovementError,
     ParsezenError,
     ProcessingCancelledError,
     RequestValidationError,
     SettingsError,
     UnexpectedProcessingError,
 )
+from parsezen.failure_recovery import classify_failure
 from parsezen.final_integrity import (
     FinalIntegrityReport,
     IntegrityLedger,
@@ -69,19 +73,21 @@ from parsezen.glossary import (
     protect_glossary,
     validate_glossary,
 )
-from parsezen.improvement import ImprovementMode, improve_markdown
+from parsezen.improvement import (
+    ImprovementMode,
+    improve_markdown,
+    review_translation_markdown,
+)
 from parsezen.local_models import is_reasoning_model_id
 from parsezen.markdown_resources import without_markdown_images, without_markdown_resource
 from parsezen.offline_translation import translate_markdown_offline
 from parsezen.output import (
     replace_binary_output,
-    replace_text_output,
+    replace_markdown_output,
     write_conversion_output,
-    write_docx_output,
     write_epub_output,
     write_epub_translation_output,
     write_improvement_outputs,
-    write_text_output,
 )
 from parsezen.pdf_conversion import (
     PdfPageRange,
@@ -93,9 +99,16 @@ from parsezen.pdf_conversion import (
     resolve_pdf_page_range,
     strip_pdf_page_markers,
 )
-from parsezen.revision import RevisionDraft, RevisionKind, build_revision_draft
+from parsezen.revision import (
+    RevisionDecision,
+    RevisionDraft,
+    RevisionKind,
+    build_revision_draft,
+    validate_revision_selection,
+)
 from parsezen.semantic_blocks import (
     DocumentTerm,
+    SemanticBlock,
     SemanticDocument,
     SemanticRole,
     analyze_markdown,
@@ -106,6 +119,8 @@ from parsezen.translation_quality import (
     TranslationQualityReport,
     build_translation_quality_report,
     detect_language_code,
+    natural_language_text,
+    numeric_tokens_are_conserved,
     repair_untranslated_source_text,
     resolve_language_code,
     restore_changed_third_language_headings,
@@ -119,7 +134,12 @@ from parsezen.work_checkpoints import (
 from parsezen.workflow import OutputFormat, WorkflowOptions, plan_workflow
 
 LOGGER = logging.getLogger(__name__)
-_PDF_OCR_CHECKPOINT_HEADER = "\x1eParsezen PDF OCR v1\x1f"
+_CURRENT_ATTEMPT_ID: ContextVar[str | None] = ContextVar(
+    "parsezen_current_attempt_id",
+    default=None,
+)
+_PDF_OCR_CHECKPOINT_PREFIX = "\x1eParsezen PDF OCR "
+_PDF_OCR_CHECKPOINT_HEADER = f"{_PDF_OCR_CHECKPOINT_PREFIX}v3\x1f"
 _MAX_EPUB_COVER_BYTES = 32 * 1024 * 1024
 _MAX_INFERRED_TERMINOLOGY_OCCURRENCES = 64
 _EPUB_COVER_MEDIA_TYPES = {
@@ -138,11 +158,13 @@ def _encode_pdf_ocr_checkpoint(markdown: str) -> str:
 
 
 def _decode_pdf_ocr_checkpoint(payload: str | None) -> str | None:
-    """Read the tagged OCR payload while remaining compatible with older caches."""
+    """Read current OCR data, retry tagged stale versions, and accept untagged legacy text."""
     if payload is None:
         return None
     if payload.startswith(_PDF_OCR_CHECKPOINT_HEADER):
         return payload[len(_PDF_OCR_CHECKPOINT_HEADER) :]
+    if payload.startswith(_PDF_OCR_CHECKPOINT_PREFIX):
+        return None
     return payload
 
 
@@ -246,6 +268,9 @@ class ProcessRequest:
     glossary: tuple[GlossaryEntry, ...] = ()
     include_images: bool = True
     preserve_styles: bool = True
+    markdown_organization: MarkdownOrganization = MarkdownOrganization.SINGLE_FILE
+    markdown_include_metadata: bool = False
+    markdown_include_page_references: bool = False
     epub_first_page_cover: bool = False
     epub_remove_cover: bool = False
     review_content: bool = False
@@ -272,8 +297,6 @@ class ProcessResult:
     revision_draft: RevisionDraft | None = None
     revision_resources: tuple[ConvertedResource, ...] = ()
     revision_epub_metadata: EpubBookMetadata | None = None
-    revision_docx_original_paragraphs: tuple[str, ...] = ()
-    revision_docx_proposed_paragraphs: tuple[str, ...] = ()
     review_markdown: str | None = None
     review_required: bool = False
     revision_approved: bool = False
@@ -282,6 +305,45 @@ class ProcessResult:
     front_matter_blocks: int = 0
     toc_blocks: int = 0
     terminology_terms: int = 0
+    markdown_organization: MarkdownOrganization = MarkdownOrganization.SINGLE_FILE
+    markdown_include_metadata: bool = False
+    markdown_include_page_references: bool = False
+    markdown_source_name: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _PreparedDocument:
+    source_path: Path
+    resolved_page_range: PdfPageRange | None
+    output_stem: str | None
+    pdf_quality_report: PdfQualityReport | None
+    source_cover_path: PurePosixPath | None
+    converted_resources: tuple[ConvertedResource, ...]
+    markdown: str
+    problematic_pdf_pages: tuple[int, ...]
+    semantic_document: SemanticDocument
+    translation_glossary: tuple[GlossaryEntry, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _TransformedDocument:
+    transformed_markdown: str
+    translation_quality_report: TranslationQualityReport | None
+    preserved_translation_chunks: tuple[int, ...]
+    revision_draft: RevisionDraft | None
+    published_markdown: str
+    review_required: bool
+    public_markdown: str
+
+
+@dataclass(frozen=True, slots=True)
+class _PreparedEpubReview:
+    document: ConvertedDocument
+    metadata: EpubBookMetadata
+    chapter_count: int
+    resource_count: int
+    integrity_report: FinalIntegrityReport | None
+    revision_draft: RevisionDraft | None
 
 
 StageCallback = Callable[[ProcessStage], None]
@@ -314,6 +376,8 @@ class _OfflineTranslationArguments(TypedDict, total=False):
     on_progress: ProgressCallback | None
     on_engine_ready: Callable[[], None]
     cancellation: CancellationToken
+    load_checkpoint: Callable[[str], str | None]
+    save_checkpoint: Callable[[str, str], bool]
 
 
 def process_document(
@@ -325,9 +389,11 @@ def process_document(
     cancellation: CancellationToken | None = None,
     epub_checkpoint_root: Path | None = None,
     work_checkpoint_root: Path | None = None,
+    attempt_id: str | None = None,
 ) -> ProcessResult:
     """Validate, read/convert, optionally improve and safely write one document."""
     started_at = monotonic()
+    effective_attempt_id = _effective_attempt_id(attempt_id)
     current_stage: ProcessStage | None = None
     telemetry = _ProcessingTelemetryCollector(started_at)
 
@@ -350,8 +416,10 @@ def process_document(
         else "invalid"
     )
     LOGGER.info(
-        "processing_started extension=%s output_format=%s conversion=%s improvement_mode=%s "
-        "offline_translation=%s review_content=%s review_structure=%s",
+        "processing_started attempt_id=%s phase=%s extension=%s output_format=%s conversion=%s "
+        "improvement_mode=%s offline_translation=%s review_content=%s review_structure=%s",
+        effective_attempt_id,
+        AttemptPhase.PREPARATION.value,
         extension,
         request.output_format.value,
         request.convert_to_markdown,
@@ -369,18 +437,36 @@ def process_document(
 
             translation_session = offline_translation_session()
         with translation_session:
-            result = _process_document(
-                request,
-                report_stage,
-                on_progress,
-                settings=settings,
-                cancellation=cancellation,
-                epub_checkpoint_root=epub_checkpoint_root,
-                work_checkpoint_root=work_checkpoint_root,
-            )
+            with _attempt_stage_context(effective_attempt_id):
+                result = _process_document(
+                    request,
+                    report_stage,
+                    on_progress,
+                    settings=settings,
+                    cancellation=cancellation,
+                    epub_checkpoint_root=epub_checkpoint_root,
+                    work_checkpoint_root=work_checkpoint_root,
+                )
+    except ProcessingCancelledError as exc:
+        phase = phase_for_process_stage(current_stage)
+        LOGGER.info(
+            "processing_cancelled attempt_id=%s phase=%s error_code=cancellation "
+            "error_type=%s stage=%s duration_ms=%d",
+            effective_attempt_id,
+            phase.value,
+            type(exc).__name__,
+            current_stage.value if current_stage is not None else "not_started",
+            _elapsed_milliseconds(started_at),
+        )
+        raise
     except ParsezenError as exc:
+        phase = phase_for_process_stage(current_stage)
         LOGGER.warning(
-            "processing_failed error_type=%s stage=%s duration_ms=%d",
+            "processing_failed attempt_id=%s phase=%s error_code=%s error_type=%s stage=%s "
+            "duration_ms=%d",
+            effective_attempt_id,
+            phase.value,
+            classify_failure(exc).value,
             type(exc).__name__,
             current_stage.value if current_stage is not None else "not_started",
             _elapsed_milliseconds(started_at),
@@ -389,8 +475,12 @@ def process_document(
     except Exception as exc:
         incident_id, module_name, function_name, line_number = _safe_failure_location(exc)
         LOGGER.error(
-            "processing_failed incident=%s unexpected_error_type=%s module=%s function=%s "
-            "line=%d stage=%s duration_ms=%d",
+            "processing_failed attempt_id=%s phase=%s error_code=unexpected incident=%s "
+            "diagnostic_reference=%s unexpected_error_type=%s module=%s function=%s line=%d "
+            "stage=%s duration_ms=%d",
+            effective_attempt_id,
+            phase_for_process_stage(current_stage).value,
+            incident_id,
             incident_id,
             type(exc).__name__,
             module_name,
@@ -406,8 +496,10 @@ def process_document(
     process_telemetry = telemetry.snapshot(monotonic())
     result = replace(result, telemetry=process_telemetry)
     LOGGER.info(
-        "processing_completed extension=%s output_format=%s improvement_mode=%s raw_output=%s "
-        "duration_ms=%d",
+        "processing_completed attempt_id=%s phase=%s extension=%s output_format=%s "
+        "improvement_mode=%s raw_output=%s duration_ms=%d",
+        effective_attempt_id,
+        AttemptPhase.COMPLETION.value,
         extension,
         request.output_format.value,
         mode,
@@ -424,20 +516,38 @@ def apply_reviewed_revision(result: ProcessResult, reviewed_text: str) -> Proces
         raise RequestValidationError("Este resultado no contiene texto editable para revisar.")
     if not isinstance(reviewed_text, str) or not reviewed_text.strip() or "\0" in reviewed_text:
         raise RequestValidationError("El texto revisado está vacío o no es válido.")
+    if draft is not None:
+        try:
+            validate_revision_selection(draft, reviewed_text)
+        except ImprovementError as exc:
+            raise RequestValidationError(str(exc)) from exc
 
-    published_text = strip_pdf_page_markers(reviewed_text)
     suffix = result.final_path.suffix.lower()
+    published_text = strip_pdf_page_markers(reviewed_text)
+    if suffix in {".md", ".markdown"} and result.markdown_include_page_references:
+        published_text = re.sub(
+            r"<!--\s*PZDOC PDF PAGE (\d+)\s*-->",
+            lambda match: (
+                f'<a id="pagina-{match.group(1)}"></a>\n\n> Página original {match.group(1)}'
+            ),
+            reviewed_text,
+            flags=re.IGNORECASE,
+        )
     epub_chapters = result.epub_chapters
     preserved_images = result.preserved_images
     integrity_report: FinalIntegrityReport | None = None
-    if suffix in {".txt", ".md", ".markdown"}:
+    if suffix in {".md", ".markdown"}:
         integrity = text_integrity_capture(
             published_text,
-            markdown=suffix in {".md", ".markdown"},
+            markdown=True,
         )
-        replace_text_output(
+        replace_markdown_output(
             result.final_path,
             published_text,
+            organization=result.markdown_organization,
+            source_name=result.markdown_source_name or result.final_path.name,
+            include_metadata=result.markdown_include_metadata,
+            include_page_references=result.markdown_include_page_references,
             validate_staged=integrity,
         )
         integrity_report = integrity.report
@@ -467,30 +577,6 @@ def apply_reviewed_revision(result: ProcessResult, reviewed_text: str) -> Proces
         )
         epub_chapters = built.chapter_count
         preserved_images = built.resource_count
-    elif suffix == ".docx":
-        source_path = result.review_original_path
-        if source_path is None:
-            raise RequestValidationError(
-                "Falta el documento Word original para aplicar la revisión."
-            )
-        if draft is not None and reviewed_text == draft.original_markdown:
-            paragraphs = result.revision_docx_original_paragraphs
-        elif draft is not None and reviewed_text == draft.proposed_markdown:
-            paragraphs = result.revision_docx_proposed_paragraphs
-        else:
-            paragraphs = tuple(published_text.split("\n\n"))
-        content = rebuild_docx_with_paragraphs(source_path, paragraphs)
-        integrity = binary_integrity_capture(
-            content,
-            format_label="DOCX",
-            validate_container=validate_docx_container,
-        )
-        replace_binary_output(
-            result.final_path,
-            content,
-            validate_staged=integrity,
-        )
-        integrity_report = integrity.report
     else:
         raise RequestValidationError(
             "Este formato todavía no admite aplicar una revisión editable."
@@ -506,58 +592,125 @@ def apply_reviewed_revision(result: ProcessResult, reviewed_text: str) -> Proces
     )
 
 
-def _process_document(
+def review_completed_result(
     request: ProcessRequest,
-    on_stage: StageCallback | None,
-    on_progress: ProgressCallback | None,
     *,
-    settings: AppSettings | None,
-    cancellation: CancellationToken | None,
-    epub_checkpoint_root: Path | None,
-    work_checkpoint_root: Path | None,
+    base_result: ProcessResult,
+    recommendation: ReviewRecommendation,
+    settings: AppSettings,
+    on_stage: StageCallback | None = None,
+    on_progress: ProgressCallback | None = None,
+    cancellation: CancellationToken | None = None,
+    work_checkpoint_root: Path | None = None,
 ) -> ProcessResult:
-    _notify(on_stage, ProcessStage.VALIDATING)
-    check_cancelled(cancellation)
-    _validate_request(request, settings)
-    check_cancelled(cancellation)
+    """Build a conservative proposal from only the blocks backed by quality signals."""
 
-    if _is_epub_translation(request):
-        return _process_epub_translation(
-            request,
-            on_stage,
-            on_progress,
-            settings=settings,
-            cancellation=cancellation,
-            epub_checkpoint_root=epub_checkpoint_root,
+    current = base_result.review_markdown
+    if current is None or not current.strip():
+        raise RequestValidationError("El resultado ya no contiene texto local revisable.")
+    target_document = analyze_markdown(current)
+    target_blocks = _reviewable_semantic_blocks(target_document)
+    resolved_positions = _resolve_targeted_review_positions(target_blocks, recommendation)
+    if resolved_positions is None:
+        raise RequestValidationError(
+            "El resultado ha cambiado desde la recomendación. "
+            "Vuelve a procesarlo antes de revisarlo."
         )
-
-    if _is_epub_personalization(request):
-        return _process_epub_personalization(
-            request,
-            on_stage,
-            cancellation=cancellation,
-        )
-
-    if _is_docx_transformation(request):
-        return _process_docx_transformation(
-            request,
-            on_stage,
-            on_progress,
-            settings=settings,
-            cancellation=cancellation,
-            work_checkpoint_root=work_checkpoint_root,
-        )
-
-    work_checkpoints = _open_general_work_checkpoints(
+    scoped_request = replace(
         request,
+        improvement_mode=None,
+        target_language=None,
+        review_content=True,
+        review_structure=False,
+    )
+    _validate_request(scoped_request, settings)
+    checkpoints = _open_general_work_checkpoints(
+        scoped_request,
         settings,
         root=work_checkpoint_root,
     )
-    pdf_checkpoints = _open_pdf_conversion_checkpoints(
-        request,
+    selected = frozenset(resolved_positions)
+
+    source_markdown = (
+        _review_source_markdown(request, base_result, cancellation)
+        if _request_translates(request)
+        else None
+    )
+    source_blocks = (
+        _reviewable_semantic_blocks(analyze_markdown(source_markdown))
+        if source_markdown is not None
+        else ()
+    )
+    bilingual = bool(source_markdown is not None and len(source_blocks) == len(target_blocks))
+    replacements: dict[str, str] = {}
+    _notify(on_stage, ProcessStage.REVIEWING_CONTENT)
+    total = len(selected)
+    for progress, position in enumerate(sorted(selected), start=1):
+        check_cancelled(cancellation)
+        if on_progress is not None:
+            on_progress(progress, total)
+        target_block = target_blocks[position]
+        if bilingual:
+            source_block = source_blocks[position]
+            proposed = _review_translation_with_checkpoints(
+                source_block.markdown,
+                target_block.markdown,
+                settings,
+                request,
+                None,
+                cancellation,
+                checkpoints,
+            )
+        else:
+            proposed = _improve_with_checkpoints(
+                target_block.markdown,
+                ImprovementMode.REVIEW_CONTENT,
+                settings,
+                scoped_request,
+                None,
+                cancellation,
+                checkpoints,
+            )
+        if proposed != target_block.markdown:
+            replacements[target_block.identifier] = proposed
+
+    proposed_markdown = "".join(
+        replacements.get(block.identifier, block.markdown) for block in target_document.blocks
+    )
+    candidate = build_revision_draft(
+        current,
+        proposed_markdown,
+        kinds=frozenset({RevisionKind.CONTENT}),
+        translation_source_markdown=source_markdown if bilingual else None,
+        translation_target_language=(
+            request.offline_translation_language or request.target_language if bilingual else None
+        ),
+        protected_translation_terms=tuple(entry.target for entry in request.glossary),
+    )
+    draft = candidate if candidate.changes else None
+    _finish_work_checkpoints(
+        checkpoints,
+        settings=settings,
         root=work_checkpoint_root,
+        cleanup_allowed=draft is None,
+    )
+    return replace(
+        base_result,
+        revision_draft=draft,
+        review_markdown=proposed_markdown if draft is not None else current,
+        review_required=draft is not None,
+        revision_approved=False,
+        telemetry=None,
     )
 
+
+def _prepare_document_input(
+    request: ProcessRequest,
+    on_stage: StageCallback | None,
+    on_progress: ProgressCallback | None,
+    cancellation: CancellationToken | None,
+    pdf_checkpoints: WorkCheckpoints | None,
+) -> _PreparedDocument:
     source_path = request.source_path
     input_stage = (
         ProcessStage.CONVERTING
@@ -693,6 +846,35 @@ def _process_document(
         semantic_document.terms,
     )
 
+    return _PreparedDocument(
+        source_path,
+        resolved_page_range,
+        output_stem,
+        pdf_quality_report,
+        source_cover_path,
+        converted_resources,
+        markdown,
+        problematic_pdf_pages,
+        semantic_document,
+        translation_glossary,
+    )
+
+
+def _transform_prepared_document(
+    prepared: _PreparedDocument,
+    request: ProcessRequest,
+    on_stage: StageCallback | None,
+    on_progress: ProgressCallback | None,
+    settings: AppSettings | None,
+    cancellation: CancellationToken | None,
+    work_checkpoints: WorkCheckpoints | None,
+    *,
+    generated_epub: bool,
+) -> _TransformedDocument:
+    source_path = prepared.source_path
+    markdown = prepared.markdown
+    pdf_quality_report = prepared.pdf_quality_report
+    translation_glossary = prepared.translation_glossary
     transformed_markdown = markdown
     translation_source: str | None = None
     preserved_translation_chunks: list[int] = []
@@ -729,8 +911,6 @@ def _process_document(
             improvement_arguments["on_translation_preserved"] = lambda current, _total: (
                 preserved_translation_chunks.append(current)
             )
-        if request.output_format is OutputFormat.TEXT:
-            improvement_arguments["plain_text"] = True
         if cancellation is not None:
             improvement_arguments["cancellation"] = cancellation
         if work_checkpoints is not None and "load_checkpoint" in checkpoint_parameters:
@@ -761,6 +941,7 @@ def _process_document(
                 settings=settings,
                 cancellation=cancellation,
                 translation_glossary=translation_glossary,
+                work_checkpoints=work_checkpoints,
             )
     elif ai_translation_is_redundant:
         LOGGER.info("translation_skipped already_in_target_language=true engine=ai")
@@ -790,6 +971,10 @@ def _process_document(
         }
         if cancellation is not None:
             translation_arguments["cancellation"] = cancellation
+        translation_parameters = inspect.signature(translate_markdown_offline).parameters
+        if work_checkpoints is not None and "load_checkpoint" in translation_parameters:
+            translation_arguments["load_checkpoint"] = work_checkpoints.load
+            translation_arguments["save_checkpoint"] = work_checkpoints.save
         protected = protect_glossary(transformed_markdown, translation_glossary)
         transformed_markdown = translate_markdown_offline(
             protected.text,
@@ -806,6 +991,7 @@ def _process_document(
             settings=settings,
             cancellation=cancellation,
             translation_glossary=translation_glossary,
+            work_checkpoints=work_checkpoints,
         )
     elif offline_translation_is_redundant:
         LOGGER.info("translation_skipped already_in_target_language=true engine=offline")
@@ -821,6 +1007,7 @@ def _process_document(
     # single, coherent proposal to inspect at the end of a chained workflow.
     revision_source = transformed_markdown
     revision_kinds: set[RevisionKind] = set()
+    translation_review_source: str | None = None
     if request.review_content:
         if settings is None:
             raise AssertionError("Validated review requests always have settings.")
@@ -835,6 +1022,17 @@ def _process_document(
                 work_checkpoints,
                 semantic_document=analyze_markdown(transformed_markdown),
                 pdf_quality_report=pdf_quality_report,
+            )
+        elif translation_source is not None:
+            translation_review_source = translation_source
+            transformed_markdown = _review_translation_with_checkpoints(
+                translation_source,
+                transformed_markdown,
+                settings,
+                request,
+                on_progress,
+                cancellation,
+                work_checkpoints,
             )
         else:
             transformed_markdown = _improve_with_checkpoints(
@@ -862,11 +1060,27 @@ def _process_document(
             work_checkpoints,
         )
         revision_kinds.add(RevisionKind.STRUCTURE)
+    if translation_source is not None and (
+        translation_review_source is not None or request.review_structure
+    ):
+        # The advisory report must describe the proposal the user will review, not the
+        # pre-review Argos output. Critical rejection remains enforced independently by
+        # the translation and improvement guards before reaching this point.
+        translation_quality_report = _translation_quality_report(
+            request,
+            translation_source,
+            transformed_markdown,
+        )
     revision_candidate = (
         build_revision_draft(
             revision_source,
             transformed_markdown,
             kinds=frozenset(revision_kinds),
+            translation_source_markdown=translation_review_source,
+            translation_target_language=(
+                request.offline_translation_language or request.target_language
+            ),
+            protected_translation_terms=tuple(entry.target for entry in translation_glossary),
         )
         if revision_kinds
         else None
@@ -889,46 +1103,54 @@ def _process_document(
     )
     public_markdown = (
         strip_pdf_page_markers(published_markdown)
-        if source_path.suffix.lower() == ".pdf" and not review_required
+        if source_path.suffix.lower() == ".pdf"
+        and not review_required
+        and not (
+            request.output_format is OutputFormat.MARKDOWN
+            and request.markdown_include_page_references
+        )
         else published_markdown
     )
 
-    if request.output_format is OutputFormat.TEXT:
-        check_cancelled(cancellation)
-        _notify(on_stage, ProcessStage.WRITING)
-        integrity = text_integrity_capture(public_markdown, markdown=False)
-        final_path = write_text_output(
-            source_path,
-            public_markdown,
-            request.output_directory,
-            validate_staged=integrity,
-        )
-        _notify(on_stage, ProcessStage.COMPLETED)
-        _finish_work_checkpoints(
-            work_checkpoints,
-            settings=settings,
-            root=work_checkpoint_root,
-            cleanup_allowed=revision_draft is None,
-        )
-        _finish_work_checkpoints(
-            pdf_checkpoints,
-            settings=settings,
-            root=work_checkpoint_root,
-            cleanup_allowed=revision_draft is None,
-        )
-        return ProcessResult(
-            final_path=final_path,
-            review_original_path=source_path,
-            translation_quality_report=translation_quality_report,
-            preserved_translation_chunks=tuple(preserved_translation_chunks),
-            revision_draft=revision_draft,
-            review_markdown=transformed_markdown,
-            review_required=review_required,
-            final_integrity_report=integrity.report,
-            front_matter_blocks=semantic_document.front_matter_blocks,
-            toc_blocks=semantic_document.toc_blocks,
-            terminology_terms=len(semantic_document.terms),
-        )
+    return _TransformedDocument(
+        transformed_markdown,
+        translation_quality_report,
+        tuple(preserved_translation_chunks),
+        revision_draft,
+        published_markdown,
+        review_required,
+        public_markdown,
+    )
+
+
+def _publish_transformed_document(
+    prepared: _PreparedDocument,
+    transformed: _TransformedDocument,
+    request: ProcessRequest,
+    on_stage: StageCallback | None,
+    settings: AppSettings | None,
+    cancellation: CancellationToken | None,
+    work_checkpoints: WorkCheckpoints | None,
+    pdf_checkpoints: WorkCheckpoints | None,
+    work_checkpoint_root: Path | None,
+) -> ProcessResult:
+    source_path = prepared.source_path
+    resolved_page_range = prepared.resolved_page_range
+    output_stem = prepared.output_stem
+    pdf_quality_report = prepared.pdf_quality_report
+    source_cover_path = prepared.source_cover_path
+    converted_resources = prepared.converted_resources
+    markdown = prepared.markdown
+    problematic_pdf_pages = prepared.problematic_pdf_pages
+    semantic_document = prepared.semantic_document
+    transformed_markdown = transformed.transformed_markdown
+    translation_quality_report = transformed.translation_quality_report
+    preserved_translation_chunks = transformed.preserved_translation_chunks
+    revision_draft = transformed.revision_draft
+    published_markdown = transformed.published_markdown
+    review_required = transformed.review_required
+    public_markdown = transformed.public_markdown
+    generated_epub = request.output_format is OutputFormat.EPUB
 
     if generated_epub:
         check_cancelled(cancellation)
@@ -1052,6 +1274,9 @@ def _process_document(
             resources=converted_resources,
             image_output_directory=request.image_output_directory,
             validate_staged=integrity,
+            markdown_organization=request.markdown_organization,
+            markdown_include_metadata=request.markdown_include_metadata,
+            markdown_include_page_references=request.markdown_include_page_references,
         )
         _notify(on_stage, ProcessStage.COMPLETED)
         _finish_work_checkpoints(
@@ -1072,6 +1297,15 @@ def _process_document(
             request.image_output_directory,
             bool(converted_resources),
         )
+        effective_review_required = (
+            _review_is_required(
+                materialized_revision,
+                pdf_quality_report,
+                translation_quality_report,
+                bool(preserved_translation_chunks),
+            )
+            or generated_epub
+        )
         return ProcessResult(
             final_path=final_path,
             raw_markdown_path=raw_path,
@@ -1086,13 +1320,17 @@ def _process_document(
             review_markdown=(
                 materialized_revision.proposed_markdown
                 if materialized_revision is not None
-                else final_path.read_text(encoding="utf-8")
+                else public_markdown
             ),
-            review_required=review_required,
+            review_required=effective_review_required,
             final_integrity_report=integrity.report,
             front_matter_blocks=semantic_document.front_matter_blocks,
             toc_blocks=semantic_document.toc_blocks,
             terminology_terms=len(semantic_document.terms),
+            markdown_organization=request.markdown_organization,
+            markdown_include_metadata=request.markdown_include_metadata,
+            markdown_include_page_references=request.markdown_include_page_references,
+            markdown_source_name=source_path.name,
         )
 
     check_cancelled(cancellation)
@@ -1106,6 +1344,9 @@ def _process_document(
         resources=converted_resources,
         image_output_directory=request.image_output_directory,
         validate_staged=integrity,
+        markdown_organization=request.markdown_organization,
+        markdown_include_metadata=request.markdown_include_metadata,
+        markdown_include_page_references=request.markdown_include_page_references,
     )
     _notify(on_stage, ProcessStage.COMPLETED)
     _finish_work_checkpoints(
@@ -1126,12 +1367,280 @@ def _process_document(
         pdf_quality_report=pdf_quality_report,
         exhaustive_pdf_ocr_used=request.force_pdf_ocr,
         preserved_images=len(converted_resources),
-        review_markdown=final_path.read_text(encoding="utf-8"),
+        # Keep private page anchors in memory so a later evidence-based review can
+        # target the exact pages. The published Markdown still uses ``public_markdown``.
+        review_markdown=published_markdown,
         review_required=_review_is_required(None, pdf_quality_report, None),
         final_integrity_report=integrity.report,
         front_matter_blocks=semantic_document.front_matter_blocks,
         toc_blocks=semantic_document.toc_blocks,
         terminology_terms=len(semantic_document.terms),
+        markdown_organization=request.markdown_organization,
+        markdown_include_metadata=request.markdown_include_metadata,
+        markdown_include_page_references=request.markdown_include_page_references,
+        markdown_source_name=source_path.name,
+    )
+
+
+def _process_document(
+    request: ProcessRequest,
+    on_stage: StageCallback | None,
+    on_progress: ProgressCallback | None,
+    *,
+    settings: AppSettings | None,
+    cancellation: CancellationToken | None,
+    epub_checkpoint_root: Path | None,
+    work_checkpoint_root: Path | None,
+) -> ProcessResult:
+    _notify(on_stage, ProcessStage.VALIDATING)
+    check_cancelled(cancellation)
+    _validate_request(request, settings)
+    check_cancelled(cancellation)
+
+    if _is_epub_translation(request):
+        return _process_epub_translation(
+            request,
+            on_stage,
+            on_progress,
+            settings=settings,
+            cancellation=cancellation,
+            epub_checkpoint_root=epub_checkpoint_root,
+            work_checkpoint_root=work_checkpoint_root,
+        )
+
+    if _is_epub_personalization(request):
+        return _process_epub_personalization(
+            request,
+            on_stage,
+            cancellation=cancellation,
+        )
+
+    work_checkpoints = _open_general_work_checkpoints(
+        request,
+        settings,
+        root=work_checkpoint_root,
+    )
+    pdf_checkpoints = _open_pdf_conversion_checkpoints(
+        request,
+        root=work_checkpoint_root,
+    )
+
+    prepared = _prepare_document_input(
+        request,
+        on_stage,
+        on_progress,
+        cancellation,
+        pdf_checkpoints,
+    )
+    generated_epub = request.output_format is OutputFormat.EPUB
+
+    transformed = _transform_prepared_document(
+        prepared,
+        request,
+        on_stage,
+        on_progress,
+        settings,
+        cancellation,
+        work_checkpoints,
+        generated_epub=generated_epub,
+    )
+
+    return _publish_transformed_document(
+        prepared,
+        transformed,
+        request,
+        on_stage,
+        settings,
+        cancellation,
+        work_checkpoints,
+        pdf_checkpoints,
+        work_checkpoint_root,
+    )
+
+
+def _prepare_translated_epub_review(
+    request: ProcessRequest,
+    final_path: Path,
+    translated_language_code: str,
+    converted_source: ConvertedDocument,
+    translation_glossary: tuple[GlossaryEntry, ...],
+    target_language: str | None,
+    effective_ai_mode: ImprovementMode | None,
+    on_stage: StageCallback | None,
+    on_progress: ProgressCallback | None,
+    settings: AppSettings | None,
+    cancellation: CancellationToken | None,
+    work_checkpoints: WorkCheckpoints | None,
+) -> _PreparedEpubReview:
+    """Prepare the normalized, editable representation of one translated EPUB."""
+
+    normalize_output = (
+        not request.preserve_styles
+        or not request.include_images
+        or request.epub_cover_path is not None
+        or request.epub_remove_cover
+    )
+    # Every translated EPUB reaches the same confirmation/editor contract. The
+    # exact package stays published unless an option requires normalization.
+    converted_document = convert_epub(final_path, cancellation=cancellation)
+    package_metadata = inspect_epub_package(final_path)
+    normalized_markdown = (
+        converted_document.markdown
+        if request.include_images
+        else without_markdown_images(converted_document.markdown)
+    )
+    normalized_resources = (
+        converted_document.resources
+        if request.include_images
+        else tuple(
+            resource
+            for resource in converted_document.resources
+            if resource.relative_path == package_metadata.cover_path
+        )
+    )
+    cover_resource_path = package_metadata.cover_path
+    if package_metadata.cover_path is not None and (
+        request.epub_cover_path is not None or request.epub_remove_cover
+    ):
+        normalized_markdown = without_markdown_resource(
+            normalized_markdown,
+            package_metadata.cover_path,
+        )
+        normalized_resources = tuple(
+            resource
+            for resource in normalized_resources
+            if resource.relative_path != package_metadata.cover_path
+        )
+    if request.epub_cover_path is not None:
+        cover_resource = _read_epub_cover(request.epub_cover_path)
+        normalized_resources = (
+            *(
+                resource
+                for resource in normalized_resources
+                if resource.relative_path != cover_resource.relative_path
+            ),
+            cover_resource,
+        )
+        cover_resource_path = cover_resource.relative_path
+    elif request.epub_remove_cover:
+        cover_resource_path = None
+
+    normalized_document = replace(
+        converted_document,
+        markdown=normalized_markdown,
+        resources=normalized_resources,
+    )
+    normalized_metadata = EpubBookMetadata(
+        title=request.epub_title or package_metadata.title or request.source_path.stem,
+        language=package_metadata.language or translated_language_code,
+        author=(
+            request.epub_author
+            if request.epub_author is not None
+            else ", ".join(package_metadata.authors) or None
+        ),
+        cover_resource=cover_resource_path,
+        identifiers=package_metadata.identifiers,
+        publisher=package_metadata.publisher,
+        publication_date=package_metadata.publication_date,
+    )
+    revision_source = normalized_document.markdown
+    reviewed_markdown = revision_source
+    revision_kinds: set[RevisionKind] = set()
+    translation_review_source: str | None = None
+    content_review_fused = bool(
+        request.review_content
+        and request.offline_translation_language is None
+        and effective_ai_mode is ImprovementMode.CLEAN_AND_TRANSLATE
+    )
+    if request.review_content and not content_review_fused:
+        if settings is None:
+            raise AssertionError("Validated review requests always have settings.")
+        _notify(on_stage, ProcessStage.REVIEWING_CONTENT)
+        translation_review_source = converted_source.markdown
+        reviewed_markdown = _review_translation_with_checkpoints(
+            translation_review_source,
+            reviewed_markdown,
+            settings,
+            request,
+            on_progress,
+            cancellation,
+            work_checkpoints,
+        )
+        if reviewed_markdown != revision_source:
+            revision_kinds.add(RevisionKind.CONTENT)
+    if request.review_structure:
+        if settings is None:
+            raise AssertionError("Validated review requests always have settings.")
+        _notify(on_stage, ProcessStage.ORGANIZING_STRUCTURE)
+        reviewed_markdown = _improve_with_checkpoints(
+            reviewed_markdown,
+            ImprovementMode.REVIEW_STRUCTURE,
+            settings,
+            request,
+            on_progress,
+            cancellation,
+            work_checkpoints,
+        )
+        revision_kinds.add(RevisionKind.STRUCTURE)
+    revision_candidate = (
+        build_revision_draft(
+            revision_source,
+            reviewed_markdown,
+            kinds=frozenset(revision_kinds),
+            translation_source_markdown=translation_review_source,
+            translation_target_language=target_language,
+            protected_translation_terms=tuple(entry.target for entry in translation_glossary),
+        )
+        if revision_kinds
+        else None
+    )
+    revision_draft = (
+        revision_candidate
+        if revision_candidate is not None and revision_candidate.changes
+        else None
+    )
+    normalized_document = replace(
+        normalized_document,
+        markdown=(revision_source if revision_draft is not None else reviewed_markdown),
+    )
+    chapter_count = 0
+    resource_count = len(normalized_resources)
+    integrity_report: FinalIntegrityReport | None = None
+    if normalize_output:
+        built = build_epub(
+            normalized_document.markdown,
+            normalized_document.resources,
+            normalized_metadata,
+            cancellation=cancellation,
+        )
+        normalized_capture = binary_integrity_capture(
+            built.content,
+            format_label="EPUB",
+            validate_container=_validate_epub_path,
+            ledger=(
+                built.integrity_report.ledger
+                if built.integrity_report is not None
+                else IntegrityLedger()
+            ),
+        )
+        replace_binary_output(
+            final_path,
+            built.content,
+            validate_staged=normalized_capture,
+        )
+        chapter_count = built.chapter_count
+        resource_count = built.resource_count
+        integrity_report = merge_integrity_reports(
+            built.integrity_report,
+            normalized_capture.report,
+        )
+    return _PreparedEpubReview(
+        document=normalized_document,
+        metadata=normalized_metadata,
+        chapter_count=chapter_count,
+        resource_count=resource_count,
+        integrity_report=integrity_report,
+        revision_draft=revision_draft,
     )
 
 
@@ -1143,13 +1652,23 @@ def _process_epub_translation(
     settings: AppSettings | None,
     cancellation: CancellationToken | None,
     epub_checkpoint_root: Path | None,
+    work_checkpoint_root: Path | None,
 ) -> ProcessResult:
     target_language = request.offline_translation_language or request.target_language
     language_code = resolve_language_code(target_language)
     if language_code is None:
         raise RequestValidationError("El idioma de destino del EPUB no está soportado.")
 
-    source_language_code = resolve_language_code(inspect_epub_package(request.source_path).language)
+    package_language_code = resolve_language_code(
+        inspect_epub_package(request.source_path).language
+    )
+    converted_source = convert_epub(request.source_path, cancellation=cancellation)
+    # Short navigation labels are too little evidence to overrule publication metadata.
+    detected_language_code = detect_language_code(
+        converted_source.markdown,
+        minimum_letters=80,
+    )
+    source_language_code = detected_language_code or package_language_code
     if source_language_code == language_code:
         LOGGER.info(
             "translation_skipped already_in_target_language=true engine=%s format=epub",
@@ -1161,8 +1680,11 @@ def _process_epub_translation(
             cancellation=cancellation,
         )
 
-    source_semantic = analyze_markdown(
-        convert_epub(request.source_path, cancellation=cancellation).markdown
+    source_semantic = analyze_markdown(converted_source.markdown)
+    work_checkpoints = _open_general_work_checkpoints(
+        request,
+        settings,
+        root=work_checkpoint_root,
     )
     translation_glossary = _combined_translation_glossary(
         request.glossary,
@@ -1202,23 +1724,37 @@ def _process_epub_translation(
             if settings is None:
                 raise AssertionError("Validated improvement requests always have settings.")
             protected = protect_glossary(translated, translation_glossary)
+            improvement_arguments: _ImprovementArguments = {"on_progress": progress}
+            if token is not None:
+                improvement_arguments["cancellation"] = token
+            if work_checkpoints is not None:
+                improvement_arguments["load_checkpoint"] = work_checkpoints.load
+                improvement_arguments["save_checkpoint"] = work_checkpoints.save
             translated = improve_markdown(
                 protected.text,
                 effective_ai_mode,
                 settings,
                 request.target_language,
-                on_progress=progress,
-                cancellation=token,
+                source_language_code=source_language_code,
+                **improvement_arguments,
             )
             translated = protected.restore(translated)
         if request.offline_translation_language is not None:
             protected = protect_glossary(translated, translation_glossary)
+            offline_arguments: _OfflineTranslationArguments = {
+                "on_progress": progress,
+                "on_engine_ready": announce_translation_stage,
+            }
+            if token is not None:
+                offline_arguments["cancellation"] = token
+            translation_parameters = inspect.signature(translate_markdown_offline).parameters
+            if work_checkpoints is not None and "load_checkpoint" in translation_parameters:
+                offline_arguments["load_checkpoint"] = work_checkpoints.load
+                offline_arguments["save_checkpoint"] = work_checkpoints.save
             translated = translate_markdown_offline(
                 protected.text,
                 request.offline_translation_language,
-                on_progress=progress,
-                on_engine_ready=announce_translation_stage,
-                cancellation=token,
+                **offline_arguments,
             )
             translated = protected.restore(translated)
         return translated
@@ -1237,6 +1773,7 @@ def _process_epub_translation(
             cancellation=token,
             source_language_code=source_language_code,
             translation_glossary=translation_glossary,
+            work_checkpoints=work_checkpoints,
         )
 
     translated_epub = translate_epub(
@@ -1270,114 +1807,32 @@ def _process_epub_translation(
         request.output_directory,
         validate_staged=translated_integrity,
     )
-    normalized_document = None
-    normalized_metadata = None
-    normalized_chapters = 0
-    normalized_resource_count = 0
-    normalized_integrity: FinalIntegrityReport | None = None
-    normalize_output = (
-        not request.preserve_styles
-        or not request.include_images
-        or request.epub_cover_path is not None
-        or request.epub_remove_cover
+    prepared_review = _prepare_translated_epub_review(
+        request,
+        final_path,
+        translated_epub.language_code,
+        converted_source,
+        translation_glossary,
+        target_language,
+        effective_ai_mode,
+        on_stage,
+        on_progress,
+        settings,
+        cancellation,
+        work_checkpoints,
     )
-    prepare_editor = True
-    if prepare_editor:
-        # The exact translated package is retained when both resources and
-        # compatible styles are requested. Normalization is otherwise the
-        # deliberate contract: it can reliably omit images and produces the
-        # editable representation required by a human quality review.
-        converted_document = convert_epub(final_path, cancellation=cancellation)
-        package_metadata = inspect_epub_package(final_path)
-        normalized_markdown = (
-            converted_document.markdown
-            if request.include_images
-            else without_markdown_images(converted_document.markdown)
-        )
-        normalized_resources = (
-            converted_document.resources
-            if request.include_images
-            else tuple(
-                resource
-                for resource in converted_document.resources
-                if resource.relative_path == package_metadata.cover_path
-            )
-        )
-        cover_resource_path = package_metadata.cover_path
-        if package_metadata.cover_path is not None and (
-            request.epub_cover_path is not None or request.epub_remove_cover
-        ):
-            normalized_markdown = without_markdown_resource(
-                normalized_markdown,
-                package_metadata.cover_path,
-            )
-            normalized_resources = tuple(
-                resource
-                for resource in normalized_resources
-                if resource.relative_path != package_metadata.cover_path
-            )
-        if request.epub_cover_path is not None:
-            cover_resource = _read_epub_cover(request.epub_cover_path)
-            normalized_resources = (
-                *(
-                    resource
-                    for resource in normalized_resources
-                    if resource.relative_path != cover_resource.relative_path
-                ),
-                cover_resource,
-            )
-            cover_resource_path = cover_resource.relative_path
-        elif request.epub_remove_cover:
-            cover_resource_path = None
-        normalized_document = replace(
-            converted_document,
-            markdown=normalized_markdown,
-            resources=normalized_resources,
-        )
-        normalized_resource_count = len(normalized_resources)
-        normalized_metadata = EpubBookMetadata(
-            request.epub_title or package_metadata.title or request.source_path.stem,
-            package_metadata.language or translated_epub.language_code,
-            request.epub_author
-            if request.epub_author is not None
-            else ", ".join(package_metadata.authors) or None,
-            cover_resource_path,
-        )
-        if normalize_output:
-            built = build_epub(
-                normalized_document.markdown,
-                normalized_document.resources,
-                normalized_metadata,
-                cancellation=cancellation,
-            )
-            normalized_capture = binary_integrity_capture(
-                built.content,
-                format_label="EPUB",
-                validate_container=_validate_epub_path,
-                ledger=(
-                    built.integrity_report.ledger
-                    if built.integrity_report is not None
-                    else IntegrityLedger()
-                ),
-            )
-            replace_binary_output(
-                final_path,
-                built.content,
-                validate_staged=normalized_capture,
-            )
-            normalized_chapters = built.chapter_count
-            normalized_resource_count = built.resource_count
-            normalized_integrity = merge_integrity_reports(
-                built.integrity_report,
-                normalized_capture.report,
-            )
     _finish_epub_checkpoints(
         checkpoints,
         settings=settings,
         root=epub_checkpoint_root,
     )
+    _finish_work_checkpoints(
+        work_checkpoints,
+        settings=settings,
+        root=work_checkpoint_root,
+        cleanup_allowed=prepared_review.revision_draft is None,
+    )
     _notify(on_stage, ProcessStage.COMPLETED)
-    review_required = True
     return ProcessResult(
         final_path=final_path,
         review_original_path=request.source_path,
@@ -1385,17 +1840,20 @@ def _process_epub_translation(
         epub_resumed_parts=translated_epub.resumed_parts,
         epub_checkpoint_degraded=translated_epub.checkpoint_degraded,
         translation_quality_report=translated_epub.quality_report,
-        preserved_images=normalized_resource_count,
-        epub_chapters=normalized_chapters,
-        revision_resources=(
-            normalized_document.resources if normalized_document is not None else ()
+        preserved_images=prepared_review.resource_count,
+        epub_chapters=prepared_review.chapter_count,
+        revision_resources=prepared_review.document.resources,
+        revision_epub_metadata=prepared_review.metadata,
+        revision_draft=prepared_review.revision_draft,
+        review_markdown=(
+            prepared_review.revision_draft.proposed_markdown
+            if prepared_review.revision_draft is not None
+            else prepared_review.document.markdown
         ),
-        revision_epub_metadata=normalized_metadata,
-        review_markdown=(normalized_document.markdown if normalized_document is not None else None),
-        review_required=review_required,
+        review_required=True,
         final_integrity_report=(
-            normalized_integrity
-            if normalized_integrity is not None
+            prepared_review.integrity_report
+            if prepared_review.integrity_report is not None
             else translated_integrity.report
         ),
         front_matter_blocks=source_semantic.front_matter_blocks,
@@ -1430,10 +1888,13 @@ def _process_epub_personalization(
         )
     )
     metadata = EpubBookMetadata(
-        package.title or request.source_path.stem,
-        package.language or "und",
-        ", ".join(package.authors) or None,
-        package.cover_path,
+        title=package.title or request.source_path.stem,
+        language=package.language or "und",
+        author=", ".join(package.authors) or None,
+        cover_resource=package.cover_path,
+        identifiers=package.identifiers,
+        publisher=package.publisher,
+        publication_date=package.publication_date,
     )
     semantic_document = analyze_markdown(markdown)
     check_cancelled(cancellation)
@@ -1486,9 +1947,7 @@ def _improve_with_checkpoints(
     """Apply one ordered review pass with the same resumable chunk contract."""
     arguments: _ImprovementArguments = {
         "on_progress": on_progress,
-        "plain_text": (
-            request.output_format is OutputFormat.TEXT if plain_text is None else plain_text
-        ),
+        "plain_text": False if plain_text is None else plain_text,
     }
     if cancellation is not None:
         arguments["cancellation"] = cancellation
@@ -1500,6 +1959,33 @@ def _improve_with_checkpoints(
         mode,
         settings,
         **arguments,
+    )
+
+
+def _review_translation_with_checkpoints(
+    source_markdown: str,
+    translated_markdown: str,
+    settings: AppSettings,
+    request: ProcessRequest,
+    on_progress: ProgressCallback | None,
+    cancellation: CancellationToken | None,
+    checkpoints: WorkCheckpoints | None,
+) -> str:
+    """Review an offline translation against its aligned source using only local Ollama."""
+
+    target_language = request.offline_translation_language or request.target_language
+    if target_language is None:
+        return translated_markdown
+    return review_translation_markdown(
+        source_markdown,
+        translated_markdown,
+        settings,
+        target_language,
+        on_progress=on_progress,
+        cancellation=cancellation,
+        load_checkpoint=checkpoints.load if checkpoints is not None else None,
+        save_checkpoint=checkpoints.save if checkpoints is not None else None,
+        priority_block_count=max(analyze_markdown(source_markdown).front_matter_blocks, 8),
     )
 
 
@@ -1578,6 +2064,114 @@ def _improve_selected_content(
     )
 
 
+def _reviewable_semantic_blocks(
+    document: SemanticDocument,
+) -> tuple[SemanticBlock, ...]:
+    """Return the stable block sequence used by content-free late-review positions."""
+
+    return tuple(
+        block
+        for block in document.blocks
+        if block.role
+        not in {
+            SemanticRole.PROVENANCE,
+            SemanticRole.CODE,
+            SemanticRole.IMAGE,
+        }
+        and natural_language_text(block.markdown).strip()
+    )
+
+
+def review_scope_fingerprint(markdown: str) -> str:
+    """Bind content-free target ordinals to the visible local result they describe."""
+
+    blocks = _reviewable_semantic_blocks(analyze_markdown(markdown))
+    canonical = "\n\0\n".join(review_block_fingerprint(block.markdown) for block in blocks)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def review_block_fingerprint(markdown: str) -> str:
+    """Identify visible block content across private anchors and EPUB packaging changes."""
+
+    public_markdown = re.sub(
+        r"<!--[\s\S]*?-->",
+        " ",
+        strip_pdf_page_markers(markdown),
+    )
+    visible = natural_language_text(public_markdown)
+    numbers = "|".join(re.findall(r"\d+(?:[.,]\d+)*", public_markdown))
+    return hashlib.sha256(f"{visible}\0{numbers}".encode()).hexdigest()
+
+
+def resolve_targeted_review_positions(
+    markdown: str,
+    recommendation: ReviewRecommendation,
+) -> tuple[int, ...] | None:
+    """Resolve stored targets, remapping by non-reversible block fingerprints if needed."""
+
+    blocks = _reviewable_semantic_blocks(analyze_markdown(markdown))
+    return _resolve_targeted_review_positions(blocks, recommendation)
+
+
+def _resolve_targeted_review_positions(
+    blocks: tuple[SemanticBlock, ...],
+    recommendation: ReviewRecommendation,
+) -> tuple[int, ...] | None:
+    positions = recommendation.block_positions
+    valid_positions = bool(positions) and max(positions) < len(blocks)
+    current_scope = hashlib.sha256(
+        "\n\0\n".join(review_block_fingerprint(block.markdown) for block in blocks).encode("utf-8")
+    ).hexdigest()
+    if recommendation.scope_fingerprint is None or (
+        valid_positions and recommendation.scope_fingerprint == current_scope
+    ):
+        return positions if valid_positions else None
+    if not recommendation.block_fingerprints:
+        return None
+    candidates: dict[str, list[int]] = {}
+    for position, block in enumerate(blocks):
+        candidates.setdefault(review_block_fingerprint(block.markdown), []).append(position)
+    resolved: list[int] = []
+    for fingerprint in recommendation.block_fingerprints:
+        matches = candidates.get(fingerprint, [])
+        if len(matches) != 1:
+            return None
+        resolved.append(matches[0])
+    ordered = tuple(sorted(set(resolved)))
+    return ordered if len(ordered) == len(resolved) else None
+
+
+def _review_source_markdown(
+    request: ProcessRequest,
+    result: ProcessResult,
+    cancellation: CancellationToken | None,
+) -> str | None:
+    """Recover the aligned local source only for an explicitly requested bilingual review."""
+
+    source = result.review_original_path or request.source_path
+    suffix = source.suffix.casefold()
+    if suffix in {".md", ".markdown", ".txt"}:
+        try:
+            return source.read_text(encoding="utf-8")
+        except (OSError, UnicodeError):
+            return None
+    arguments: _ConversionArguments = {}
+    if cancellation is not None:
+        arguments["cancellation"] = cancellation
+    if suffix == ".pdf" and request.pdf_page_range is not None:
+        arguments["pdf_page_range"] = request.pdf_page_range
+    if suffix == ".pdf" and request.force_pdf_ocr:
+        arguments["force_pdf_ocr"] = True
+    try:
+        return convert_document(
+            source,
+            preserve_resources=False,
+            **arguments,
+        ).markdown
+    except (OSError, ParsezenError, ValueError):
+        return None
+
+
 def _contains_conversion_damage(markdown: str) -> bool:
     visible = re.sub(r"<!--[\s\S]*?-->", "", markdown)
     return bool(
@@ -1585,249 +2179,6 @@ def _contains_conversion_damage(markdown: str) -> bool:
         or re.search(r"(?i)\b(?:aviso|warning)\s+OCR\b", visible)
         or re.search(r"\b(?:[^\W\d_]\s+){5,}[^\W\d_]\b", visible)
         or re.search(r"(?i)\b([^\W\d_]{3,})(?:\s+\1){2,}\b", visible)
-    )
-
-
-def _process_docx_transformation(
-    request: ProcessRequest,
-    on_stage: StageCallback | None,
-    on_progress: ProgressCallback | None,
-    *,
-    settings: AppSettings | None,
-    cancellation: CancellationToken | None,
-    work_checkpoint_root: Path | None,
-) -> ProcessResult:
-    """Transform Word text while retaining the original OOXML package and resources."""
-    work_checkpoints = _open_general_work_checkpoints(
-        request,
-        settings,
-        root=work_checkpoint_root,
-    )
-    _notify(on_stage, ProcessStage.READING)
-    revision_baseline_payload: str | None = None
-    preserved_translation_chunks: list[int] = []
-    translation_performed = False
-    semantic_document: SemanticDocument | None = None
-    effective_ai_mode = _effective_ai_improvement_mode(request)
-
-    def transform_payload(payload: str) -> str:
-        nonlocal revision_baseline_payload, semantic_document, translation_performed
-        transformed = payload
-        semantic_document = analyze_markdown(payload)
-        translation_glossary = _combined_translation_glossary(
-            request.glossary,
-            semantic_document.terms,
-        )
-        translation_source: str | None = None
-        ai_translation_is_redundant = (
-            request.improvement_mode is ImprovementMode.TRANSLATE
-            and _translation_is_redundant(
-                transformed,
-                request.target_language,
-            )
-        )
-        if request.improvement_mode is not None and not ai_translation_is_redundant:
-            if settings is None:
-                raise AssertionError("Validated improvement requests always have settings.")
-            if effective_ai_mode is None:
-                raise AssertionError("An enabled AI transformation always has an effective mode.")
-            _notify(
-                on_stage,
-                (
-                    ProcessStage.TRANSLATING
-                    if request.improvement_mode
-                    in {ImprovementMode.TRANSLATE, ImprovementMode.CLEAN_AND_TRANSLATE}
-                    else ProcessStage.IMPROVING
-                ),
-            )
-            if request.improvement_mode in {
-                ImprovementMode.TRANSLATE,
-                ImprovementMode.CLEAN_AND_TRANSLATE,
-            }:
-                translation_source = transformed
-                translation_performed = True
-            protected = (
-                protect_glossary(transformed, translation_glossary)
-                if translation_source is not None
-                else None
-            )
-            arguments: _ImprovementArguments = {"on_progress": on_progress}
-            arguments["plain_text"] = True
-            improvement_parameters = inspect.signature(improve_markdown).parameters
-            if "on_translation_preserved" in improvement_parameters:
-                arguments["on_translation_preserved"] = lambda current, _total: (
-                    preserved_translation_chunks.append(current)
-                )
-            if cancellation is not None:
-                arguments["cancellation"] = cancellation
-            if work_checkpoints is not None and "load_checkpoint" in improvement_parameters:
-                arguments["load_checkpoint"] = work_checkpoints.load
-                arguments["save_checkpoint"] = work_checkpoints.save
-            transformed = improve_markdown(
-                protected.text if protected is not None else transformed,
-                effective_ai_mode,
-                settings,
-                request.target_language,
-                **arguments,
-            )
-            if protected is not None:
-                transformed = protected.restore(transformed)
-        elif ai_translation_is_redundant:
-            LOGGER.info("translation_skipped already_in_target_language=true engine=ai")
-        offline_translation_is_redundant = (
-            request.offline_translation_language is not None
-            and _translation_is_redundant(
-                transformed,
-                request.offline_translation_language,
-            )
-        )
-        if (
-            request.offline_translation_language is not None
-            and not offline_translation_is_redundant
-        ):
-            _notify(on_stage, ProcessStage.PREPARING_TRANSLATION)
-            translation_source = transformed
-            translation_performed = True
-            translation_announced = False
-
-            def announce_translation() -> None:
-                nonlocal translation_announced
-                if not translation_announced:
-                    translation_announced = True
-                    _notify(on_stage, ProcessStage.TRANSLATING)
-
-            protected = protect_glossary(transformed, translation_glossary)
-            transformed = translate_markdown_offline(
-                protected.text,
-                request.offline_translation_language,
-                on_progress=on_progress,
-                on_engine_ready=announce_translation,
-                cancellation=cancellation,
-            )
-            announce_translation()
-            transformed = protected.restore(transformed)
-        elif offline_translation_is_redundant:
-            LOGGER.info("translation_skipped already_in_target_language=true engine=offline")
-        if translation_source is not None:
-            transformed = _repair_translation_warnings(
-                request,
-                translation_source,
-                transformed,
-                settings=settings,
-                cancellation=cancellation,
-                translation_glossary=translation_glossary,
-            )
-        revision_baseline_payload = transformed
-        if request.review_content and not _content_review_was_fused(
-            request,
-            effective_ai_mode,
-            translation_source,
-        ):
-            if settings is None:
-                raise AssertionError("Validated review requests always have settings.")
-            _notify(on_stage, ProcessStage.REVIEWING_CONTENT)
-            transformed = _improve_with_checkpoints(
-                transformed,
-                ImprovementMode.REVIEW_CONTENT,
-                settings,
-                request,
-                on_progress,
-                cancellation,
-                work_checkpoints,
-                plain_text=True,
-            )
-        return transformed
-
-    transformed_docx = transform_docx(
-        request.source_path,
-        transform_payload,
-        cancellation=cancellation,
-    )
-    baseline_paragraphs = (
-        split_docx_payload(revision_baseline_payload, transformed_docx.paragraph_count)
-        if revision_baseline_payload is not None
-        else transformed_docx.source_paragraphs
-    )
-    baseline_text = "\n\n".join(baseline_paragraphs)
-    report = _translation_quality_report(
-        request,
-        transformed_docx.source_text if translation_performed else None,
-        baseline_text if request.review_content else transformed_docx.transformed_text,
-    )
-    revision_candidate = (
-        build_revision_draft(
-            baseline_text,
-            transformed_docx.transformed_text,
-            kinds=frozenset({RevisionKind.CONTENT}),
-        )
-        if request.review_content
-        else None
-    )
-    revision_draft = (
-        revision_candidate
-        if revision_candidate is not None and revision_candidate.changes
-        else None
-    )
-    check_cancelled(cancellation)
-    _notify(on_stage, ProcessStage.WRITING)
-    output_content = (
-        rebuild_docx_with_paragraphs(request.source_path, baseline_paragraphs)
-        if revision_draft is not None
-        else transformed_docx.content
-    )
-    integrity = binary_integrity_capture(
-        output_content,
-        format_label="DOCX",
-        validate_container=validate_docx_container,
-        ledger=IntegrityLedger(
-            blocks=len(baseline_paragraphs)
-            if revision_draft is not None
-            else transformed_docx.paragraph_count,
-            paragraphs=len(baseline_paragraphs)
-            if revision_draft is not None
-            else transformed_docx.paragraph_count,
-            resources=transformed_docx.preserved_resources,
-        ),
-    )
-    final_path = write_docx_output(
-        request.source_path,
-        output_content,
-        request.output_directory,
-        validate_staged=integrity,
-    )
-    _notify(on_stage, ProcessStage.COMPLETED)
-    _finish_work_checkpoints(
-        work_checkpoints,
-        settings=settings,
-        root=work_checkpoint_root,
-        cleanup_allowed=revision_draft is None,
-    )
-    return ProcessResult(
-        final_path=final_path,
-        review_original_path=request.source_path,
-        translation_quality_report=report,
-        preserved_translation_chunks=tuple(preserved_translation_chunks),
-        preserved_images=transformed_docx.preserved_resources,
-        revision_draft=revision_draft,
-        revision_docx_original_paragraphs=(
-            baseline_paragraphs if revision_draft is not None else ()
-        ),
-        revision_docx_proposed_paragraphs=(
-            transformed_docx.transformed_paragraphs if revision_draft is not None else ()
-        ),
-        review_markdown=transformed_docx.transformed_text,
-        review_required=_review_is_required(
-            revision_draft,
-            None,
-            report,
-            bool(preserved_translation_chunks),
-        ),
-        final_integrity_report=integrity.report,
-        front_matter_blocks=(
-            semantic_document.front_matter_blocks if semantic_document is not None else 0
-        ),
-        toc_blocks=semantic_document.toc_blocks if semantic_document is not None else 0,
-        terminology_terms=len(semantic_document.terms) if semantic_document is not None else 0,
     )
 
 
@@ -1882,6 +2233,7 @@ def _repair_translation_warnings(
     cancellation: CancellationToken | None,
     source_language_code: str | None = None,
     translation_glossary: tuple[GlossaryEntry, ...] | None = None,
+    work_checkpoints: WorkCheckpoints | None = None,
 ) -> str:
     """Retry aligned blocks with source-language residue or a critical fidelity warning."""
 
@@ -1909,14 +2261,19 @@ def _repair_translation_warnings(
                 return protected.restore(repaired)
             if settings is None:
                 raise AssertionError("Validated AI translations always have settings.")
+            repair_arguments: _ImprovementArguments = {"plain_text": False}
+            if cancellation is not None:
+                repair_arguments["cancellation"] = cancellation
+            if work_checkpoints is not None:
+                repair_arguments["load_checkpoint"] = work_checkpoints.load
+                repair_arguments["save_checkpoint"] = work_checkpoints.save
             repaired = improve_markdown(
                 protected.text,
                 ImprovementMode.TRANSLATE,
                 settings,
                 request.target_language,
-                cancellation=cancellation,
-                plain_text=request.output_format in {OutputFormat.TEXT, OutputFormat.DOCX},
                 source_language_code=source_language_code,
+                **repair_arguments,
             )
             return protected.restore(repaired)
         except ProcessingCancelledError:
@@ -1946,12 +2303,16 @@ def _repair_translation_warnings(
         )
     if source_language_code is None or source_language_code == target_language_code:
         return repair.translated
-    return restore_changed_third_language_headings(
+    restored = restore_changed_third_language_headings(
         source,
         repair.translated,
         source_language=source_language_code,
         target_language=target_language_code,
     )
+    if not numeric_tokens_are_conserved(repair.translated, restored):
+        LOGGER.warning("translation_third_language_heading_restore_preserved numbers_changed=true")
+        return repair.translated
+    return restored
 
 
 def _epub_translation_resume_key(
@@ -1962,12 +2323,13 @@ def _epub_translation_resume_key(
 ) -> str:
     """Identify settings that can materially change translated EPUB text."""
 
-    mode = request.improvement_mode.value if request.improvement_mode is not None else "none"
+    effective_mode = _effective_ai_improvement_mode(request)
+    mode = effective_mode.value if effective_mode is not None else "none"
     model = settings.model if settings is not None else None
     context_window = settings.context_window if settings is not None else None
     return repr(
         (
-            "epub-translation-v3",
+            "epub-translation-v10",
             language_code,
             mode,
             request.offline_translation_language is not None,
@@ -2218,11 +2580,19 @@ def _validate_translation_options(request: ProcessRequest) -> None:
         raise RequestValidationError("Las opciones de revisión no son válidas.")
     if mode is not None and not isinstance(mode, ImprovementMode):
         raise RequestValidationError("El modo de mejora seleccionado no es válido.")
+    if mode in {ImprovementMode.TRANSLATE, ImprovementMode.CLEAN_AND_TRANSLATE}:
+        target_language = request.target_language
+        if not isinstance(target_language, str) or not target_language.strip():
+            raise RequestValidationError("Indica el idioma de destino para traducir.")
+        if resolve_language_code(target_language) is None:
+            raise RequestValidationError("El idioma de destino no está soportado.")
     offline_language = request.offline_translation_language
     if offline_language is not None and (
         not isinstance(offline_language, str) or not offline_language.strip()
     ):
         raise RequestValidationError("Indica el idioma de destino para traducir offline.")
+    if offline_language is not None and resolve_language_code(offline_language) is None:
+        raise RequestValidationError("El idioma de destino no está soportado.")
     if (
         mode in {ImprovementMode.TRANSLATE, ImprovementMode.CLEAN_AND_TRANSLATE}
         and offline_language
@@ -2255,7 +2625,6 @@ def _validate_requested_action(request: ProcessRequest) -> None:
         and not request.convert_to_markdown
         and not _is_epub_translation(request)
         and not _is_epub_personalization(request)
-        and not _is_docx_transformation(request)
     ):
         format_name = source_path.suffix.removeprefix(".").upper()
         raise RequestValidationError(
@@ -2298,19 +2667,6 @@ def _validate_output_format(request: ProcessRequest) -> None:
         raise RequestValidationError(
             "El formato de salida no está disponible para el documento seleccionado."
         )
-    if plan.semantic_issue is not None and request.output_format in {
-        OutputFormat.TEXT,
-        OutputFormat.DOCX,
-    }:
-        raise RequestValidationError(plan.semantic_issue)
-    if request.output_format is OutputFormat.TEXT and request.convert_to_markdown:
-        raise RequestValidationError(
-            "La salida TXT debe conservar el texto sin convertirlo a Markdown."
-        )
-    if request.output_format is OutputFormat.DOCX and not _is_docx_transformation(request):
-        raise RequestValidationError(
-            "La salida Word debe conservar directamente el documento DOCX."
-        )
     if request.output_format is OutputFormat.EPUB and not (
         generated_epub or direct_epub_translation or direct_epub_personalization
     ):
@@ -2325,6 +2681,20 @@ def _validate_output_format(request: ProcessRequest) -> None:
         raise RequestValidationError("La opción de incluir imágenes no es válida.")
     if not isinstance(request.preserve_styles, bool):
         raise RequestValidationError("La opción de conservar estilos no es válida.")
+    if not isinstance(request.markdown_organization, MarkdownOrganization):
+        raise RequestValidationError("La organización del Markdown no es válida.")
+    if not isinstance(request.markdown_include_metadata, bool) or not isinstance(
+        request.markdown_include_page_references, bool
+    ):
+        raise RequestValidationError("Las opciones de referencia del Markdown no son válidas.")
+    if request.output_format is not OutputFormat.MARKDOWN and (
+        request.markdown_organization is not MarkdownOrganization.SINGLE_FILE
+        or request.markdown_include_metadata
+        or request.markdown_include_page_references
+    ):
+        raise RequestValidationError(
+            "La organización, los metadatos y las páginas de origen solo se aplican a Markdown."
+        )
     if not request.include_images and request.output_format not in {
         OutputFormat.MARKDOWN,
         OutputFormat.EPUB,
@@ -2435,9 +2805,6 @@ def _validate_ai_settings(
                 "Ese modelo prioriza el razonamiento y no es apto para transformar documentos. "
                 "Elige una variante Instruct."
             )
-        if mode in {ImprovementMode.TRANSLATE, ImprovementMode.CLEAN_AND_TRANSLATE}:
-            if request.target_language is None or not request.target_language.strip():
-                raise RequestValidationError("Indica el idioma de destino para traducir.")
 
 
 def _validate_output_directory(output_directory: Path, source_path: Path) -> None:
@@ -2509,15 +2876,8 @@ def _validate_temporary_working_space(request: ProcessRequest) -> None:
 def _is_epub_translation(request: ProcessRequest) -> bool:
     return (
         request.source_path.suffix.lower() == ".epub"
-        and not request.convert_to_markdown
-        and not request.review_content
-        and not request.review_structure
         and request.output_format is OutputFormat.EPUB
-        and (
-            request.offline_translation_language is not None
-            or request.improvement_mode
-            in {ImprovementMode.TRANSLATE, ImprovementMode.CLEAN_AND_TRANSLATE}
-        )
+        and _request_translates(request)
     )
 
 
@@ -2530,19 +2890,6 @@ def _is_epub_personalization(request: ProcessRequest) -> bool:
         and request.offline_translation_language is None
         and not request.review_content
         and not request.review_structure
-    )
-
-
-def _is_docx_transformation(request: ProcessRequest) -> bool:
-    return (
-        request.source_path.suffix.lower() == ".docx"
-        and not request.convert_to_markdown
-        and request.output_format is OutputFormat.DOCX
-        and (
-            request.improvement_mode is not None
-            or request.offline_translation_language is not None
-            or request.review_content
-        )
     )
 
 
@@ -2580,15 +2927,42 @@ def _materialize_markdown_revision(
             raise RequestValidationError(
                 "La carpeta de imágenes debe estar en la misma unidad que el Markdown."
             ) from exc
+    safe_proposed = draft.render(
+        {
+            change.identifier: RevisionDecision.ACCEPTED
+            for change in draft.changes
+            if change.proposal_selectable
+        }
+    )
+    if safe_proposed == draft.original_markdown:
+        return None
     original = materialize_converted_markdown(
         draft.original_markdown,
         resources_reference,
     )
     proposed = materialize_converted_markdown(
-        draft.proposed_markdown,
+        safe_proposed,
         resources_reference,
     )
-    return build_revision_draft(original, proposed, kinds=draft.kinds)
+    materialized = build_revision_draft(original, proposed, kinds=draft.kinds)
+    if len(materialized.changes) == len(draft.changes):
+        materialized = replace(
+            materialized,
+            changes=tuple(
+                replace(
+                    materialized_change,
+                    risk=source_change.risk,
+                    risk_reason=source_change.risk_reason,
+                    proposal_selectable=source_change.proposal_selectable,
+                )
+                for materialized_change, source_change in zip(
+                    materialized.changes,
+                    draft.changes,
+                    strict=True,
+                )
+            ),
+        )
+    return materialized if materialized.changes else None
 
 
 def _validate_epub_path(path: Path) -> None:
@@ -2599,8 +2973,28 @@ def _validate_preserved_epub_path(path: Path) -> None:
     inspect_epub_package(path)
 
 
+@contextmanager
+def _attempt_stage_context(attempt_id: str) -> Iterator[None]:
+    token = _CURRENT_ATTEMPT_ID.set(attempt_id)
+    try:
+        yield
+    finally:
+        _CURRENT_ATTEMPT_ID.reset(token)
+
+
+def _effective_attempt_id(value: str | None) -> str:
+    if value is not None and is_safe_token(value):
+        return value
+    return secrets.token_hex(16)
+
+
 def _notify(on_stage: StageCallback | None, stage: ProcessStage) -> None:
-    LOGGER.info("processing_stage stage=%s", stage.value)
+    LOGGER.info(
+        "processing_stage attempt_id=%s phase=%s stage=%s",
+        _CURRENT_ATTEMPT_ID.get() or "unassigned",
+        phase_for_process_stage(stage).value,
+        stage.value,
+    )
     if on_stage is not None:
         on_stage(stage)
 

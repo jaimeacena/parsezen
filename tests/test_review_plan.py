@@ -9,8 +9,7 @@ from parsezen.domain.jobs import (
     DocumentFormat,
     JobConfiguration,
     OutputConfiguration,
-    RefinementConfiguration,
-    StructureConfiguration,
+    ProcessingPlan,
     TranslationConfiguration,
 )
 from parsezen.domain.reviews import ReviewKind
@@ -30,8 +29,7 @@ def full_configuration() -> JobConfiguration:
     return JobConfiguration(
         output=OutputConfiguration(format=DocumentFormat.EPUB),
         translation=TranslationConfiguration(enabled=True, target_language="es"),
-        refinement=RefinementConfiguration(enabled=True),
-        structure=StructureConfiguration(enabled=True),
+        plan=ProcessingPlan.LOCAL_AI_REVIEWED,
     )
 
 
@@ -189,3 +187,62 @@ def test_review_workload_uses_real_unit_counts() -> None:
         (ReviewKind.TRANSLATION, 10),
         (ReviewKind.REFINEMENT, 90),
     )
+
+
+def test_quarantined_content_does_not_create_a_correction_gate_or_workload() -> None:
+    result = ProcessResult(
+        Path("book.md"),
+        revision_draft=RevisionDraft(
+            "Original.\n",
+            "Original.\n\nInventado.\n",
+            (
+                RevisionChange(
+                    "unsafe",
+                    RevisionKind.CONTENT,
+                    1,
+                    1,
+                    "",
+                    "Inventado.\n",
+                    "Contenido propuesto para añadir",
+                    proposal_selectable=False,
+                ),
+            ),
+            frozenset({RevisionKind.CONTENT}),
+        ),
+        review_required=False,
+    )
+
+    assert review_steps_for_result(result, full_configuration()) == ()
+    assert review_workload_for_result(result, full_configuration()) == ()
+
+
+def test_quarantined_epub_keeps_the_final_personalization_gate() -> None:
+    original = "Original.\n"
+    result = ProcessResult(
+        Path("book.epub"),
+        revision_draft=RevisionDraft(
+            original,
+            original + "\nInventado.\n",
+            (
+                RevisionChange(
+                    "unsafe",
+                    RevisionKind.CONTENT,
+                    1,
+                    1,
+                    "",
+                    "Inventado.\n",
+                    "Contenido inventado",
+                    proposal_selectable=False,
+                ),
+            ),
+            frozenset({RevisionKind.CONTENT}),
+        ),
+        review_markdown=original,
+        review_required=True,
+        revision_epub_metadata=EpubBookMetadata("Book", "en"),
+    )
+
+    assert review_steps_for_result(result, JobConfiguration()) == (
+        ReviewStep(ReviewKind.STRUCTURE, StageKind.PUBLISH),
+    )
+    assert result.review_markdown == original

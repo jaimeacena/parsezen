@@ -11,7 +11,7 @@ import parsezen.output as output_module
 import parsezen.processing as processing_module
 from parsezen.cancellation import CancellationToken
 from parsezen.document_model import ConvertedDocument, ConvertedResource
-from parsezen.docx_preservation import DocxTransformation
+from parsezen.domain.jobs import ReviewRecommendation, ReviewSignal
 from parsezen.epub_builder import EPUB_CHAPTER_MARKER, EpubBookMetadata, build_epub
 from parsezen.errors import (
     ConversionError,
@@ -33,14 +33,175 @@ from parsezen.pdf_conversion import (
 from parsezen.processing import (
     OutputFormat,
     ProcessRequest,
+    ProcessResult,
     ProcessStage,
     apply_reviewed_revision,
     process_document,
+    review_completed_result,
+    review_scope_fingerprint,
     validate_process_request,
 )
+from parsezen.revision import RevisionDecision
 from parsezen.settings import AppSettings
 
 LOCAL_SETTINGS = AppSettings(model="local-model", context_window=4_096)
+
+
+def test_targeted_review_sends_only_signalled_blocks_to_local_ai(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "book.md"
+    source.write_text("Primer bloque.\n\nSegundo eror.\n\nTercer bloque.\n", encoding="utf-8")
+    final_path = tmp_path / "result.md"
+    final_path.write_text(source.read_text(encoding="utf-8"), encoding="utf-8")
+    reviewed: list[str] = []
+
+    def improve(markdown: str, *_args, **_kwargs) -> str:
+        reviewed.append(markdown)
+        return markdown.replace("eror", "error")
+
+    monkeypatch.setattr(processing_module, "_improve_with_checkpoints", improve)
+    result = review_completed_result(
+        ProcessRequest(source, convert_to_markdown=False),
+        base_result=ProcessResult(
+            final_path,
+            review_original_path=source,
+            review_markdown=source.read_text(encoding="utf-8"),
+        ),
+        recommendation=ReviewRecommendation(
+            ((ReviewSignal.CONVERSION_DAMAGE, 1),),
+            (1,),
+        ),
+        settings=LOCAL_SETTINGS,
+        work_checkpoint_root=tmp_path / "checkpoints",
+    )
+
+    assert reviewed == ["Segundo eror.\n\n"]
+    assert result.revision_draft is not None
+    assert "Segundo error." in result.revision_draft.proposed_markdown
+    assert final_path.read_text(encoding="utf-8") == source.read_text(encoding="utf-8")
+
+
+def test_targeted_review_rejects_a_result_changed_after_the_recommendation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "book.md"
+    source.write_text("Original block.\n", encoding="utf-8")
+    changed = "Changed block.\n"
+    final_path = tmp_path / "result.md"
+    final_path.write_text(changed, encoding="utf-8")
+    monkeypatch.setattr(
+        processing_module,
+        "_improve_with_checkpoints",
+        lambda *_args, **_kwargs: pytest.fail("A stale scope must not reach the model."),
+    )
+
+    with pytest.raises(RequestValidationError, match="ha cambiado"):
+        review_completed_result(
+            ProcessRequest(source, convert_to_markdown=False),
+            base_result=ProcessResult(final_path, review_markdown=changed),
+            recommendation=ReviewRecommendation(
+                ((ReviewSignal.CONVERSION_DAMAGE, 1),),
+                (0,),
+                review_scope_fingerprint("Original block.\n"),
+            ),
+            settings=LOCAL_SETTINGS,
+            work_checkpoint_root=tmp_path / "checkpoints",
+        )
+
+
+@pytest.mark.parametrize("offline", [False, True])
+def test_targeted_translation_review_keeps_source_alignment_for_both_routes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    offline: bool,
+) -> None:
+    source = tmp_path / "book.md"
+    source.write_text("Source one.\n\nSource two.\n", encoding="utf-8")
+    final_path = tmp_path / "translated.md"
+    translated = "Destino uno.\n\nDestino dos eror.\n"
+    final_path.write_text(translated, encoding="utf-8")
+    reviewed: list[tuple[str, str, str | None]] = []
+
+    def review_translation(
+        source_markdown: str,
+        target_markdown: str,
+        _settings: AppSettings,
+        request: ProcessRequest,
+        *_args,
+    ) -> str:
+        reviewed.append(
+            (
+                source_markdown,
+                target_markdown,
+                request.offline_translation_language or request.target_language,
+            )
+        )
+        return target_markdown.replace("eror", "error")
+
+    monkeypatch.setattr(
+        processing_module,
+        "_review_translation_with_checkpoints",
+        review_translation,
+    )
+    request = ProcessRequest(
+        source,
+        convert_to_markdown=False,
+        improvement_mode=None if offline else ImprovementMode.TRANSLATE,
+        target_language=None if offline else "Español",
+        offline_translation_language="Español" if offline else None,
+    )
+
+    result = review_completed_result(
+        request,
+        base_result=ProcessResult(
+            final_path,
+            review_original_path=source,
+            review_markdown=translated,
+        ),
+        recommendation=ReviewRecommendation(
+            ((ReviewSignal.TRANSLATION_INCONSISTENCY, 1),),
+            (1,),
+        ),
+        settings=LOCAL_SETTINGS,
+        work_checkpoint_root=tmp_path / "checkpoints",
+    )
+
+    assert reviewed == [("Source two.\n", "Destino dos eror.\n", "Español")]
+    assert result.revision_draft is not None
+    assert "Destino dos error." in result.revision_draft.proposed_markdown
+    assert final_path.read_text(encoding="utf-8") == translated
+
+
+def test_epub_translation_checkpoint_key_includes_fused_content_review() -> None:
+    source = Path("book.epub")
+    translation = ProcessRequest(
+        source,
+        convert_to_markdown=False,
+        output_format=OutputFormat.EPUB,
+        improvement_mode=ImprovementMode.TRANSLATE,
+        target_language="es",
+    )
+    translated_and_corrected = ProcessRequest(
+        source,
+        convert_to_markdown=False,
+        output_format=OutputFormat.EPUB,
+        improvement_mode=ImprovementMode.TRANSLATE,
+        target_language="es",
+        review_content=True,
+    )
+
+    assert processing_module._epub_translation_resume_key(  # noqa: SLF001
+        translation,
+        LOCAL_SETTINGS,
+        "es",
+    ) != processing_module._epub_translation_resume_key(  # noqa: SLF001
+        translated_and_corrected,
+        LOCAL_SETTINGS,
+        "es",
+    )
 
 
 def test_pdf_page_checkpoints_are_shared_across_sample_and_full_ranges(
@@ -98,7 +259,10 @@ def test_epub_can_open_final_personalization_without_another_transformation(
     assert result.final_path.exists()
     assert result.final_path != source
     assert result.review_required
-    assert result.revision_epub_metadata == EpubBookMetadata("Book", "en")
+    assert result.revision_epub_metadata is not None
+    assert result.revision_epub_metadata.title == "Book"
+    assert result.revision_epub_metadata.language == "en"
+    assert len(result.revision_epub_metadata.identifiers) == 1
     assert "# Chapter" in (result.review_markdown or "")
 
 
@@ -127,6 +291,32 @@ def test_each_processing_stage_is_logged_only_once(
     assert [record.message.rsplit("=", 1)[-1] for record in stage_records] == [
         stage.value for stage in stages
     ]
+
+
+def test_process_document_propagates_one_opaque_attempt_id_to_lifecycle_logs(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    source = tmp_path / "notes.txt"
+    source.write_text("Local notes.", encoding="utf-8")
+    attempt_id = "c" * 32
+
+    with caplog.at_level(logging.INFO, logger="parsezen.processing"):
+        process_document(
+            ProcessRequest(source, convert_to_markdown=True),
+            attempt_id=attempt_id,
+        )
+
+    lifecycle = [
+        record.message
+        for record in caplog.records
+        if record.message.startswith(
+            ("processing_started", "processing_stage", "processing_completed")
+        )
+    ]
+    assert lifecycle
+    assert all(f"attempt_id={attempt_id}" in message for message in lifecycle)
+    assert any(message.startswith("processing_stage") for message in lifecycle)
 
 
 def test_completed_result_contains_privacy_safe_stage_telemetry(tmp_path: Path) -> None:
@@ -278,35 +468,6 @@ def test_processes_txt_and_reports_real_stages(tmp_path: Path) -> None:
         ProcessStage.WRITING,
         ProcessStage.COMPLETED,
     ]
-
-
-def test_txt_can_be_improved_to_a_new_txt_without_overwriting_source(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    source = tmp_path / "notes.txt"
-    source.write_text("Original text", encoding="utf-8")
-    monkeypatch.setattr(
-        processing_module,
-        "improve_markdown",
-        lambda text, *_args, **_kwargs: text.replace("Original", "Improved"),
-    )
-
-    result = process_document(
-        ProcessRequest(
-            source,
-            convert_to_markdown=False,
-            improvement_mode=ImprovementMode.CLEAN,
-            output_format=OutputFormat.TEXT,
-        ),
-        settings=LOCAL_SETTINGS,
-    )
-
-    assert result.final_path.name == "notes.mended.txt"
-    assert result.final_path.read_text(encoding="utf-8") == "Improved text"
-    assert source.read_text(encoding="utf-8") == "Original text"
-    assert result.final_integrity_report is not None
-    assert result.final_integrity_report.verified
 
 
 def test_chained_ai_translation_and_correction_are_fused_in_the_target_language(
@@ -497,15 +658,79 @@ def test_offline_translation_applies_and_restores_the_glossary(
     result = process_document(
         ProcessRequest(
             source,
-            convert_to_markdown=False,
+            convert_to_markdown=True,
             offline_translation_language="Español",
-            output_format=OutputFormat.TEXT,
             glossary=(GlossaryEntry("Parsezen", "Parsezen revisado"),),
         )
     )
 
     assert "PZDOCGLOSSARY" in captured[0]
     assert result.final_path.read_text(encoding="utf-8") == "Parsezen revisado"
+
+
+def test_offline_translation_content_review_compares_source_and_target(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "book.md"
+    source_markdown = "# The History, Astrology and Magic of the Decans\n\nBy Austin Coppock.\n"
+    translated = (
+        "# Historia del Ajedrez; Astrología y Magia de los Decanos\n\nKor Austin Coppock.\n"
+    )
+    corrected = "# Historia, Astrología y Magia de los Decanos\n\nPor Austin Coppock.\n"
+    source.write_text(source_markdown, encoding="utf-8")
+    review_calls: list[tuple[str, str, str]] = []
+    quality_calls: list[tuple[str | None, str]] = []
+
+    monkeypatch.setattr(
+        processing_module,
+        "translate_markdown_offline",
+        lambda *_args, **_kwargs: translated,
+    )
+    monkeypatch.setattr(
+        processing_module,
+        "_repair_translation_warnings",
+        lambda _request, _source, value, **_kwargs: value,
+    )
+    monkeypatch.setattr(
+        processing_module,
+        "_translation_quality_report",
+        lambda _request, original, current: quality_calls.append((original, current)),
+    )
+
+    def review(
+        original: str,
+        current: str,
+        _settings: AppSettings,
+        target_language: str,
+        **_kwargs: object,
+    ) -> str:
+        review_calls.append((original, current, target_language))
+        return corrected
+
+    monkeypatch.setattr(processing_module, "review_translation_markdown", review)
+
+    result = process_document(
+        ProcessRequest(
+            source,
+            convert_to_markdown=True,
+            offline_translation_language="es",
+            review_content=True,
+        ),
+        settings=LOCAL_SETTINGS,
+    )
+
+    assert review_calls == [(source_markdown, translated, "es")]
+    assert quality_calls == [
+        (source_markdown, translated),
+        (source_markdown, corrected),
+    ]
+    assert result.revision_draft is not None
+    assert result.revision_draft.render() == corrected
+    assert all(
+        change.recommended_decision is RevisionDecision.ACCEPTED
+        for change in result.revision_draft.changes
+    )
 
 
 def test_repeated_document_terms_are_protected_without_a_manual_glossary(
@@ -561,115 +786,84 @@ def test_inferred_terminology_has_a_bounded_occurrence_budget() -> None:
     )
 
 
-def test_docx_can_be_transformed_without_a_markdown_round_trip(
-    tmp_path: Path,
+def test_ai_translation_repair_reuses_encrypted_work_checkpoints(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    source = tmp_path / "formatted.docx"
-    source.write_bytes(b"docx")
-    converted = DocxTransformation(b"rebuilt-docx", "Original", "Improved", 1)
+    checkpoint = SimpleNamespace(
+        load=lambda _key: None,
+        save=lambda _key, _payload: True,
+    )
+    callbacks: list[tuple[object, object]] = []
 
-    def transform(_path: Path, callback, **_kwargs: object) -> DocxTransformation:
-        assert callback("Original") == "Improved"
-        return converted
+    def improve(_text: str, *_args: object, **kwargs: object) -> str:
+        callbacks.append((kwargs.get("load_checkpoint"), kwargs.get("save_checkpoint")))
+        return "Texto reparado."
 
-    monkeypatch.setattr(processing_module, "transform_docx", transform)
-    monkeypatch.setattr(processing_module, "validate_docx_container", lambda _path: None)
+    def repair(*_args: object, **kwargs: object) -> SimpleNamespace:
+        translated = kwargs["translate_segment"]("Source text.", "Current text.")
+        return SimpleNamespace(translated=translated, attempted_segments=1, repaired_segments=1)
+
+    monkeypatch.setattr(processing_module, "improve_markdown", improve)
+    monkeypatch.setattr(processing_module, "repair_untranslated_source_text", repair)
     monkeypatch.setattr(
         processing_module,
-        "improve_markdown",
-        lambda text, *_args, **_kwargs: text.replace("Original", "Improved"),
+        "restore_changed_third_language_headings",
+        lambda _source, translated, **_kwargs: translated,
     )
 
-    result = process_document(
+    result = processing_module._repair_translation_warnings(
         ProcessRequest(
-            source,
+            Path("book.epub"),
             convert_to_markdown=False,
-            improvement_mode=ImprovementMode.CLEAN,
-            output_format=OutputFormat.DOCX,
+            improvement_mode=ImprovementMode.TRANSLATE,
+            target_language="Español",
+            output_format=OutputFormat.EPUB,
         ),
+        "Source text.",
+        "Current text.",
         settings=LOCAL_SETTINGS,
+        cancellation=None,
+        source_language_code="en",
+        work_checkpoints=checkpoint,
     )
 
-    assert result.final_path.name == "formatted.mended.docx"
-    assert result.final_path.read_bytes() == b"rebuilt-docx"
+    assert result == "Texto reparado."
+    assert callbacks == [(checkpoint.load, checkpoint.save)]
 
 
-def test_docx_translation_is_skipped_when_text_is_already_in_target_language(
-    tmp_path: Path,
+def test_translation_repair_rejects_numeric_damage_from_heading_restoration(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    source = tmp_path / "formatted.docx"
-    source.write_bytes(b"docx")
-    original = (
-        "Este documento ya está escrito completamente en español y no necesita "
-        "una traducción adicional para conservar su contenido."
-    )
-    converted = DocxTransformation(
-        b"rebuilt-docx",
-        original,
-        original,
-        1,
-        source_paragraphs=(original,),
-        transformed_paragraphs=(original,),
-    )
-    stages: list[ProcessStage] = []
-
-    def transform(_path: Path, callback, **_kwargs: object) -> DocxTransformation:
-        assert callback(original) == original
-        return converted
-
-    monkeypatch.setattr(processing_module, "transform_docx", transform)
-    monkeypatch.setattr(processing_module, "validate_docx_container", lambda _path: None)
-    monkeypatch.setattr(processing_module, "detect_language_code", lambda *_args, **_kwargs: "es")
     monkeypatch.setattr(
         processing_module,
-        "translate_markdown_offline",
-        lambda *_args, **_kwargs: pytest.fail("No debe invocarse la traducción redundante."),
-    )
-
-    result = process_document(
-        ProcessRequest(
-            source,
-            convert_to_markdown=False,
-            offline_translation_language="Español",
-            output_format=OutputFormat.DOCX,
+        "repair_untranslated_source_text",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            translated="Referencia 202.\n",
+            attempted_segments=1,
+            repaired_segments=1,
         ),
-        on_stage=stages.append,
+    )
+    monkeypatch.setattr(
+        processing_module,
+        "restore_changed_third_language_headings",
+        lambda *_args, **_kwargs: "Referencia 260.\n",
     )
 
-    assert ProcessStage.PREPARING_TRANSLATION not in stages
-    assert ProcessStage.TRANSLATING not in stages
-    assert result.final_path.read_bytes() == b"rebuilt-docx"
-    assert result.translation_quality_report is None
+    result = processing_module._repair_translation_warnings(
+        ProcessRequest(
+            Path("book.pdf"),
+            convert_to_markdown=True,
+            offline_translation_language="Español",
+            output_format=OutputFormat.EPUB,
+        ),
+        "Reference 202.\n",
+        "Referencia 202.\n",
+        settings=None,
+        cancellation=None,
+        source_language_code="en",
+    )
 
-
-@pytest.mark.parametrize(
-    ("extension", "output_format", "message"),
-    [
-        (".txt", OutputFormat.TEXT, "sin convertirlo a Markdown"),
-        (".docx", OutputFormat.DOCX, "conservar directamente"),
-    ],
-)
-def test_same_format_outputs_reject_a_markdown_round_trip(
-    tmp_path: Path,
-    extension: str,
-    output_format: OutputFormat,
-    message: str,
-) -> None:
-    source = tmp_path / f"document{extension}"
-    source.write_bytes(b"content")
-
-    with pytest.raises(RequestValidationError, match=message):
-        process_document(
-            ProcessRequest(
-                source,
-                convert_to_markdown=True,
-                improvement_mode=ImprovementMode.CLEAN,
-                output_format=output_format,
-            ),
-            settings=LOCAL_SETTINGS,
-        )
+    assert result == "Referencia 202.\n"
 
 
 def test_avoids_overwriting_and_keeps_existing_output(tmp_path: Path) -> None:
@@ -1354,6 +1548,35 @@ def test_rejects_an_invalid_forced_ocr_flag(tmp_path: Path) -> None:
         )
 
 
+@pytest.mark.parametrize(
+    ("improvement_mode", "offline_language", "settings"),
+    [
+        (ImprovementMode.TRANSLATE, None, LOCAL_SETTINGS),
+        (None, "Klingon", None),
+    ],
+)
+def test_rejects_an_unsupported_translation_language_during_preflight(
+    tmp_path: Path,
+    improvement_mode: ImprovementMode | None,
+    offline_language: str | None,
+    settings: AppSettings | None,
+) -> None:
+    source = tmp_path / "document.txt"
+    source.write_text("Local content.", encoding="utf-8")
+
+    with pytest.raises(RequestValidationError, match="idioma de destino no est\u00e1 soportado"):
+        process_document(
+            ProcessRequest(
+                source,
+                convert_to_markdown=True,
+                improvement_mode=improvement_mode,
+                target_language="Klingon" if improvement_mode is not None else None,
+                offline_translation_language=offline_language,
+            ),
+            settings=settings,
+        )
+
+
 @pytest.mark.parametrize("filename", ["document.rtf", "document", "document.exe"])
 def test_rejects_unsupported_inputs(tmp_path: Path, filename: str) -> None:
     source = tmp_path / filename
@@ -1689,7 +1912,54 @@ def test_direct_epub_translation_is_skipped_when_declared_language_matches_targe
     assert ProcessStage.TRANSLATING not in stages
     assert result.review_required
     assert result.translation_quality_report is None
-    assert result.revision_epub_metadata == EpubBookMetadata("Libro", "es", "Autora")
+    assert result.revision_epub_metadata is not None
+    assert result.revision_epub_metadata.title == "Libro"
+    assert result.revision_epub_metadata.language == "es"
+    assert result.revision_epub_metadata.author == "Autora"
+    assert len(result.revision_epub_metadata.identifiers) == 1
+
+
+def test_direct_epub_translation_does_not_trust_incorrect_declared_language(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "book.epub"
+    source.write_bytes(
+        build_epub(
+            "# Chapter\n\n"
+            "This complete English paragraph contains enough natural language to detect that "
+            "the publication metadata is incorrect and translation is still required.",
+            (),
+            EpubBookMetadata("Book", "es", "Author"),
+        ).content
+    )
+    translated = SimpleNamespace(
+        content=source.read_bytes(),
+        language_code="es",
+        translation_parts=1,
+        resumed_parts=0,
+        checkpoint_degraded=False,
+        quality_report=None,
+    )
+    calls: list[bool] = []
+
+    def translate(*_args, **_kwargs):
+        calls.append(True)
+        return translated
+
+    monkeypatch.setattr(processing_module, "translate_epub", translate)
+
+    result = process_document(
+        ProcessRequest(
+            source,
+            convert_to_markdown=False,
+            offline_translation_language="es",
+            output_format=OutputFormat.EPUB,
+        )
+    )
+
+    assert calls == [True]
+    assert result.epub_translation_parts == 1
 
 
 def test_direct_epub_translation_propagates_checkpoint_degradation(
@@ -1740,6 +2010,9 @@ def test_direct_epub_translation_propagates_checkpoint_degradation(
             language="en" if Path(path) == source else "es",
             authors=(),
             cover_path=None,
+            identifiers=(),
+            publisher=None,
+            publication_date=None,
         ),
     )
 
@@ -1815,6 +2088,9 @@ def test_direct_epub_translation_can_remove_content_images_but_keep_the_cover(
             language="en" if Path(path) == source else "es",
             authors=("Autora",),
             cover_path=resource.relative_path,
+            identifiers=(),
+            publisher=None,
+            publication_date=None,
         ),
     )
 
@@ -1898,6 +2174,9 @@ def test_direct_epub_translation_can_normalize_styles_while_retaining_images(
             language="en" if Path(path) == source else "es",
             authors=(),
             cover_path=None,
+            identifiers=(),
+            publisher=None,
+            publication_date=None,
         ),
     )
 
@@ -2229,6 +2508,12 @@ def test_pdf_ocr_checkpoint_encoding_preserves_empty_results() -> None:
     assert processing_module._decode_pdf_ocr_checkpoint(encoded_text) == "Recognized"
     assert processing_module._decode_pdf_ocr_checkpoint("Legacy") == "Legacy"
     assert processing_module._decode_pdf_ocr_checkpoint(None) is None
+
+
+def test_pdf_ocr_checkpoint_rejects_a_stale_tagged_version() -> None:
+    stale = "\x1eParsezen PDF OCR v2\x1fRecognized"
+
+    assert processing_module._decode_pdf_ocr_checkpoint(stale) is None
 
 
 def test_pdf_result_reports_pages_marked_for_review(

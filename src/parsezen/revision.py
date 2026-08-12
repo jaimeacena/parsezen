@@ -9,10 +9,28 @@ from dataclasses import dataclass
 from difflib import SequenceMatcher
 from enum import StrEnum
 
+from parsezen.document_model import RESOURCE_REFERENCE_PREFIX
 from parsezen.errors import ImprovementError
+from parsezen.translation_quality import (
+    TranslationQualityError,
+    detect_language_code,
+    resolve_language_code,
+    validate_translation_quality,
+)
 
 _HEADING_PATTERN = re.compile(r"^(#{1,6})\s+(.+?)\s*$")
 _MAX_REVIEW_MARKDOWN_CHARACTERS = 2_000_000
+_INTERNAL_COMMENT_PATTERN = re.compile(r"<!--(?P<body>[\s\S]*?)-->")
+_PRIVATE_RESOURCE_PATTERN = re.compile(
+    re.escape(RESOURCE_REFERENCE_PREFIX) + r"[^\s)>'\"]+",
+)
+_PRIVATE_IMAGE_PATTERN = re.compile(
+    r"!\[(?P<alt>(?:\\.|[^\]\\])*)\]"
+    r"\(\s*(?:<)?" + re.escape(RESOURCE_REFERENCE_PREFIX) + r"[^\s)>\"']+(?:>)?[^)]*\)",
+)
+_PZDOC_TEXT_PATTERN = re.compile(r"PZDOC", re.IGNORECASE)
+_PZDOC_TOKEN_PATTERN = re.compile(r"\bPZDOC[^\s<>()\]]*", re.IGNORECASE)
+_INTERNAL_COMMENT_TEXT_PATTERN = re.compile(r"comentario\s+interno", re.IGNORECASE)
 
 
 class RevisionKind(StrEnum):
@@ -58,12 +76,13 @@ class RevisionChange:
     summary: str
     risk: RevisionRisk = RevisionRisk.LOW
     risk_reason: str | None = None
+    proposal_selectable: bool = True
 
     @property
     def recommended_decision(self) -> RevisionDecision:
         return (
             RevisionDecision.REJECTED
-            if self.risk is RevisionRisk.HIGH
+            if self.risk is RevisionRisk.HIGH or not self.proposal_selectable
             else RevisionDecision.ACCEPTED
         )
 
@@ -93,6 +112,8 @@ class RevisionDraft:
                 block.markdown for block in original_blocks[cursor : change.original_start]
             )
             decision = resolved.get(change.identifier, change.recommended_decision)
+            if not change.proposal_selectable:
+                decision = RevisionDecision.REJECTED
             if decision is RevisionDecision.ACCEPTED:
                 output.append(change.proposed_markdown)
             else:
@@ -152,10 +173,23 @@ def build_revision_draft(
     proposed_markdown: str,
     *,
     kinds: frozenset[RevisionKind],
+    translation_source_markdown: str | None = None,
+    translation_target_language: str | None = None,
+    protected_translation_terms: tuple[str, ...] = (),
 ) -> RevisionDraft:
     """Build compact independently reviewable replacements from two documents."""
     original_blocks = split_markdown_blocks(original_markdown)
     proposed_blocks = split_markdown_blocks(proposed_markdown)
+    translation_source_blocks = (
+        split_markdown_blocks(translation_source_markdown)
+        if translation_source_markdown is not None
+        else ()
+    )
+    translation_alignment_available = bool(
+        translation_source_blocks
+        and len(translation_source_blocks) == len(original_blocks)
+        and resolve_language_code(translation_target_language) is not None
+    )
     matcher = SequenceMatcher(
         a=[block.markdown for block in original_blocks],
         b=[block.markdown for block in proposed_blocks],
@@ -173,7 +207,32 @@ def build_revision_draft(
         original = "".join(block.markdown for block in original_blocks[original_start:original_end])
         proposed = "".join(block.markdown for block in proposed_blocks[proposed_start:proposed_end])
         kind = _change_kind(original, proposed, default_kind, kinds)
-        risk, risk_reason = _revision_risk(original, proposed, kind)
+        validated_translation_correction = False
+        if translation_alignment_available and kind is RevisionKind.CONTENT:
+            translation_source = "".join(
+                block.markdown for block in translation_source_blocks[original_start:original_end]
+            )
+            validated_translation_correction = _validated_translation_correction(
+                translation_source,
+                original,
+                proposed,
+                target_language=translation_target_language,
+                protected_terms=protected_translation_terms,
+            )
+        risk, risk_reason = _revision_risk(
+            original,
+            proposed,
+            kind,
+            validated_translation_correction=validated_translation_correction,
+        )
+        proposal_selectable = True
+        if kind is RevisionKind.CONTENT:
+            try:
+                validate_review_content_candidate(original, proposed)
+            except ImprovementError as exc:
+                proposal_selectable = False
+                risk = RevisionRisk.HIGH
+                risk_reason = risk_reason or f"La propuesta no es seleccionable: {exc}"
         original_identity = ",".join(
             block.identifier for block in original_blocks[original_start:original_end]
         )
@@ -197,6 +256,7 @@ def build_revision_draft(
                 summary=_change_summary(tag, original, proposed, kind),
                 risk=risk,
                 risk_reason=risk_reason,
+                proposal_selectable=proposal_selectable,
             )
         )
     return RevisionDraft(
@@ -292,7 +352,13 @@ def _revision_risk(
     original: str,
     proposed: str,
     kind: RevisionKind,
+    *,
+    validated_translation_correction: bool = False,
 ) -> tuple[RevisionRisk, str | None]:
+    if Counter(_REVISION_NUMBER_PATTERN.findall(original)) != Counter(
+        _REVISION_NUMBER_PATTERN.findall(proposed)
+    ):
+        return RevisionRisk.HIGH, "La propuesta cambia números o fechas."
     if kind is RevisionKind.STRUCTURE:
         original_levels = tuple(level for level, _title in markdown_headings(original))
         proposed_levels = tuple(level for level, _title in markdown_headings(proposed))
@@ -322,14 +388,15 @@ def _revision_risk(
             "La propuesta añade o elimina un bloque completo; "
             "se conserva el original por seguridad.",
         )
-    if Counter(_REVISION_NUMBER_PATTERN.findall(original)) != Counter(
-        _REVISION_NUMBER_PATTERN.findall(proposed)
-    ):
-        return RevisionRisk.HIGH, "La propuesta cambia números o fechas."
-    if _protected_revision_terms(original) != _protected_revision_terms(proposed):
+    if not validated_translation_correction and _protected_revision_terms(
+        original
+    ) != _protected_revision_terms(proposed):
         return RevisionRisk.HIGH, "La propuesta cambia nombres propios o siglas."
-    if _heading_only(original) and _heading_only(proposed):
-        return RevisionRisk.LOW, None
+    if not validated_translation_correction and _heading_only(original) and _heading_only(proposed):
+        return (
+            RevisionRisk.HIGH,
+            "La propuesta cambia palabras de un título; se conserva el original por seguridad.",
+        )
     if len(split_markdown_blocks(original)) != len(split_markdown_blocks(proposed)):
         return RevisionRisk.HIGH, "La propuesta cambia la cantidad de párrafos."
 
@@ -353,8 +420,194 @@ def _revision_risk(
     return RevisionRisk.LOW, None
 
 
+def validate_revision_selection(draft: RevisionDraft, reviewed_markdown: str) -> None:
+    """Reject a mixed review that invents or silently loses numeric values.
+
+    A user may choose either the original or proposed occurrence count for a
+    value. Combining independent changes must never produce a count outside
+    that closed interval, which catches shifted or ambiguously aligned blocks
+    without preventing an explicitly proposed numeric correction.
+    """
+
+    original = Counter(_REVISION_NUMBER_PATTERN.findall(draft.original_markdown))
+    proposed = Counter(_REVISION_NUMBER_PATTERN.findall(draft.proposed_markdown))
+    reviewed = Counter(_REVISION_NUMBER_PATTERN.findall(reviewed_markdown))
+    for value in original.keys() | proposed.keys() | reviewed.keys():
+        lower = min(original[value], proposed[value])
+        upper = max(original[value], proposed[value])
+        if not lower <= reviewed[value] <= upper:
+            raise ImprovementError(
+                "La selección de revisión combina cambios numéricos de forma insegura."
+            )
+
+
+def _validated_translation_correction(
+    source: str,
+    original: str,
+    proposed: str,
+    *,
+    target_language: str | None,
+    protected_terms: tuple[str, ...],
+) -> bool:
+    target_code = resolve_language_code(target_language)
+    if target_code is None or not source.strip() or not proposed.strip():
+        return False
+    source_content = _translation_content_view(source)
+    proposed_content = _translation_content_view(proposed)
+    try:
+        validate_translation_quality(
+            source_content,
+            proposed_content,
+            source_language=detect_language_code(source_content),
+            target_language=target_code,
+            preserve_paragraphs=True,
+        )
+    except TranslationQualityError:
+        return False
+    if not _protected_translation_terms_are_conserved(original, proposed, protected_terms):
+        return False
+    return _shared_source_names_are_conserved(source, original, proposed)
+
+
+def _translation_content_view(markdown: str) -> str:
+    """Ignore independently validated heading markers in a mixed review proposal."""
+
+    return re.sub(r"(?m)^(\s{0,3})#{1,6}[ \t]+", r"\1", markdown)
+
+
+def _protected_translation_terms_are_conserved(
+    original: str,
+    proposed: str,
+    protected_terms: tuple[str, ...],
+) -> bool:
+    for term in protected_terms:
+        normalized = term.strip()
+        if len(normalized) < 2:
+            continue
+        pattern = re.compile(rf"(?<!\w){re.escape(normalized)}(?!\w)", re.IGNORECASE)
+        if len(pattern.findall(original)) != len(pattern.findall(proposed)):
+            return False
+    return True
+
+
+def _shared_source_names_are_conserved(source: str, original: str, proposed: str) -> bool:
+    phrases = {
+        match.group(0)
+        for match in re.finditer(
+            r"(?<!\w)(?:[A-ZÁÉÍÓÚÜÑ][^\W\d_]+(?:\s+|$)){2,4}",
+            source,
+            re.UNICODE,
+        )
+    }
+    acronyms = {match.group(0) for match in re.finditer(r"(?<!\w)[A-ZÁÉÍÓÚÜÑ]{2,}(?!\w)", source)}
+    for value in phrases | acronyms:
+        normalized = value.strip()
+        if not normalized:
+            continue
+        pattern = re.compile(rf"(?<!\w){re.escape(normalized)}(?!\w)", re.IGNORECASE)
+        original_count = len(pattern.findall(original))
+        if original_count and len(pattern.findall(proposed)) != original_count:
+            return False
+    return True
+
+
 def _revision_words(markdown: str) -> tuple[str, ...]:
     return tuple(match.group(0).casefold() for match in _REVISION_WORD_PATTERN.finditer(markdown))
+
+
+def validate_review_content_candidate(original: str, proposed: str) -> None:
+    """Fail closed when a content-review proposal is not a bounded edit.
+
+    Content review may correct an aligned typo, but it is not allowed to act as
+    a summarizer or generator. This guard is deliberately independent of the
+    model response validator so old drafts and materialized caches receive the
+    same treatment.
+    """
+
+    if not original.strip() or not proposed.strip():
+        raise ImprovementError("La propuesta añade o elimina un bloque completo.")
+
+    original_blocks = split_markdown_blocks(original)
+    proposed_blocks = split_markdown_blocks(proposed)
+    if len(original_blocks) != len(proposed_blocks):
+        raise ImprovementError("La propuesta cambia el número de bloques o párrafos.")
+
+    _validate_private_content(original, proposed)
+    for original_block, proposed_block in zip(original_blocks, proposed_blocks, strict=True):
+        original_words = _revision_words(_without_private_content(original_block.markdown))
+        proposed_words = _revision_words(_without_private_content(proposed_block.markdown))
+        if not original_words:
+            if proposed_words:
+                raise ImprovementError("La propuesta inventa contenido en un bloque vacío.")
+            continue
+
+        if len(proposed_words) > len(original_words) + max(4, round(len(original_words) * 0.35)):
+            raise ImprovementError("La propuesta expande sustancialmente el contenido.")
+        if len(original_words) >= 5 and len(proposed_words) < round(len(original_words) * 0.60):
+            raise ImprovementError("La propuesta omite una parte sustancial del contenido.")
+        if len(original_words) >= 5:
+            similarity = SequenceMatcher(
+                a=original_words,
+                b=proposed_words,
+                autojunk=False,
+            ).ratio()
+            if similarity < 0.60:
+                raise ImprovementError("La propuesta reescribe demasiado contenido.")
+
+
+def _without_private_content(markdown: str) -> str:
+    without_comments = _INTERNAL_COMMENT_PATTERN.sub("", markdown)
+    return _PRIVATE_RESOURCE_PATTERN.sub("", without_comments)
+
+
+def _validate_private_content(original: str, proposed: str) -> None:
+    original_comments = Counter(
+        match.group(0)
+        for match in _INTERNAL_COMMENT_PATTERN.finditer(original)
+        if _is_private_comment(match.group(0))
+    )
+    proposed_comments = Counter(
+        match.group(0)
+        for match in _INTERNAL_COMMENT_PATTERN.finditer(proposed)
+        if _is_private_comment(match.group(0))
+    )
+    if original_comments != proposed_comments:
+        raise ImprovementError("La propuesta añadió o modificó comentarios internos.")
+
+    original_resources = Counter(_PRIVATE_RESOURCE_PATTERN.findall(original))
+    proposed_resources = Counter(_PRIVATE_RESOURCE_PATTERN.findall(proposed))
+    if original_resources != proposed_resources:
+        raise ImprovementError("La propuesta añadió o modificó recursos privados.")
+
+    original_images = Counter(match.group(0) for match in _PRIVATE_IMAGE_PATTERN.finditer(original))
+    proposed_images = Counter(match.group(0) for match in _PRIVATE_IMAGE_PATTERN.finditer(proposed))
+    if original_images != proposed_images:
+        raise ImprovementError("La propuesta modificó la sintaxis de una imagen privada.")
+
+    original_visible = _INTERNAL_COMMENT_PATTERN.sub("", original)
+    proposed_visible = _INTERNAL_COMMENT_PATTERN.sub("", proposed)
+    if _visible_private_marker_lines(original_visible) != _visible_private_marker_lines(
+        proposed_visible
+    ):
+        raise ImprovementError("La propuesta añadió o filtró una marca PZDOC.")
+    if Counter(_INTERNAL_COMMENT_TEXT_PATTERN.findall(original_visible)) != Counter(
+        _INTERNAL_COMMENT_TEXT_PATTERN.findall(proposed_visible)
+    ):
+        raise ImprovementError("La propuesta añadió o modificó un comentario interno.")
+
+
+def _visible_private_marker_lines(markdown: str) -> Counter[str]:
+    return Counter(
+        line.strip()
+        for line in markdown.splitlines()
+        if _PZDOC_TOKEN_PATTERN.search(line) or _INTERNAL_COMMENT_TEXT_PATTERN.search(line)
+    )
+
+
+def _is_private_comment(comment: str) -> bool:
+    return bool(
+        _PZDOC_TEXT_PATTERN.search(comment) or _INTERNAL_COMMENT_TEXT_PATTERN.search(comment)
+    )
 
 
 def _protected_revision_terms(markdown: str) -> Counter[str]:

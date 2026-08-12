@@ -14,6 +14,9 @@ from parsezen.domain.jobs import (
     DocumentSource,
     JobConfiguration,
     OutputConfiguration,
+    ProcessingPlan,
+    TranslationConfiguration,
+    TranslationMethod,
 )
 from parsezen.domain.stages import StageKind
 from parsezen.processing import OutputFormat, ProcessRequest, ProcessStage
@@ -48,8 +51,10 @@ def test_process_request_and_settings_round_trip_independent_configuration() -> 
     assert restored_request.review_structure
     assert configuration.ai.model == "qwen3:4b"
     assert configuration.ai.context_window == 8192
-    assert configuration.translation.model is None
-    assert configuration.refinement.model is None
+    assert configuration.plan is ProcessingPlan.LOCAL_AI_REVIEWED
+    assert configuration.translation.method is TranslationMethod.LOCAL_AI
+    assert restored_request.target_language == "Español"
+    assert restored_request.offline_translation_language is None
     assert restored_settings.model == "qwen3:4b"
     assert restored_settings.context_window == 8192
 
@@ -107,6 +112,27 @@ def test_translation_precedes_refinement_in_the_stable_pipeline() -> None:
     participating = tuple(stage.kind for stage in job.stages if stage.participates)
 
     assert participating.index(StageKind.TRANSLATE) < participating.index(StageKind.REFINE)
+
+
+def test_offline_translation_maps_only_to_argos_runtime() -> None:
+    job = DocumentJob.create(
+        DocumentSource(Path("book.pdf"), DocumentFormat.PDF, 100, 1),
+        JobConfiguration(
+            translation=TranslationConfiguration(
+                enabled=True,
+                method=TranslationMethod.OFFLINE,
+                target_language="es",
+            )
+        ),
+        order=0,
+    )
+
+    request, settings = request_and_settings_from_job(job)
+
+    assert request.target_language is None
+    assert request.offline_translation_language == "es"
+    assert request.improvement_mode is None
+    assert settings.model is None
 
 
 def test_runtime_mapping_rejects_a_job_without_deliberate_output() -> None:

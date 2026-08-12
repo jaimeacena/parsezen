@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
@@ -47,6 +48,8 @@ def test_processing_log_omits_document_name_path_and_content(tmp_path: Path) -> 
     assert "processing_started" in log_text
     assert "processing_completed" in log_text
     assert "extension=.txt" in log_text
+    attempt_ids = set(re.findall(r"attempt_id=([0-9a-f]{32})", log_text))
+    assert len(attempt_ids) == 1
     assert "private-customer-name" not in log_text
     assert str(tmp_path) not in log_text
     assert "TOP SECRET DOCUMENT CONTENT" not in log_text

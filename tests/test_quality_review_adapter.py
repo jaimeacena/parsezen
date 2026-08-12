@@ -1,3 +1,4 @@
+import logging
 from dataclasses import replace
 from pathlib import Path
 
@@ -13,10 +14,12 @@ from parsezen.domain.reviews import ReviewChoice, ReviewKind, ReviewSession, Rev
 from parsezen.domain.stages import StageKind
 from parsezen.infrastructure.artifact_store import ArtifactStore
 from parsezen.pdf_conversion import PdfQualityReport, PdfReviewIssue
+from parsezen.review_projection import project_review_text
 from parsezen.translation_quality import (
     TranslationIssueKind,
     TranslationQualityIssue,
     TranslationQualityReport,
+    build_translation_quality_report,
 )
 
 
@@ -58,7 +61,7 @@ def test_translation_review_applies_manual_excerpt_without_touching_other_text(
     assert review is not None
     edited = store.put_text(job_id="job", text="Buenas.")
     review = review.decide(
-        "segment",
+        review.units[0].id,
         ReviewChoice.EDITED,
         edited_artifact_id=edited.id,
     )
@@ -103,11 +106,281 @@ def test_translation_review_anchors_collapsed_whitespace_to_the_real_document(
     assert store.read_text("job", review.units[0].proposed_artifact_id or "") == "Hola\nmundo."
     edited = store.put_text(job_id="job", text="Buenas, mundo.")
     review = review.decide(
-        "segment",
+        review.units[0].id,
         ReviewChoice.EDITED,
         edited_artifact_id=edited.id,
     )
     assert apply_translation_review(document, review, store) == ("Start.\n\nBuenas, mundo.\n\nEnd.")
+
+
+@pytest.mark.parametrize("marker", ["…", "..."])
+def test_translation_review_completes_only_the_truncated_sentence(
+    tmp_path: Path,
+    marker: str,
+) -> None:
+    store = ArtifactStore(tmp_path / "artifacts", protect=reversible, unprotect=reversible)
+    paragraph = (
+        "Este párrafo traducido es deliberadamente largo y continúa en otra línea "
+        "para que el informe solo conserve un prefijo.\n"
+        "La segunda línea también forma parte del mismo bloque."
+    )
+    document = f"Inicio.\n\n{paragraph}\n\nFin."
+    input_record = store.put_text(job_id="job", text=document)
+    prefix = "Este párrafo traducido es deliberadamente largo"
+    report = TranslationQualityReport(
+        "en",
+        "Español",
+        "es",
+        1,
+        20,
+        19,
+        1,
+        (
+            TranslationQualityIssue(
+                1,
+                TranslationIssueKind.FIDELITY,
+                "Revisar párrafo",
+                "Long source excerpt",
+                f"{prefix}{marker}",
+                "long-block",
+            ),
+        ),
+    )
+
+    review = create_translation_review(
+        report,
+        job_id="job",
+        configuration_revision=1,
+        input_artifact_id=input_record.id,
+        artifacts=store,
+    )
+
+    assert review is not None
+    unit = review.units[0]
+    assert not unit.original_selectable
+    first_sentence = paragraph.splitlines()[0]
+    assert store.read_text("job", unit.proposed_artifact_id or "") == first_sentence
+    assert len(first_sentence) < len(paragraph)
+    edited = store.put_text(job_id="job", text="Edición completa y segura.")
+    decided = review.decide(
+        unit.id,
+        ReviewChoice.EDITED,
+        edited_artifact_id=edited.id,
+    )
+    assert apply_translation_review(document, decided, store) == (
+        "Inicio.\n\nEdición completa y segura.\n"
+        "La segunda línea también forma parte del mismo bloque.\n\nFin."
+    )
+
+
+def test_translation_review_materializes_multiple_non_overlapping_long_blocks(
+    tmp_path: Path,
+) -> None:
+    store = ArtifactStore(tmp_path / "artifacts", protect=reversible, unprotect=reversible)
+    first = "Primer párrafo traducido con bastante contenido y una continuación segura."
+    second = "Segundo párrafo traducido separado para mantener un anclaje independiente."
+    document = f"{first}\n\n{second}\n\nFinal."
+    input_record = store.put_text(job_id="job", text=document)
+    report = TranslationQualityReport(
+        "en",
+        "Español",
+        "es",
+        2,
+        30,
+        28,
+        2,
+        (
+            TranslationQualityIssue(
+                1,
+                TranslationIssueKind.ALIGNMENT,
+                "Primero",
+                "First source",
+                "Primer párrafo traducido con bastante…",
+                "first",
+            ),
+            TranslationQualityIssue(
+                2,
+                TranslationIssueKind.FIDELITY,
+                "Segundo",
+                "Second source",
+                "Segundo párrafo traducido separado…",
+                "second",
+            ),
+        ),
+    )
+
+    review = create_translation_review(
+        report,
+        job_id="job",
+        configuration_revision=1,
+        input_artifact_id=input_record.id,
+        artifacts=store,
+    )
+
+    assert review is not None
+    assert {unit.id.split("-", 1)[0] for unit in review.units} == {"first", "second"}
+    assert {
+        unit.id.split("-", 1)[0]: store.read_text("job", unit.proposed_artifact_id or "")
+        for unit in review.units
+    } == {"first": first, "second": second}
+
+
+def test_translation_review_shows_a_readable_context_and_changes_identity_with_scope(
+    tmp_path: Path,
+) -> None:
+    store = ArtifactStore(tmp_path / "artifacts", protect=reversible, unprotect=reversible)
+    document = (
+        "The current result starts here and continues until this complete sentence. "
+        "Unrelated translated content must stay outside the review."
+    )
+    input_record = store.put_text(job_id="job", text=document)
+    report = TranslationQualityReport(
+        "en",
+        "Español",
+        "es",
+        1,
+        100,
+        100,
+        1,
+        (
+            TranslationQualityIssue(
+                1,
+                TranslationIssueKind.SOURCE_TEXT,
+                "Parece conservar texto original",
+                "The source context is complete. Another unfinished senten…",
+                "The current result starts here and contin…",
+                "legacy-id",
+            ),
+        ),
+    )
+
+    review = create_translation_review(
+        report,
+        job_id="job",
+        configuration_revision=1,
+        input_artifact_id=input_record.id,
+        artifacts=store,
+    )
+
+    assert review is not None
+    unit = review.units[0]
+    assert unit.id.startswith("legacy-id-")
+    assert unit.recommended_choice is None
+    assert unit.warning is not None
+    assert store.read_text("job", unit.original_artifact_id) == "The source context is complete. …"
+    assert store.read_text("job", unit.proposed_artifact_id or "") == (
+        "The current result starts here and continues until this complete sentence."
+    )
+
+
+def test_future_quality_excerpts_stop_at_the_last_complete_sentence(tmp_path: Path) -> None:
+    store = ArtifactStore(tmp_path / "artifacts", protect=reversible, unprotect=reversible)
+    document = "A complete opening sentence. " + "unfinished context " * 30
+    input_record = store.put_text(job_id="job", text=document)
+    report = build_translation_quality_report(
+        document,
+        document,
+        source_language="en",
+        target_language="es",
+    )
+
+    review = create_translation_review(
+        report,
+        job_id="job",
+        configuration_revision=1,
+        input_artifact_id=input_record.id,
+        artifacts=store,
+    )
+
+    assert report.issues[0].translated_excerpt == "A complete opening sentence.…"
+    assert review is not None
+    assert store.read_text("job", review.units[0].proposed_artifact_id or "") == (
+        "A complete opening sentence."
+    )
+
+
+def test_legacy_truncated_translation_uses_the_same_complete_boundary_as_context(
+    tmp_path: Path,
+) -> None:
+    store = ArtifactStore(tmp_path / "artifacts", protect=reversible, unprotect=reversible)
+    first = "The first complete sentence ends here."
+    document = f"{first} A second sentence continues beyond the old report limit."
+    input_record = store.put_text(job_id="job", text=document)
+    report = TranslationQualityReport(
+        "en",
+        "Español",
+        "es",
+        1,
+        len(document),
+        len(document),
+        1,
+        (
+            TranslationQualityIssue(
+                1,
+                TranslationIssueKind.SOURCE_TEXT,
+                "Parece conservar texto original",
+                f"{first} A second senten…",
+                f"{first} A second senten…",
+                "legacy-boundary",
+            ),
+        ),
+    )
+
+    review = create_translation_review(
+        report,
+        job_id="job",
+        configuration_revision=1,
+        input_artifact_id=input_record.id,
+        artifacts=store,
+    )
+
+    assert review is not None
+    unit = review.units[0]
+    assert store.read_text("job", unit.original_artifact_id) == f"{first} …"
+    assert store.read_text("job", unit.proposed_artifact_id or "") == first
+    assert "únicamente todo el texto visible" in (unit.warning or "")
+
+
+def test_unanchored_translation_issue_logs_only_a_sanitized_count(
+    tmp_path: Path,
+    caplog,
+) -> None:
+    store = ArtifactStore(tmp_path / "artifacts", protect=reversible, unprotect=reversible)
+    private_text = "Contenido privado que nunca debe aparecer en el registro."
+    input_record = store.put_text(job_id="job", text=private_text)
+    report = TranslationQualityReport(
+        "en",
+        "Español",
+        "es",
+        1,
+        10,
+        9,
+        1,
+        (
+            TranslationQualityIssue(
+                1,
+                TranslationIssueKind.ALIGNMENT,
+                "Incidencia sin anclaje",
+                "Fuente privada",
+                "Fragmento que no existe…",
+                "missing",
+            ),
+        ),
+    )
+    caplog.set_level(logging.WARNING, logger="parsezen.application.quality_review_adapter")
+
+    review = create_translation_review(
+        report,
+        job_id="job",
+        configuration_revision=1,
+        input_artifact_id=input_record.id,
+        artifacts=store,
+    )
+
+    assert review is None
+    assert "translation_review_issue_not_materialized count=1" in caplog.text
+    assert private_text not in caplog.text
+    assert "Fuente privada" not in caplog.text
 
 
 def test_saved_review_tolerates_line_ending_normalization_when_applied(
@@ -183,6 +456,81 @@ def test_pdf_review_uses_page_image_and_applies_edited_text(
     assert apply_pdf_review("<!-- page -->\nOld OCR", decided, store) == (
         "<!-- page -->\nCorrected OCR"
     )
+
+
+def test_pdf_review_anchors_multiple_issues_to_the_transformed_pages(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    store = ArtifactStore(tmp_path / "artifacts", protect=reversible, unprotect=reversible)
+    source = tmp_path / "book.pdf"
+    source.write_bytes(b"%PDF")
+    document = (
+        "<!-- PZDOC PDF PAGE 1 -->\n\n"
+        "Texto ya traducido.\n\n"
+        "<!-- PZDOC PDF PAGE 2 -->\n\n"
+        "![](<__parsezen_resources__/pdf/page-0002-image-01.jpg>)\n"
+    )
+    input_record = store.put_text(job_id="job", text=document)
+    report = PdfQualityReport(
+        (1, 2),
+        (1, 2),
+        (
+            PdfReviewIssue(
+                1,
+                "OCR dudoso",
+                "Stale source text.",
+                "page-one",
+                False,
+                "<!-- PZDOC PDF PAGE 1 -->",
+            ),
+            PdfReviewIssue(
+                2,
+                "Página visual",
+                "",
+                "page-two",
+                False,
+                "<!-- PZDOC PDF PAGE 2 -->",
+            ),
+        ),
+    )
+    monkeypatch.setattr(
+        "parsezen.application.quality_review_adapter.render_pdf_page_cover",
+        lambda *_args: b"jpeg-page",
+    )
+
+    review = create_pdf_review(
+        report,
+        source,
+        job_id="job",
+        configuration_revision=2,
+        input_artifact_id=input_record.id,
+        artifacts=store,
+    )
+
+    assert review is not None
+    first, second = review.units
+    assert first.proposed_artifact_id is not None
+    assert second.proposed_artifact_id is not None
+    first_proposal = store.read_text("job", first.proposed_artifact_id)
+    second_proposal = store.read_text("job", second.proposed_artifact_id)
+    assert "Texto ya traducido." in first_proposal
+    assert "Stale source text." not in first_proposal
+    assert project_review_text(second_proposal).visible_text.strip() == ""
+
+    edited_text = project_review_text(first_proposal).restore("Texto ya corregido.\n\n")
+    edited = store.put_text(job_id="job", text=edited_text)
+    decided = review.decide(
+        first.id,
+        ReviewChoice.EDITED,
+        edited_artifact_id=edited.id,
+    ).decide(second.id, ReviewChoice.NO_TEXT)
+
+    applied = apply_pdf_review(document, decided, store)
+    assert "Texto ya corregido." in applied
+    assert "Texto ya traducido." not in applied
+    assert "<!-- PZDOC PDF PAGE 2 -->" in applied
+    assert "page-0002-image-01.jpg" in applied
 
 
 def test_quality_review_handles_empty_reports_targets_and_invalid_decisions(

@@ -20,7 +20,7 @@ from parsezen.domain.jobs import (
     JobConfiguration,
     JobStatus,
     OutputConfiguration,
-    StructureConfiguration,
+    ProcessingPlan,
 )
 from parsezen.domain.reviews import ReviewSession
 from parsezen.domain.stages import StageKind
@@ -63,7 +63,7 @@ def _blocked_job(
         DocumentSource.inspect(source),
         JobConfiguration(
             output=OutputConfiguration(format=DocumentFormat.EPUB),
-            structure=StructureConfiguration(enabled=True),
+            plan=ProcessingPlan.LOCAL_AI_REVIEWED,
         ),
         job_id="job",
     )

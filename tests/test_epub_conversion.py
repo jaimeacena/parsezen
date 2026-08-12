@@ -7,8 +7,10 @@ from zipfile import ZIP_DEFLATED, ZIP_STORED, ZipFile
 
 import pytest
 
+import parsezen.epub_conversion as epub_conversion_module
 import parsezen.processing as processing_module
 from parsezen.conversion import RESOURCE_REFERENCE_PREFIX, convert_document, convert_file
+from parsezen.epub_builder import EpubBookMetadata, build_epub
 from parsezen.epub_conversion import (
     inspect_epub_package,
     replace_epub_metadata,
@@ -19,6 +21,107 @@ from parsezen.improvement import ImprovementMode
 from parsezen.output import write_improvement_outputs
 from parsezen.processing import OutputFormat, ProcessRequest, ProcessStage, process_document
 from parsezen.settings import AppSettings
+
+
+def test_epub_literal_work_title_requires_full_emphasis() -> None:
+    assert epub_conversion_module._epub_unit_is_fully_emphasized(
+        '<p xmlns="urn:test"><i>THE QUIET PATH THROUGH INNER FREEDOM</i></p>'
+    )
+    assert not epub_conversion_module._epub_unit_is_fully_emphasized(
+        '<p xmlns="urn:test">Context <i>THE QUIET PATH</i></p>'
+    )
+
+
+def test_epub_literal_work_title_requires_reference_section_context() -> None:
+    title = '<p xmlns="urn:test"><i>THE QUIET PATH THROUGH INNER FREEDOM</i></p>'
+    ordinary_units = [epub_conversion_module._EpubTranslationUnit("chapter.xhtml", (0,), title)]
+
+    assert (
+        epub_conversion_module._literal_epub_work_title_segments(
+            ordinary_units,
+            [title],
+            source_language="en",
+            target_language="es",
+        )
+        == frozenset()
+    )
+
+    bibliography_units = [
+        epub_conversion_module._EpubTranslationUnit("references.xhtml", (0,), title),
+        epub_conversion_module._EpubTranslationUnit(
+            "references.xhtml",
+            (1,),
+            '<h1 xmlns="urn:test">BIBLIOGRAPHY</h1>',
+        ),
+        epub_conversion_module._EpubTranslationUnit("references.xhtml", (2,), title),
+        epub_conversion_module._EpubTranslationUnit(
+            "references.xhtml",
+            (3,),
+            '<h2 xmlns="urn:test">PRIMARY SOURCES</h2>',
+        ),
+        epub_conversion_module._EpubTranslationUnit("references.xhtml", (4,), title),
+    ]
+
+    assert epub_conversion_module._literal_epub_work_title_segments(
+        bibliography_units,
+        [unit.source for unit in bibliography_units],
+        source_language="en",
+        target_language="es",
+    ) == frozenset({3, 5})
+
+
+def test_epub_package_inspection_retains_all_publication_metadata(tmp_path: Path) -> None:
+    source = tmp_path / "metadata.epub"
+    _write_epub2(source)
+    with ZipFile(source) as archive:
+        package = archive.read("OEBPS/content.opf")
+    package = package.replace(
+        b'<dc:identifier id="book-id">small-book-id</dc:identifier>',
+        (
+            b'<dc:identifier id="book-id">small-book-id</dc:identifier>'
+            b"<dc:identifier>secondary-id</dc:identifier>"
+            b"<dc:publisher>Local Publisher</dc:publisher>"
+            b"<dc:date>2024-03-14</dc:date>"
+        ),
+    )
+    _rewrite_epub_members(source, {"OEBPS/content.opf": package})
+
+    metadata = inspect_epub_package(source)
+
+    assert metadata.identifier == "small-book-id"
+    assert metadata.identifiers == ("small-book-id", "secondary-id")
+    assert metadata.publisher == "Local Publisher"
+    assert metadata.publication_date == "2024-03-14"
+
+
+def test_epub_translation_prefers_detected_text_language_over_incorrect_metadata(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "incorrect-language.epub"
+    source.write_bytes(
+        build_epub(
+            "# Chapter\n\n"
+            "This complete English paragraph contains enough natural language to establish "
+            "the actual source language even though the publication metadata is incorrect.",
+            (),
+            EpubBookMetadata("Book", "es", "Author"),
+        ).content
+    )
+
+    translated = translate_epub(
+        source,
+        "es",
+        lambda text, *_args: text.replace("Chapter", "Capítulo").replace(
+            "This complete English paragraph contains enough natural language to establish "
+            "the actual source language even though the publication metadata is incorrect.",
+            "Este párrafo completo en inglés contiene suficiente lenguaje natural para "
+            "establecer el idioma de origen real aunque los metadatos de publicación sean "
+            "incorrectos.",
+        ),
+    )
+
+    assert translated.quality_report is not None
+    assert translated.quality_report.source_language == "en"
 
 
 def test_epub2_conversion_restores_navigation_images_and_internal_links(
@@ -153,7 +256,7 @@ def test_epub_translation_preserves_package_images_links_and_reading_order(
         return (
             text.replace("Modern Book", "Libro moderno")
             .replace("Modern EPUB content.", "Contenido EPUB moderno.")
-            .replace(">Cover image</span>", ">Imagen de portada</span>")
+            .replace("Cover image", "Imagen de portada")
             .replace("Contents", "Índice")
             .replace("Opening", "Apertura")
         )
@@ -301,22 +404,32 @@ def test_epub_translation_still_rejects_content_encryption(tmp_path: Path) -> No
         translate_epub(source, "es", lambda text, _progress, _token: text)
 
 
-def test_epub_translation_rejects_changed_internal_references(tmp_path: Path) -> None:
+def test_epub_translation_does_not_expose_internal_references_to_translator(
+    tmp_path: Path,
+) -> None:
     source = tmp_path / "unsafe.epub"
     _write_epub3(source)
 
     def change_link(text: str, _on_progress, _cancellation) -> str:
         return text.replace("opening.xhtml#start", "missing.xhtml#start")
 
-    with pytest.raises(ConversionError, match="estructura interna|enlaces o estructura"):
-        translate_epub(source, "es", change_link)
+    translated = translate_epub(source, "es", change_link)
+
+    with ZipFile(BytesIO(translated.content)) as archive:
+        navigation = archive.read("EPUB/nav.xhtml").decode("utf-8")
+    assert 'href="opening.xhtml#start"' in navigation
+    assert "missing.xhtml#start" not in navigation
 
 
 def test_epub2_translation_preserves_prefixed_opf_attributes(tmp_path: Path) -> None:
     source = tmp_path / "legacy.epub"
     _write_epub2(source)
 
-    translated = translate_epub(source, "es", lambda text, _progress, _token: text)
+    translated = translate_epub(
+        source,
+        "es",
+        lambda text, _progress, _token: _translate_epub2_payload(text),
+    )
 
     with ZipFile(BytesIO(translated.content)) as result:
         package = result.read("OEBPS/content.opf")
@@ -335,7 +448,7 @@ def test_epub_translation_uses_semantic_parts_without_chapter_metadata(
     def translate(text: str, _progress, _token) -> str:
         nonlocal calls
         calls += 1
-        return text.replace("Original paragraph", "Párrafo traducido")
+        return _translate_chapterless_payload(text)
 
     translated = translate_epub(
         source,
@@ -390,7 +503,7 @@ def test_epub_translation_resumes_only_verified_completed_parts(tmp_path: Path) 
         first_calls += 1
         if first_calls == 2:
             raise ConversionError("Interrupción simulada")
-        return text.replace("Original paragraph", "Párrafo traducido")
+        return _translate_chapterless_payload(text)
 
     with pytest.raises(ConversionError, match="Interrupción simulada"):
         translate_epub(
@@ -407,7 +520,7 @@ def test_epub_translation_resumes_only_verified_completed_parts(tmp_path: Path) 
     def finish_translation(text: str, _progress, _token) -> str:
         nonlocal resumed_calls
         resumed_calls += 1
-        return text.replace("Original paragraph", "Párrafo traducido")
+        return _translate_chapterless_payload(text)
 
     translated = translate_epub(
         source,
@@ -443,6 +556,417 @@ def test_epub_translation_retranslates_an_invalid_cached_part(tmp_path: Path) ->
 
     assert calls == translated.translation_parts
     assert translated.resumed_parts == 0
+
+
+def test_epub_translation_retranslates_a_cached_part_that_changed_a_number(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "number-cache.epub"
+    source.write_bytes(
+        build_epub(
+            "# Chapter 10\n\n"
+            "This substantial paragraph records exactly 10,000 observations and contains "
+            "enough English text to establish its language reliably during translation.",
+            (),
+            EpubBookMetadata("Number Book", "en"),
+        ).content
+    )
+    checkpoints: dict[str, str] = {}
+
+    def translate(text: str, _progress, _token) -> str:
+        return (
+            text.replace("Chapter", "Capítulo")
+            .replace("Number Book", "Libro de cifras")
+            .replace(
+                "This substantial paragraph records exactly",
+                "Este párrafo sustancial registra exactamente",
+            )
+            .replace(
+                "observations and contains enough English text to establish its language "
+                "reliably during translation.",
+                "observaciones y contiene suficiente texto para establecer su idioma con "
+                "fiabilidad durante la traducción.",
+            )
+        )
+
+    first = translate_epub(
+        source,
+        "es",
+        translate,
+        save_checkpoint=lambda key, value: not checkpoints.__setitem__(key, value),
+    )
+    damaged = {key: value.replace("10,000", "10") for key, value in checkpoints.items()}
+    calls = 0
+
+    def count_translation(text: str, progress, token) -> str:
+        nonlocal calls
+        calls += 1
+        return translate(text, progress, token)
+
+    second = translate_epub(
+        source,
+        "es",
+        count_translation,
+        load_checkpoint=damaged.get,
+    )
+
+    assert first.translation_parts == second.translation_parts
+    assert second.resumed_parts == second.translation_parts - 1
+    assert calls == 1
+    with ZipFile(BytesIO(second.content)) as archive:
+        content = archive.read("EPUB/text/chapter-0001.xhtml").decode("utf-8")
+    assert "10,000" in content
+
+
+def test_epub_translation_retries_a_unit_that_dropped_a_protected_number(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "changed-number.epub"
+    source.write_bytes(
+        build_epub(
+            "# Chapter\n\n"
+            "This substantial paragraph records exactly 10,000 observations and contains "
+            "enough English text to establish its language reliably during translation.",
+            (),
+            EpubBookMetadata("Number Book", "en"),
+        ).content
+    )
+    unit_retries = 0
+
+    def translate(text: str, _progress, _token) -> str:
+        nonlocal unit_retries
+        is_unit_retry = "PZDOC_EPUB_XML_RETRY" in text
+        unit_retries += is_unit_retry
+        translated = (
+            text.replace("Chapter", "Capítulo")
+            .replace("Number Book", "Libro de cifras")
+            .replace(
+                "This substantial paragraph records exactly",
+                "Este párrafo sustancial registra exactamente",
+            )
+            .replace(
+                "observations and contains enough English text to establish its language "
+                "reliably during translation.",
+                "observaciones y contiene suficiente texto para establecer su idioma con "
+                "fiabilidad durante la traducción.",
+            )
+        )
+        if is_unit_retry:
+            return translated
+        return re.sub(
+            r"(registra exactamente\s+)<!-- PZDOC_EPUB_XML_[A-Z_]+ -->",
+            r"\g<1>10",
+            translated,
+        )
+
+    translated = translate_epub(source, "es", translate)
+
+    assert unit_retries == 1
+    with ZipFile(BytesIO(translated.content)) as archive:
+        content = archive.read("EPUB/text/chapter-0001.xhtml").decode("utf-8")
+    assert "10,000" in content
+
+
+@pytest.mark.parametrize("damage", ["empty", "duplicated"])
+def test_epub_translation_retries_a_unit_with_unsafe_content_coverage(
+    tmp_path: Path,
+    damage: str,
+) -> None:
+    source = tmp_path / f"unsafe-coverage-{damage}.epub"
+    original = (
+        "This substantial paragraph contains enough English prose to verify that the complete "
+        "meaning remains present after a safe local translation."
+    )
+    translated_paragraph = (
+        "Este párrafo sustancial contiene suficiente prosa para verificar que todo el sentido "
+        "permanece presente después de una traducción local segura."
+    )
+    source.write_bytes(
+        build_epub(
+            f"# Chapter\n\n{original}",
+            (),
+            EpubBookMetadata("Coverage Book", "en"),
+        ).content
+    )
+    unit_retries = 0
+
+    def translate(text: str, _progress, _token) -> str:
+        nonlocal unit_retries
+        is_unit_retry = "PZDOC_EPUB_XML_RETRY" in text
+        unit_retries += is_unit_retry
+        result = (
+            text.replace("Chapter", "Capítulo")
+            .replace("Coverage Book", "Libro de cobertura")
+            .replace(original, translated_paragraph)
+        )
+        if is_unit_retry:
+            return result
+        replacement = "" if damage == "empty" else f"{translated_paragraph} {translated_paragraph}"
+        return result.replace(translated_paragraph, replacement)
+
+    result = translate_epub(source, "es", translate)
+
+    assert unit_retries == 1
+    with ZipFile(BytesIO(result.content)) as archive:
+        content = archive.read("EPUB/text/chapter-0001.xhtml").decode("utf-8")
+    assert content.count(translated_paragraph) == 1
+
+
+def test_epub_translation_escapes_invalid_xml_text_without_retranslating(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "invalid-xhtml-unit.epub"
+    _write_epub3(source)
+    calls: list[bool] = []
+
+    def translate(text: str, _progress, _token) -> str:
+        is_unit_retry = "PZDOC_EPUB_XML_RETRY" in text
+        calls.append(is_unit_retry)
+        assert "xmlns:" not in text
+        assert "<html:" not in text
+        assert "<dc:" not in text
+        translated = text.replace("Opening", "Apertura").replace(
+            "Modern EPUB content.",
+            "Contenido EPUB moderno.",
+        )
+        if not is_unit_retry and "Contenido EPUB moderno." in translated:
+            return translated.replace(
+                "Contenido EPUB moderno.",
+                "Contenido & EPUB moderno.",
+            )
+        return translated
+
+    result = translate_epub(source, "es", translate)
+
+    assert calls.count(True) == 0
+    assert len(calls) == result.translation_parts
+    with ZipFile(BytesIO(result.content)) as archive:
+        content = archive.read("EPUB/opening.xhtml").decode("utf-8")
+    assert "Contenido &amp; EPUB moderno." in content
+
+
+def test_epub_xml_protection_uses_independent_private_comments() -> None:
+    source = '<p xmlns="urn:test"><strong>Opening</strong></p>'
+
+    protected, markers = epub_conversion_module._protect_epub_xml_markup(source, 0)
+
+    assert len(markers) == 2
+    assert protected.count("<!-- PZDOC_EPUB_XML_") == len(markers)
+    assert "`" not in protected
+    assert epub_conversion_module._restore_epub_xml_markup(protected, markers) == source
+    translated = protected.replace("Opening", "Apertura & cierre <seguro>")
+    assert epub_conversion_module._restore_epub_xml_markup(translated, markers) == (
+        '<p xmlns="urn:test"><strong>Apertura &amp; cierre &lt;seguro&gt;</strong></p>'
+    )
+    wrapped = f"Explicación ajena. {translated} Nota ajena."
+    assert epub_conversion_module._restore_epub_xml_markup(wrapped, markers) == (
+        '<p xmlns="urn:test"><strong>Apertura &amp; cierre &lt;seguro&gt;</strong></p>'
+    )
+
+
+def test_epub_xml_protection_locks_visible_numbers_and_urls() -> None:
+    source = '<p xmlns="urn:test">Keep 10,000 and https://example.com/10 intact.</p>'
+
+    protected, markers = epub_conversion_module._protect_epub_xml_markup(source, 0)
+
+    assert "10,000" not in protected
+    assert "https://example.com/10" not in protected
+    assert len(markers) == 4
+    assert epub_conversion_module._restore_epub_xml_markup(protected, markers) == source
+
+
+def test_epub_text_coverage_does_not_treat_plain_xml_text_as_markdown() -> None:
+    epub_conversion_module._validate_epub_conserved_text(
+        "- Original label",
+        "Etiqueta traducida",
+    )
+
+
+def test_epub_translation_retries_a_detectably_unchanged_part_by_unit(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "unchanged-part.epub"
+    _write_chapterless_epub(source)
+    calls: list[bool] = []
+
+    def translate(text: str, _progress, _token) -> str:
+        is_unit_retry = "PZDOC_EPUB_XML_RETRY" in text
+        calls.append(is_unit_retry)
+        if not is_unit_retry:
+            return text
+        return text.replace("Original paragraph", "Párrafo traducido").replace(
+            "This is deliberately substantial text",
+            "Este es un texto deliberadamente sustancial",
+        )
+
+    result = translate_epub(source, "es", translate)
+
+    assert calls.count(False) == result.translation_parts
+    assert calls.count(True) > 0
+    with ZipFile(BytesIO(result.content)) as archive:
+        content = archive.read("EPUB/book.xhtml").decode("utf-8")
+    assert content.count("Párrafo traducido") == 30
+    assert "Original paragraph" not in content
+
+
+def test_epub_translation_retries_a_part_still_dominated_by_source_language(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "mostly-unchanged-part.epub"
+    _write_chapterless_epub(source)
+    calls: list[bool] = []
+
+    def translate(text: str, _progress, _token) -> str:
+        is_unit_retry = "PZDOC_EPUB_XML_RETRY" in text
+        calls.append(is_unit_retry)
+        if not is_unit_retry:
+            return text.replace("Original paragraph", "Párrafo traducido", 1)
+        return text.replace("Original paragraph", "Párrafo traducido").replace(
+            "This is deliberately substantial text",
+            "Este es un texto deliberadamente sustancial",
+        )
+
+    result = translate_epub(source, "es", translate)
+
+    assert calls.count(False) == result.translation_parts
+    assert calls.count(True) > 0
+    with ZipFile(BytesIO(result.content)) as archive:
+        content = archive.read("EPUB/book.xhtml").decode("utf-8")
+    assert content.count("Párrafo traducido") == 30
+    assert "Original paragraph" not in content
+
+
+def test_epub_translation_retries_one_substantial_source_language_unit(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "one-residual-unit.epub"
+    regular = (
+        "A regular English paragraph contains enough source-language prose to be translated "
+        "safely and completely. " * 4
+    )
+    residual = (
+        "This unique English paragraph must not remain untranslated when all surrounding units "
+        "are already in the requested language. " * 4
+    )
+    source.write_bytes(
+        build_epub(
+            "# Book\n\n" + "\n\n".join((*((regular,) * 12), residual)),
+            (),
+            EpubBookMetadata("Book", "en"),
+        ).content
+    )
+    unit_retries = 0
+
+    def translate(text: str, _progress, _token) -> str:
+        nonlocal unit_retries
+        is_unit_retry = "PZDOC_EPUB_XML_RETRY" in text
+        unit_retries += is_unit_retry
+        result = (
+            text.replace("Book", "Libro")
+            .replace(
+                "A regular English paragraph contains enough source-language prose to be "
+                "translated",
+                "Un párrafo normal contiene suficiente prosa traducida",
+            )
+            .replace("safely and completely.", "de forma segura y completa.")
+        )
+        if is_unit_retry:
+            result = result.replace(
+                "This unique English paragraph must not remain untranslated when all "
+                "surrounding units",
+                "Este párrafo único no debe permanecer sin traducir cuando las demás unidades",
+            ).replace(
+                "are already in the requested language.",
+                "ya están en el idioma solicitado.",
+            )
+        return result
+
+    result = translate_epub(source, "es", translate)
+
+    assert unit_retries == 1
+    with ZipFile(BytesIO(result.content)) as archive:
+        content = archive.read("EPUB/text/chapter-0001.xhtml").decode("utf-8")
+    assert residual not in content
+
+
+def test_epub_does_not_retry_a_changed_unit_only_because_a_citation_dominates_language(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_text = (
+        "The complete English citation has a deliberately long subtitle about inner freedom, "
+        "consciousness, and the meaning of life for every attentive reader."
+    )
+    translated_text = (
+        "Referencia conservada con su título original: a deliberately long subtitle about "
+        "inner freedom, consciousness, and the meaning of life for every attentive reader."
+    )
+    unit = epub_conversion_module._EpubTranslationUnit(
+        "chapter.xhtml",
+        (),
+        f'<p xmlns="urn:test">{source_text}</p>',
+    )
+    monkeypatch.setattr(
+        epub_conversion_module,
+        "detect_language_code",
+        lambda *_args, **_kwargs: "en",
+    )
+
+    assert not epub_conversion_module._translated_unit_remains_source_language(
+        unit,
+        f'<p xmlns="urn:test">{translated_text}</p>',
+        "en",
+    )
+
+
+def test_epub_translation_repairs_invalid_and_untranslated_units_independently(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "invalid-and-untranslated.epub"
+    _write_chapterless_epub(source)
+    calls: list[bool] = []
+
+    def translate(text: str, _progress, _token) -> str:
+        is_unit_retry = "PZDOC_EPUB_XML_RETRY" in text
+        calls.append(is_unit_retry)
+        if not is_unit_retry:
+            return text.replace("Original paragraph 1.", "Párrafo & inválido.", 1)
+        return _translate_chapterless_payload(text)
+
+    result = translate_epub(source, "es", translate)
+
+    assert calls.count(False) == result.translation_parts
+    assert calls.count(True) == result.translated_units
+    with ZipFile(BytesIO(result.content)) as archive:
+        content = archive.read("EPUB/book.xhtml").decode("utf-8")
+    assert content.count("Párrafo traducido") == 30
+    assert "Original paragraph" not in content
+
+
+def test_epub_translation_starts_grouped_for_dense_short_markup(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "dense-short-units.epub"
+    markdown = "# Short Book\n\n" + "\n\n".join(
+        f"Short original sentence {index} contains clear English words." for index in range(25)
+    )
+    source.write_bytes(build_epub(markdown, (), EpubBookMetadata("Book", "en")).content)
+    calls: list[bool] = []
+
+    def translate(text: str, _progress, _token) -> str:
+        is_unit_retry = "PZDOC_EPUB_XML_RETRY" in text
+        calls.append(is_unit_retry)
+        assert not is_unit_retry
+        return text.replace("Short original sentence", "Frase original breve").replace(
+            "contains clear English words",
+            "contiene palabras claras en inglés",
+        )
+
+    result = translate_epub(source, "es", translate)
+
+    assert calls and not any(calls)
+    with ZipFile(BytesIO(result.content)) as archive:
+        content = archive.read("EPUB/text/chapter-0001.xhtml").decode("utf-8")
+    assert content.count("Frase original breve") == 25
 
 
 def test_epub_translation_completes_but_reports_checkpoint_degradation(
@@ -563,6 +1087,7 @@ def test_epub_review_route_can_remove_the_original_cover(
 ) -> None:
     source = tmp_path / "without-cover.epub"
     _write_epub3(source)
+    review_modes: list[ImprovementMode] = []
 
     def translate(markdown: str, _language: str, **kwargs) -> str:
         on_engine_ready = kwargs.get("on_engine_ready")
@@ -577,10 +1102,26 @@ def test_epub_review_route_can_remove_the_original_cover(
         )
 
     monkeypatch.setattr(processing_module, "translate_markdown_offline", translate)
+
+    def improve(markdown: str, mode: ImprovementMode, *_args, **_kwargs) -> str:
+        review_modes.append(mode)
+        return markdown
+
+    monkeypatch.setattr(processing_module, "improve_markdown", improve)
+
+    def review_translation(
+        _source_markdown: str,
+        translated_markdown: str,
+        *_args,
+        **_kwargs,
+    ) -> str:
+        review_modes.append(ImprovementMode.REVIEW_CONTENT)
+        return translated_markdown
+
     monkeypatch.setattr(
         processing_module,
-        "improve_markdown",
-        lambda markdown, *_args, **_kwargs: markdown,
+        "review_translation_markdown",
+        review_translation,
     )
     result = process_document(
         ProcessRequest(
@@ -592,24 +1133,43 @@ def test_epub_review_route_can_remove_the_original_cover(
             epub_remove_cover=True,
         ),
         settings=AppSettings(model="installed-model"),
+        epub_checkpoint_root=tmp_path / "epub-checkpoints",
+        work_checkpoint_root=tmp_path / "work-checkpoints",
     )
 
     with ZipFile(result.final_path) as archive:
         package = archive.read("EPUB/package.opf").decode("utf-8")
         assert 'properties="cover-image"' not in package
         assert not any("cover" in name.casefold() for name in archive.namelist())
+    assert result.epub_translation_parts > 0
+    assert review_modes == [ImprovementMode.REVIEW_CONTENT]
 
 
+@pytest.mark.parametrize(
+    ("review_content", "expected_mode"),
+    [
+        (False, ImprovementMode.TRANSLATE),
+        (True, ImprovementMode.CLEAN_AND_TRANSLATE),
+    ],
+)
 def test_processes_an_epub_translation_with_the_selected_ollama_model(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    review_content: bool,
+    expected_mode: ImprovementMode,
 ) -> None:
     source = tmp_path / "ai-book.epub"
     _write_epub3(source)
     calls: list[tuple[ImprovementMode, str | None]] = []
+    checkpoint_callbacks: list[tuple[object, object]] = []
+    source_languages: list[str | None] = []
 
     def improve(markdown: str, mode: ImprovementMode, _settings, language, **_kwargs) -> str:
         calls.append((mode, language))
+        checkpoint_callbacks.append(
+            (_kwargs.get("load_checkpoint"), _kwargs.get("save_checkpoint"))
+        )
+        source_languages.append(_kwargs.get("source_language_code"))
         return (
             markdown.replace("Modern Book", "Libro moderno")
             .replace("Contents", "Índice")
@@ -622,16 +1182,21 @@ def test_processes_an_epub_translation_with_the_selected_ollama_model(
     result = process_document(
         ProcessRequest(
             source,
-            convert_to_markdown=False,
+            convert_to_markdown=review_content,
             improvement_mode=ImprovementMode.TRANSLATE,
             target_language="Español",
             output_format=OutputFormat.EPUB,
+            review_content=review_content,
         ),
         settings=AppSettings(model="installed-model"),
+        epub_checkpoint_root=tmp_path / f"epub-checkpoints-{review_content}",
+        work_checkpoint_root=tmp_path / f"work-checkpoints-{review_content}",
     )
 
     assert result.final_path == tmp_path / "ai-book.es.epub"
-    assert calls == [(ImprovementMode.TRANSLATE, "Español")]
+    assert calls == [(expected_mode, "Español")]
+    assert source_languages == ["en"]
+    assert all(callable(callback) for callbacks in checkpoint_callbacks for callback in callbacks)
     with ZipFile(result.final_path) as translated:
         assert b"Contenido EPUB moderno." in translated.read("EPUB/opening.xhtml")
 
@@ -668,6 +1233,8 @@ def test_epub_translation_repairs_residual_text_before_saving_the_part(
     )
 
     assert len(calls) == 2
+    assert all("xmlns:" not in payload for payload in calls)
+    assert all("<html:" not in payload for payload in calls)
     assert result.translation_quality_report is not None
     assert result.translation_quality_report.total_issues == 0
     with ZipFile(result.final_path) as translated:
@@ -698,7 +1265,7 @@ def test_direct_epub_translation_resumes_after_an_interruption(
             interrupted_main_calls += 1
         if interrupted_main_calls == 2:
             raise ConversionError("Interrupción simulada")
-        return markdown.replace("Original paragraph", "Párrafo traducido")
+        return _translate_chapterless_payload(markdown)
 
     monkeypatch.setattr(processing_module, "translate_markdown_offline", interrupt_translation)
     with pytest.raises(ConversionError, match="Interrupción simulada"):
@@ -715,7 +1282,7 @@ def test_direct_epub_translation_resumes_after_an_interruption(
         nonlocal resumed_main_calls
         if markdown.count("PZDOC EPUB TRANSLATION UNIT") > 1:
             resumed_main_calls += 1
-        return markdown.replace("Original paragraph", "Párrafo traducido")
+        return _translate_chapterless_payload(markdown)
 
     monkeypatch.setattr(processing_module, "translate_markdown_offline", finish_translation)
     result = process_document(
@@ -739,6 +1306,48 @@ def test_rejects_a_zip_that_is_not_an_epub(tmp_path: Path) -> None:
 
     with pytest.raises(ConversionError, match="identificación mínima"):
         convert_document(source)
+
+
+def test_rejects_an_epub_member_above_the_individual_limit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "oversized-member.epub"
+    _write_epub2(source)
+    _rewrite_epub_members(source, {}, {"OEBPS/unreferenced.bin": b"x" * 2_048})
+    monkeypatch.setattr(epub_conversion_module, "_MAX_ARCHIVE_MEMBER_BYTES", 1_024)
+
+    with pytest.raises(ConversionError, match="archivo interno demasiado grande"):
+        inspect_epub_package(source)
+
+
+def test_epub_rebuild_streams_unchanged_unreferenced_members(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "streamed.epub"
+    _write_epub2(source)
+    payload = b"binary-resource" * 1_000
+    _rewrite_epub_members(source, {}, {"OEBPS/unreferenced.bin": payload})
+    original_read = ZipFile.read
+
+    def guarded_read(archive: ZipFile, name, *args, **kwargs):
+        filename = name.filename if hasattr(name, "filename") else name
+        if filename == "OEBPS/unreferenced.bin":
+            raise AssertionError("unchanged resources must be streamed")
+        return original_read(archive, name, *args, **kwargs)
+
+    monkeypatch.setattr(ZipFile, "read", guarded_read)
+
+    translated = translate_epub(
+        source,
+        "es",
+        lambda text, *_arguments: _translate_epub2_payload(text),
+    )
+
+    with ZipFile(BytesIO(translated.content)) as archive:
+        with archive.open("OEBPS/unreferenced.bin") as resource:
+            assert resource.read() == payload
 
 
 def test_every_materialized_local_link_in_fixture_has_a_target(tmp_path: Path) -> None:
@@ -826,6 +1435,43 @@ def test_epub_requires_conversion_before_cleanup_without_translation(tmp_path: P
             ),
             settings=AppSettings(model="installed-model"),
         )
+
+
+def _translate_chapterless_payload(text: str) -> str:
+    return text.replace("Original paragraph", "Párrafo traducido").replace(
+        "This is deliberately substantial text",
+        "Este es un texto deliberadamente sustancial",
+    )
+
+
+def _translate_epub2_payload(text: str) -> str:
+    replacements = (
+        ("Small Book", "Libro pequeño"),
+        ("Chapter One", "Capítulo uno"),
+        ("Chapter Two", "Capítulo dos"),
+        ("A faithful first paragraph.", "Un primer párrafo fiel."),
+        ("Read the", "Lee el"),
+        ("next chapter", "capítulo siguiente"),
+        ("Visit", "Visita"),
+        ("official site", "sitio oficial"),
+        (
+            "A deliberately long promotional sentence that crosses a page boundary and asks "
+            "readers to",
+            "Una oración promocional deliberadamente larga que cruza un límite de página y "
+            "pide a los lectores",
+        ),
+        ("visit", "visitar"),
+        ("for details", "para obtener detalles"),
+        ("Cover", "Portada"),
+        ("A faithful second paragraph.", "Un segundo párrafo fiel."),
+        ("Return to", "Vuelve al"),
+        ("chapter one", "capítulo uno"),
+        ("Document Outline", "Esquema del documento"),
+    )
+    translated = text
+    for source, target in replacements:
+        translated = translated.replace(source, target)
+    return translated
 
 
 def _write_epub2(destination: Path) -> None:

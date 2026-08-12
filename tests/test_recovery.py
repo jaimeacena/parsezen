@@ -1,14 +1,14 @@
-from parsezen.application.recovery import (
-    FailureKind,
-    ProcessingFailure,
-    RecoveryAction,
-    recovery_plan,
-)
 from parsezen.domain.stages import StageKind
 from parsezen.errors import (
     FinalIntegrityError,
     LocalModelUnavailableError,
     OutputWriteError,
+)
+from parsezen.failure_recovery import (
+    FailureKind,
+    ProcessingFailure,
+    RecoveryAction,
+    recovery_plan,
 )
 
 

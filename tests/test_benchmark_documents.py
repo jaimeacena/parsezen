@@ -67,6 +67,70 @@ def test_private_pdf_benchmark_requires_a_new_baseline_when_the_source_changes(
     assert result.problems == ("El documento cambió; vuelve a registrar su referencia.",)
 
 
+def test_private_pdf_benchmark_uses_worst_repeated_resource_sample(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "book.pdf"
+    source.write_bytes(b"%PDF")
+    samples = iter(
+        (
+            benchmark_module.PdfMetrics("a" * 64, 10, 1, 0, 0, 50, 4, 60.0, 512.0),
+            benchmark_module.PdfMetrics("a" * 64, 10, 1, 0, 0, 50, 4, 90.0, 768.0),
+        )
+    )
+    monkeypatch.setattr(benchmark_module, "measure_pdf", lambda *_args, **_kwargs: next(samples))
+
+    recorded = benchmark_module.record_manifest(
+        tmp_path / "benchmark.json",
+        (source,),
+        runs=2,
+    )[0]
+
+    assert recorded.expected.elapsed_seconds == 90.0
+    assert recorded.expected.peak_incremental_mib == 768.0
+    assert recorded.max_elapsed_seconds == pytest.approx(121.5)
+    assert recorded.max_peak_mib == pytest.approx(1_036.8)
+
+
+def test_private_pdf_benchmark_rejects_unstable_repeated_output(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "book.pdf"
+    source.write_bytes(b"%PDF")
+    samples = iter(
+        (
+            benchmark_module.PdfMetrics("a" * 64, 10, 1, 0, 0, 50, 4, 60.0, 512.0),
+            benchmark_module.PdfMetrics("b" * 64, 10, 1, 0, 0, 50, 4, 61.0, 513.0),
+        )
+    )
+    monkeypatch.setattr(benchmark_module, "measure_pdf", lambda *_args, **_kwargs: next(samples))
+
+    with pytest.raises(RuntimeError, match="salida estructural estable"):
+        benchmark_module.record_manifest(
+            tmp_path / "benchmark.json",
+            (source,),
+            runs=2,
+        )
+
+
+@pytest.mark.parametrize("runs", [0, 11, True])
+def test_private_pdf_benchmark_rejects_invalid_recording_runs(
+    tmp_path: Path,
+    runs: object,
+) -> None:
+    source = tmp_path / "book.pdf"
+    source.write_bytes(b"%PDF")
+
+    with pytest.raises(ValueError, match="repeticiones"):
+        benchmark_module.record_manifest(
+            tmp_path / "benchmark.json",
+            (source,),
+            runs=runs,  # type: ignore[arg-type]
+        )
+
+
 def test_private_pdf_benchmark_rejects_an_untrusted_manifest(tmp_path: Path) -> None:
     manifest = tmp_path / "benchmark.json"
     manifest.write_text('{"schema_version": 1, "documents": []}', encoding="utf-8")

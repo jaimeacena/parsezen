@@ -5,7 +5,7 @@ from PIL import Image
 from PySide6.QtWidgets import QApplication
 
 import parsezen.presentation.design_system as design_system_module
-from parsezen.branding import BRAND_DARK_LOGO_PATH, BRAND_LOGO_PATH
+from parsezen.branding import APP_ICON_PATH, BRAND_DARK_LOGO_PATH, BRAND_LOGO_PATH
 from parsezen.presentation.design_system import (
     COLORS,
     ThemeMode,
@@ -64,6 +64,36 @@ def test_each_theme_has_a_transparent_official_wordmark() -> None:
     for path in (Path(BRAND_LOGO_PATH), Path(BRAND_DARK_LOGO_PATH)):
         with Image.open(path).convert("RGBA") as logo:
             assert logo.getchannel("A").getextrema() == (0, 255)
+
+
+def test_every_brand_variant_keeps_the_white_outlined_official_icon() -> None:
+    with Image.open(APP_ICON_PATH).convert("RGBA") as icon:
+        pixels = tuple(icon.get_flattened_data())
+        assert icon.getchannel("A").getextrema() == (0, 255)
+        assert all(icon.getpixel(point)[3] == 0 for point in ((0, 0), (1023, 0), (0, 1023)))
+        assert (
+            sum(alpha >= 240 and min(red, green, blue) >= 240 for red, green, blue, alpha in pixels)
+            > 250_000
+        )
+
+    for path in (Path(BRAND_LOGO_PATH), Path(BRAND_DARK_LOGO_PATH)):
+        with Image.open(path).convert("RGBA") as logo:
+            icon_area = logo.crop((0, 0, logo.width // 4, logo.height))
+            pixels = tuple(icon_area.get_flattened_data())
+            assert (
+                sum(
+                    alpha >= 220 and min(red, green, blue) >= 235
+                    for red, green, blue, alpha in pixels
+                )
+                > 500
+            )
+            assert (
+                sum(
+                    alpha >= 220 and blue > red * 1.2 and green > red * 1.2
+                    for red, green, blue, alpha in pixels
+                )
+                > 200
+            )
 
 
 def test_product_ui_colours_are_centralized_in_the_design_system() -> None:

@@ -1,5 +1,5 @@
 #define AppName "Parsezen"
-#define AppVersion "1.1.0"
+#define AppVersion "1.2.0"
 
 [Setup]
 AppId={{B11F2D89-386D-42EF-9468-A8F69C329627}

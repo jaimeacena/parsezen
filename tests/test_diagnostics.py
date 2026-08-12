@@ -8,8 +8,8 @@ from PySide6.QtCore import Qt
 
 import parsezen.diagnostics as diagnostics_module
 from parsezen.diagnostics import build_diagnostic_report
-from parsezen.diagnostics_dialog import DiagnosticsDialog
-from parsezen.job_sessions import (
+from parsezen.presentation.diagnostics_dialog import DiagnosticsDialog
+from parsezen.recent_activity import (
     RecentJob,
     RecentJobStatus,
     append_recent_jobs,
@@ -26,8 +26,6 @@ def test_diagnostic_report_contains_useful_state_but_no_private_paths_or_names(
     source.write_bytes(b"%PDF-private")
     result.write_text("Private result", encoding="utf-8")
     history_path = tmp_path / "recent.json"
-    session_path = tmp_path / "active.json"
-    session_path.write_text("{}", encoding="utf-8")
     append_recent_jobs(
         (
             RecentJob(source, RecentJobStatus.COMPLETED, datetime.now(UTC), result),
@@ -54,7 +52,6 @@ def test_diagnostic_report_contains_useful_state_but_no_private_paths_or_names(
         AppSettings(model="qwen3:4b"),
         ollama_status="ready",
         installed_models=3,
-        session_path=session_path,
         history_path=history_path,
         work_checkpoint_root=checkpoint_root,
         log_path=log_path,
@@ -94,7 +91,7 @@ def test_diagnostic_report_uses_the_current_sqlite_queue_count(tmp_path: Path) -
     )
 
     assert "Documentos guardados en la cola: 4" in report
-    assert "Trabajo recuperable activo" not in report
+    assert "Documentos guardados en la cola: 4" in report
 
 
 def test_diagnostic_fallbacks_remain_sanitized_when_local_checks_fail(
@@ -122,7 +119,6 @@ def test_diagnostic_fallbacks_remain_sanitized_when_local_checks_fail(
         AppSettings(model="bad\nmodel"),
         ollama_status=None,
         installed_models=-4,
-        session_path=tmp_path / "missing-session",
         history_path=tmp_path / "missing-history",
         work_checkpoint_root=tmp_path / "missing-checkpoints",
         log_path=expected_log,
@@ -138,3 +134,29 @@ def test_diagnostic_fallbacks_remain_sanitized_when_local_checks_fail(
     assert diagnostics_module._safe_model(None) == "Ninguno"
     assert diagnostics_module._format_bytes(2 * 1024**2) == "2.0 MiB"
     assert diagnostics_module._format_bytes(3 * 1024) == "3.0 KiB"
+
+
+def test_diagnostics_uses_the_latest_canonical_early_check_failure(
+    tmp_path: Path,
+) -> None:
+    log_path = tmp_path / "parsezen.log"
+    log_path.write_text(
+        "processing_failed attempt_id=older phase=translate error_code=translation "
+        "error_type=TranslationError\n"
+        "processing_failed attempt_id=newer phase=early_check error_code=early_check "
+        "error_type=EarlyCheckError\n",
+        encoding="utf-8",
+    )
+
+    report = build_diagnostic_report(
+        AppSettings(),
+        ollama_status=None,
+        installed_models=0,
+        history_path=tmp_path / "missing-history",
+        work_checkpoint_root=tmp_path / "missing-checkpoints",
+        log_path=log_path,
+    )
+
+    assert "EarlyCheckError \u00b7 etapa comprobaci\u00f3n temprana" in report
+    assert "TranslationError" not in report
+    assert "newer" not in report

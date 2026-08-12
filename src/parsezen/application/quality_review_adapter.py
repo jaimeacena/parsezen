@@ -2,8 +2,12 @@
 
 from __future__ import annotations
 
+import hashlib
+import logging
+import re
 from pathlib import Path
 
+from parsezen.application.artifact_repository import ArtifactRepository
 from parsezen.domain.reviews import (
     ReviewChoice,
     ReviewKind,
@@ -12,9 +16,16 @@ from parsezen.domain.reviews import (
     ReviewUnit,
 )
 from parsezen.domain.stages import StageKind
-from parsezen.infrastructure.artifact_store import ArtifactStore
 from parsezen.pdf_conversion import PdfQualityReport, render_pdf_page_cover
+from parsezen.review_projection import private_review_content
 from parsezen.translation_quality import TranslationQualityReport
+
+LOGGER = logging.getLogger(__name__)
+_PDF_PAGE_MARKER_PATTERN = re.compile(
+    r"(?m)^<!--\s*PZDOC PDF PAGE \d+\s*-->[ \t]*(?:\r?\n|$)",
+    re.IGNORECASE,
+)
+_TRANSLATION_REVIEW_MAX_CHARACTERS = 640
 
 
 def create_translation_review(
@@ -23,26 +34,30 @@ def create_translation_review(
     job_id: str,
     configuration_revision: int,
     input_artifact_id: str,
-    artifacts: ArtifactStore,
+    artifacts: ArtifactRepository,
 ) -> ReviewSession | None:
     if not report.issues:
         return None
     document_text = artifacts.read_text(job_id, input_artifact_id)
     units: list[ReviewUnit] = []
     occupied: list[tuple[int, int]] = []
+    skipped_count = 0
     for index, issue in enumerate(report.issues, start=1):
-        span = _find_review_span(
+        original_context = _readable_translation_context(issue.original_excerpt)
+        translated_context = _readable_translation_context(issue.translated_excerpt)
+        span = _find_translation_span(
             document_text,
-            issue.translated_excerpt,
+            translated_context,
             occupied=tuple(occupied),
         )
         if span is None:
+            skipped_count += 1
             continue
         occupied.append(span)
         anchored_translation = document_text[slice(*span)]
         original = artifacts.put_text(
             job_id=job_id,
-            text=issue.original_excerpt,
+            text=original_context,
             media_type="text/plain; charset=utf-8",
         )
         translated = artifacts.put_text(
@@ -50,14 +65,23 @@ def create_translation_review(
             text=anchored_translation,
             media_type="text/plain; charset=utf-8",
         )
+        base_identifier = issue.identifier or f"translation-{index:04d}"
+        content_identifier = hashlib.sha256(anchored_translation.encode("utf-8")).hexdigest()[:12]
         units.append(
             ReviewUnit(
-                issue.identifier or f"translation-{index:04d}",
+                f"{base_identifier}-{content_identifier}",
                 original.id,
                 translated.id,
                 label=issue.message,
+                original_selectable=False,
+                warning=_translation_review_warning(issue.kind.value),
                 severity=_translation_issue_severity(issue.kind.value),
             )
+        )
+    if skipped_count:
+        LOGGER.warning(
+            "translation_review_issue_not_materialized count=%d",
+            skipped_count,
         )
     if not units:
         return None
@@ -78,10 +102,11 @@ def create_pdf_review(
     job_id: str,
     configuration_revision: int,
     input_artifact_id: str,
-    artifacts: ArtifactStore,
+    artifacts: ArtifactRepository,
 ) -> ReviewSession | None:
     if not report.issues:
         return None
+    document_text = artifacts.read_text(job_id, input_artifact_id)
     units: list[ReviewUnit] = []
     for index, issue in enumerate(report.issues, start=1):
         page = artifacts.put(
@@ -89,14 +114,23 @@ def create_pdf_review(
             payload=render_pdf_page_cover(source_path, issue.page_number),
             media_type="image/jpeg",
         )
+        review_text = (
+            _reviewable_pdf_page(
+                document_text,
+                issue.target_marker,
+            )
+            or issue.markdown
+        )
         converted = artifacts.put_text(
             job_id=job_id,
-            text=issue.markdown,
+            text=review_text,
             media_type="text/markdown; charset=utf-8",
         )
+        base_identifier = issue.identifier or f"pdf-page-{issue.page_number}-{index}"
+        content_identifier = hashlib.sha256(review_text.encode("utf-8")).hexdigest()[:12]
         units.append(
             ReviewUnit(
-                issue.identifier or f"pdf-page-{issue.page_number}-{index}",
+                f"{base_identifier}-{content_identifier}",
                 page.id,
                 converted.id,
                 label=f"Página {issue.page_number} · {issue.message}",
@@ -115,16 +149,44 @@ def create_pdf_review(
     )
 
 
+def _reviewable_pdf_page(document_text: str, target_marker: str) -> str | None:
+    """Return one exact transformed page so review edits match the final document."""
+
+    if not target_marker:
+        return None
+    marker_start = document_text.find(target_marker)
+    if marker_start < 0:
+        return None
+    marker_match = _PDF_PAGE_MARKER_PATTERN.match(document_text, marker_start)
+    if marker_match is None:
+        return None
+    next_marker = _PDF_PAGE_MARKER_PATTERN.search(document_text, marker_match.end())
+    page_end = next_marker.start() if next_marker is not None else len(document_text)
+    return document_text[marker_start:page_end]
+
+
 def _translation_issue_severity(kind: str) -> ReviewSeverity:
     if kind in {"source_text", "language", "fidelity"}:
         return ReviewSeverity.HIGH
     return ReviewSeverity.MEDIUM
 
 
+def _translation_review_warning(kind: str) -> str | None:
+    if kind == "source_text":
+        return (
+            "Este fragmento parece conservar texto en el idioma original. "
+            "Traduce únicamente todo el texto visible del panel derecho; "
+            "no necesitas continuar fuera del fragmento."
+        )
+    if kind == "language":
+        return "Comprueba que todo el fragmento esté escrito en el idioma del resultado."
+    return None
+
+
 def apply_translation_review(
     text: str,
     review: ReviewSession,
-    artifacts: ArtifactStore,
+    artifacts: ArtifactRepository,
 ) -> str:
     replacements: list[tuple[str, str]] = []
     for unit in review.units:
@@ -145,7 +207,7 @@ def apply_translation_review(
 def apply_pdf_review(
     text: str,
     review: ReviewSession,
-    artifacts: ArtifactStore,
+    artifacts: ArtifactRepository,
 ) -> str:
     replacements: list[tuple[str, str]] = []
     insertions: list[tuple[str, str]] = []
@@ -174,7 +236,7 @@ def apply_pdf_review(
 def _selected_text(
     review: ReviewSession,
     unit: ReviewUnit,
-    artifacts: ArtifactStore,
+    artifacts: ArtifactRepository,
 ) -> str:
     if unit.choice is ReviewChoice.EDITED:
         if unit.edited_artifact_id is None:
@@ -184,13 +246,94 @@ def _selected_text(
         if not unit.original_selectable:
             raise ValueError("La imagen original no puede sustituir al texto convertido.")
         return artifacts.read_text(review.job_id, unit.original_artifact_id)
-    if unit.choice is ReviewChoice.PROPOSED and unit.proposed_artifact_id is not None:
+    if unit.choice is ReviewChoice.NO_TEXT:
+        if review.kind is not ReviewKind.OCR or unit.proposed_artifact_id is None:
+            raise ValueError("La opción de texto vacío solo está disponible para OCR.")
+        return private_review_content(
+            artifacts.read_text(review.job_id, unit.proposed_artifact_id),
+        )
+    if unit.choice is ReviewChoice.PROPOSED:
+        if not unit.proposed_selectable or unit.proposed_artifact_id is None:
+            raise ValueError("La propuesta de esta revisión no se puede seleccionar.")
         return artifacts.read_text(review.job_id, unit.proposed_artifact_id)
     raise ValueError("Decide todos los elementos de la revisión antes de continuar.")
 
 
 def _replace_review_excerpt(text: str, original: str, replacement: str) -> str:
     return _apply_review_replacements(text, ((original, replacement),))
+
+
+def _find_translation_span(
+    text: str,
+    excerpt: str,
+    *,
+    occupied: tuple[tuple[int, int], ...] = (),
+) -> tuple[int, int] | None:
+    """Anchor one readable fragment without expanding it to a whole page or block."""
+
+    prefix, truncated = _truncated_excerpt_prefix(excerpt)
+    match = _find_review_span(text, prefix if truncated else excerpt, occupied=occupied)
+    if match is None:
+        return None
+    if not truncated or prefix.rstrip().endswith((".", "!", "?")):
+        return match
+    return _complete_translation_span(text, match, occupied=occupied)
+
+
+def _truncated_excerpt_prefix(excerpt: str) -> tuple[str, bool]:
+    compact = excerpt.rstrip()
+    if compact.endswith("…"):
+        prefix = _drop_possible_partial_word(compact[:-1].rstrip())
+        return prefix, bool(prefix)
+    if compact.endswith("..."):
+        prefix = _drop_possible_partial_word(compact[:-3].rstrip())
+        return prefix, bool(prefix)
+    return excerpt, False
+
+
+def _drop_possible_partial_word(prefix: str) -> str:
+    """Remove only the final token of an explicitly truncated preview."""
+
+    if not prefix or prefix[-1] in ".!?;:":
+        return prefix
+    head, separator, _tail = prefix.rpartition(" ")
+    return head.rstrip() if separator and head.strip() else prefix
+
+
+def _complete_translation_span(
+    text: str,
+    span: tuple[int, int],
+    *,
+    occupied: tuple[tuple[int, int], ...],
+) -> tuple[int, int]:
+    """Finish the current sentence while keeping the editable fragment bounded."""
+
+    limit = min(len(text), span[0] + _TRANSLATION_REVIEW_MAX_CHARACTERS)
+    paragraph_end = text.find("\n\n", span[1], limit)
+    if paragraph_end >= 0:
+        limit = paragraph_end
+    marker_end = text.find("<!-- PZDOC PDF PAGE ", span[1], limit)
+    if marker_end >= 0:
+        limit = marker_end
+    ending = re.search(r"[.!?](?=\s|$)", text[span[1] : limit])
+    completed = (span[0], span[1] + ending.end()) if ending is not None else span
+    return span if _overlaps(completed, occupied) else completed
+
+
+def _readable_translation_context(excerpt: str) -> str:
+    """Present a bounded report preview at a sentence or word boundary."""
+
+    compact = excerpt.strip()
+    marker = "…" if compact.endswith("…") else "..." if compact.endswith("...") else ""
+    if not marker:
+        return compact
+    body = compact[: -len(marker)].rstrip()
+    sentence_ends = tuple(re.finditer(r"[.!?](?=\s|$)", body))
+    if sentence_ends:
+        body = body[: sentence_ends[-1].end()].rstrip()
+    else:
+        body = _drop_possible_partial_word(body)
+    return f"{body} …" if body else compact
 
 
 def _apply_review_replacements(

@@ -963,10 +963,47 @@ def apply_parsezen_theme(
             color: {COLORS.text_primary};
             font-weight: 650;
         }}
+        QLabel#preflightDocumentName {{
+            font-size: {TYPOGRAPHY.section_points}pt;
+        }}
+        QLabel#preflightSectionTitle {{
+            color: {COLORS.text_primary};
+            font-weight: 650;
+            margin-top: {SPACING.sm}px;
+        }}
+        QLabel#preflightDuration {{
+            color: {COLORS.text_primary};
+            font-size: 13pt;
+            font-weight: 650;
+        }}
+        QLabel#preflightFlow {{
+            color: {COLORS.text_primary};
+            padding-top: {SPACING.xs}px;
+        }}
         QFrame#preflightDocument {{
             background-color: transparent;
             border: none;
             border-bottom: 1px solid {COLORS.divider};
+        }}
+        QFrame#preflightTechnicalDetails {{
+            background-color: transparent;
+            border: none;
+            border-top: 1px solid {COLORS.divider};
+        }}
+        QPushButton#preflightDetailsToggle {{
+            color: {COLORS.text_secondary};
+            background-color: transparent;
+            border: none;
+            padding: {SPACING.xs}px 0;
+            min-height: 32px;
+        }}
+        QPushButton#preflightDetailsToggle:hover {{
+            color: {COLORS.text_primary};
+            background-color: transparent;
+        }}
+        QPushButton#preflightDetailsToggle:focus {{
+            border: 2px solid {COLORS.focus_ring};
+            border-radius: {RADIUS_SMALL}px;
         }}
         QLabel#preflightFinding[severity="attention"] {{
             color: {COLORS.warning};
@@ -1175,6 +1212,10 @@ def apply_parsezen_theme(
             border: none;
             border-radius: {RADIUS_SMALL}px;
         }}
+        QFrame#reviewPane[selected="true"] {{
+            background-color: {COLORS.action_primary_soft};
+            border: none;
+        }}
         QFrame#revisionOriginalPane, QFrame#revisionProposalPane,
         QFrame#epubStructurePane, QFrame#epubPreviewPane {{
             background-color: {COLORS.surface};
@@ -1314,6 +1355,19 @@ def apply_parsezen_theme(
             color: {COLORS.text_primary};
             font-size: 11pt;
             font-weight: 650;
+        }}
+        QLabel#activityFailureHeading {{
+            color: {COLORS.text_primary};
+            font-weight: 650;
+            margin-top: {SPACING.xs}px;
+        }}
+        QLabel#activityFailureMessage, QLabel#activityReusableWork,
+        QLabel#activityTimeline {{
+            color: {COLORS.text_primary};
+        }}
+        QLabel#activityReference, QLabel#activityRecoveryNote,
+        QLabel#activityFeedback {{
+            color: {COLORS.text_secondary};
         }}
         QFrame#activityDetails {{
             background-color: transparent;

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "parsezen"
-version = "1.1.0"
+version = "1.2.0"
 description = "Aplicación local para convertir, revisar y traducir documentos en Markdown y EPUB"
 readme = "README.md"
 license = "MIT"

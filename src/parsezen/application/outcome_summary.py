@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from parsezen.domain.estimates import DurationEstimate
-from parsezen.domain.jobs import DocumentFormat, DocumentJob
+from parsezen.domain.jobs import DocumentFormat, DocumentJob, ProcessingPlan
 from parsezen.domain.outcomes import EarlyCheckReport, OutcomeSummary
 from parsezen.domain.reviews import ReviewChoice, ReviewSession
 from parsezen.processing import ProcessResult
@@ -24,12 +24,14 @@ def build_outcome_summary(
     pdf_report = result.pdf_quality_report
     translation_report = result.translation_quality_report
     integrity = result.final_integrity_report
+    recommendation = job.review_recommendation
     operations: list[str] = ["Conversión"]
     if job.configuration.translation.enabled:
         operations.append("Traducción")
-    if job.configuration.refinement.enabled:
+    reviewed = job.configuration.plan is ProcessingPlan.LOCAL_AI_REVIEWED
+    if reviewed:
         operations.append("Corrección")
-    if job.configuration.structure.enabled:
+    if reviewed and job.configuration.output.format is DocumentFormat.EPUB:
         operations.append("Pre-organización")
     if job.configuration.output.format is DocumentFormat.EPUB:
         operations.append("Edición EPUB")
@@ -56,9 +58,8 @@ def build_outcome_summary(
             job.configuration.output.format is DocumentFormat.EPUB and result.revision_approved
         ),
         manual_review_expected=(
-            (job.configuration.translation.enabled and job.configuration.translation.manual_review)
-            or (job.configuration.refinement.enabled and job.configuration.refinement.manual_review)
-            or (job.configuration.structure.enabled and job.configuration.structure.manual_review)
+            job.configuration.translation.enabled
+            or reviewed
             or job.configuration.output.format is DocumentFormat.EPUB
         ),
         integrity_verified=bool(integrity is not None and integrity.verified),
@@ -73,4 +74,7 @@ def build_outcome_summary(
         estimate_upper_seconds=(estimate.upper_seconds if estimate is not None else None),
         early_check_pages=(len(early_check.sampled_pages) if early_check is not None else 0),
         early_check_warnings=(early_check.warning_pages if early_check is not None else 0),
+        ai_review_recommended=recommendation is not None,
+        ai_review_blocks=(len(recommendation.block_positions) if recommendation is not None else 0),
+        ai_review_signals=(recommendation.signal_total if recommendation is not None else 0),
     )

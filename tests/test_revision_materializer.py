@@ -64,3 +64,26 @@ def test_revision_materializer_marks_high_risk_changes_as_original_by_default(
     assert review is not None
     assert review.units[0].recommended_choice is ReviewChoice.ORIGINAL
     assert review.units[0].warning is not None
+
+
+def test_revision_materializer_quarantines_invented_blocks_without_artifacts(
+    tmp_path: Path,
+) -> None:
+    draft = build_revision_draft(
+        "Original conservado.\n",
+        "Original conservado.\n\nPárrafo inventado por el modelo.\n",
+        kinds=frozenset({RevisionKind.CONTENT}),
+    )
+    store = ArtifactStore(tmp_path / "artifacts", protect=reversible, unprotect=reversible)
+
+    review = create_revision_review(
+        draft,
+        revision_kind=RevisionKind.CONTENT,
+        job_id="job",
+        configuration_revision=1,
+        artifacts=store,
+    )
+
+    assert review is None
+    assert not (store.root / "job").exists()
+    assert render_revision_reviews(draft, (), store) == draft.original_markdown

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import zlib
+from dataclasses import replace
 from pathlib import Path
 from statistics import median
 from types import SimpleNamespace
@@ -262,6 +264,28 @@ def test_extracts_sorted_unique_pages_from_pdf_review_warnings() -> None:
 """
 
     assert extract_pdf_warning_pages(markdown) == (2, 9)
+
+
+def test_table_renderer_uses_markdown_html_and_reviewable_text_fallbacks() -> None:
+    simple = (("Name", "Value"), ("A", "1"), ("B", "2"))
+    assert pdf_conversion_module._table_rendering(simple, 2).value == "markdown"
+    assert "| Name | Value |" in pdf_conversion_module._markdown_table(simple)
+
+    multiline = (("Name", "Notes"), ("A", "first\nsecond"))
+    assert pdf_conversion_module._table_rendering(multiline, 2).value == "html"
+    assert "<br>" in pdf_conversion_module._html_table(multiline)
+
+    complex_rows = tuple((f"row-{index}", "value") for index in range(81))
+    assert pdf_conversion_module._table_rendering(complex_rows, 2).value == "structured_text"
+    blocks = []
+    table = pdf_conversion_module._PdfTable(
+        (10.0, 10.0, 200.0, 300.0),
+        complex_rows,
+        pdf_conversion_module._TableRendering.STRUCTURED_TEXT,
+    )
+    pdf_conversion_module._append_pdf_table(blocks, 7, table)
+    assert any(block.kind == "warning" and "página 7" in block.text for block in blocks)
+    assert any("Tabla recuperada" in block.text for block in blocks)
 
 
 def test_explains_that_an_empty_pdf_has_nothing_to_recognize(tmp_path: Path) -> None:
@@ -621,7 +645,7 @@ def test_repairs_a_long_spaced_word_without_joining_surrounding_prose() -> None:
 
 
 def test_splits_widely_separated_columns_and_orders_each_column_contiguously() -> None:
-    def line(text: str, x0: float, x1: float, top: float) -> object:
+    def line(text: str, x0: float, x1: float, top: float, *, bold: bool = False) -> object:
         return pdf_conversion_module._PdfLine(
             page_number=1,
             page_width=600,
@@ -633,14 +657,14 @@ def test_splits_widely_separated_columns_and_orders_each_column_contiguously() -
             top=top,
             bottom=top + 12,
             font_size=12,
-            bold=False,
+            bold=bold,
             links=(),
             soft_hyphen_end=False,
             hard_hyphen_end=False,
             rotated=False,
         )
 
-    heading = line("Chapter", 170, 430, 50)
+    heading = line("Chapter", 170, 430, 50, bold=True)
     source_order = [
         heading,
         line("Left one", 50, 270, 100),
@@ -662,6 +686,811 @@ def test_splits_widely_separated_columns_and_orders_each_column_contiguously() -
         "Right two",
         "Right three",
     ]
+
+
+def test_detects_a_scanned_table_from_repeated_side_by_side_text() -> None:
+    def line(text: str, x0: float, x1: float, top: float, *, bold: bool = False) -> object:
+        return pdf_conversion_module._PdfLine(
+            page_number=1,
+            page_width=600,
+            page_height=800,
+            text=text,
+            chars=(),
+            x0=x0,
+            x1=x1,
+            top=top,
+            bottom=top + 12,
+            font_size=12,
+            bold=bold,
+            links=(),
+            soft_hyphen_end=False,
+            hard_hyphen_end=False,
+            rotated=False,
+        )
+
+    grid = (
+        line("Key", 50, 90, 100, bold=True),
+        line("Kind", 180, 220, 100, bold=True),
+        line("Description", 300, 390, 100, bold=True),
+        *(
+            item
+            for row, top in enumerate((130.0, 160.0, 190.0), start=1)
+            for item in (
+                line(f"Item {row}", 50, 100, top),
+                line(f"Type {row}", 180, 230, top),
+                line(f"Description {row}", 300, 500, top),
+            )
+        ),
+    )
+    prose = tuple(
+        line(f"Complete prose line {row}", 50, 540, top)
+        for row, top in enumerate(range(100, 300, 20))
+    )
+
+    assert pdf_conversion_module._has_spatial_table_candidate(grid)
+    assert not pdf_conversion_module._has_spatial_table_candidate(prose)
+
+
+def test_spatial_table_boundaries_use_real_gutters_without_cutting_wide_cells() -> None:
+    def line(text: str, x0: float, x1: float, top: float) -> object:
+        return pdf_conversion_module._PdfLine(
+            page_number=1,
+            page_width=432,
+            page_height=648,
+            text=text,
+            chars=(),
+            x0=x0,
+            x1=x1,
+            top=top,
+            bottom=top + 10,
+            font_size=10,
+            bold=False,
+            links=(),
+            soft_hyphen_end=False,
+            hard_hyphen_end=False,
+            rotated=False,
+        )
+
+    lines = tuple(
+        item
+        for top in (70.0, 100.0, 130.0)
+        for item in (
+            line("Aries", 30, 65, top),
+            line("Fire", 129, 165, top),
+            line("Cardinal/Coagula", 228, 304, top),
+            line("Fixed/Conjunctio", 329, 396, top),
+        )
+    )
+    rules = tuple(
+        pdf_conversion_module._RasterHorizontalRule(20, top, 410)
+        for top in (60.0, 90.0, 120.0, 150.0, 180.0)
+    )
+    boundaries = pdf_conversion_module._spatial_table_boundaries(
+        lines,
+        pdf_conversion_module._side_by_side_line_indexes(lines, 432),
+        432,
+        648,
+        rules,
+    )
+
+    assert boundaries is not None
+    vertical, _horizontal = boundaries
+    assert 304 < vertical[-2] < 329
+
+
+def test_spatial_table_rules_split_at_an_explicit_caption() -> None:
+    caption = pdf_conversion_module._PdfLine(
+        page_number=1,
+        page_width=432,
+        page_height=648,
+        text="Table 2. Secondary correspondences",
+        chars=(),
+        x0=100,
+        x1=330,
+        top=160,
+        bottom=172,
+        font_size=12,
+        bold=True,
+        links=(),
+        soft_hyphen_end=False,
+        hard_hyphen_end=False,
+        rotated=False,
+    )
+    rules = tuple(
+        pdf_conversion_module._RasterHorizontalRule(20, top, 410)
+        for top in (60.0, 90.0, 120.0, 200.0, 230.0, 260.0)
+    )
+
+    groups = pdf_conversion_module._spatial_table_rule_groups(rules, (caption,))
+
+    assert tuple(len(group) for group in groups) == (3, 3)
+
+
+def test_short_captioned_table_keeps_columns_with_blank_cells_in_the_first_row() -> None:
+    def line(text: str, x0: float, x1: float, top: float) -> object:
+        return pdf_conversion_module._PdfLine(
+            page_number=1,
+            page_width=432,
+            page_height=648,
+            text=text,
+            chars=(),
+            x0=x0,
+            x1=x1,
+            top=top,
+            bottom=top + 10,
+            font_size=10,
+            bold=False,
+            links=(),
+            soft_hyphen_end=False,
+            hard_hyphen_end=False,
+            rotated=False,
+        )
+
+    lines = (
+        line("Element", 130, 175, 70),
+        line("Mode of sign", 230, 300, 70),
+        line("Mode of decan", 330, 405, 70),
+        line("Aries 1", 30, 70, 100),
+        line("Fire", 130, 155, 100),
+        line("Cardinal", 330, 375, 100),
+    )
+    rules = tuple(
+        pdf_conversion_module._RasterHorizontalRule(20, top, 410) for top in (60.0, 90.0, 120.0)
+    )
+
+    boundaries = pdf_conversion_module._spatial_table_boundaries(
+        lines,
+        pdf_conversion_module._side_by_side_line_indexes(lines, 432),
+        432,
+        648,
+        rules,
+        allow_singleton_columns=True,
+    )
+
+    assert boundaries is not None
+    vertical, horizontal = boundaries
+    assert len(vertical) == 5
+    assert 70 < vertical[1] < 130
+    assert 175 < vertical[2] < 230
+    assert 300 < vertical[3] < 330
+    assert len(horizontal) == 3
+
+
+def test_recovers_a_raster_ruled_table_without_absorbing_following_prose(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "raster-ruled-table.pdf"
+    _write_raster_ruled_table_pdf(source)
+
+    page = pdf_conversion_module._extract_pages(source, None)[0]
+
+    assert len(page.tables) == 1
+    assert page.has_table
+    assert page.tables[0].rows == (
+        ("Key", "Count", "Description"),
+        ("Alpha", "17", "First description\ncontinues here"),
+        ("Beta", "23", "Second description"),
+        ("Gamma", "41", "Third description"),
+    )
+    assert page.tables[0].bbox[3] < next(
+        line.top for line in page.lines if line.text.startswith("Following prose")
+    )
+    assert (
+        pdf_conversion_module._deserialize_page_checkpoint(
+            pdf_conversion_module._serialize_page_checkpoint(page),
+            1,
+        )
+        == page
+    )
+
+
+def test_table_cells_join_discretionary_and_typesetting_hyphens() -> None:
+    assert pdf_conversion_module._normalize_table_cell("pre\u00ad\ntending") == "pretending"
+    assert pdf_conversion_module._render_table_cell("wak-\nling") == "wakling"
+    assert pdf_conversion_module._render_table_cell("ISO-\n9001") == "ISO-\n9001"
+
+
+def test_table_rendering_preserves_an_empty_header_without_inventing_a_label() -> None:
+    rows = (("", "Image"), ("Aries I", "A figure"))
+
+    assert pdf_conversion_module._markdown_table(rows).startswith("|  | Image |")
+    assert "<th></th><th>Image</th>" in pdf_conversion_module._html_table(rows)
+    assert "Columna" not in pdf_conversion_module._html_table(rows)
+
+
+def test_recovers_a_short_captioned_table_with_only_outer_raster_rules(tmp_path: Path) -> None:
+    source = tmp_path / "short-raster-ruled-table.pdf"
+    _write_short_raster_ruled_table_pdf(source)
+
+    page = pdf_conversion_module._extract_pages(source, None)[0]
+
+    assert len(page.tables) == 1
+    assert page.tables[0].rows == (
+        ("Decan", "Name", "Source", "Image"),
+        ("Aries 1", "Chontare", "Aulathamas", "First description continues here"),
+        ("Aries 2", "Chontachre", "Sabaoth", "Second description continues here"),
+    )
+
+
+def test_raster_ruled_table_with_a_link_stays_in_the_normal_text_flow(tmp_path: Path) -> None:
+    source = tmp_path / "linked-raster-table.pdf"
+    _write_raster_ruled_table_pdf(source, linked=True)
+
+    page = pdf_conversion_module._extract_pages(source, None)[0]
+
+    assert page.tables == ()
+    assert not page.has_table
+    assert any(line.links for line in page.lines)
+
+
+def test_table_checkpoint_accepts_complex_output_but_rejects_unsafe_geometry(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "raster-ruled-table.pdf"
+    _write_raster_ruled_table_pdf(source)
+    page = pdf_conversion_module._extract_pages(source, None)[0]
+    rows = (("First", "Second"),) + tuple(
+        (f"Item {index}", f"Value {index}") for index in range(80)
+    )
+    complex_page = replace(
+        page,
+        tables=(
+            pdf_conversion_module._PdfTable(
+                page.tables[0].bbox,
+                rows,
+                pdf_conversion_module._TableRendering.STRUCTURED_TEXT,
+            ),
+        ),
+    )
+    payload = pdf_conversion_module._serialize_page_checkpoint(complex_page)
+
+    assert pdf_conversion_module._deserialize_page_checkpoint(payload, 1) == complex_page
+
+    unsafe_bbox = json.loads(payload)
+    unsafe_bbox["tables"][0]["bbox"] = [0, 0, 100_000, 100_000]
+    ragged = json.loads(payload)
+    ragged["tables"][0]["rows"][1].append("unexpected")
+
+    assert pdf_conversion_module._deserialize_page_checkpoint(json.dumps(unsafe_bbox), 1) is None
+    assert pdf_conversion_module._deserialize_page_checkpoint(json.dumps(ragged), 1) is None
+
+
+def test_orders_three_text_columns_contiguously() -> None:
+    def line(text: str, x0: float, x1: float, top: float, *, bold: bool = False) -> object:
+        return pdf_conversion_module._PdfLine(
+            page_number=1,
+            page_width=600,
+            page_height=800,
+            text=text,
+            chars=(),
+            x0=x0,
+            x1=x1,
+            top=top,
+            bottom=top + 12,
+            font_size=10,
+            bold=bold,
+            links=(),
+            soft_hyphen_end=False,
+            hard_hyphen_end=False,
+            rotated=False,
+        )
+
+    heading = line("Index", 170, 430, 50, bold=True)
+    source_order = [heading]
+    for row, top in enumerate((100.0, 120.0, 140.0), start=1):
+        source_order.extend(
+            (
+                line(f"Left {row}", 40, 170, top),
+                line(f"Middle {row}", 240, 370, top),
+                line(f"Right {row}", 440, 570, top),
+            )
+        )
+
+    ordered = pdf_conversion_module._reading_order_lines(source_order)
+
+    assert [item.text for item in ordered] == [
+        "Index",
+        "Left 1",
+        "Left 2",
+        "Left 3",
+        "Middle 1",
+        "Middle 2",
+        "Middle 3",
+        "Right 1",
+        "Right 2",
+        "Right 3",
+    ]
+
+
+def test_pairs_a_detached_toc_page_number_column_by_visual_row() -> None:
+    number_link = pdf_conversion_module._PdfLink("#page-9", 500, 520, 100, 112)
+
+    def line(
+        text: str,
+        x0: float,
+        x1: float,
+        top: float,
+        *,
+        links: tuple[pdf_conversion_module._PdfLink, ...] = (),
+    ) -> pdf_conversion_module._PdfLine:
+        return pdf_conversion_module._PdfLine(
+            page_number=1,
+            page_width=600,
+            page_height=800,
+            text=text,
+            chars=(),
+            x0=x0,
+            x1=x1,
+            top=top,
+            bottom=top + 12,
+            font_size=10,
+            bold=False,
+            links=links,
+            soft_hyphen_end=False,
+            hard_hyphen_end=False,
+            rotated=False,
+        )
+
+    source_order = [
+        line("Table of Contents", 60, 240, 50),
+        line("Opening", 70, 150, 100),
+        line("First chapter", 70, 190, 120),
+        line("Second chapter", 70, 205, 140),
+        line("9", 500, 510, 100, links=(number_link,)),
+        line("17", 500, 520, 120),
+        line("31", 500, 520, 140),
+    ]
+
+    normalized = pdf_conversion_module._normalize_toc_entry_rows(source_order)
+
+    assert [item.text for item in normalized] == [
+        "Table of Contents",
+        "Opening 9",
+        "First chapter 17",
+        "Second chapter 31",
+    ]
+    assert len(normalized[1].links) == 1
+    assert normalized[1].links[0].target == number_link.target
+    assert (normalized[1].links[0].x0, normalized[1].links[0].x1) == (70, 510)
+
+
+def test_leaves_an_uncertain_small_page_number_column_untouched() -> None:
+    lines = [
+        _pdf_model_line(1, "Contents"),
+        _pdf_model_line(1, "Opening"),
+        replace(_pdf_model_line(1, "9"), x0=500, x1=510),
+        _pdf_model_line(1, "First chapter"),
+        replace(_pdf_model_line(1, "17"), x0=500, x1=520),
+        _pdf_model_line(1, "Body note"),
+    ]
+
+    assert pdf_conversion_module._normalize_toc_entry_rows(lines) == lines
+
+
+def test_pairs_toc_folios_without_interleaving_two_existing_columns() -> None:
+    def line(text: str, x0: float, x1: float, top: float) -> pdf_conversion_module._PdfLine:
+        return replace(
+            _pdf_model_line(1, text),
+            x0=x0,
+            x1=x1,
+            top=top,
+            bottom=top + 10,
+            font_size=10,
+        )
+
+    source_order = [
+        line("Contents", 40, 170, 40),
+        line("Left one", 40, 130, 100),
+        line("Left two", 40, 130, 120),
+        line("Left three", 40, 140, 140),
+        line("9", 250, 260, 100),
+        line("17", 250, 270, 120),
+        line("25", 250, 270, 140),
+        line("Right one", 330, 430, 100),
+        line("Right two", 330, 430, 120),
+        line("Right three", 330, 440, 140),
+        line("33", 550, 570, 100),
+        line("41", 550, 570, 120),
+        line("49", 550, 570, 140),
+    ]
+
+    normalized = pdf_conversion_module._normalize_toc_entry_rows(source_order)
+
+    assert [item.text for item in normalized] == [
+        "Contents",
+        "Left one 9",
+        "Left two 17",
+        "Left three 25",
+        "Right one 33",
+        "Right two 41",
+        "Right three 49",
+    ]
+
+
+def test_repairs_toc_spacing_and_roman_glyphs_only_with_native_heading_consensus() -> None:
+    def line(
+        page_number: int,
+        text: str,
+        *,
+        top: float = 50,
+        size: float = 18,
+        bold: bool = True,
+    ) -> pdf_conversion_module._PdfLine:
+        return pdf_conversion_module._PdfLine(
+            page_number=page_number,
+            page_width=600,
+            page_height=800,
+            text=text,
+            chars=(),
+            x0=70,
+            x1=530,
+            top=top,
+            bottom=top + size,
+            font_size=size,
+            bold=bold,
+            links=(),
+            soft_hyphen_end=False,
+            hard_hyphen_end=False,
+            rotated=False,
+        )
+
+    pages = [
+        pdf_conversion_module._PdfPage(
+            number=number,
+            lines=(reference,),
+            has_images=False,
+            image_area_ratios=(),
+            has_table=False,
+            image_orientation_mismatch=False,
+        )
+        for number, reference in enumerate(
+            (
+                line(10, "ARIES I: THE AXE"),
+                line(11, "ARIES II: THE CROWN"),
+                line(12, "ARIES III: THE ROSE"),
+                line(
+                    13,
+                    "table 4. Gods and Spirits from The 36 Airs of the Zodiac",
+                    size=10,
+                    bold=False,
+                ),
+                line(
+                    14,
+                    "table 13. Angelic correspondences, from Book T and 777",
+                    size=10,
+                    bold=False,
+                ),
+            ),
+            start=10,
+        )
+    ]
+    exact, romans = pdf_conversion_module._native_toc_heading_references(
+        pages,
+        body_size=10,
+        heading_sizes={18.0: 2},
+        repeated_margins=set(),
+    )
+    toc_lines = [
+        line(1, "ARIES 1 53", size=10, bold=False),
+        line(1, "ARIES 11 59", size=10, bold=False),
+        line(1, "ARIES III 64", size=10, bold=False),
+        line(
+            1,
+            "4- Gods and Spirits from The 3 6 Airs of the Zodiac 279",
+            size=10,
+            bold=False,
+        ),
+        line(
+            1,
+            "13. Angelic correspondences, from Book Tand 777 310",
+            size=10,
+            bold=False,
+        ),
+        line(1, "TAURUS 11 74", size=10, bold=False),
+    ]
+
+    repaired = pdf_conversion_module._repair_toc_entries_from_native_headings(
+        toc_lines,
+        exact,
+        romans,
+    )
+
+    assert [item.text for item in repaired] == [
+        "ARIES I 53",
+        "ARIES II 59",
+        "ARIES III 64",
+        "4- Gods and Spirits from The 36 Airs of the Zodiac 279",
+        "13. Angelic correspondences, from Book T and 777 310",
+        "TAURUS 11 74",
+    ]
+
+
+def test_renders_toc_entries_as_distinct_markdown_list_rows() -> None:
+    def line(
+        text: str,
+        x0: float,
+        x1: float,
+        top: float,
+        *,
+        size: float = 10,
+    ) -> pdf_conversion_module._PdfLine:
+        return pdf_conversion_module._PdfLine(
+            page_number=1,
+            page_width=600,
+            page_height=800,
+            text=text,
+            chars=(),
+            x0=x0,
+            x1=x1,
+            top=top,
+            bottom=top + size,
+            font_size=size,
+            bold=False,
+            links=(),
+            soft_hyphen_end=False,
+            hard_hyphen_end=False,
+            rotated=False,
+        )
+
+    page = pdf_conversion_module._PdfPage(
+        number=1,
+        lines=(
+            line("Table of Contents", 60, 260, 50, size=18),
+            line("Opening", 70, 150, 100, size=18),
+            line("First chapter", 70, 190, 120),
+            line("Second chapter", 70, 205, 140),
+            line("9", 500, 510, 100),
+            line("17", 500, 520, 120),
+            line("31", 500, 520, 140),
+        ),
+        has_images=False,
+        image_area_ratios=(),
+        has_table=False,
+        image_orientation_mismatch=False,
+    )
+
+    markdown, _issues = pdf_conversion_module._render_document(
+        [page],
+        body_size=10,
+        heading_sizes={18.0: 2},
+        repeated_margins=set(),
+        referenced_pages=set(),
+        ocr_pages={},
+        ocr_failed_pages=set(),
+    )
+
+    assert "## Table of Contents" in markdown
+    assert "- Opening 9\n- First chapter 17\n- Second chapter 31" in markdown
+
+
+def test_separates_unnumbered_toc_sections_from_adjacent_list_entries() -> None:
+    blocks = [
+        pdf_conversion_module._MarkdownBlock("toc", "- PISCES III 258", 6),
+        pdf_conversion_module._MarkdownBlock("toc", "**APPENDICES**", 6),
+        pdf_conversion_module._MarkdownBlock("toc", "- Decanic Magic 266", 6),
+        pdf_conversion_module._MarkdownBlock(
+            "toc",
+            "**TABLES OF CORRESPONDENCE**",
+            6,
+        ),
+    ]
+
+    assert pdf_conversion_module._blocks_to_markdown(blocks) == (
+        "- PISCES III 258\n\n**APPENDICES**\n\n- Decanic Magic 266\n\n**TABLES OF CORRESPONDENCE**"
+    )
+
+
+def test_table_ocr_requires_faithful_size_tokens_and_numbers() -> None:
+    def line(text: str, top: float) -> object:
+        return pdf_conversion_module._PdfLine(
+            page_number=1,
+            page_width=600,
+            page_height=800,
+            text=text,
+            chars=(),
+            x0=50,
+            x1=540,
+            top=top,
+            bottom=top + 12,
+            font_size=12,
+            bold=False,
+            links=(),
+            soft_hyphen_end=False,
+            hard_hyphen_end=False,
+            rotated=False,
+        )
+
+    page = pdf_conversion_module._PdfPage(
+        number=1,
+        lines=(
+            line("Quarter Total", 100),
+            line("Q1 120", 120),
+            line("Q2 135", 140),
+        ),
+        has_images=True,
+        image_area_ratios=(0.95,),
+        has_table=True,
+        image_orientation_mismatch=False,
+        tables=(
+            pdf_conversion_module._PdfTable(
+                (40, 80, 560, 160),
+                (("Quarter", "Total"), ("Q1", "120"), ("Q2", "135")),
+                pdf_conversion_module._TableRendering.MARKDOWN,
+            ),
+        ),
+    )
+    faithful = "| Quarter | Total |\n| --- | --- |\n| Q1 | 120 |\n| Q2 | 135 |"
+    changed_number = faithful.replace("135", "136")
+    exploded = "\n".join(faithful for _ in range(6))
+
+    assert pdf_conversion_module._table_ocr_is_faithful(page, faithful)
+    assert not pdf_conversion_module._table_ocr_is_faithful(page, changed_number)
+    assert not pdf_conversion_module._table_ocr_is_faithful(page, exploded)
+
+
+def test_table_ocr_cannot_drop_a_column_with_an_empty_data_cell() -> None:
+    def line(text: str, top: float) -> object:
+        return pdf_conversion_module._PdfLine(
+            page_number=1,
+            page_width=432,
+            page_height=648,
+            text=text,
+            chars=(),
+            x0=40,
+            x1=405,
+            top=top,
+            bottom=top + 10,
+            font_size=10,
+            bold=False,
+            links=(),
+            soft_hyphen_end=False,
+            hard_hyphen_end=False,
+            rotated=False,
+        )
+
+    page = pdf_conversion_module._PdfPage(
+        number=1,
+        lines=(
+            line("DECAN QUALITY IMAGE", 70),
+            line("Aries I A complete figure description", 100),
+        ),
+        has_images=True,
+        image_area_ratios=(0.95,),
+        has_table=True,
+        image_orientation_mismatch=False,
+        tables=(
+            pdf_conversion_module._PdfTable(
+                (30, 60, 410, 120),
+                (("DECAN", "QUALITY", "IMAGE"), ("Aries I", "", "A complete figure description")),
+                pdf_conversion_module._TableRendering.MARKDOWN,
+            ),
+        ),
+    )
+    missing_empty_column = (
+        "| DECAN | IMAGE |\n| --- | --- |\n| Aries I | A complete figure description |"
+    )
+
+    assert not pdf_conversion_module._table_ocr_is_faithful(page, missing_empty_column)
+
+
+def test_repairs_one_short_ocr_insertion_from_a_repeated_native_title() -> None:
+    target = pdf_conversion_module._PdfPage(
+        number=1,
+        lines=(),
+        has_images=True,
+        image_area_ratios=(0.96,),
+        has_table=False,
+        image_orientation_mismatch=False,
+    )
+    reference_line = _pdf_model_line(
+        2,
+        "The History Astrology and Magic of the Decans",
+        centered=True,
+    )
+    reference = pdf_conversion_module._PdfPage(
+        number=2,
+        lines=(
+            reference_line,
+            _pdf_model_line(
+                2,
+                "Additional reliable publication text confirms the native layer quality.",
+            ),
+        ),
+        has_images=False,
+        image_area_ratios=(),
+        has_table=False,
+        image_orientation_mismatch=False,
+    )
+    raw = {1: "36 FACES\r\n\r\nThe History Astrology and Magic of Che Decans\r\n\r\nA. Writer"}
+
+    assert pdf_conversion_module._native_page_quality(reference) >= 0.75
+    assert pdf_conversion_module._is_reliable_native_title_line(
+        reference,
+        reference_line,
+        reference_line.text,
+        pdf_conversion_module._title_word_tokens(reference_line.text),
+        12,
+    )
+    repaired = pdf_conversion_module._repair_repeated_front_matter_ocr_titles(
+        [target, reference],
+        raw,
+        12,
+    )
+
+    assert raw[1] == (
+        "36 FACES\r\n\r\nThe History Astrology and Magic of Che Decans\r\n\r\nA. Writer"
+    )
+    assert repaired[1] == (
+        "36 FACES\r\n\r\nThe History Astrology and Magic of the Decans\r\n\r\nA. Writer"
+    )
+
+
+def test_preserves_an_expanded_ocr_title_with_two_substantive_words() -> None:
+    target = pdf_conversion_module._PdfPage(
+        number=1,
+        lines=(),
+        has_images=True,
+        image_area_ratios=(0.96,),
+        has_table=False,
+        image_orientation_mismatch=False,
+    )
+    reference = pdf_conversion_module._PdfPage(
+        number=2,
+        lines=(
+            _pdf_model_line(
+                2,
+                "The Complete History of Stellar Magic",
+                centered=True,
+            ),
+        ),
+        has_images=False,
+        image_area_ratios=(),
+        has_table=False,
+        image_orientation_mismatch=False,
+    )
+    markdown = "The Complete History Revised Edition of Stellar Magic"
+
+    repaired = pdf_conversion_module._repair_repeated_front_matter_ocr_titles(
+        [target, reference],
+        {1: markdown},
+        12,
+    )
+
+    assert repaired[1] == markdown
+
+
+def test_preserves_an_ocr_title_when_native_repetitions_disagree() -> None:
+    target = pdf_conversion_module._PdfPage(
+        number=1,
+        lines=(),
+        has_images=True,
+        image_area_ratios=(0.96,),
+        has_table=False,
+        image_orientation_mismatch=False,
+    )
+    references = [
+        pdf_conversion_module._PdfPage(
+            number=number,
+            lines=(_pdf_model_line(number, text, centered=True),),
+            has_images=False,
+            image_area_ratios=(),
+            has_table=False,
+            image_orientation_mismatch=False,
+        )
+        for number, text in (
+            (2, "The History Astrology and Magic of the Decans"),
+            (3, "The History of Astrology and Magic of the Decans"),
+        )
+    ]
+    markdown = "The History of Che Astrology and Magic of the Decans"
+
+    repaired = pdf_conversion_module._repair_repeated_front_matter_ocr_titles(
+        [target, *references],
+        {1: markdown},
+        12,
+    )
+
+    assert repaired[1] == markdown
 
 
 def test_splits_one_extracted_line_when_two_columns_are_separated_by_a_wide_gap() -> None:
@@ -694,6 +1523,37 @@ def test_splits_one_extracted_line_when_two_columns_are_separated_by_a_wide_gap(
     parts = pdf_conversion_module._split_wide_line(combined)
 
     assert [part.text for part in parts] == ["Left text", "Right text"]
+
+
+def test_splits_scanned_columns_separated_by_a_moderate_gutter() -> None:
+    characters = (
+        pdf_conversion_module._PdfCharacter("Left", 50, 74, 100, 112, 10, True),
+        pdf_conversion_module._PdfCharacter("text", 78, 102, 100, 112, 10, True),
+        pdf_conversion_module._PdfCharacter("Right", 140, 170, 100, 112, 10, True),
+        pdf_conversion_module._PdfCharacter("text", 174, 198, 100, 112, 10, True),
+    )
+    combined = pdf_conversion_module._PdfLine(
+        page_number=1,
+        page_width=600,
+        page_height=800,
+        text="Left text Right text",
+        chars=characters,
+        x0=50,
+        x1=198,
+        top=100,
+        bottom=112,
+        font_size=10,
+        bold=False,
+        links=(),
+        soft_hyphen_end=False,
+        hard_hyphen_end=False,
+        rotated=False,
+    )
+
+    assert [part.text for part in pdf_conversion_module._split_wide_line(combined)] == [
+        "Left text",
+        "Right text",
+    ]
 
 
 def test_recovers_a_clustered_vector_illustration_as_an_image_box() -> None:
@@ -1145,6 +2005,35 @@ def test_does_not_merge_toc_blocks_from_different_pages() -> None:
     assert pdf_conversion_module._blocks_to_markdown(blocks) == "First 1\n\nSecond 2"
 
 
+def test_pdf_nests_explicit_chapters_under_a_container_only_with_two_siblings() -> None:
+    blocks = [
+        pdf_conversion_module._MarkdownBlock("heading", "Part I — Origins", 1, level=2),
+        pdf_conversion_module._MarkdownBlock("paragraph", "Opening context.", 1),
+        pdf_conversion_module._MarkdownBlock("heading", "Chapter 1 — Roots", 1, level=2),
+        pdf_conversion_module._MarkdownBlock("paragraph", "Roots.", 1),
+        pdf_conversion_module._MarkdownBlock("heading", "Chapter 2 — Branches", 1, level=2),
+        pdf_conversion_module._MarkdownBlock("paragraph", "Branches.", 1),
+        pdf_conversion_module._MarkdownBlock("heading", "Part II — Return", 1, level=2),
+        pdf_conversion_module._MarkdownBlock("heading", "Chapter 3 — Home", 1, level=2),
+    ]
+
+    assert pdf_conversion_module._blocks_to_markdown(blocks) == (
+        "## Part I — Origins\n\nOpening context.\n\n"
+        "### Chapter 1 — Roots\n\nRoots.\n\n"
+        "### Chapter 2 — Branches\n\nBranches.\n\n"
+        "## Part II — Return\n\n## Chapter 3 — Home"
+    )
+
+
+def test_pdf_leaves_an_ambiguous_container_flat() -> None:
+    blocks = [
+        pdf_conversion_module._MarkdownBlock("heading", "Parte I", 1, level=4),
+        pdf_conversion_module._MarkdownBlock("heading", "Chapter 1", 1, level=5),
+    ]
+
+    assert pdf_conversion_module._blocks_to_markdown(blocks) == "#### Parte I\n\n##### Chapter 1"
+
+
 def test_repairs_a_hyphenated_word_across_a_pdf_page_marker() -> None:
     blocks = [
         pdf_conversion_module._MarkdownBlock("paragraph", "muchos proble-", 1),
@@ -1224,6 +2113,32 @@ def test_repairs_a_hyphenated_word_split_across_false_heading_blocks() -> None:
 
     assert pdf_conversion_module._blocks_to_markdown(blocks) == (
         "Knowledge despertarte in time and **atrapado in a dream.** More text."
+    )
+
+
+def _pdf_model_line(
+    page_number: int,
+    text: str,
+    *,
+    centered: bool = False,
+    bold: bool = False,
+) -> pdf_conversion_module._PdfLine:
+    return pdf_conversion_module._PdfLine(
+        page_number=page_number,
+        page_width=600,
+        page_height=800,
+        text=text,
+        chars=(),
+        x0=100 if centered else 72,
+        x1=500 if centered else 420,
+        top=180,
+        bottom=194,
+        font_size=12,
+        bold=bold,
+        links=(),
+        soft_hyphen_end=False,
+        hard_hyphen_end=False,
+        rotated=False,
     )
 
 
@@ -1340,6 +2255,105 @@ def _write_empty_pdf(destination: Path) -> None:
         b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
         b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R >>",
         _stream(b""),
+    ]
+    _write_pdf(destination, objects)
+
+
+def _write_raster_ruled_table_pdf(destination: Path, *, linked: bool = False) -> None:
+    width, height = 600, 800
+    pixels = bytearray(b"\xff" * (width * height))
+    for top in (80, 115, 165, 205, 245):
+        for y in (top, top + 1):
+            pixels[y * width + 20 : y * width + 580] = b"\x00" * 560
+    compressed = zlib.compress(bytes(pixels), level=9)
+    image = (
+        (
+            f"<< /Type /XObject /Subtype /Image /Width {width} /Height {height} "
+            f"/ColorSpace /DeviceGray /BitsPerComponent 8 /Filter /FlateDecode "
+            f"/Length {len(compressed)} >>\nstream\n"
+        ).encode("ascii")
+        + compressed
+        + b"\nendstream"
+    )
+    text_rows = (
+        (700, ("Key", "Count", "Description")),
+        (670, ("Alpha", "17", "First description")),
+        (655, ("", "", "continues here")),
+        (610, ("Beta", "23", "Second description")),
+        (570, ("Gamma", "41", "Third description")),
+        (520, ("Following prose remains outside the table.", "", "")),
+    )
+    operations = [f"q\n{width} 0 0 {height} 0 0 cm\n/Im1 Do\nQ"]
+    for y, cells in text_rows:
+        for x, value in zip((50, 180, 300), cells, strict=True):
+            if value:
+                operations.append(f"BT\n/F1 12 Tf\n{x} {y} Td\n({value}) Tj\nET")
+    page = (
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 600 800] "
+        b"/Resources << /XObject << /Im1 4 0 R >> /Font << /F1 5 0 R >> >> "
+        b"/Contents 6 0 R" + (b" /Annots [7 0 R]" if linked else b"") + b" >>"
+    )
+    objects = [
+        b"<< /Type /Catalog /Pages 2 0 R >>",
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        page,
+        image,
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+        _stream("\n".join(operations).encode("latin-1")),
+    ]
+    if linked:
+        objects.append(
+            b"<< /Type /Annot /Subtype /Link /Rect [50 665 90 680] /Border [0 0 0] "
+            b"/A << /S /URI /URI (https://example.invalid) >> >>"
+        )
+    _write_pdf(destination, objects)
+
+
+def _write_short_raster_ruled_table_pdf(destination: Path) -> None:
+    width, height = 600, 800
+    pixels = bytearray(b"\xff" * (width * height))
+    for top in (150, 350):
+        for y in (top, top + 1):
+            pixels[y * width + 40 : y * width + 560] = b"\x00" * 520
+    compressed = zlib.compress(bytes(pixels), level=9)
+    image = (
+        (
+            f"<< /Type /XObject /Subtype /Image /Width {width} /Height {height} "
+            f"/ColorSpace /DeviceGray /BitsPerComponent 8 /Filter /FlateDecode "
+            f"/Length {len(compressed)} >>\nstream\n"
+        ).encode("ascii")
+        + compressed
+        + b"\nendstream"
+    )
+    text_cells = (
+        (700, 80, "Table 5. Short fragment"),
+        (630, 50, "Decan"),
+        (630, 145, "Name"),
+        (630, 250, "Source"),
+        (632, 345, "Image"),
+        (575, 50, "Aries 1"),
+        (575, 145, "Chontare"),
+        (575, 250, "Aulathamas"),
+        (578, 345, "First description continues here"),
+        (475, 50, "Aries 2"),
+        (475, 145, "Chontachre"),
+        (475, 250, "Sabaoth"),
+        (478, 345, "Second description continues here"),
+    )
+    operations = [f"q\n{width} 0 0 {height} 0 0 cm\n/Im1 Do\nQ"]
+    for y, x, value in text_cells:
+        operations.append(f"BT\n/F1 11 Tf\n{x} {y} Td\n({value}) Tj\nET")
+    objects = [
+        b"<< /Type /Catalog /Pages 2 0 R >>",
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        (
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 600 800] "
+            b"/Resources << /XObject << /Im1 4 0 R >> /Font << /F1 5 0 R >> >> "
+            b"/Contents 6 0 R >>"
+        ),
+        image,
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+        _stream("\n".join(operations).encode("latin-1")),
     ]
     _write_pdf(destination, objects)
 

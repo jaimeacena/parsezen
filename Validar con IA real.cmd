@@ -13,7 +13,7 @@ if not exist "%PARSEZEN_PYTHON%" (
 echo Comprobando un flujo breve con tu modelo local de IA...
 echo Esta prueba puede tardar varios minutos, pero no envia documentos a Internet.
 echo.
-"%PARSEZEN_PYTHON%" scripts\validate_real_workflows.py
+"%PARSEZEN_PYTHON%" scripts\validate_real_workflows.py %*
 set "PARSEZEN_RESULT=%ERRORLEVEL%"
 echo.
 

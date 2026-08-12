@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import re
 import unicodedata
-from collections.abc import Callable
+from collections import Counter
+from collections.abc import Callable, Iterator
 from copy import copy
 from dataclasses import dataclass
+from difflib import SequenceMatcher
 from io import BytesIO
 from pathlib import Path, PurePosixPath
 from tempfile import SpooledTemporaryFile
@@ -18,7 +21,6 @@ from zipfile import ZIP_STORED, BadZipFile, ZipFile, ZipInfo, is_zipfile
 
 from defusedxml import ElementTree
 from defusedxml.common import DefusedXmlException
-from markitdown import MarkItDown, MarkItDownException
 
 from parsezen.cancellation import CancellationToken, check_cancelled
 from parsezen.document_model import (
@@ -28,10 +30,20 @@ from parsezen.document_model import (
 )
 from parsezen.errors import ConversionError
 from parsezen.translation_quality import (
+    NUMBER_PATTERN,
+    RAW_URL_PATTERN,
+    TITLE_ROMAN_REFERENCE_PATTERN,
+    TranslationQualityError,
     TranslationQualityReport,
-    build_translation_quality_report,
+    build_aligned_translation_quality_report,
     detect_language_code,
+    is_literal_work_title_translation,
+    is_reference_or_catalogue_heading,
+    numeric_tokens_are_conserved,
+    validate_translation_content_coverage,
 )
+
+LOGGER = logging.getLogger(__name__)
 
 _EPUB_MIMETYPE = b"application/epub+zip"
 _CONTAINER_PATH = "META-INF/container.xml"
@@ -40,6 +52,8 @@ _HTML_MEDIA_TYPES = frozenset({"application/xhtml+xml", "text/html"})
 _NAVIGATION_MEDIA_TYPES = frozenset({"application/x-dtbncx+xml"})
 _MAX_ARCHIVE_ENTRIES = 10_000
 _MAX_ARCHIVE_UNCOMPRESSED_BYTES = 512 * 1024 * 1024
+_MAX_ARCHIVE_MEMBER_BYTES = 128 * 1024 * 1024
+_MAX_ARCHIVE_COMPRESSION_RATIO = 1_000
 _MAX_XML_BYTES = 10 * 1024 * 1024
 _MAX_RESOURCE_BYTES = 100 * 1024 * 1024
 _SPACE_PATTERN = re.compile(r"\s+")
@@ -72,8 +86,14 @@ _UNSAFE_TRANSLATION_CONTENT = frozenset({"code", "math", "pre", "script", "style
 _TRANSLATABLE_ATTRIBUTES = frozenset({"alt", "aria-label", "title"})
 _TRANSLATABLE_METADATA = frozenset({"description", "subject", "title"})
 _EPUB_TRANSLATION_MARKER_PREFIX = "PZDOC EPUB TRANSLATION UNIT"
+_EPUB_XML_MARKER_PREFIX = "PZDOC EPUB XML"
+_XML_TAG_PATTERN = re.compile(r"(?:<[^>]+>)+")
+_BARE_XML_TEXT_AMPERSAND_PATTERN = re.compile(
+    r"&(?!amp;|lt;|gt;|apos;|quot;|#\d+;|#x[0-9A-Fa-f]+;)"
+)
 _MAX_EPUB_TRANSLATION_PART_CHARACTERS = 8_000
 _MIN_EPUB_TRANSLATION_PART_CHARACTERS = 1_000
+_MIN_SOURCE_RESIDUAL_RETRY_SIMILARITY = 0.92
 _XML_LANGUAGE_ATTRIBUTE = "{http://www.w3.org/XML/1998/namespace}lang"
 _STANDARD_FONT_OBFUSCATION_ALGORITHMS = frozenset(
     {
@@ -120,8 +140,14 @@ class _Metadata:
     language: str | None
     publisher: str | None
     date: str | None
-    identifier: str | None
+    identifiers: tuple[str, ...]
     cover_item_id: str | None
+
+    @property
+    def identifier(self) -> str | None:
+        """Return the primary identifier while retaining every declared value."""
+
+        return self.identifiers[0] if self.identifiers else None
 
 
 @dataclass(slots=True)
@@ -153,6 +179,9 @@ class EpubPackageMetadata:
     language: str | None
     identifier: str | None
     cover_path: PurePosixPath | None
+    identifiers: tuple[str, ...] = ()
+    publisher: str | None = None
+    publication_date: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -263,6 +292,9 @@ def inspect_epub_package(source_path: Path) -> EpubPackageMetadata:
         language=metadata.language,
         identifier=metadata.identifier,
         cover_path=PurePosixPath(cover.path) if cover is not None else None,
+        identifiers=metadata.identifiers,
+        publisher=metadata.publisher,
+        publication_date=metadata.date,
     )
 
 
@@ -384,7 +416,6 @@ def translate_epub(
                 opf_path,
                 opf_root,
             )
-            original_payloads = {path: archive.read(members[path]) for path in roots}
             original_signatures = {
                 path: _document_structure_signature(root) for path, root in roots.items()
             }
@@ -405,17 +436,24 @@ def translate_epub(
                 repair_text,
                 source_language_code,
             )
-            quality_report = build_translation_quality_report(
-                "\n\n".join(unit.source for unit in units),
-                "\n\n".join(translated_values),
+            quality_report = build_aligned_translation_quality_report(
+                (unit.source for unit in units),
+                translated_values,
                 source_language=source_language_code,
                 target_language=target_language_code,
+                literal_work_title_segments=_literal_epub_work_title_segments(
+                    units,
+                    translated_values,
+                    source_language=source_language_code,
+                    target_language=target_language_code,
+                ),
             )
             changed_paths = _apply_epub_translations(roots, units, translated_values)
             _validate_translated_roots(roots, original_signatures)
             changed_paths.update(
                 _set_epub_language(roots, manifest, opf_path, target_language_code)
             )
+            original_payloads = {path: archive.read(members[path]) for path in changed_paths}
             replacements = {
                 path: _serialize_xml_document(roots[path], original_payloads[path])
                 for path in changed_paths
@@ -476,9 +514,7 @@ def _collect_epub_translation_units(
             allowed_elements = frozenset({"text"})
         else:
             allowed_elements = _TRANSLATABLE_BLOCKS
-        selected_paths = _select_translation_element_paths(root, allowed_elements)
-        for element_path in selected_paths:
-            element = _element_at_path(root, element_path)
+        for element_path, element in _select_translation_elements(root, allowed_elements):
             units.append(
                 _EpubTranslationUnit(
                     archive_path,
@@ -506,13 +542,77 @@ def _collect_epub_translation_units(
     return units
 
 
-def _select_translation_element_paths(
+def _literal_epub_work_title_segments(
+    units: list[_EpubTranslationUnit],
+    translated_values: list[str],
+    *,
+    source_language: str | None,
+    target_language: str,
+) -> frozenset[int]:
+    """Identify fully emphasized bibliographic titles without hiding ordinary prose."""
+
+    if source_language is None or source_language == target_language:
+        return frozenset()
+    reference_level: dict[str, int] = {}
+    segments: set[int] = set()
+    for segment_number, (unit, translated) in enumerate(
+        zip(units, translated_values, strict=True),
+        start=1,
+    ):
+        if unit.attribute is None and (heading_level := _epub_unit_heading_level(unit.source)):
+            if is_reference_or_catalogue_heading(unit.source):
+                reference_level[unit.archive_path] = heading_level
+            elif heading_level <= reference_level.get(unit.archive_path, 0):
+                reference_level.pop(unit.archive_path, None)
+            continue
+        if (
+            unit.attribute is not None
+            or unit.archive_path not in reference_level
+            or not _epub_unit_is_fully_emphasized(unit.source)
+        ):
+            continue
+        if is_literal_work_title_translation(
+            unit.source,
+            translated,
+            source_language=source_language,
+            target_language=target_language,
+        ):
+            segments.add(segment_number)
+    return frozenset(segments)
+
+
+def _epub_unit_heading_level(value: str) -> int | None:
+    try:
+        root = ElementTree.fromstring(value)
+    except (DefusedXmlException, XmlElementTree.ParseError):
+        return None
+    name = _local_name(root).casefold()
+    return int(name[1]) if re.fullmatch(r"h[1-6]", name) else None
+
+
+def _epub_unit_is_fully_emphasized(value: str) -> bool:
+    try:
+        root = ElementTree.fromstring(value)
+    except (DefusedXmlException, XmlElementTree.ParseError):
+        return False
+    children = list(root)
+    if (
+        _local_name(root).casefold() != "p"
+        or len(children) != 1
+        or _local_name(children[0]).casefold() not in {"em", "i"}
+    ):
+        return False
+    return not (root.text or "").strip() and not (children[0].tail or "").strip()
+
+
+def _select_translation_elements(
     root: XmlElementTree.Element,
     allowed_elements: frozenset[str],
-) -> tuple[tuple[int, ...], ...]:
-    selected: list[tuple[int, ...]] = []
-
-    def visit(element: XmlElementTree.Element, path: tuple[int, ...]) -> None:
+) -> Iterator[tuple[tuple[int, ...], XmlElementTree.Element]]:
+    def visit(
+        element: XmlElementTree.Element,
+        path: tuple[int, ...],
+    ) -> Iterator[tuple[tuple[int, ...], XmlElementTree.Element]]:
         name = _local_name(element).casefold()
         contains_unsafe_content = any(
             _local_name(descendant).casefold() in _UNSAFE_TRANSLATION_CONTENT
@@ -523,13 +623,12 @@ def _select_translation_element_paths(
             and any(character.isalpha() for character in _element_text(element))
             and not contains_unsafe_content
         ):
-            selected.append(path)
+            yield path, element
             return
         for index, child in enumerate(element):
-            visit(child, (*path, index))
+            yield from visit(child, (*path, index))
 
-    visit(root, ())
-    return tuple(selected)
+    yield from visit(root, ())
 
 
 def _is_fallback_translation_element(
@@ -544,16 +643,16 @@ def _is_fallback_translation_element(
 
 def _walk_elements(
     root: XmlElementTree.Element,
-) -> list[tuple[tuple[int, ...], XmlElementTree.Element]]:
-    result: list[tuple[tuple[int, ...], XmlElementTree.Element]] = []
-
-    def visit(element: XmlElementTree.Element, path: tuple[int, ...]) -> None:
-        result.append((path, element))
+) -> Iterator[tuple[tuple[int, ...], XmlElementTree.Element]]:
+    def visit(
+        element: XmlElementTree.Element,
+        path: tuple[int, ...],
+    ) -> Iterator[tuple[tuple[int, ...], XmlElementTree.Element]]:
+        yield path, element
         for index, child in enumerate(element):
-            visit(child, (*path, index))
+            yield from visit(child, (*path, index))
 
-    visit(root, ())
-    return result
+    yield from visit(root, ())
 
 
 def _translate_epub_units(
@@ -576,10 +675,11 @@ def _translate_epub_units(
         check_cancelled(cancellation)
         if on_progress is not None:
             on_progress(part_index, len(parts))
-        payload = _translation_part_payload(part.indexed_units)
         translated_payload = load_checkpoint(part.key) if load_checkpoint is not None else None
         extracted: dict[int, str] | None = None
         checkpoint_needs_save = False
+        retried_indexes: set[int] = set()
+        source_residual_retry_indexes: set[int] = set()
         if translated_payload is not None:
             try:
                 extracted = _validate_translated_part(part, translated_payload)
@@ -588,26 +688,148 @@ def _translate_epub_units(
             else:
                 resumed_parts += 1
         if translated_payload is None:
-            translated_payload = translate_text(payload, None, cancellation)
-            if not isinstance(translated_payload, str) or not translated_payload.strip():
+            model_payload, protected_markup = _translation_model_part_payload(part.indexed_units)
+            translated_model_payload = translate_text(model_payload, None, cancellation)
+            if (
+                not isinstance(translated_model_payload, str)
+                or not translated_model_payload.strip()
+            ):
                 raise ConversionError("El traductor devolvió una parte EPUB vacía.")
-            extracted = _validate_translated_part(part, translated_payload)
+            translated_payload = ""
+            try:
+                translated_payload = _restore_translated_part_markup(
+                    part,
+                    translated_model_payload,
+                    protected_markup,
+                )
+                extracted = _validate_translated_part(part, translated_payload)
+            except ConversionError:
+                translated_payload, forced_retries = _partially_restore_translated_part_markup(
+                    part,
+                    translated_model_payload,
+                    protected_markup,
+                )
+                translated_payload, extracted, invalid_retries = _retry_invalid_translated_units(
+                    part,
+                    translated_payload,
+                    translate_text,
+                    cancellation,
+                    forced_indexes=forced_retries,
+                )
+                retried_indexes.update(invalid_retries)
+            if _translated_part_remains_source_language(
+                part,
+                extracted,
+                source_language_code,
+            ):
+                residual_indexes = {index for index, _unit in part.indexed_units} - retried_indexes
+                if not residual_indexes:
+                    LOGGER.warning(
+                        "epub_translation_source_language_residual phase=retry_exhausted "
+                        "part=%d total=%d units=%d retried=%d",
+                        part_index,
+                        len(parts),
+                        len(part.indexed_units),
+                        len(retried_indexes),
+                    )
+                    raise ConversionError(
+                        "El traductor conservó una parte EPUB completa en el idioma de origen."
+                    )
+                translated_payload, extracted, residual_retries = _retry_invalid_translated_units(
+                    part,
+                    translated_payload,
+                    translate_text,
+                    cancellation,
+                    forced_indexes=residual_indexes,
+                )
+                retried_indexes.update(residual_retries)
+                source_residual_retry_indexes.update(residual_retries)
+                if _translated_part_remains_source_language(
+                    part,
+                    extracted,
+                    source_language_code,
+                ):
+                    LOGGER.warning(
+                        "epub_translation_source_language_residual phase=after_retry "
+                        "part=%d total=%d units=%d retried=%d",
+                        part_index,
+                        len(parts),
+                        len(part.indexed_units),
+                        len(retried_indexes),
+                    )
+                    raise ConversionError(
+                        "El traductor conservó una parte EPUB completa en el idioma de origen."
+                    )
             checkpoint_needs_save = True
         if extracted is None:
             raise AssertionError("A validated EPUB part always has extracted units.")
+        residual_unit_indexes = {
+            index
+            for index, unit in part.indexed_units
+            if index not in retried_indexes
+            and _translated_unit_remains_source_language(
+                unit,
+                extracted[index],
+                source_language_code,
+            )
+        }
+        if residual_unit_indexes:
+            LOGGER.info(
+                "epub_translation_unit_source_residual_retry part=%d total=%d units=%d",
+                part_index,
+                len(parts),
+                len(residual_unit_indexes),
+            )
+            translated_payload, extracted, unit_retries = _retry_invalid_translated_units(
+                part,
+                translated_payload,
+                translate_text,
+                cancellation,
+                forced_indexes=residual_unit_indexes,
+            )
+            retried_indexes.update(unit_retries)
+            source_residual_retry_indexes.update(unit_retries)
+            checkpoint_needs_save = True
         if repair_text is not None:
             repaired_values: dict[int, str] = {}
             for index, unit in part.indexed_units:
-                repaired = repair_text(
+                if index in source_residual_retry_indexes:
+                    repaired_values[index] = extracted[index]
+                    continue
+                protected_source, _source_markup = _protect_epub_xml_markup(
                     unit.source,
+                    index,
+                )
+                protected_translated, translated_markup = _protect_epub_xml_markup(
                     extracted[index],
+                    index,
+                )
+                repaired = repair_text(
+                    protected_source,
+                    protected_translated,
                     source_language_code,
                     cancellation,
                 )
                 if not isinstance(repaired, str) or not repaired.strip():
                     raise ConversionError("La reparación dejó vacío un fragmento EPUB.")
+                repaired = _restore_epub_xml_markup(repaired, translated_markup)
                 _parse_epub_translation(unit, repaired)
                 repaired_values[index] = repaired
+            if _translated_part_remains_source_language(
+                part,
+                repaired_values,
+                source_language_code,
+            ):
+                LOGGER.warning(
+                    "epub_translation_source_language_residual phase=after_repair "
+                    "part=%d total=%d units=%d",
+                    part_index,
+                    len(parts),
+                    len(part.indexed_units),
+                )
+                raise ConversionError(
+                    "La reparación conservó una parte EPUB completa en el idioma de origen."
+                )
             if repaired_values != extracted:
                 extracted = repaired_values
                 translated_payload = _translation_part_payload_from_values(
@@ -635,15 +857,17 @@ def _epub_source_language_code(
     opf_root: XmlElementTree.Element,
     units: list[_EpubTranslationUnit],
 ) -> str | None:
+    detected = detect_language_code(
+        "\n\n".join(unit.source for unit in units),
+        minimum_letters=80,
+    )
     declared = _read_metadata(opf_root).language
     if declared is not None:
         match = re.match(r"^[A-Za-z]{2,3}", declared.strip())
         if match is not None:
-            return match.group(0).casefold()
-    return detect_language_code(
-        "\n\n".join(unit.source for unit in units),
-        minimum_letters=80,
-    )
+            declared_code = match.group(0).casefold()
+            return detected or declared_code
+    return detected
 
 
 def _plan_epub_translation_parts(
@@ -703,6 +927,145 @@ def _translation_part_payload_from_values(
     )
 
 
+def _translation_model_part_payload(
+    indexed_units: tuple[tuple[int, _EpubTranslationUnit], ...],
+    *,
+    retry: bool = False,
+) -> tuple[str, dict[int, tuple[tuple[str, str], ...]]]:
+    protected_markup: dict[int, tuple[tuple[str, str], ...]] = {}
+    payloads: list[str] = []
+    for index, unit in indexed_units:
+        protected, markup = _protect_epub_xml_markup(unit.source, index, retry=retry)
+        protected_markup[index] = markup
+        payloads.append(f"{_translation_marker(index)}\n{protected}")
+    return "\n\n".join(payloads), protected_markup
+
+
+def _protect_epub_xml_markup(
+    value: str,
+    unit_index: int,
+    *,
+    retry: bool = False,
+) -> tuple[str, tuple[tuple[str, str], ...]]:
+    prefix = f"{_EPUB_XML_MARKER_PREFIX}{' RETRY' if retry else ''}"
+    while prefix in value:
+        prefix = f"Z{prefix}"
+    spans = [
+        (match.start(), match.end())
+        for pattern in (
+            _XML_TAG_PATTERN,
+            RAW_URL_PATTERN,
+            NUMBER_PATTERN,
+            TITLE_ROMAN_REFERENCE_PATTERN,
+        )
+        for match in pattern.finditer(value)
+    ]
+    non_overlapping: list[tuple[int, int]] = []
+    for start, end in sorted(spans, key=lambda span: (span[0], -(span[1] - span[0]))):
+        if non_overlapping and start < non_overlapping[-1][1]:
+            continue
+        non_overlapping.append((start, end))
+
+    protected_values: list[tuple[str, str]] = []
+    for protected_index, (start, end) in enumerate(non_overlapping):
+        marker = (
+            f"<!-- {prefix.replace(' ', '_')}_{_alphabetic_index(unit_index)}_"
+            f"{_alphabetic_index(protected_index)}_XZQ -->"
+        )
+        protected_values.append((marker, value[start:end]))
+
+    protected = value
+    for (start, end), (marker, _original) in reversed(
+        list(zip(non_overlapping, protected_values, strict=True))
+    ):
+        protected = f"{protected[:start]}{marker}{protected[end:]}"
+    return protected, tuple(protected_values)
+
+
+def _restore_epub_xml_markup(
+    value: str,
+    protected_markup: tuple[tuple[str, str], ...],
+) -> str:
+    positions: list[int] = []
+    for marker, _original in protected_markup:
+        if value.count(marker) != 1:
+            raise ConversionError("El traductor cambió el marcado protegido del EPUB.")
+        positions.append(value.index(marker))
+    if positions != sorted(positions):
+        raise ConversionError("El traductor cambió el orden del marcado protegido del EPUB.")
+    first_marker = protected_markup[0][0]
+    last_marker = protected_markup[-1][0]
+    envelope_start = value.index(first_marker)
+    envelope_end = value.index(last_marker) + len(last_marker)
+    if value[:envelope_start].strip() or value[envelope_end:].strip():
+        LOGGER.info("epub_translation_external_envelope_removed")
+    value = value[envelope_start:envelope_end]
+    restored = _escape_epub_model_text(value, protected_markup)
+    for marker, original in protected_markup:
+        restored = restored.replace(marker, original)
+    return restored
+
+
+def _escape_epub_model_text(
+    value: str,
+    protected_markup: tuple[tuple[str, str], ...],
+) -> str:
+    pieces: list[str] = []
+    cursor = 0
+    for marker, _original in protected_markup:
+        marker_start = value.index(marker, cursor)
+        visible = value[cursor:marker_start]
+        visible = _BARE_XML_TEXT_AMPERSAND_PATTERN.sub("&amp;", visible)
+        visible = visible.replace("<", "&lt;").replace(">", "&gt;")
+        pieces.extend((visible, marker))
+        cursor = marker_start + len(marker)
+    visible = value[cursor:]
+    visible = _BARE_XML_TEXT_AMPERSAND_PATTERN.sub("&amp;", visible)
+    pieces.append(visible.replace("<", "&lt;").replace(">", "&gt;"))
+    return "".join(pieces)
+
+
+def _restore_translated_part_markup(
+    part: _EpubTranslationPart,
+    translated_payload: str,
+    protected_markup: dict[int, tuple[tuple[str, str], ...]],
+) -> str:
+    indexes = [index for index, _unit in part.indexed_units]
+    extracted = _extract_translated_units(translated_payload, indexes)
+    restored = {
+        index: _restore_epub_xml_markup(extracted[index], protected_markup[index])
+        for index in indexes
+    }
+    return _translation_part_payload_from_values(part.indexed_units, restored)
+
+
+def _partially_restore_translated_part_markup(
+    part: _EpubTranslationPart,
+    translated_payload: str,
+    protected_markup: dict[int, tuple[tuple[str, str], ...]],
+) -> tuple[str, set[int]]:
+    """Keep valid units from a rejected group so only damaged units are retried."""
+
+    indexes = [index for index, _unit in part.indexed_units]
+    try:
+        extracted = _extract_translated_units(translated_payload, indexes)
+    except ConversionError:
+        return translated_payload, set(indexes)
+    restored: dict[int, str] = {}
+    invalid_indexes: set[int] = set()
+    units = dict(part.indexed_units)
+    for index in indexes:
+        try:
+            value = _restore_epub_xml_markup(extracted[index], protected_markup[index])
+            _parse_epub_translation(units[index], value)
+        except ConversionError:
+            restored[index] = extracted[index]
+            invalid_indexes.add(index)
+        else:
+            restored[index] = value
+    return _translation_part_payload_from_values(part.indexed_units, restored), invalid_indexes
+
+
 def _validate_translated_part(
     part: _EpubTranslationPart,
     translated_payload: str,
@@ -712,6 +1075,132 @@ def _validate_translated_part(
     for index, unit in part.indexed_units:
         _parse_epub_translation(unit, extracted[index])
     return extracted
+
+
+def _retry_invalid_translated_units(
+    part: _EpubTranslationPart,
+    translated_payload: str,
+    translate_text: EpubTextTranslator,
+    cancellation: CancellationToken | None,
+    *,
+    forced_indexes: set[int] | None = None,
+) -> tuple[str, dict[int, str], frozenset[int]]:
+    """Retry once only the units that fail protected EPUB reconstruction."""
+
+    indexes = [index for index, _unit in part.indexed_units]
+    try:
+        extracted = _extract_translated_units(translated_payload, indexes)
+    except ConversionError:
+        extracted = {}
+    invalid_indexes = set(forced_indexes or ())
+    for index, unit in part.indexed_units:
+        value = extracted.get(index)
+        if value is None:
+            invalid_indexes.add(index)
+            continue
+        try:
+            _parse_epub_translation(unit, value)
+        except ConversionError:
+            invalid_indexes.add(index)
+
+    if not invalid_indexes:
+        raise AssertionError("A rejected EPUB part always contains an invalid unit.")
+    for index, unit in part.indexed_units:
+        if index not in invalid_indexes:
+            continue
+        check_cancelled(cancellation)
+        indexed_unit = ((index, unit),)
+        retry_source, protected_markup = _translation_model_part_payload(
+            indexed_unit,
+            retry=True,
+        )
+        retried_model_payload = translate_text(retry_source, None, cancellation)
+        if not isinstance(retried_model_payload, str) or not retried_model_payload.strip():
+            raise ConversionError("El traductor dejó vacío un fragmento EPUB reintentado.")
+        retried_part = _EpubTranslationPart(part.key, indexed_unit)
+        retried_payload = _restore_translated_part_markup(
+            retried_part,
+            retried_model_payload,
+            protected_markup,
+        )
+        retried = _validate_translated_part(retried_part, retried_payload)
+        extracted[index] = retried[index]
+
+    rebuilt_payload = _translation_part_payload_from_values(part.indexed_units, extracted)
+    return (
+        rebuilt_payload,
+        _validate_translated_part(part, rebuilt_payload),
+        frozenset(invalid_indexes),
+    )
+
+
+def _translated_part_remains_source_language(
+    part: _EpubTranslationPart,
+    translated_values: dict[int, str],
+    source_language_code: str | None,
+) -> bool:
+    if source_language_code is None:
+        return False
+    source_text: list[str] = []
+    translated_text: list[str] = []
+    for index, unit in part.indexed_units:
+        source_parsed, source_attribute = _parse_epub_translation(unit, unit.source)
+        translated_parsed, translated_attribute = _parse_epub_translation(
+            unit,
+            translated_values[index],
+        )
+        source_text.append(source_attribute or _element_text(source_parsed))
+        translated_text.append(translated_attribute or _element_text(translated_parsed))
+    normalized_source = _SPACE_PATTERN.sub(" ", "\n".join(source_text)).strip().casefold()
+    normalized_translated = _SPACE_PATTERN.sub(" ", "\n".join(translated_text)).strip().casefold()
+    if not normalized_source:
+        return False
+    if detect_language_code(normalized_source, minimum_letters=80) != source_language_code:
+        return False
+    if normalized_source == normalized_translated:
+        return True
+    return detect_language_code(normalized_translated, minimum_letters=80) == source_language_code
+
+
+def _translated_unit_remains_source_language(
+    unit: _EpubTranslationUnit,
+    translated_value: str,
+    source_language_code: str | None,
+) -> bool:
+    """Find one substantial aligned unit still confidently written in the source language."""
+
+    if source_language_code is None:
+        return False
+    source_parsed, source_attribute = _parse_epub_translation(unit, unit.source)
+    translated_parsed, translated_attribute = _parse_epub_translation(unit, translated_value)
+    source_text = _SPACE_PATTERN.sub(
+        " ",
+        source_attribute or _element_text(source_parsed),
+    ).strip()
+    translated_text = _SPACE_PATTERN.sub(
+        " ",
+        translated_attribute or _element_text(translated_parsed),
+    ).strip()
+    if sum(character.isalpha() for character in source_text) < 80:
+        return False
+    if detect_language_code(source_text, minimum_letters=80) != source_language_code:
+        return False
+    if source_text.casefold() == translated_text.casefold():
+        return True
+    if (
+        sum(character.isalpha() for character in translated_text) < 80
+        or detect_language_code(translated_text, minimum_letters=80) != source_language_code
+    ):
+        return False
+    return (
+        SequenceMatcher(
+            None,
+            source_text.casefold(),
+            translated_text.casefold(),
+            autojunk=False,
+        ).ratio()
+        >= _MIN_SOURCE_RESIDUAL_RETRY_SIMILARITY
+    )
 
 
 def _translation_marker(index: int) -> str:
@@ -800,13 +1289,39 @@ def _parse_epub_translation(
         source_element = _parse_xml_payload(unit.source.encode("utf-8"))
         if _document_structure_signature(parsed) != _document_structure_signature(source_element):
             raise ConversionError("La traducción cambió la estructura interna de una parte.")
+        _validate_epub_conserved_text(
+            _element_text(source_element),
+            _element_text(parsed),
+        )
         return parsed, None
     if _local_name(parsed) != "span" or len(parsed):
         raise ConversionError("La traducción cambió un texto alternativo de imagen.")
+    source_element = _parse_xml_payload(unit.source.encode("utf-8"))
+    source_text = _element_text(source_element)
     translated_text = _element_text(parsed)
     if not translated_text:
         raise ConversionError("La traducción dejó vacío un texto alternativo de imagen.")
+    _validate_epub_conserved_text(source_text, translated_text)
     return parsed, translated_text
+
+
+def _validate_epub_conserved_text(source: str, translated: str) -> None:
+    """Reject valid-looking EPUB text that changed protected factual tokens."""
+
+    if not numeric_tokens_are_conserved(source, translated):
+        raise ConversionError("La traducción EPUB cambió u omitió números o fechas.")
+    if Counter(TITLE_ROMAN_REFERENCE_PATTERN.findall(source)) != Counter(
+        TITLE_ROMAN_REFERENCE_PATTERN.findall(translated)
+    ):
+        raise ConversionError("La traducción EPUB cambió una referencia romana.")
+    if Counter(RAW_URL_PATTERN.findall(source)) != Counter(RAW_URL_PATTERN.findall(translated)):
+        raise ConversionError("La traducción EPUB cambió u omitió una dirección web.")
+    try:
+        validate_translation_content_coverage(source, translated)
+    except TranslationQualityError as exc:
+        raise ConversionError(
+            "La traducción EPUB omitió o duplicó una parte sustancial del contenido."
+        ) from exc
 
 
 def _element_at_path(
@@ -1022,17 +1537,46 @@ def _rebuild_epub(
             for info in ordered_infos:
                 check_cancelled(cancellation)
                 normalized = _normalize_archive_path(info.filename)
+                if normalized not in replacements and normalized != "mimetype":
+                    binary_resources += 1
+                compression = ZIP_STORED if normalized == "mimetype" else info.compress_type
+                target_info = copy(info)
+                target_info.compress_type = compression
+                if normalized in replacements:
+                    rebuilt.writestr(
+                        target_info,
+                        replacements[normalized],
+                        compress_type=compression,
+                    )
+                    continue
+                if normalized == "mimetype":
+                    try:
+                        rebuilt.writestr(
+                            target_info,
+                            archive.read(info),
+                            compress_type=ZIP_STORED,
+                        )
+                    except (KeyError, OSError, RuntimeError) as exc:
+                        raise ConversionError(
+                            "No se pudo copiar un recurso del EPUB original."
+                        ) from exc
+                    continue
                 try:
-                    original = archive.read(info)
+                    with (
+                        archive.open(info) as source,
+                        rebuilt.open(
+                            target_info,
+                            "w",
+                            force_zip64=True,
+                        ) as target,
+                    ):
+                        while block := source.read(1024 * 1024):
+                            check_cancelled(cancellation)
+                            target.write(block)
                 except (KeyError, OSError, RuntimeError) as exc:
                     raise ConversionError(
                         "No se pudo copiar un recurso del EPUB original."
                     ) from exc
-                payload = replacements.get(normalized, original)
-                if normalized not in replacements and normalized != "mimetype":
-                    binary_resources += 1
-                compression = ZIP_STORED if normalized == "mimetype" else info.compress_type
-                rebuilt.writestr(copy(info), payload, compress_type=compression)
         output.seek(0)
         with ZipFile(output) as verification:
             if verification.namelist()[0] != "mimetype":
@@ -1144,6 +1688,16 @@ def _validate_archive_limits(archive: ZipFile, filename: str) -> dict[str, ZipIn
     for info in infos:
         if info.is_dir():
             continue
+        if info.flag_bits & 0x1:
+            raise ConversionError(f"{filename} contiene archivos cifrados.")
+        if info.file_size > _MAX_ARCHIVE_MEMBER_BYTES:
+            raise ConversionError(f"{filename} contiene un archivo interno demasiado grande.")
+        unsafe_ratio = info.file_size and (
+            not info.compress_size
+            or info.file_size / info.compress_size > _MAX_ARCHIVE_COMPRESSION_RATIO
+        )
+        if unsafe_ratio:
+            raise ConversionError(f"{filename} contiene datos con una compresi\u00f3n no segura.")
         normalized = _normalize_archive_path(info.filename)
         if not normalized or normalized in members:
             raise ConversionError(f"{filename} contiene rutas internas no válidas o repetidas.")
@@ -1229,7 +1783,7 @@ def _read_metadata(opf_root: XmlElementTree.Element) -> _Metadata:
         None,
     )
     if metadata is None:
-        return _Metadata(None, (), None, None, None, None, None)
+        return _Metadata(None, (), None, None, None, (), None)
 
     values: dict[str, list[str]] = {}
     cover_item_id: str | None = None
@@ -1246,7 +1800,7 @@ def _read_metadata(opf_root: XmlElementTree.Element) -> _Metadata:
         language=_first(values, "language"),
         publisher=_first(values, "publisher"),
         date=_first(values, "date"),
-        identifier=_first(values, "identifier"),
+        identifiers=tuple(values.get("identifier", ())),
         cover_item_id=cover_item_id,
     )
 
@@ -1404,6 +1958,8 @@ def _convert_documents(
     metadata: _Metadata,
     cancellation: CancellationToken | None,
 ) -> tuple[str, set[str]]:
+    from markitdown import MarkItDown, MarkItDownException
+
     for document in documents:
         _repair_fragmented_paragraphs(document.root)
     anchor_map = _build_anchor_map(documents)

@@ -10,6 +10,7 @@ from hashlib import sha256
 from html import escape
 from io import BytesIO
 from pathlib import Path, PurePosixPath
+from typing import cast
 from urllib.parse import quote, unquote, urlsplit
 from uuid import UUID, uuid4
 from zipfile import ZIP_DEFLATED, ZIP_STORED, BadZipFile, ZipFile, ZipInfo
@@ -45,13 +46,41 @@ _RESOURCE_PATTERN = re.compile(
     re.escape(RESOURCE_REFERENCE_PREFIX) + r"([^\s)>'\"]+)",
 )
 _RENDERED_IMAGE_SOURCE_PATTERN = re.compile(r'<img\b[^>]*\bsrc="([^"]+)"', re.IGNORECASE)
+_RENDERED_INTERNAL_LINK_PATTERN = re.compile(
+    r'<a\b(?P<before>[^>]*?)\bhref="#(?P<anchor>[A-Za-z][A-Za-z0-9._:-]{0,127})"'
+    r"(?P<after>[^>]*)>(?P<label>.*?)</a>",
+    re.IGNORECASE | re.DOTALL,
+)
 _HEADING_PATTERN = re.compile(r"^(#{1,6})\s+(.+?)\s*#*\s*$", re.MULTILINE)
 _FENCE_PATTERN = re.compile(r"^\s*(```|~~~)")
+_NUMERIC_REFERENCE_LIST_PATTERN = re.compile(
+    r"(?m)^(?P<indent>[ \t]{0,3})(?P<marker>\d{1,4})(?P<delimiter>[.)])"
+    r"(?P<space>[ \t]+)(?P<references>[^\r\n]*)$"
+)
+_NUMERIC_REFERENCE_TOKEN_PATTERN = re.compile(r"\d+(?:[.,:/-]\d+)*")
+_RAW_TABLE_BLOCK_PATTERN = re.compile(r"<table>.*?</table>", re.IGNORECASE | re.DOTALL)
+_SAFE_TABLE_TAGS = frozenset({"table", "thead", "tbody", "tr", "th", "td", "br"})
 _MAX_CHAPTER_CHARACTERS = 120_000
 _MIN_CHAPTER_CHARACTERS = 1_500
 _MIN_STRONG_CHAPTER_CHARACTERS = 240
 _MAX_CHAPTERS = 250
+_ORDINAL_HEADING_PATTERN = (
+    r"(?:\d+|[ivxlcdm]+|one|two|three|four|five|six|seven|eight|nine|ten|"
+    r"uno|dos|tres|cuatro|cinco|seis|siete|ocho|nueve|diez)"
+)
+_CONTAINER_TITLE_PATTERN = re.compile(
+    r"^\s*(?:part|parte|book|libro|volume|volumen|section|secci(?:\u00f3|o)n|tomo)\s+"
+    + _ORDINAL_HEADING_PATTERN
+    + r"(?:\b|[.:\u2013\u2014-])",
+    re.IGNORECASE,
+)
 _CHAPTER_TITLE_PATTERN = re.compile(
+    r"^\s*(?:chapter|cap(?:\u00ed|i)tulo|chapitre|cap\.)\s+"
+    + _ORDINAL_HEADING_PATTERN
+    + r"(?:\b|[.:\u2013\u2014-])",
+    re.IGNORECASE,
+)
+_STRONG_CHAPTER_TITLE_PATTERN = re.compile(
     r"^(?:(?:chapter|cap[ií]tulo|part|parte|book|libro)\s+"
     r"(?:\d+|[ivxlcdm]+|one|two|three|four|five|six|seven|eight|nine|ten)"
     r"(?:\b|[.:—-])|introduction|introducci[oó]n|preface|pr[oó]logo|"
@@ -80,6 +109,9 @@ class EpubBookMetadata:
     language: str = "und"
     author: str | None = None
     cover_resource: PurePosixPath | None = None
+    identifiers: tuple[str, ...] = ()
+    publisher: str | None = None
+    publication_date: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -99,6 +131,7 @@ class EpubChapterPlan:
     filename: str
     title: str
     markdown: str
+    role: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -129,6 +162,22 @@ class EpubNavigationNode:
     children: tuple[EpubNavigationNode, ...] = ()
 
 
+def classify_heading_role(title: str) -> str | None:
+    """Classify only explicit, numbered container or chapter titles."""
+
+    cleaned = re.sub(r"[*_`~\[\]]", "", title).strip()
+    if _CONTAINER_TITLE_PATTERN.match(cleaned):
+        return "container"
+    if _CHAPTER_TITLE_PATTERN.match(cleaned):
+        return "chapter"
+    return None
+
+
+def _markdown_heading_role(markdown: str) -> str | None:
+    heading = _HEADING_PATTERN.search(markdown)
+    return classify_heading_role(heading.group(2)) if heading else None
+
+
 def chapter_filename(index: int) -> str:
     """Return the one canonical filename used for generated EPUB chapters."""
 
@@ -148,11 +197,17 @@ def build_epub(
 ) -> BuiltEpub:
     """Return a standards-shaped, reflowable EPUB 3 without touching the filesystem."""
     check_cancelled(cancellation)
+    markdown = _xml_safe_text(markdown)
     if not markdown.strip():
         raise ConversionError("No hay contenido suficiente para crear el EPUB.")
     title = _clean_metadata_text(metadata.title, "Documento sin título")
     language = _clean_language(metadata.language)
     author = _clean_metadata_text(metadata.author, "") if metadata.author else None
+    identifiers = _publication_identifiers(metadata.identifiers, identifier)
+    publisher = _clean_metadata_text(metadata.publisher, "") if metadata.publisher else None
+    publication_date = (
+        _clean_metadata_text(metadata.publication_date, "") if metadata.publication_date else None
+    )
     normalized_resources = _normalized_resources(resources)
     cover_resource = (
         metadata.cover_resource.as_posix() if metadata.cover_resource is not None else None
@@ -162,7 +217,6 @@ def build_epub(
     _validate_resource_references(markdown, normalized_resources)
     plan = plan_epub(markdown, title)
     chapters = plan.chapters
-    publication_id = identifier or uuid4()
     modified = (modified_at or datetime.now(UTC)).astimezone(UTC).replace(microsecond=0)
 
     rendered_chapters = _render_chapters(
@@ -178,8 +232,10 @@ def build_epub(
         title=title,
         language=language,
         author=author,
+        identifiers=identifiers,
+        publisher=publisher,
+        publication_date=publication_date,
         cover_resource=cover_resource,
-        publication_id=publication_id,
         modified=modified,
         cancellation=cancellation,
     )
@@ -213,6 +269,7 @@ def build_epub_from_xhtml(
 ) -> BuiltEpub:
     """Publish validated XHTML from the normalized book editor."""
 
+    rendered_chapters = tuple(_xml_safe_text(chapter) for chapter in rendered_chapters)
     if not chapters or len(chapters) > _MAX_CHAPTERS or len(chapters) != len(rendered_chapters):
         raise ConversionError("El libro editable no contiene capítulos válidos.")
     normalized_resources = _normalized_resources(resources)
@@ -227,7 +284,11 @@ def build_epub_from_xhtml(
     title = _clean_metadata_text(metadata.title, "Documento sin título")
     language = _clean_language(metadata.language)
     author = _clean_metadata_text(metadata.author, "") if metadata.author else None
-    publication_id = identifier or uuid4()
+    identifiers = _publication_identifiers(metadata.identifiers, identifier)
+    publisher = _clean_metadata_text(metadata.publisher, "") if metadata.publisher else None
+    publication_date = (
+        _clean_metadata_text(metadata.publication_date, "") if metadata.publication_date else None
+    )
     modified = (modified_at or datetime.now(UTC)).astimezone(UTC).replace(microsecond=0)
     content = _write_epub_archive(
         chapters,
@@ -236,8 +297,10 @@ def build_epub_from_xhtml(
         title=title,
         language=language,
         author=author,
+        identifiers=identifiers,
+        publisher=publisher,
+        publication_date=publication_date,
         cover_resource=cover_resource,
-        publication_id=publication_id,
         modified=modified,
         cancellation=cancellation,
         navigation=navigation,
@@ -280,6 +343,7 @@ def plan_epub(markdown: str, fallback_title: str) -> EpubPlan:
                 filename=chapter_filename(index),
                 title=_chapter_title(chapter, fallback_title, index, len(explicit_chapters)),
                 markdown=chapter,
+                role=_markdown_heading_role(chapter),
             )
             for index, chapter in enumerate(explicit_chapters, start=1)
         )
@@ -288,6 +352,7 @@ def plan_epub(markdown: str, fallback_title: str) -> EpubPlan:
             filename=chapter.filename,
             title=chapter.title,
             markdown=_normalize_heading_hierarchy(chapter.markdown),
+            role=chapter.role,
         )
         for chapter in chapters
     )
@@ -409,6 +474,7 @@ def _chapters_from_blocks(
             filename=chapter_filename(index),
             title=_chapter_title(chunk, fallback_title, index, len(chunks)),
             markdown=chunk,
+            role=_markdown_heading_role(chunk),
         )
         for index, chunk in enumerate(chunks, start=1)
     )
@@ -485,7 +551,7 @@ def _preferred_heading_level(
             counts[level] = counts.get(level, 0) + 1
             title = _block_heading_title(block)
             score = 1.0
-            if title is not None and _CHAPTER_TITLE_PATTERN.match(title):
+            if title is not None and _STRONG_CHAPTER_TITLE_PATTERN.match(title):
                 score += 5.0
             if title is not None and _normalized_heading_title(title) in toc_titles:
                 score += 3.0
@@ -542,7 +608,7 @@ def _strong_chapter_headings(
             continue
         normalized = _normalized_heading_title(title)
         if (
-            _CHAPTER_TITLE_PATTERN.match(title)
+            _STRONG_CHAPTER_TITLE_PATTERN.match(title)
             or normalized in toc_titles
             or (had_front_matter and not first_body_heading_added)
         ):
@@ -618,7 +684,10 @@ def _render_chapters(
     rendered: list[str] = []
     for chapter, source in zip(chapters, prepared, strict=True):
         check_cancelled(cancellation)
-        body = renderer.render(source)
+        protected_source, safe_tables = _protect_safe_table_blocks(source)
+        body = renderer.render(protected_source)
+        for sentinel, table in safe_tables:
+            body = body.replace(f"<p>{sentinel}</p>\n", f"{table}\n")
         if any(
             not match.group(1).startswith("../images/")
             for match in _RENDERED_IMAGE_SOURCE_PATTERN.finditer(body)
@@ -636,6 +705,78 @@ def _render_chapters(
     return tuple(rendered)
 
 
+def _protect_safe_table_blocks(markdown: str) -> tuple[str, tuple[tuple[str, str], ...]]:
+    """Protect only Parsezen's restricted table HTML while arbitrary raw HTML stays disabled."""
+
+    replacements: list[tuple[str, str]] = []
+
+    def replace(match: re.Match[str]) -> str:
+        table = _safe_table_xhtml(match.group(0))
+        if table is None:
+            return match.group(0)
+        sentinel = f"PZDOCEPUBTABLE{sha256(match.group(0).encode('utf-8')).hexdigest()[:24]}"
+        while sentinel in markdown or any(item[0] == sentinel for item in replacements):
+            sentinel = f"Z{sentinel}"
+        replacements.append((sentinel, table))
+        return f"\n\n{sentinel}\n\n"
+
+    return _RAW_TABLE_BLOCK_PATTERN.sub(replace, markdown), tuple(replacements)
+
+
+def _safe_table_xhtml(value: str) -> str | None:
+    """Return normalized XHTML for a strict, attribute-free generated table fragment."""
+
+    normalized = re.sub(r"<br\s*/?>", "<br />", value, flags=re.IGNORECASE)
+    try:
+        root = SafeElementTree.fromstring(normalized)
+    except (DefusedXmlException, SafeElementTree.ParseError):
+        return None
+    elements = tuple(root.iter())
+    if (
+        root.tag.casefold() != "table"
+        or any(element.tag.casefold() not in _SAFE_TABLE_TAGS for element in elements)
+        or any(element.attrib for element in elements)
+        or (root.text or "").strip()
+    ):
+        return None
+    children = list(root)
+    if [child.tag.casefold() for child in children] != ["thead", "tbody"]:
+        return None
+    thead, tbody = children
+    header_rows = list(thead)
+    body_rows = list(tbody)
+    if len(header_rows) != 1 or not body_rows:
+        return None
+    header_cells = list(header_rows[0])
+    if not header_cells or any(cell.tag.casefold() != "th" for cell in header_cells):
+        return None
+    column_count = len(header_cells)
+    if any(
+        row.tag.casefold() != "tr"
+        or len(row) != column_count
+        or any(cell.tag.casefold() != "td" for cell in row)
+        for row in body_rows
+    ):
+        return None
+    cells = (*header_cells, *(cell for row in body_rows for cell in row))
+    structural = (thead, tbody, header_rows[0], *body_rows)
+    if any((element.text or "").strip() for element in structural) or any(
+        (element.tail or "").strip()
+        for element in (*children, *header_rows, *body_rows, *header_cells, *cells)
+    ):
+        return None
+    if any(
+        child.tag.casefold() != "br" or child.attrib or len(child)
+        for cell in cells
+        for child in cell
+    ):
+        return None
+    return cast(
+        str,
+        SafeElementTree.tostring(root, encoding="unicode", short_empty_elements=True),
+    )
+
+
 def _prepare_markdown(
     markdown: str,
     chapter_filename: str,
@@ -651,10 +792,30 @@ def _prepare_markdown(
         prepared,
     )
     prepared = _PDF_PAGE_MARKER_PATTERN.sub("", prepared)
+    prepared = _escape_numeric_reference_list_markers(prepared)
     for path in resources:
         target = quote(f"../images/{path}", safe="/._-~")
         prepared = prepared.replace(f"{RESOURCE_REFERENCE_PREFIX}{path}", target)
     return prepared
+
+
+def _escape_numeric_reference_list_markers(markdown: str) -> str:
+    """Keep dense index continuations from being renumbered as CommonMark lists."""
+
+    def replace(match: re.Match[str]) -> str:
+        references = match.group("references")
+        if (
+            int(match.group("marker")) < 10
+            or any(character.isalpha() for character in references)
+            or len(_NUMERIC_REFERENCE_TOKEN_PATTERN.findall(references)) < 2
+        ):
+            return match.group(0)
+        return (
+            f"{match.group('indent')}{match.group('marker')}\\{match.group('delimiter')}"
+            f"{match.group('space')}{references}"
+        )
+
+    return _NUMERIC_REFERENCE_LIST_PATTERN.sub(replace, markdown)
 
 
 def _anchors(markdown: str) -> set[str]:
@@ -674,13 +835,21 @@ def _rewrite_internal_links(
     anchors_by_chapter: dict[str, str],
 ) -> str:
     def replacement(match: re.Match[str]) -> str:
-        anchor = match.group(1)
+        anchor = match.group("anchor")
         destination = anchors_by_chapter.get(anchor)
-        if destination is None or destination == current_filename:
+        if destination is None:
+            # A partial document can retain the label of a link whose target
+            # falls outside the selected content. Keep the information without
+            # publishing an invalid interactive control.
+            return match.group("label")
+        if destination == current_filename:
             return match.group(0)
-        return f'href="{destination}#{escape(anchor, quote=True)}"'
+        return (
+            f'<a{match.group("before")}href="{destination}#{escape(anchor, quote=True)}"'
+            f"{match.group('after')}>{match.group('label')}</a>"
+        )
 
-    return re.sub(r'href="#([A-Za-z][A-Za-z0-9._:-]{0,127})"', replacement, html)
+    return _RENDERED_INTERNAL_LINK_PATTERN.sub(replacement, html)
 
 
 def _xhtml_document(title: str, body: str, language: str) -> str:
@@ -707,8 +876,10 @@ def _write_epub_archive(
     title: str,
     language: str,
     author: str | None,
+    identifiers: tuple[str, ...],
+    publisher: str | None,
+    publication_date: str | None,
     cover_resource: str | None,
-    publication_id: UUID,
     modified: datetime,
     cancellation: CancellationToken | None,
     navigation: tuple[EpubNavigationNode, ...] = (),
@@ -740,8 +911,10 @@ def _write_epub_archive(
                 title,
                 language,
                 author,
+                identifiers,
+                publisher,
+                publication_date,
                 cover_resource,
-                publication_id,
                 modified,
                 chapters,
                 resources,
@@ -833,8 +1006,10 @@ def _package_document(
     title: str,
     language: str,
     author: str | None,
+    identifiers: tuple[str, ...],
+    publisher: str | None,
+    publication_date: str | None,
     cover_resource: str | None,
-    publication_id: UUID,
     modified: datetime,
     chapters: tuple[EpubChapterPlan, ...],
     resources: dict[str, ConvertedResource],
@@ -865,6 +1040,15 @@ def _package_document(
         else chapter_spine
     )
     creator = f"<dc:creator>{escape(author)}</dc:creator>" if author else ""
+    primary_identifier, *additional_identifiers = identifiers
+    identifier_elements = (
+        f'<dc:identifier id="book-id">{escape(primary_identifier)}</dc:identifier>'
+        + "".join(
+            f"<dc:identifier>{escape(value)}</dc:identifier>" for value in additional_identifiers
+        )
+    )
+    publisher_element = f"<dc:publisher>{escape(publisher)}</dc:publisher>" if publisher else ""
+    date_element = f"<dc:date>{escape(publication_date)}</dc:date>" if publication_date else ""
     modified_text = modified.strftime("%Y-%m-%dT%H:%M:%SZ")
     return (
         '<?xml version="1.0" encoding="utf-8"?>\n'
@@ -872,9 +1056,10 @@ def _package_document(
         f'unique-identifier="book-id" xml:lang="{escape(language, quote=True)}">'
         '<metadata xmlns:dc="http://purl.org/dc/elements/1.1/" '
         'xmlns:dcterms="http://purl.org/dc/terms/">'
-        f'<dc:identifier id="book-id">urn:uuid:{publication_id}</dc:identifier>'
+        f"{identifier_elements}"
         f"<dc:title>{escape(title)}</dc:title><dc:language>{escape(language)}</dc:language>"
-        f'{creator}<meta property="dcterms:modified">{modified_text}</meta></metadata>'
+        f"{creator}{publisher_element}{date_element}"
+        f'<meta property="dcterms:modified">{modified_text}</meta></metadata>'
         '<manifest><item id="nav" href="nav.xhtml" media-type="application/xhtml+xml" '
         'properties="nav"/><item id="css" href="styles/book.css" '
         f'media-type="text/css"/>{cover_manifest}{chapter_manifest}'
@@ -891,8 +1076,17 @@ def _book_css() -> str:
   font-family: serif;
   line-height: 1.5;
   margin: 5%;
+  padding-top: 0.5em;
 }
-h1, h2, h3, h4, h5, h6 { line-height: 1.2; page-break-after: avoid; }
+h1, h2, h3, h4, h5, h6 {
+  break-inside: avoid;
+  line-height: 1.2;
+  max-width: 100%;
+  overflow-wrap: anywhere;
+  page-break-after: avoid;
+  page-break-inside: avoid;
+  word-break: normal;
+}
 p { orphans: 2; widows: 2; }
 img { display: block; height: auto; margin: 1.2em auto; max-width: 100%; }
 .cover { align-items: center; display: flex; justify-content: center; min-height: 90vh; }
@@ -906,8 +1100,42 @@ code { font-family: monospace; }
 
 
 def _clean_metadata_text(value: str | None, fallback: str) -> str:
-    cleaned = " ".join((value or "").replace("\0", "").split()).strip()
+    cleaned = " ".join(_xml_safe_text(value or "").split()).strip()
     return (cleaned or fallback)[:500]
+
+
+def _xml_safe_text(value: str) -> str:
+    """Replace only code points forbidden by XML 1.0 without joining words."""
+
+    return "".join(
+        character if _xml_character_is_valid(ord(character)) else " " for character in value
+    )
+
+
+def _xml_character_is_valid(codepoint: int) -> bool:
+    return (
+        codepoint in {0x9, 0xA, 0xD}
+        or 0x20 <= codepoint <= 0xD7FF
+        or 0xE000 <= codepoint <= 0xFFFD
+        or 0x10000 <= codepoint <= 0x10FFFF
+    )
+
+
+def _publication_identifiers(
+    values: tuple[str, ...],
+    explicit_identifier: UUID | None,
+) -> tuple[str, ...]:
+    cleaned: list[str] = []
+    for value in values:
+        normalized = _clean_metadata_text(value, "")
+        if normalized and normalized not in cleaned:
+            cleaned.append(normalized)
+    if explicit_identifier is not None:
+        primary = f"urn:uuid:{explicit_identifier}"
+        return (primary, *(value for value in cleaned if value != primary))
+    if cleaned:
+        return tuple(cleaned)
+    return (f"urn:uuid:{uuid4()}",)
 
 
 def _clean_language(language: str) -> str:

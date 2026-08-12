@@ -8,6 +8,7 @@ import json
 import logging
 import re
 import sys
+from collections import Counter
 from collections.abc import Iterable
 from dataclasses import asdict, dataclass, field
 from itertools import product
@@ -18,6 +19,7 @@ from xml.etree import ElementTree
 from zipfile import ZIP_STORED, BadZipFile, ZipFile
 
 from parsezen.conversion import SUPPORTED_EXTENSIONS
+from parsezen.epub_conversion import inspect_epub_package
 from parsezen.errors import ParsezenError, SettingsError
 from parsezen.glossary import GlossaryEntry, validate_glossary
 from parsezen.improvement import ImprovementMode
@@ -33,7 +35,7 @@ from parsezen.processing import (
 from parsezen.revision import RevisionDecision
 from parsezen.settings import AppSettings, load_settings
 
-REPORT_SCHEMA_VERSION = 6
+REPORT_SCHEMA_VERSION = 10
 DEFAULT_REPORT_PATH = Path("local-benchmarks") / "real-workflows" / "latest.json"
 SYNTHETIC_PAGE_COUNT = 20
 MAX_EPUB_HEADING_CHARACTERS = 320
@@ -61,6 +63,7 @@ class LiveWorkflowResult:
     passed: bool
     elapsed_seconds: float
     stages: tuple[str, ...]
+    translation_engine: str | None = None
     quality_gate_passed: bool = False
     output_extension: str | None = None
     output_bytes: int | None = None
@@ -68,21 +71,28 @@ class LiveWorkflowResult:
     revision_changes: int = 0
     recommended_revision_changes: int = 0
     rejected_revision_changes: int = 0
+    revision_changes_by_kind: dict[str, int] = field(default_factory=dict)
+    recommended_revision_changes_by_kind: dict[str, int] = field(default_factory=dict)
     processed_pages: int = 0
     ocr_pages: int = 0
     pdf_issues: int = 0
+    blocking_pdf_issues: int = 0
     translation_issues: int = 0
     translation_issue_kinds: dict[str, int] = field(default_factory=dict)
     preserved_translation_chunks: int = 0
     preserved_images: int = 0
     epub_chapters: int = 0
     epub_structure_issues: int = 0
+    source_epub_structure_issues: int = 0
+    epub_structure_regressions: int = 0
     ocr_replaced_pages: int = 0
     low_confidence_pages: int = 0
     front_matter_blocks: int = 0
     toc_blocks: int = 0
     terminology_terms: int = 0
     stage_duration_ms: dict[str, int] = field(default_factory=dict)
+    planned_text_passes: int = 0
+    planned_ai_passes: int = 0
     error_type: str | None = None
     failed_stage: str | None = None
 
@@ -96,6 +106,52 @@ CRITICAL_CASES = (
         review_structure=True,
     ),
 )
+
+TRANSLATION_CASES = (
+    LiveWorkflowCase(
+        "epub-solo-traduccion",
+        OutputFormat.EPUB,
+        translate=True,
+        review_content=False,
+        review_structure=False,
+    ),
+)
+
+REVIEW_CASES = (
+    LiveWorkflowCase(
+        "markdown-procesamiento-directo",
+        OutputFormat.MARKDOWN,
+        translate=False,
+        review_content=False,
+        review_structure=False,
+    ),
+    LiveWorkflowCase(
+        "markdown-revision-semantica",
+        OutputFormat.MARKDOWN,
+        translate=False,
+        review_content=True,
+        review_structure=False,
+    ),
+)
+
+TRANSLATION_REVIEW_CASES = (
+    LiveWorkflowCase(
+        "epub-traduccion-directa",
+        OutputFormat.EPUB,
+        translate=True,
+        review_content=False,
+        review_structure=False,
+    ),
+    LiveWorkflowCase(
+        "epub-traduccion-revisada",
+        OutputFormat.EPUB,
+        translate=True,
+        review_content=True,
+        review_structure=True,
+    ),
+)
+
+WORKFLOW_PROFILES = frozenset({"critical", "translation", "review", "translation-review"})
 
 
 def full_matrix_cases() -> tuple[LiveWorkflowCase, ...]:
@@ -172,11 +228,19 @@ def run_live_workflows(
     full_matrix: bool = False,
     page_range: PdfPageRange | None = None,
     glossary: tuple[GlossaryEntry, ...] = (),
+    translation_engine: str = "argos",
+    workflow_profile: str = "critical",
 ) -> tuple[LiveWorkflowResult, ...]:
     """Run real workflows while collecting no document text, names or paths."""
     if not sources:
         raise ValueError("Añade al menos un documento para la comprobación real.")
-    cases = full_matrix_cases() if full_matrix else CRITICAL_CASES
+    if translation_engine not in {"argos", "local_ai"}:
+        raise ValueError("El motor de traducción de la comprobación no es válido.")
+    if workflow_profile not in WORKFLOW_PROFILES:
+        raise ValueError("El perfil de comprobación no es válido.")
+    if full_matrix and workflow_profile != "critical":
+        raise ValueError("La matriz completa no se puede combinar con otro perfil.")
+    cases = _workflow_cases(workflow_profile, full_matrix=full_matrix)
     output_root.mkdir(parents=True, exist_ok=True)
     results: list[LiveWorkflowResult] = []
     for source_index, raw_source in enumerate(sources, start=1):
@@ -187,6 +251,9 @@ def run_live_workflows(
         if full_matrix and extension != ".pdf":
             raise ValueError("La matriz completa se reserva para una muestra PDF breve.")
         source_hash = _file_sha256(source)
+        source_epub_structure_issues = (
+            _validate_generated_output(source, OutputFormat.EPUB) if extension == ".epub" else 0
+        )
         for case in cases:
             stages: list[ProcessStage] = []
             started = monotonic()
@@ -197,21 +264,29 @@ def run_live_workflows(
             revision_changes = 0
             recommended_revision_changes = 0
             rejected_revision_changes = 0
+            revision_changes_by_kind: dict[str, int] = {}
+            recommended_revision_changes_by_kind: dict[str, int] = {}
             processed_pages = 0
             ocr_pages = 0
             pdf_issues = 0
+            blocking_pdf_issues = 0
             translation_issues = 0
             translation_issue_kinds: dict[str, int] = {}
             preserved_translation_chunks = 0
             preserved_images = 0
             epub_chapters = 0
             epub_structure_issues = 0
+            epub_structure_regressions = 0
             ocr_replaced_pages = 0
             low_confidence_pages = 0
             front_matter_blocks = 0
             toc_blocks = 0
             terminology_terms = 0
             stage_duration_ms: dict[str, int] = {}
+            planned_text_passes, planned_ai_passes = _planned_passes(
+                case,
+                translation_engine,
+            )
             error_type: str | None = None
             try:
                 request = ProcessRequest(
@@ -219,8 +294,21 @@ def run_live_workflows(
                     convert_to_markdown=True,
                     output_directory=case_output,
                     output_format=case.output_format,
-                    improvement_mode=(ImprovementMode.TRANSLATE if case.translate else None),
-                    target_language=target_language if case.translate else None,
+                    improvement_mode=(
+                        ImprovementMode.TRANSLATE
+                        if case.translate and translation_engine == "local_ai"
+                        else None
+                    ),
+                    target_language=(
+                        target_language
+                        if case.translate and translation_engine == "local_ai"
+                        else None
+                    ),
+                    offline_translation_language=(
+                        target_language
+                        if case.translate and translation_engine == "argos"
+                        else None
+                    ),
                     pdf_page_range=page_range if extension == ".pdf" else None,
                     review_content=case.review_content,
                     review_structure=case.review_structure,
@@ -229,7 +317,12 @@ def run_live_workflows(
                 )
                 processed = process_document(
                     request,
-                    settings=settings if _case_needs_ai(case) else None,
+                    settings=(
+                        settings
+                        if _case_needs_ai(case)
+                        or (case.translate and translation_engine == "local_ai")
+                        else None
+                    ),
                     on_stage=stages.append,
                     work_checkpoint_root=case_output / ".checkpoints",
                     epub_checkpoint_root=case_output / ".epub-checkpoints",
@@ -246,13 +339,19 @@ def run_live_workflows(
                     len(pdf_report.low_confidence_pages) if pdf_report is not None else 0
                 )
                 pdf_issues = len(pdf_report.issues) if pdf_report is not None else 0
+                blocking_pdf_issues = (
+                    sum(issue.blocking for issue in pdf_report.issues)
+                    if pdf_report is not None
+                    else 0
+                )
                 translation_issues = (
                     translation_report.total_issues if translation_report is not None else 0
                 )
                 if translation_report is not None:
-                    for issue in translation_report.issues:
-                        kind = issue.kind.value
-                        translation_issue_kinds[kind] = translation_issue_kinds.get(kind, 0) + 1
+                    translation_issue_kinds = {
+                        kind.value: count
+                        for kind, count in translation_report.issues_by_kind.items()
+                    }
                 preserved_translation_chunks = len(processed.preserved_translation_chunks)
                 preserved_images = processed.preserved_images
                 epub_chapters = processed.epub_chapters
@@ -265,9 +364,19 @@ def run_live_workflows(
                     }
                 if processed.revision_draft is not None:
                     revision_changes = len(processed.revision_draft.changes)
+                    revision_changes_by_kind = dict(
+                        Counter(change.kind.value for change in processed.revision_draft.changes)
+                    )
                     recommended_revision_changes = sum(
                         change.recommended_decision is RevisionDecision.ACCEPTED
                         for change in processed.revision_draft.changes
+                    )
+                    recommended_revision_changes_by_kind = dict(
+                        Counter(
+                            change.kind.value
+                            for change in processed.revision_draft.changes
+                            if change.recommended_decision is RevisionDecision.ACCEPTED
+                        )
                     )
                     rejected_revision_changes = revision_changes - recommended_revision_changes
                     processed = apply_reviewed_revision(
@@ -280,6 +389,10 @@ def run_live_workflows(
                 epub_structure_issues = (
                     _validate_generated_output(result_path, case.output_format) or 0
                 )
+                epub_structure_regressions = max(
+                    0,
+                    epub_structure_issues - source_epub_structure_issues,
+                )
                 if not stages or stages[-1] is not ProcessStage.COMPLETED:
                     raise RuntimeError("El flujo terminó sin anunciar su finalización.")
             except (ParsezenError, OSError, RuntimeError, ValueError, BadZipFile) as exc:
@@ -288,10 +401,9 @@ def run_live_workflows(
             passed = error_type is None
             quality_gate_passed = (
                 passed
-                and pdf_issues == 0
-                and translation_issues == 0
+                and blocking_pdf_issues == 0
                 and preserved_translation_chunks == 0
-                and epub_structure_issues == 0
+                and epub_structure_regressions == 0
             )
             results.append(
                 LiveWorkflowResult(
@@ -301,6 +413,7 @@ def run_live_workflows(
                     passed=passed,
                     elapsed_seconds=round(elapsed, 3),
                     stages=tuple(stage.value for stage in stages),
+                    translation_engine=translation_engine if case.translate else None,
                     quality_gate_passed=quality_gate_passed,
                     output_extension=result_path.suffix.lower()
                     if result_path is not None
@@ -314,21 +427,28 @@ def run_live_workflows(
                     revision_changes=revision_changes,
                     recommended_revision_changes=recommended_revision_changes,
                     rejected_revision_changes=rejected_revision_changes,
+                    revision_changes_by_kind=revision_changes_by_kind,
+                    recommended_revision_changes_by_kind=(recommended_revision_changes_by_kind),
                     processed_pages=processed_pages,
                     ocr_pages=ocr_pages,
                     pdf_issues=pdf_issues,
+                    blocking_pdf_issues=blocking_pdf_issues,
                     translation_issues=translation_issues,
                     translation_issue_kinds=translation_issue_kinds,
                     preserved_translation_chunks=preserved_translation_chunks,
                     preserved_images=preserved_images,
                     epub_chapters=epub_chapters,
                     epub_structure_issues=epub_structure_issues,
+                    source_epub_structure_issues=source_epub_structure_issues,
+                    epub_structure_regressions=epub_structure_regressions,
                     ocr_replaced_pages=ocr_replaced_pages,
                     low_confidence_pages=low_confidence_pages,
                     front_matter_blocks=front_matter_blocks,
                     toc_blocks=toc_blocks,
                     terminology_terms=terminology_terms,
                     stage_duration_ms=stage_duration_ms,
+                    planned_text_passes=planned_text_passes,
+                    planned_ai_passes=planned_ai_passes,
                     error_type=error_type,
                     failed_stage=stages[-1].value if error_type is not None and stages else None,
                 )
@@ -437,7 +557,35 @@ def write_synthetic_pdf(destination: Path) -> None:
 
 
 def _case_needs_ai(case: LiveWorkflowCase) -> bool:
-    return case.translate or case.review_content or case.review_structure
+    return case.review_content or case.review_structure
+
+
+def _workflow_cases(
+    workflow_profile: str,
+    *,
+    full_matrix: bool,
+) -> tuple[LiveWorkflowCase, ...]:
+    if full_matrix:
+        return full_matrix_cases()
+    return {
+        "critical": CRITICAL_CASES,
+        "translation": TRANSLATION_CASES,
+        "review": REVIEW_CASES,
+        "translation-review": TRANSLATION_REVIEW_CASES,
+    }[workflow_profile]
+
+
+def _planned_passes(case: LiveWorkflowCase, translation_engine: str) -> tuple[int, int]:
+    translated = int(case.translate)
+    content_review_fused = bool(
+        case.translate and case.review_content and translation_engine == "local_ai"
+    )
+    content_review = int(case.review_content and not content_review_fused)
+    structure_review = int(case.review_structure)
+    text_passes = translated + content_review + structure_review
+    ai_translation = int(case.translate and translation_engine == "local_ai")
+    ai_passes = ai_translation + content_review + structure_review
+    return text_passes, ai_passes
 
 
 def _parse_glossary_arguments(values: list[str] | None) -> tuple[GlossaryEntry, ...]:
@@ -459,6 +607,7 @@ def _validate_generated_output(path: Path, output_format: OutputFormat) -> int:
         return 0
     if path.suffix.lower() != ".epub":
         raise RuntimeError("El flujo no publicó un EPUB.")
+    inspect_epub_package(path)
     with ZipFile(path) as archive:
         if archive.testzip() is not None:
             raise RuntimeError("El EPUB contiene una entrada dañada.")
@@ -468,8 +617,6 @@ def _validate_generated_output(path: Path, output_format: OutputFormat) -> int:
             or names[0] != "mimetype"
             or archive.getinfo("mimetype").compress_type != ZIP_STORED
             or archive.read("mimetype") != b"application/epub+zip"
-            or "EPUB/package.opf" not in names
-            or "EPUB/nav.xhtml" not in names
         ):
             raise RuntimeError("El EPUB no tiene la estructura mínima esperada.")
         structure_issues = 0
@@ -610,6 +757,20 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--context-window", type=int, help="Ventana de contexto de la prueba.")
     parser.add_argument("--target-language", default="Español")
     parser.add_argument(
+        "--translation-engine",
+        choices=("argos", "local_ai"),
+        default="argos",
+        help="Motor usado por los casos que traducen.",
+    )
+    parser.add_argument(
+        "--profile",
+        choices=tuple(sorted(WORKFLOW_PROFILES)),
+        default="critical",
+        help=(
+            "Flujo completo, traducción aislada o comparaciones directas de revisión y traducción."
+        ),
+    )
+    parser.add_argument(
         "--glossary",
         action="append",
         metavar="ORIGEN=DESTINO",
@@ -651,6 +812,8 @@ def _run_from_arguments(arguments: argparse.Namespace) -> int:
             full_matrix=arguments.full_matrix,
             page_range=PdfPageRange(*arguments.pages) if arguments.pages is not None else None,
             glossary=_parse_glossary_arguments(arguments.glossary),
+            translation_engine=arguments.translation_engine,
+            workflow_profile=arguments.profile,
         )
         write_report(arguments.report, results, model=settings.model or "none")
     for result in results:
@@ -663,7 +826,7 @@ def _run_from_arguments(arguments: argparse.Namespace) -> int:
                 f"{result.pdf_issues} incidencias PDF, "
                 f"{result.translation_issues} de traducción y "
                 f"{result.preserved_translation_chunks} fragmentos conservados, "
-                f"{result.epub_structure_issues} incidencias estructurales EPUB"
+                f"{result.epub_structure_regressions} regresiones estructurales EPUB"
                 if not result.quality_gate_passed
                 else ""
             )

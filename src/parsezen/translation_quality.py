@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 import unicodedata
 from collections import Counter
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from difflib import SequenceMatcher
 from enum import StrEnum
@@ -20,7 +20,7 @@ MIN_CONTENT_RATIO = 0.55
 MAX_CONTENT_RATIO = 1.80
 MAX_REPORT_ISSUES = 20
 MAX_REPORT_EXCERPT_CHARACTERS = 320
-MAX_AUTOMATIC_SOURCE_TEXT_REPAIRS = 5
+MAX_AUTOMATIC_SOURCE_TEXT_REPAIRS = 20
 
 TARGET_LANGUAGE_CODES = {
     "Español": "es",
@@ -119,6 +119,63 @@ ORGANIZATION_NAME_SUFFIXES = frozenset(
 )
 
 NUMBER_PATTERN = re.compile(r"(?<!\d)[+-]?\d+(?:[.,:/-]\d+)*(?!\d)")
+WRITTEN_NUMBER_VALUES = {
+    "two": 2,
+    "dos": 2,
+    "three": 3,
+    "tres": 3,
+    "four": 4,
+    "cuatro": 4,
+    "five": 5,
+    "cinco": 5,
+    "six": 6,
+    "seis": 6,
+    "seven": 7,
+    "siete": 7,
+    "eight": 8,
+    "ocho": 8,
+    "nine": 9,
+    "nueve": 9,
+    "ten": 10,
+    "diez": 10,
+    "eleven": 11,
+    "once": 11,
+    "twelve": 12,
+    "doce": 12,
+    "thirteen": 13,
+    "trece": 13,
+    "fourteen": 14,
+    "catorce": 14,
+    "fifteen": 15,
+    "quince": 15,
+    "sixteen": 16,
+    "dieciséis": 16,
+    "seventeen": 17,
+    "diecisiete": 17,
+    "eighteen": 18,
+    "dieciocho": 18,
+    "nineteen": 19,
+    "diecinueve": 19,
+    "twenty": 20,
+    "veinte": 20,
+    "thirty": 30,
+    "treinta": 30,
+    "forty": 40,
+    "cuarenta": 40,
+    "fifty": 50,
+    "cincuenta": 50,
+    "sixty": 60,
+    "sesenta": 60,
+    "seventy": 70,
+    "setenta": 70,
+    "eighty": 80,
+    "ochenta": 80,
+    "ninety": 90,
+    "noventa": 90,
+    "hundred": 100,
+    "cien": 100,
+    "ciento": 100,
+}
 TITLE_ROMAN_REFERENCE_PATTERN = re.compile(
     r"(?<![A-Za-z])([IVXLCDM]+)(?=[ \t]+[+-]?\d)",
 )
@@ -130,16 +187,33 @@ ATX_HEADING_PATTERN = re.compile(r"(?m)^\s{0,3}(#{1,6})(?:\s+|$)")
 TABLE_DIVIDER_PATTERN = re.compile(r"^\s*\|?\s*:?-{3,}:?\s*(?:\|\s*:?-{3,}:?\s*)+\|?\s*$")
 UNESCAPED_PIPE_PATTERN = re.compile(r"(?<!\\)\|")
 LIST_ITEM_PATTERN = re.compile(r"(?m)^([ \t]*)([-+*]|\d+[.)])[ \t]+")
+LIST_ITEM_LINE_PATTERN = re.compile(r"^[ \t]*([-+*]|\d+[.)])[ \t]+(?P<content>.*)$")
+TRAILING_LIST_REFERENCE_PATTERN = re.compile(
+    r"(?P<reference>(?<!\d)\d{1,3}|(?<![A-Za-z])[ivxlcdm]+)"
+    r"(?=[ \t]*(?:\]\(\s*(?:<[^>]+>|[^\s)]+)(?:\s+[^)]*)?\))?[ \t]*$)",
+    re.IGNORECASE,
+)
 BLOCKQUOTE_PATTERN = re.compile(r"(?m)^([ \t]{0,3}>+)[ \t]?")
 IMAGE_PATTERN = re.compile(r"!\[[^\]]*\]\(")
 HTML_COMMENT_PATTERN = re.compile(r"<!--[\s\S]*?-->")
+EPUB_XML_PROTECTION_COMMENT_PATTERN = re.compile(
+    r"^<!--\s*Z*PZDOC_EPUB_XML(?:_RETRY)?_[A-Z]+_[A-Z]+_XZQ\s*-->$",
+    re.IGNORECASE,
+)
 PDF_PAGE_MARKER_PATTERN = re.compile(
     r"(?m)^\s*<!--\s*PZDOC PDF PAGE \d+\s*-->\s*$",
     re.IGNORECASE,
 )
 MARKDOWN_LINK_PATTERN = re.compile(r"!?\[([^\]]*)\]\(\s*(?:<[^>]+>|[^\s)]+)(?:\s+[^)]*)?\)")
 RAW_URL_PATTERN = re.compile(r"(?:https?://|mailto:)\S+")
+WEB_IDENTIFIER_PATTERN = re.compile(
+    r"(?i)^(?:www\.)?[a-z0-9](?:[a-z0-9-]*\.)+[a-z]{2,}(?:/[^\s]*)?$"
+)
 HTML_TAG_PATTERN = re.compile(r"</?[A-Za-z][^>]*>")
+RAW_TABLE_STRUCTURE_TAG_PATTERN = re.compile(
+    r"<\s*(/?)\s*(table|thead|tbody|tr|th|td|br)\b([^>]*)>",
+    re.IGNORECASE,
+)
 REFERENCE_DEFINITION_LINE_PATTERN = re.compile(r"(?m)^\s{0,3}\[[^\]]+\]:\s*\S+.*$")
 SENTENCE_SPLIT_PATTERN = re.compile(r"(?<=[.!?])\s+|\n+")
 
@@ -182,6 +256,15 @@ class TranslationQualityReport:
     translated_characters: int
     total_issues: int
     issues: tuple[TranslationQualityIssue, ...]
+    issue_totals: tuple[tuple[TranslationIssueKind, int], ...] = ()
+
+    @property
+    def issues_by_kind(self) -> dict[TranslationIssueKind, int]:
+        """Return exhaustive category totals, including details hidden by the report cap."""
+
+        if self.issue_totals:
+            return dict(self.issue_totals)
+        return dict(Counter(issue.kind for issue in self.issues))
 
 
 @dataclass(frozen=True, slots=True)
@@ -254,6 +337,12 @@ def validate_translation_quality(
         _validate_target_language(source, translated, source_language, target_language)
 
 
+def validate_translation_content_coverage(source: str, translated: str) -> None:
+    """Reject only substantive omission or duplication when structure is checked elsewhere."""
+
+    _validate_content_coverage(source, translated)
+
+
 def build_translation_quality_report(
     source: str,
     translated: str,
@@ -263,17 +352,66 @@ def build_translation_quality_report(
 ) -> TranslationQualityReport:
     """Return bounded, non-blocking review signals without logging document text."""
 
+    return _build_translation_quality_report(
+        source,
+        translated,
+        source_blocks=_report_blocks(source),
+        translated_blocks=_report_blocks(translated),
+        target_language=target_language,
+        source_language=source_language,
+        check_heading_fidelity=True,
+        literal_work_title_segments=frozenset(),
+    )
+
+
+def build_aligned_translation_quality_report(
+    source_segments: Iterable[str],
+    translated_segments: Iterable[str],
+    *,
+    target_language: str,
+    source_language: str | None = None,
+    literal_work_title_segments: Iterable[int] = (),
+) -> TranslationQualityReport:
+    """Review known one-to-one segments without guessing alignment from blank lines."""
+
+    sources = tuple(source_segments)
+    translations = tuple(translated_segments)
+    source = "\n\n".join(sources)
+    translated = "\n\n".join(translations)
+    return _build_translation_quality_report(
+        source,
+        translated,
+        source_blocks=sources,
+        translated_blocks=translations,
+        target_language=target_language,
+        source_language=source_language,
+        check_heading_fidelity=False,
+        literal_work_title_segments=frozenset(literal_work_title_segments),
+    )
+
+
+def _build_translation_quality_report(
+    source: str,
+    translated: str,
+    *,
+    source_blocks: tuple[str, ...],
+    translated_blocks: tuple[str, ...],
+    target_language: str,
+    source_language: str | None,
+    check_heading_fidelity: bool,
+    literal_work_title_segments: frozenset[int],
+) -> TranslationQualityReport:
     resolved_source_language = source_language or detect_language_code(source)
     detected_language = detect_language_code(translated)
-    source_blocks = _report_blocks(source)
-    translated_blocks = _report_blocks(translated)
     checked_segments = min(len(source_blocks), len(translated_blocks))
     issues: list[TranslationQualityIssue] = []
     total_issues = 0
+    issue_totals: Counter[TranslationIssueKind] = Counter()
 
     def add_issue(issue: TranslationQualityIssue) -> None:
         nonlocal total_issues
         total_issues += 1
+        issue_totals[issue.kind] += 1
         if len(issues) < MAX_REPORT_ISSUES:
             issues.append(issue)
 
@@ -315,10 +453,20 @@ def build_translation_quality_report(
             resolved_source_language,
             target_language,
         )
+        if (
+            issue is not None
+            and issue.kind is TranslationIssueKind.SOURCE_TEXT
+            and index in literal_work_title_segments
+        ):
+            issue = None
         if issue is not None:
             add_issue(issue)
 
-    if resolved_source_language is not None and resolved_source_language != target_language:
+    if (
+        check_heading_fidelity
+        and resolved_source_language is not None
+        and resolved_source_language != target_language
+    ):
         for issue in _heading_fidelity_issues(
             source,
             translated,
@@ -336,6 +484,9 @@ def build_translation_quality_report(
         translated_characters=len(translated),
         total_issues=total_issues,
         issues=tuple(issues),
+        issue_totals=tuple(
+            (kind, issue_totals[kind]) for kind in TranslationIssueKind if issue_totals[kind]
+        ),
     )
 
 
@@ -593,6 +744,7 @@ def repair_untranslated_source_text(
     )
     attempted = 0
     repaired = 0
+    attempted_fragments: set[tuple[int, str]] = set()
 
     def propose_repair(
         source_fragment: str,
@@ -602,6 +754,11 @@ def repair_untranslated_source_text(
         nonlocal attempted
         if attempted >= MAX_AUTOMATIC_SOURCE_TEXT_REPAIRS:
             return None
+        natural_fragment = natural_language_text(source_fragment).casefold()
+        fragment_key = (segment_number, natural_fragment)
+        if not natural_fragment or fragment_key in attempted_fragments:
+            return None
+        attempted_fragments.add(fragment_key)
         attempted += 1
         proposal = translate_segment(source_fragment, current_fragment)
         if not isinstance(proposal, str) or not proposal.strip() or proposal == current_fragment:
@@ -629,33 +786,22 @@ def repair_untranslated_source_text(
         source_part: str,
         current_part: str,
         candidate: str,
-        source_block: _RepairableReportBlock,
     ) -> bool:
         try:
-            validate_translation_quality(
+            _validate_structure(
                 source_part,
                 candidate,
-                source_language=resolved_source_language,
-                target_language=target_language,
                 preserve_paragraphs=False,
             )
-            validate_translation_quality(
+            _validate_structure(
                 current_part,
                 candidate,
-                source_language=target_language,
-                target_language=target_language,
                 preserve_paragraphs=True,
             )
+            _validate_content_coverage(current_part, candidate)
         except TranslationQualityError:
             return False
-        candidate_issue = _translation_segment_issue(
-            source_block.segment_number,
-            source_block.natural_text,
-            natural_language_text(candidate),
-            resolved_source_language,
-            target_language,
-        )
-        return candidate_issue is None
+        return True
 
     for source_block, translated_block in zip(source_blocks, translated_blocks, strict=True):
         issue = _translation_segment_issue(
@@ -707,7 +853,10 @@ def repair_untranslated_source_text(
                     )
                     if proposal is None:
                         continue
-                    translated_subparts[translated_subblock.part_index] = proposal
+                    current_subpart = translated_subparts[translated_subblock.part_index]
+                    translated_subparts[translated_subblock.part_index] = (
+                        _preserve_boundary_whitespace(current_subpart, proposal)
+                    )
                     localized_repairs += 1
                 if localized_repairs:
                     localized = "".join(translated_subparts)
@@ -715,7 +864,6 @@ def repair_untranslated_source_text(
                         source_part,
                         current,
                         localized,
-                        source_block,
                     ):
                         translated_parts[translated_block.part_index] = localized
                         repaired += localized_repairs
@@ -740,13 +888,15 @@ def repair_untranslated_source_text(
                         TranslationIssueKind.FIDELITY,
                     }:
                         continue
+                    current_fragment = localized[occurrence[0] : occurrence[1]]
                     proposal = propose_repair(
                         source_fragment,
-                        localized[occurrence[0] : occurrence[1]],
+                        current_fragment,
                         source_block.segment_number,
                     )
                     if proposal is None:
                         continue
+                    proposal = _preserve_boundary_whitespace(current_fragment, proposal)
                     localized = (
                         f"{localized[: occurrence[0]]}{proposal}{localized[occurrence[1] :]}"
                     )
@@ -755,11 +905,77 @@ def repair_untranslated_source_text(
                     source_part,
                     current,
                     localized,
-                    source_block,
                 ):
                     translated_parts[translated_block.part_index] = localized
                     repaired += localized_repairs
                     continue
+
+            sentence_repairs = 0
+            sentence_candidate = current
+            for source_sentence in find_untranslated_source_sentences(
+                source_part,
+                sentence_candidate,
+                resolved_source_language,
+            ):
+                if attempted >= MAX_AUTOMATIC_SOURCE_TEXT_REPAIRS:
+                    break
+                occurrence = _unique_prose_occurrence(sentence_candidate, source_sentence)
+                if occurrence is None:
+                    continue
+                proposal = propose_repair(
+                    source_sentence,
+                    sentence_candidate[occurrence[0] : occurrence[1]],
+                    source_block.segment_number,
+                )
+                if proposal is None:
+                    continue
+                sentence_candidate = (
+                    f"{sentence_candidate[: occurrence[0]]}{proposal}"
+                    f"{sentence_candidate[occurrence[1] :]}"
+                )
+                sentence_repairs += 1
+            if sentence_repairs and localized_page_is_safe(
+                source_part,
+                current,
+                sentence_candidate,
+            ):
+                translated_parts[translated_block.part_index] = sentence_candidate
+                repaired += sentence_repairs
+                continue
+
+        if not page_aligned:
+            sentence_repairs = 0
+            sentence_candidate = current
+            for source_sentence in find_untranslated_source_sentences(
+                source_part,
+                sentence_candidate,
+                resolved_source_language,
+            ):
+                if attempted >= MAX_AUTOMATIC_SOURCE_TEXT_REPAIRS:
+                    break
+                occurrence = _unique_prose_occurrence(sentence_candidate, source_sentence)
+                if occurrence is None:
+                    continue
+                proposal = propose_repair(
+                    source_sentence,
+                    sentence_candidate[occurrence[0] : occurrence[1]],
+                    source_block.segment_number,
+                )
+                if proposal is None:
+                    continue
+                sentence_candidate = (
+                    f"{sentence_candidate[: occurrence[0]]}{proposal}"
+                    f"{sentence_candidate[occurrence[1] :]}"
+                )
+                sentence_repairs += 1
+            if sentence_repairs and localized_page_is_safe(
+                source_part,
+                current,
+                sentence_candidate,
+            ):
+                translated_parts[translated_block.part_index] = sentence_candidate
+                repaired += sentence_repairs
+                continue
 
         proposal = propose_repair(
             source_part,
@@ -775,21 +991,13 @@ def repair_untranslated_source_text(
 
     candidate = "".join(translated_parts)
     try:
-        validate_translation_quality(
+        _validate_structure(
             source,
             candidate,
-            source_language=resolved_source_language,
-            target_language=target_language,
             preserve_paragraphs=preserve_paragraphs and not page_aligned,
         )
-        if page_aligned:
-            validate_translation_quality(
-                translated,
-                candidate,
-                source_language=target_language,
-                target_language=target_language,
-                preserve_paragraphs=True,
-            )
+        _validate_structure(translated, candidate, preserve_paragraphs=True)
+        _validate_content_coverage(translated, candidate)
     except TranslationQualityError:
         return TranslationRepairResult(translated, attempted, 0)
     return TranslationRepairResult(candidate, attempted, repaired)
@@ -840,6 +1048,16 @@ def find_untranslated_title_lines(
             untranslated.append(stripped)
             seen.add(stripped)
     return tuple(untranslated)
+
+
+def _preserve_boundary_whitespace(reference: str, replacement: str) -> str:
+    """Keep page and paragraph separators outside a locally repaired prose block."""
+
+    leading = re.match(r"\s*", reference)
+    trailing = re.search(r"\s*$", reference)
+    prefix = leading.group(0) if leading is not None else ""
+    suffix = trailing.group(0) if trailing is not None else ""
+    return f"{prefix}{replacement.strip()}{suffix}"
 
 
 def find_titles_with_source_language_residue(
@@ -914,13 +1132,48 @@ def find_untranslated_source_sentences(
     if source_language is None:
         return ()
     normalized_translation = translated.casefold()
+    compact_reference_prefixes = tuple(
+        prefix
+        for block in re.split(r"\n\s*\n", source)
+        if (prefix := _compact_reference_prefix(block)) is not None
+    )
+    has_index_context = _is_collapsed_index(source)
+    catalogue_cells = {
+        natural_language_text(cell).casefold()
+        for line in source.splitlines()
+        if line.count("|") >= 2 and is_reference_or_catalogue_text(line)
+        for cell in line.split("|")
+        if natural_language_text(cell)
+    }
     untranslated: list[str] = []
-    for raw_candidate in SENTENCE_SPLIT_PATTERN.split(source):
-        candidate = _strip_boundary_markup(raw_candidate.strip())
+    raw_candidates: list[str] = []
+    for sentence_or_line in SENTENCE_SPLIT_PATTERN.split(source):
+        if sentence_or_line.count("|") >= 2:
+            raw_candidates.extend(sentence_or_line.split("|"))
+        else:
+            raw_candidates.append(sentence_or_line)
+    for raw_candidate in raw_candidates:
+        candidate = re.sub(
+            r"\s+",
+            " ",
+            _strip_boundary_markup(raw_candidate.strip()),
+        ).strip()
         natural_candidate = natural_language_text(candidate)
         if _letter_count(natural_candidate) < 12:
             continue
-        if not _contains_standalone_text(normalized_translation, candidate.casefold()):
+        normalized_natural_candidate = natural_candidate.casefold()
+        if (
+            is_reference_or_catalogue_text(candidate)
+            or (has_index_context and _is_index_entry(candidate))
+            or normalized_natural_candidate in catalogue_cells
+            or any(normalized_natural_candidate in prefix for prefix in compact_reference_prefixes)
+        ):
+            continue
+        normalized_candidate = candidate.casefold()
+        if (
+            not _contains_standalone_text(normalized_translation, normalized_candidate)
+            and _unique_prose_occurrence(normalized_translation, normalized_candidate) is None
+        ):
             continue
         if _likely_language(natural_candidate, source_language):
             untranslated.append(candidate)
@@ -945,6 +1198,53 @@ def is_probable_organization_name_line(line: str) -> bool:
     )
     name_like_casing = all(word.isupper() or word[:1].isupper() for word in words)
     return has_organization_suffix and name_like_casing
+
+
+def is_probable_proper_name_line(text: str, source_language: str) -> bool:
+    """Expose the conservative proper-name check to local translation fallbacks."""
+
+    return _looks_like_probable_proper_name(text, source_language)
+
+
+def is_literal_work_title_translation(
+    source: str,
+    translated: str,
+    *,
+    source_language: str,
+    target_language: str,
+) -> bool:
+    """Recognize a cited work title whose literal wording should remain stable."""
+
+    source_words = re.findall(r"[^\W\d_]+", natural_language_text(source))
+    translated_words = re.findall(r"[^\W\d_]+", natural_language_text(translated))
+    if not 2 <= len(source_words) <= 12 or len(source_words) != len(translated_words):
+        return False
+    if all(word.isupper() for word in source_words):
+        return all(
+            source_word.casefold() == translated_word.casefold()
+            for source_word, translated_word in zip(
+                source_words,
+                translated_words,
+                strict=True,
+            )
+        )
+
+    changed_indexes = {
+        index
+        for index, (source_word, translated_word) in enumerate(
+            zip(source_words, translated_words, strict=True)
+        )
+        if source_word.casefold() != translated_word.casefold()
+    }
+    if changed_indexes != {0}:
+        return False
+    source_hints = TITLE_LANGUAGE_HINTS.get(source_language, frozenset())
+    target_hints = TITLE_LANGUAGE_HINTS.get(target_language, frozenset())
+    return (
+        source_words[0].casefold() in source_hints
+        and translated_words[0].casefold() in target_hints
+        and sum(word.isupper() or word[:1].isupper() for word in source_words[1:]) >= 2
+    )
 
 
 def uppercase_person_name_base(line: str, source_language: str | None) -> str | None:
@@ -1011,6 +1311,7 @@ def natural_language_text(markdown: str) -> str:
 
 
 def _unique_prose_occurrence(container: str, fragment: str) -> tuple[int, int] | None:
+    comments = HTML_COMMENT_PATTERN.findall(fragment)
     if (
         not fragment.strip()
         or "\n\n" in fragment
@@ -1018,19 +1319,25 @@ def _unique_prose_occurrence(container: str, fragment: str) -> tuple[int, int] |
         or LIST_ITEM_PATTERN.search(fragment)
         or TABLE_DIVIDER_PATTERN.search(fragment)
         or IMAGE_PATTERN.search(fragment)
-        or HTML_COMMENT_PATTERN.search(fragment)
+        or any(
+            EPUB_XML_PROTECTION_COMMENT_PATTERN.fullmatch(comment) is None for comment in comments
+        )
     ):
         return None
     if container.count(fragment) == 1:
         start = container.index(fragment)
-        return start, start + len(fragment)
+        end = start + len(fragment)
+        if _has_standalone_text_boundaries(container, start, end):
+            return start, end
     tokens = fragment.split()
     if not tokens:
         return None
-    flexible = re.compile(
-        r"(?<!\S)" + r"\s+".join(re.escape(token) for token in tokens) + r"(?!\S)"
+    flexible = re.compile(r"\s+".join(re.escape(token) for token in tokens))
+    matches = tuple(
+        match
+        for match in flexible.finditer(container)
+        if _has_standalone_text_boundaries(container, match.start(), match.end())
     )
-    matches = tuple(flexible.finditer(container))
     if len(matches) != 1:
         return None
     return matches[0].start(), matches[0].end()
@@ -1099,8 +1406,8 @@ def _paragraph_repairable_report_blocks(
 
 
 def _report_blocks(document: str) -> tuple[str, ...]:
-    _parts, blocks = _repairable_report_blocks(document)
-    return tuple(block.natural_text for block in blocks)
+    parts, blocks = _repairable_report_blocks(document)
+    return tuple(parts[block.part_index] for block in blocks)
 
 
 def _translation_segment_issue(
@@ -1110,8 +1417,12 @@ def _translation_segment_issue(
     source_language: str | None,
     target_language: str,
 ) -> TranslationQualityIssue | None:
-    source_letters = _letter_count(source)
-    source_words = {word.casefold() for word in re.findall(r"[^\W\d_]+", source)}
+    source_natural = natural_language_text(source)
+    translated_natural = natural_language_text(translated)
+    source_letters = _letter_count(source_natural)
+    source_words = {word.casefold() for word in re.findall(r"[^\W\d_]+", source_natural)}
+    is_web_identifier = _looks_like_web_identifier(source_natural)
+    is_reference_or_catalogue = is_reference_or_catalogue_text(source)
     has_source_language_hint = bool(
         source_words & TITLE_LANGUAGE_HINTS.get(source_language or "", frozenset())
     )
@@ -1123,12 +1434,16 @@ def _translation_segment_issue(
     if (
         unchanged is not None
         and source_language is not None
-        and _looks_like_probable_proper_name(source, source_language)
+        and (
+            _looks_like_probable_proper_name(unchanged, source_language)
+            or is_probable_organization_name_line(unchanged)
+        )
     ):
         unchanged = None
     if (
         source_language is not None
         and source_language != target_language
+        and not is_web_identifier
         and (
             unchanged is not None
             or source_letters >= MIN_SOURCE_TEXT_REPORT_LETTERS
@@ -1145,11 +1460,16 @@ def _translation_segment_issue(
             )
         similarity = SequenceMatcher(
             None,
-            source.casefold(),
-            translated.casefold(),
+            source_natural.casefold(),
+            translated_natural.casefold(),
             autojunk=False,
         ).ratio()
-        if similarity >= 0.92 and _likely_language(source, source_language):
+        if (
+            not is_reference_or_catalogue
+            and similarity >= 0.92
+            and _likely_language(source, source_language)
+            and not _is_translated_name_credit(source, translated, source_language)
+        ):
             return _report_issue(
                 segment_number,
                 TranslationIssueKind.SOURCE_TEXT,
@@ -1172,7 +1492,7 @@ def _translation_segment_issue(
             translated,
         )
 
-    translated_letters = _letter_count(translated)
+    translated_letters = _letter_count(translated_natural)
     if source_letters >= 80:
         ratio = translated_letters / source_letters
         if ratio < MIN_CONTENT_RATIO:
@@ -1192,6 +1512,162 @@ def _translation_segment_issue(
                 translated,
             )
     return None
+
+
+def is_reference_or_catalogue_text(text: str) -> bool:
+    """Recognize one reference entry or an overwhelmingly catalogue-like text unit.
+
+    This deliberately does not classify a whole mixed page merely because it starts with an
+    ``INDEX`` or ``BIBLIOGRAPHY`` heading. Callers use it on each unchanged sentence/title and use
+    the aggregate result only to suppress the weak whole-segment similarity fallback.
+    """
+
+    table_cells = [
+        natural_language_text(cell)
+        for cell in text.split("|")
+        if natural_language_text(cell) and not re.fullmatch(r"\s*:?-{3,}:?\s*", cell)
+    ]
+    if len(table_cells) >= 3:
+        cell_word_counts = [len(re.findall(r"[^\W\d_]+", cell)) for cell in table_cells]
+        name_like_cells = sum(_is_name_like_catalogue_cell(cell) for cell in table_cells)
+        short_cells = sum(word_count <= 3 for word_count in cell_word_counts)
+        if (
+            max(cell_word_counts, default=0) <= 6
+            and sum(cell_word_counts) >= 3
+            and name_like_cells / len(table_cells) >= 0.60
+            and short_cells / len(table_cells) >= 0.67
+        ):
+            return True
+
+    if _is_collapsed_index(text):
+        return True
+
+    natural_text = natural_language_text(text)
+    words = re.findall(r"[^\W\d_]+", natural_text)
+    if not words:
+        return False
+    normalized = tuple(word.casefold() for word in words)
+    if is_reference_or_catalogue_heading(text):
+        return True
+    if len(words) < 8:
+        return False
+
+    citation_hints = {
+        "author",
+        "authors",
+        "cambridge",
+        "edition",
+        "edited",
+        "editor",
+        "journal",
+        "london",
+        "press",
+        "publisher",
+        "publishers",
+        "published",
+        "reprinted",
+        "translated",
+        "translator",
+        "university",
+        "volume",
+    }
+    distinct_citation_hints = set(normalized) & citation_hints
+    citation_punctuation = len(re.findall(r"[.,:;()]", natural_text))
+    if len(distinct_citation_hints) >= 3 and citation_punctuation >= 2:
+        return True
+    if (
+        {"press"} <= distinct_citation_hints
+        and citation_punctuation >= 1
+        and sum(word.isupper() or word[:1].isupper() for word in words) >= 3
+    ):
+        return True
+
+    sentence_endings = len(re.findall(r"[.!?](?=\s|$)", natural_text))
+    title_like_words = sum(word.isupper() or word[:1].isupper() for word in words)
+    title_like_ratio = title_like_words / len(words)
+    return (
+        len(words) >= 24
+        and sentence_endings <= 2
+        and natural_text.count(",") >= 8
+        and title_like_ratio >= 0.25
+    )
+
+
+def is_reference_or_catalogue_heading(text: str) -> bool:
+    """Return whether a short unit is explicitly a references, bibliography or index heading."""
+
+    words = tuple(word.casefold() for word in re.findall(r"[^\W\d_]+", natural_language_text(text)))
+    return (
+        bool(words)
+        and len(words) <= 3
+        and words[0]
+        in {
+            "bibliography",
+            "bibliografia",
+            "bibliographie",
+            "literaturverzeichnis",
+            "references",
+            "referencias",
+            "index",
+            "indice",
+        }
+    )
+
+
+def _is_name_like_catalogue_cell(value: str) -> bool:
+    words = re.findall(r"[^\W\d_]+", value)
+    if not words or re.search(r"[.!?](?=\s|$)", value):
+        return False
+    capitalized = sum(1 for word in words if word.isupper() or word[:1].isupper())
+    return capitalized * 5 >= len(words) * 3
+
+
+def _is_collapsed_index(text: str) -> bool:
+    heading = re.match(
+        r"\A\s*(?:[#>*-]+\s*)?(?:index|indice)\s*[.:]?\s*",
+        text,
+        re.IGNORECASE,
+    )
+    body = text[heading.end() :] if heading is not None else text
+    separators = r"\s*;\s*" if ";" in body else r"\r?\n+"
+    entries = [entry.strip() for entry in re.split(separators, body) if entry.strip()]
+    minimum_entries = 1 if heading is not None else 2
+    return len(entries) >= minimum_entries and all(_is_index_entry(entry) for entry in entries)
+
+
+def _is_index_entry(text: str) -> bool:
+    candidate = re.sub(r"\A\s*(?:[-*+]\s+|\d+[.)]\s+)", "", text)
+    if re.search(r"[.!?](?=\s|$)", candidate):
+        return False
+    match = re.search(r"(?:^|\s)(\d{1,4}|[ivxlcdm]+)\s*$", candidate, re.IGNORECASE)
+    if match is None or len(re.findall(r"[^\W\d_]+", candidate)) > 20:
+        return False
+    folio = match.group(1)
+    return not folio.isdigit() or 1 <= int(folio) <= 999
+
+
+def _compact_reference_prefix(text: str) -> str | None:
+    """Return the citation prefix ending at its year, excluding any following prose."""
+
+    if not re.match(
+        r"\s*(?:[#>*-]+\s*)?(?:bibliography|bibliografia|bibliographie|"
+        r"literaturverzeichnis|references|referencias)\b",
+        text,
+        re.IGNORECASE,
+    ):
+        return None
+    year = re.search(r"\b(?:1[5-9]\d{2}|20\d{2}|21\d{2})\b", text)
+    if year is None:
+        return None
+    prefix = text[: year.end()]
+    words = re.findall(r"[^\W\d_]+", natural_language_text(prefix))
+    if not 4 <= len(words) <= 30 or not re.search(
+        r"\b(?:press|publisher|edition|volume)\b",
+        prefix,
+        re.IGNORECASE,
+    ):
+        return None
+    return natural_language_text(prefix).casefold()
 
 
 def _has_critical_polarity_reversal(
@@ -1273,15 +1749,12 @@ def _unchanged_source_sentence(
     translated: str,
     source_language: str,
 ) -> str | None:
-    normalized_translation = translated.casefold()
-    for sentence in SENTENCE_SPLIT_PATTERN.split(source):
-        candidate = sentence.strip()
-        if _letter_count(candidate) < 12:
+    for candidate in find_untranslated_source_sentences(source, translated, source_language):
+        if _looks_like_probable_proper_name(candidate, source_language):
             continue
-        if not _contains_standalone_text(normalized_translation, candidate.casefold()):
+        if is_probable_organization_name_line(candidate):
             continue
-        if _likely_language(candidate, source_language):
-            return candidate
+        return candidate
     return None
 
 
@@ -1293,11 +1766,53 @@ def _likely_language(text: str, language: str) -> bool:
     )
     if detected == language:
         return True
+    if detected in TARGET_LANGUAGE_CODES.values():
+        return False
     original_words = re.findall(r"[^\W\d_]+", text)
     words = {word.casefold() for word in original_words}
     if words & TITLE_LANGUAGE_HINTS.get(language, frozenset()):
         return True
     return len(original_words) >= 2 and any(word[:1].islower() for word in original_words)
+
+
+def _is_translated_name_credit(
+    source: str,
+    translated: str,
+    source_language: str,
+) -> bool:
+    """Accept a translated connector surrounded by names that must remain literal."""
+
+    source_words = re.findall(r"[^\W\d_]+", source)
+    translated_words = re.findall(r"[^\W\d_]+", translated)
+    if not 3 <= len(source_words) <= 8 or len(source_words) != len(translated_words):
+        return False
+    changed_indexes = {
+        index
+        for index, (source_word, translated_word) in enumerate(
+            zip(source_words, translated_words, strict=True)
+        )
+        if source_word.casefold() != translated_word.casefold()
+    }
+    if not changed_indexes:
+        return False
+    source_hints = TITLE_LANGUAGE_HINTS.get(source_language, frozenset())
+    for index, (source_word, translated_word) in enumerate(
+        zip(source_words, translated_words, strict=True)
+    ):
+        if index in changed_indexes:
+            if not source_word[:1].islower() or not translated_word[:1].islower():
+                return False
+            continue
+        if source_word.casefold() in source_hints:
+            return False
+        if not (source_word.isupper() or source_word[:1].isupper()):
+            return False
+    return True
+
+
+def _looks_like_web_identifier(text: str) -> bool:
+    candidate = text.strip().rstrip(" \t\r\n.,;:!?")
+    return WEB_IDENTIFIER_PATTERN.fullmatch(candidate) is not None
 
 
 def _strip_boundary_markup(text: str) -> str:
@@ -1306,22 +1821,30 @@ def _strip_boundary_markup(text: str) -> str:
     while stripped != previous:
         previous = stripped
         stripped = re.sub(r"^(?:<!--[^>]*-->|</?[A-Za-z][^>]*>)\s*", "", stripped)
-        stripped = re.sub(r"\s*</?[A-Za-z][^>]*>$", "", stripped)
+        stripped = re.sub(
+            r"\s*(?:<!--[^>]*-->|</?[A-Za-z][^>]*>)$",
+            "",
+            stripped,
+        )
     return stripped.strip()
 
 
 def _contains_standalone_text(container: str, candidate: str) -> bool:
     position = container.find(candidate)
     while position >= 0:
-        before = container[position - 1] if position else ""
         end = position + len(candidate)
-        after = container[end] if end < len(container) else ""
-        before_is_boundary = not before or before.isspace() or before in ">\"'([{"
-        after_is_boundary = not after or after.isspace() or after in "<\"')]}.,;:!?"
-        if before_is_boundary and after_is_boundary:
+        if _has_standalone_text_boundaries(container, position, end):
             return True
         position = container.find(candidate, position + 1)
     return False
+
+
+def _has_standalone_text_boundaries(container: str, start: int, end: int) -> bool:
+    before = container[start - 1] if start else ""
+    after = container[end] if end < len(container) else ""
+    before_is_boundary = not before or before.isspace() or before in ">\"'([{"
+    after_is_boundary = not after or after.isspace() or after in "<\"')]}.,;:!?"
+    return before_is_boundary and after_is_boundary
 
 
 def _report_issue(
@@ -1348,7 +1871,13 @@ def _excerpt(text: str) -> str:
     compact = re.sub(r"\s+", " ", text).strip()
     if len(compact) <= MAX_REPORT_EXCERPT_CHARACTERS:
         return compact
-    return f"{compact[: MAX_REPORT_EXCERPT_CHARACTERS - 1].rstrip()}…"
+    candidate = compact[: MAX_REPORT_EXCERPT_CHARACTERS - 1].rstrip()
+    sentence_ends = tuple(re.finditer(r"[.!?](?=\s|$)", candidate))
+    if sentence_ends:
+        candidate = candidate[: sentence_ends[-1].end()].rstrip()
+    elif " " in candidate:
+        candidate = candidate.rsplit(" ", 1)[0].rstrip()
+    return f"{candidate}…"
 
 
 def link_destination_spans(markdown: str) -> list[tuple[int, int, str]]:
@@ -1362,7 +1891,7 @@ def link_destination_spans(markdown: str) -> list[tuple[int, int, str]]:
 
 
 def _validate_structure(source: str, translated: str, *, preserve_paragraphs: bool) -> None:
-    if Counter(NUMBER_PATTERN.findall(source)) != Counter(NUMBER_PATTERN.findall(translated)):
+    if not numeric_tokens_are_conserved(source, translated):
         raise TranslationQualityError("La traducción cambió u omitió números o fechas.")
     if Counter(TITLE_ROMAN_REFERENCE_PATTERN.findall(source)) != Counter(
         TITLE_ROMAN_REFERENCE_PATTERN.findall(translated)
@@ -1380,8 +1909,14 @@ def _validate_structure(source: str, translated: str, *, preserve_paragraphs: bo
         raise TranslationQualityError("La traducción cambió la estructura de encabezados.")
     if markdown_table_shapes(source) != markdown_table_shapes(translated):
         raise TranslationQualityError("La traducción cambió la estructura de una tabla.")
+    if _raw_table_structure(source) != _raw_table_structure(translated):
+        raise TranslationQualityError("La traducción cambió la estructura de una tabla HTML.")
     if _list_structure(source) != _list_structure(translated):
         raise TranslationQualityError("La traducción cambió la estructura de las listas.")
+    if _list_item_trailing_references(source) != _list_item_trailing_references(translated):
+        raise TranslationQualityError(
+            "La traducción desplazó referencias finales de una lista o índice."
+        )
     if _blockquote_structure(source) != _blockquote_structure(translated):
         raise TranslationQualityError("La traducción cambió la estructura de las citas.")
     if len(IMAGE_PATTERN.findall(source)) != len(IMAGE_PATTERN.findall(translated)):
@@ -1412,9 +1947,6 @@ def _validate_target_language(
     source_language: str | None,
     target_language: str,
 ) -> None:
-    if source_language is not None and source_language != target_language:
-        _validate_short_titles(source, translated, source_language)
-
     natural_text = natural_language_text(translated)
     total_letters = _letter_count(natural_text)
     if total_letters < MIN_LANGUAGE_VALIDATION_LETTERS:
@@ -1588,7 +2120,20 @@ def _looks_like_probable_proper_name(text: str, source_language: str) -> bool:
     normalized = {word.casefold() for word in words}
     if normalized & TITLE_LANGUAGE_HINTS.get(source_language, frozenset()):
         return False
-    return 2 <= len(words) <= 4 and all(word[:1].isupper() and not word.isupper() for word in words)
+    if (
+        len(words) == 5
+        and detect_language_code(
+            text,
+            minimum_letters=12,
+            minimum_confidence=0.80,
+        )
+        == source_language
+    ):
+        return False
+    return 2 <= len(words) <= 5 and all(
+        (word[:1].isupper() and not word.isupper()) or (len(word) == 1 and word.isupper())
+        for word in words
+    )
 
 
 def _natural_text_similarity(source: str, translated: str) -> float:
@@ -1598,21 +2143,6 @@ def _natural_text_similarity(source: str, translated: str) -> float:
         natural_language_text(translated).casefold(),
         autojunk=False,
     ).ratio()
-
-
-def _validate_short_titles(
-    source: str,
-    translated: str,
-    source_language: str,
-) -> None:
-    if find_untranslated_title_lines(source, translated, source_language):
-        raise TranslationQualityError(
-            "La traducción dejó un título o encabezado en el idioma original."
-        )
-    if find_titles_with_source_language_residue(source, translated, source_language):
-        raise TranslationQualityError(
-            "La traducción dejó parte de un título o encabezado en el idioma original."
-        )
 
 
 def _looks_like_title(block: str) -> bool:
@@ -1632,6 +2162,37 @@ def markdown_link_destinations(markdown: str) -> Counter[str]:
     """Return conserved link targets independently of visible labels."""
 
     return Counter(value for _start, _end, value in link_destination_spans(markdown))
+
+
+def numeric_tokens_are_conserved(source: str, translated: str) -> bool:
+    """Keep explicit values exact while allowing a written number to become digits once."""
+
+    source_tokens = Counter(NUMBER_PATTERN.findall(source))
+    translated_tokens = Counter(NUMBER_PATTERN.findall(translated))
+    if source_tokens - translated_tokens:
+        return False
+    added_tokens = translated_tokens - source_tokens
+    if not added_tokens:
+        return True
+    source_words = _written_number_value_counts(source)
+    translated_words = _written_number_value_counts(translated)
+    available_conversions = source_words - translated_words
+    for token, count in added_tokens.items():
+        if re.fullmatch(r"\d+", token) is None:
+            return False
+        value = int(token)
+        if available_conversions[value] < count:
+            return False
+        available_conversions[value] -= count
+    return True
+
+
+def _written_number_value_counts(text: str) -> Counter[int]:
+    return Counter(
+        WRITTEN_NUMBER_VALUES[word.casefold()]
+        for word in re.findall(r"[^\W\d_]+", natural_language_text(text))
+        if word.casefold() in WRITTEN_NUMBER_VALUES
+    )
 
 
 def markdown_heading_levels(markdown: str) -> tuple[int, ...]:
@@ -1656,6 +2217,20 @@ def markdown_table_shapes(markdown: str) -> tuple[tuple[int, int], ...]:
             end += 1
         shapes.append((end - start - 1, _table_column_count(line)))
     return tuple(shapes)
+
+
+def _raw_table_structure(markdown: str) -> tuple[tuple[str, str, str], ...]:
+    """Return ordered raw-table tags, preserving attributes but normalizing harmless syntax."""
+
+    structure: list[tuple[str, str, str]] = []
+    for match in RAW_TABLE_STRUCTURE_TAG_PATTERN.finditer(markdown):
+        closing = "/" if match.group(1) else ""
+        name = match.group(2).casefold()
+        suffix = re.sub(r"\s+", " ", match.group(3).strip())
+        if name == "br" and suffix == "/":
+            suffix = ""
+        structure.append((closing, name, suffix.casefold()))
+    return tuple(structure)
 
 
 def _is_table_row(line: str) -> bool:
@@ -1707,6 +2282,19 @@ def _list_structure(markdown: str) -> tuple[tuple[int, str], ...]:
         )
         for match in LIST_ITEM_PATTERN.finditer(markdown)
     )
+
+
+def _list_item_trailing_references(markdown: str) -> tuple[str | None, ...]:
+    """Keep page-like references attached to the end of their list entry."""
+
+    references: list[str | None] = []
+    for line in markdown.splitlines():
+        item = LIST_ITEM_LINE_PATTERN.match(line)
+        if item is None:
+            continue
+        reference = TRAILING_LIST_REFERENCE_PATTERN.search(item.group("content"))
+        references.append(reference.group("reference").casefold() if reference else None)
+    return tuple(references)
 
 
 def _blockquote_structure(markdown: str) -> tuple[int, ...]:

@@ -301,6 +301,64 @@ def test_book_editor_dialog_saves_for_later_without_publishing(qtbot, tmp_path: 
     assert not destination.exists()
 
 
+def test_book_editor_external_reject_uses_the_safe_draft_exit(qtbot, tmp_path: Path) -> None:
+    store = ArtifactStore(tmp_path / "artifacts", protect=reversible, unprotect=reversible)
+    book = create_book_from_markdown(
+        "# Chapter\n\nOriginal.",
+        (),
+        EpubBookMetadata("Book", "en"),
+        store,
+        job_id="job",
+    )
+    dialog = BookEditorDialog(book, store, job_id="job", destination=None)
+    qtbot.addWidget(dialog)
+    dialog.title_input.setText("Edited title")
+    dialog.editor.setHtml("<h1>Chapter</h1><p>Saved through Escape.</p>")
+
+    dialog.reject()
+
+    assert dialog.saved_for_later
+    assert dialog.book.metadata.title == "Edited title"
+    assert "Saved through Escape." in dialog._service().editable_html(book.spine[0])
+
+
+def test_book_editor_discard_requires_confirmation_when_dirty(
+    qtbot,
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    store = ArtifactStore(tmp_path / "artifacts", protect=reversible, unprotect=reversible)
+    book = create_book_from_markdown(
+        "# Chapter\n\nOriginal.",
+        (),
+        EpubBookMetadata("Book", "en"),
+        store,
+        job_id="job",
+    )
+    dialog = BookEditorDialog(book, store, job_id="job", destination=None)
+    qtbot.addWidget(dialog)
+    dialog.editor.setHtml("<h1>Chapter</h1><p>Unsaved.</p>")
+    answers = iter(
+        (
+            QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes,
+        )
+    )
+    monkeypatch.setattr(
+        QMessageBox,
+        "question",
+        lambda *_args, **_kwargs: next(answers),
+    )
+
+    dialog._cancel()
+    assert not dialog._discarding  # noqa: SLF001
+    assert not dialog.saved_for_later
+    dialog._cancel()
+
+    assert dialog._discarding  # noqa: SLF001
+    assert not dialog.saved_for_later
+
+
 def test_book_editor_dialog_resolves_encrypted_book_images(qtbot, tmp_path: Path) -> None:
     store = ArtifactStore(tmp_path / "artifacts", protect=reversible, unprotect=reversible)
     image = b64decode(

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import inspect
-import json
 import logging
 import math
 import re
@@ -11,12 +10,14 @@ import unicodedata
 from collections import Counter, defaultdict
 from collections.abc import Callable
 from dataclasses import dataclass, replace
+from difflib import SequenceMatcher
 from enum import StrEnum
 from hashlib import sha256
+from html import escape
 from io import BytesIO
 from pathlib import Path, PurePosixPath
 from statistics import median
-from typing import Any, TypedDict
+from typing import Any
 from urllib.parse import quote, unquote, urlsplit
 
 import pdfplumber
@@ -26,6 +27,24 @@ from parsezen.cancellation import CancellationToken, check_cancelled
 from parsezen.document_model import RESOURCE_REFERENCE_PREFIX
 from parsezen.errors import ConversionError
 from parsezen.ocr_conversion import convert_pdf_pages_with_ocr
+from parsezen.pdf_checkpoints import (
+    _MAX_PDF_TABLE_CELL_CHARACTERS,
+    _MAX_PDF_TABLE_COLUMNS,
+    _MAX_PDF_TABLE_ROWS,
+    _deserialize_page_checkpoint,
+    _serialize_page_checkpoint,
+)
+from parsezen.pdf_layout import (
+    _MarkdownBlock,
+    _PdfCharacter,
+    _PdfLine,
+    _PdfLink,
+    _PdfPage,
+    _PdfTable,
+    _RasterHorizontalRule,
+    _TableRendering,
+)
+from parsezen.translation_quality import markdown_table_shapes
 
 LOGGER = logging.getLogger(__name__)
 
@@ -37,8 +56,25 @@ _RUNNING_FOOTER_PATTERN = re.compile(
 )
 _LETTER_PATTERN = re.compile(r"[^\W\d_]", re.UNICODE)
 _BULLET_PATTERN = re.compile(r"^[•●◦▪‣⁃]\s*")
+_ORDINAL_HEADING_WORDS = (
+    r"\d+|[ivxlcdm]+|one|two|three|four|five|six|seven|eight|nine|ten|"
+    r"uno|dos|tres|cuatro|cinco|seis|siete|ocho|nueve|diez"
+)
+_CONTAINER_HEADING_PATTERN = re.compile(
+    r"^(?:part|parte|book|libro|volume|volumen|section|secci[oó]n|tomo)\s+(?:"
+    + _ORDINAL_HEADING_WORDS
+    + r")(?:\b|[.:—-])",
+    re.IGNORECASE,
+)
+_CHAPTER_HEADING_PATTERN = re.compile(
+    r"^(?:chapter|cap[ií]tulo|chapitre|cap\.)\s+(?:" + _ORDINAL_HEADING_WORDS + r")(?:\b|[.:—-])",
+    re.IGNORECASE,
+)
 _SECTION_HEADING_PATTERN = re.compile(
-    r"^(?:chapter|cap[ií]tulo|part|parte|day|d[ií]a)\s+[\divxlcdm]+[:.]?$",
+    r"^(?:(?:chapter|cap[ií]tulo|chapitre|cap\.)|"
+    r"(?:part|parte|book|libro|volume|volumen|section|secci[oó]n|tomo))\s+(?:"
+    + _ORDINAL_HEADING_WORDS
+    + r")(?:\b|[.:—-])",
     re.IGNORECASE,
 )
 _SPACED_WORD_PATTERN = re.compile(
@@ -50,11 +86,6 @@ _MAX_HEADING_LENGTH = 120
 _DUPLICATE_OVERLAP_RATIO = 0.55
 _DEDUPLICATION_GRID_SIZE = 16.0
 _MAX_CHARACTER_GRID_CELLS = 1_024
-_PDF_PAGE_CHECKPOINT_VERSION = 5
-_MAX_PDF_PAGE_CHECKPOINT_BYTES = 8 * 1024 * 1024
-_MAX_PDF_PAGE_LINES = 50_000
-_MAX_PDF_LINE_CHARACTERS = 100_000
-_MAX_PDF_LINE_LINKS = 10_000
 _GRAPHIC_WARNING_LETTER_LIMIT = 40
 _MIN_USABLE_NATIVE_LETTERS = 10
 _LOW_NATIVE_QUALITY_THRESHOLD = 0.48
@@ -66,6 +97,59 @@ _MIN_EXPORTED_IMAGE_AREA_RATIO = 0.015
 _MAX_EXPORTED_IMAGE_AREA_RATIO = 0.75
 _MAX_EXPORTED_PDF_IMAGES = 500
 _MAX_EXPORTED_IMAGE_BYTES = 12 * 1024 * 1024
+_OCR_TITLE_TARGET_LAST_PAGE = 4
+_OCR_TITLE_REFERENCE_LAST_PAGE = 12
+_OCR_TITLE_CONNECTORS = frozenset(
+    {
+        "a",
+        "an",
+        "and",
+        "da",
+        "das",
+        "de",
+        "del",
+        "della",
+        "der",
+        "des",
+        "die",
+        "do",
+        "dos",
+        "du",
+        "e",
+        "el",
+        "en",
+        "et",
+        "for",
+        "in",
+        "la",
+        "las",
+        "le",
+        "les",
+        "los",
+        "o",
+        "of",
+        "on",
+        "or",
+        "para",
+        "the",
+        "to",
+        "und",
+        "von",
+        "y",
+        "zu",
+    }
+)
+_TOC_REFERENCE_PREFIX_PATTERN = re.compile(
+    r"^(?P<prefix>(?:(?:table|tabla|cuadro)\s+)?\d+\s*[.\-:)]\s*)(?P<label>.+)$",
+    re.IGNORECASE,
+)
+_TABLE_CAPTION_LINE_PATTERN = re.compile(
+    r"^(?:table|tabla|cuadro)\s+(?:\d+|[ivxlcdm]+)\s*[.\-:]",
+    re.IGNORECASE,
+)
+_ROMAN_HEADING_REFERENCE_PATTERN = re.compile(
+    r"^(?P<prefix>.+?)\s+(?P<roman>[IVXLCDM]{1,6})(?=\s*(?::|[-–—]|$))"
+)
 _FULL_PAGE_EXPORT_LETTER_LIMIT = 100
 _MIN_COLUMN_LINES = 3
 _MIN_VECTOR_CURVES = 3
@@ -85,71 +169,6 @@ _PDF_PAGE_MARKER_PATTERN = re.compile(r"<!--\s*PZDOC PDF PAGE \d+\s*-->", re.IGN
 def strip_pdf_page_markers(markdown: str) -> str:
     """Remove private page anchors before publishing user-visible text."""
     return _PDF_PAGE_MARKER_PATTERN.sub("", markdown)
-
-
-@dataclass(frozen=True, slots=True)
-class _PdfLink:
-    target: str
-    x0: float
-    x1: float
-    top: float
-    bottom: float
-
-
-@dataclass(frozen=True, slots=True)
-class _PdfCharacter:
-    """Only the character fields needed after pdfplumber releases a page."""
-
-    text: str
-    x0: float
-    x1: float
-    top: float
-    bottom: float
-    size: float
-    upright: bool
-
-
-@dataclass(frozen=True, slots=True)
-class _PdfLine:
-    page_number: int
-    page_width: float
-    page_height: float
-    text: str
-    chars: tuple[_PdfCharacter, ...]
-    x0: float
-    x1: float
-    top: float
-    bottom: float
-    font_size: float
-    bold: bool
-    links: tuple[_PdfLink, ...]
-    soft_hyphen_end: bool
-    hard_hyphen_end: bool
-    rotated: bool
-
-    @property
-    def centered(self) -> bool:
-        line_center = (self.x0 + self.x1) / 2
-        return abs(line_center - self.page_width / 2) <= self.page_width * 0.09
-
-
-@dataclass(frozen=True, slots=True)
-class _PdfPage:
-    number: int
-    lines: tuple[_PdfLine, ...]
-    has_images: bool
-    image_area_ratios: tuple[float, ...]
-    has_table: bool
-    image_orientation_mismatch: bool
-
-
-@dataclass(slots=True)
-class _MarkdownBlock:
-    kind: str
-    text: str
-    page_number: int
-    level: int | None = None
-    source_line: _PdfLine | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -221,10 +240,6 @@ class _PdfOcrPlan:
     required_page_numbers: set[int]
 
 
-class _OcrCheckpointArguments(TypedDict, total=False):
-    on_page_result: Callable[[int, str], None]
-
-
 def extract_pdf_warning_pages(markdown: str) -> tuple[int, ...]:
     """Return sorted PDF page numbers explicitly marked for human review."""
     return tuple(
@@ -232,13 +247,21 @@ def extract_pdf_warning_pages(markdown: str) -> tuple[int, ...]:
     )
 
 
-def resolve_pdf_page_range(source_path: Path, requested: PdfPageRange) -> PdfPageRange:
+def resolve_pdf_page_range(
+    source_path: Path,
+    requested: PdfPageRange,
+    *,
+    cancellation: CancellationToken | None = None,
+) -> PdfPageRange:
     """Clamp a valid requested range to the real final page of a local PDF."""
+    check_cancelled(cancellation)
     _validate_pdf_header(source_path)
     _validate_page_range_values(requested)
     try:
         with pdfplumber.open(source_path, unicode_norm="NFC") as pdf:
-            return _resolve_page_range(len(pdf.pages), requested)
+            resolved = _resolve_page_range(len(pdf.pages), requested)
+            check_cancelled(cancellation)
+            return resolved
     except (MalformedPDFException, PdfminerException, OSError, ValueError) as exc:
         raise ConversionError(f"No se pudo abrir el PDF {source_path.name}.") from exc
 
@@ -371,13 +394,18 @@ def convert_pdf_document(
     heading_sizes = _heading_size_levels(lines, body_size)
     repeated_margins = _repeated_margin_lines(lines, len(pages))
     referenced_pages = _referenced_pages(lines)
+    rendered_ocr_pages = _repair_repeated_front_matter_ocr_titles(
+        pages,
+        ocr_pages,
+        body_size,
+    )
     markdown, review_issues = _render_document(
         pages,
         body_size,
         heading_sizes,
         repeated_margins,
         referenced_pages,
-        ocr_pages,
+        rendered_ocr_pages,
         ocr_failed_pages,
         page_images,
         on_progress,
@@ -391,7 +419,7 @@ def convert_pdf_document(
         pages,
         ocr_plan.page_numbers,
         review_issues,
-        ocr_pages,
+        rendered_ocr_pages,
     )
     return PdfConversionResult(
         f"{markdown}\n",
@@ -465,80 +493,33 @@ def _run_planned_ocr(
         if save_checkpoint is not None:
             save_checkpoint(page_number, markdown)
 
-    checkpoint_arguments: _OcrCheckpointArguments = {}
+    ocr_arguments: dict[str, Any] = {}
     ocr_parameters = inspect.signature(convert_pdf_pages_with_ocr).parameters
     if save_checkpoint is not None and "on_page_result" in ocr_parameters:
-        checkpoint_arguments["on_page_result"] = persist_page
+        ocr_arguments["on_page_result"] = persist_page
     force_full_page_numbers = (
         plan.force_full_page_numbers & pending_pages
         if "force_full_page_numbers" in ocr_parameters
         else set()
     )
+    if force_full_page_numbers:
+        ocr_arguments["force_full_page_numbers"] = force_full_page_numbers
+    if progress is not None:
+        ocr_arguments["on_progress"] = progress
 
     try:
         if cancellation is None:
-            if force_full_page_numbers:
-                if progress is None:
-                    ocr_pages = convert_pdf_pages_with_ocr(
-                        source_path,
-                        pending_pages,
-                        force_full_page_numbers=force_full_page_numbers,
-                        **checkpoint_arguments,
-                    )
-                else:
-                    ocr_pages = convert_pdf_pages_with_ocr(
-                        source_path,
-                        pending_pages,
-                        force_full_page_numbers=force_full_page_numbers,
-                        on_progress=progress,
-                        **checkpoint_arguments,
-                    )
-            else:
-                if progress is None:
-                    ocr_pages = convert_pdf_pages_with_ocr(
-                        source_path,
-                        pending_pages,
-                        **checkpoint_arguments,
-                    )
-                else:
-                    ocr_pages = convert_pdf_pages_with_ocr(
-                        source_path,
-                        pending_pages,
-                        on_progress=progress,
-                        **checkpoint_arguments,
-                    )
-        elif force_full_page_numbers:
-            if progress is None:
-                ocr_pages = convert_pdf_pages_with_ocr(
-                    source_path,
-                    pending_pages,
-                    cancellation,
-                    force_full_page_numbers=force_full_page_numbers,
-                    **checkpoint_arguments,
-                )
-            else:
-                ocr_pages = convert_pdf_pages_with_ocr(
-                    source_path,
-                    pending_pages,
-                    cancellation,
-                    force_full_page_numbers=force_full_page_numbers,
-                    on_progress=progress,
-                    **checkpoint_arguments,
-                )
-        elif progress is None:
             ocr_pages = convert_pdf_pages_with_ocr(
                 source_path,
                 pending_pages,
-                cancellation,
-                **checkpoint_arguments,
+                **ocr_arguments,
             )
         else:
             ocr_pages = convert_pdf_pages_with_ocr(
                 source_path,
                 pending_pages,
                 cancellation,
-                on_progress=progress,
-                **checkpoint_arguments,
+                **ocr_arguments,
             )
     except ConversionError:
         if plan.required_page_numbers:
@@ -696,13 +677,17 @@ def _extract_pages(
                 if line is not None:
                     built_lines.extend(_split_wide_line(line))
             lines = tuple(_reading_order_lines(built_lines))
+            tables = _extract_tables(page)
+            if not tables and _has_spatial_table_candidate(lines):
+                tables = _extract_spatial_tables(page, lines)
             extracted_page = _PdfPage(
                 number=page_number,
                 lines=lines,
                 has_images=bool(page.images),
                 image_area_ratios=_image_area_ratios(page),
-                has_table=_has_table_candidate(page),
+                has_table=bool(tables),
                 image_orientation_mismatch=_image_orientation_mismatch(page),
+                tables=tables,
             )
             pages.append(extracted_page)
             filtered_page.close()
@@ -713,209 +698,6 @@ def _extract_pages(
                 on_progress(PdfProgressPhase.EXTRACTING, current, total_pages)
         check_cancelled(cancellation)
         return pages
-
-
-def _serialize_page_checkpoint(page: _PdfPage) -> str:
-    record = {
-        "version": _PDF_PAGE_CHECKPOINT_VERSION,
-        "page": page.number,
-        "has_images": page.has_images,
-        "image_area_ratios": list(page.image_area_ratios),
-        "has_table": page.has_table,
-        "image_orientation_mismatch": page.image_orientation_mismatch,
-        "lines": [
-            {
-                "page_width": line.page_width,
-                "page_height": line.page_height,
-                "text": line.text,
-                "chars": [
-                    [
-                        character.text,
-                        character.x0,
-                        character.x1,
-                        character.top,
-                        character.bottom,
-                        character.size,
-                        character.upright,
-                    ]
-                    for character in line.chars
-                ],
-                "x0": line.x0,
-                "x1": line.x1,
-                "top": line.top,
-                "bottom": line.bottom,
-                "font_size": line.font_size,
-                "bold": line.bold,
-                "links": [
-                    [link.target, link.x0, link.x1, link.top, link.bottom] for link in line.links
-                ],
-                "soft_hyphen_end": line.soft_hyphen_end,
-                "hard_hyphen_end": line.hard_hyphen_end,
-                "rotated": line.rotated,
-            }
-            for line in page.lines
-        ],
-    }
-    return json.dumps(record, ensure_ascii=False, separators=(",", ":"))
-
-
-def _deserialize_page_checkpoint(payload: str | None, page_number: int) -> _PdfPage | None:
-    if payload is None:
-        return None
-    try:
-        payload_size = len(payload.encode("utf-8"))
-    except UnicodeError:
-        return None
-    if payload_size > _MAX_PDF_PAGE_CHECKPOINT_BYTES:
-        return None
-    try:
-        raw = json.loads(payload)
-        return _page_from_checkpoint(raw, page_number)
-    except (KeyError, TypeError, ValueError, json.JSONDecodeError):
-        return None
-
-
-def _page_from_checkpoint(raw: object, page_number: int) -> _PdfPage:
-    if not isinstance(raw, dict) or set(raw) != {
-        "version",
-        "page",
-        "has_images",
-        "image_area_ratios",
-        "has_table",
-        "image_orientation_mismatch",
-        "lines",
-    }:
-        raise ValueError
-    if (
-        raw["version"] != _PDF_PAGE_CHECKPOINT_VERSION
-        or isinstance(raw["page"], bool)
-        or raw["page"] != page_number
-        or type(raw["has_images"]) is not bool
-        or type(raw["has_table"]) is not bool
-        or type(raw["image_orientation_mismatch"]) is not bool
-    ):
-        raise ValueError
-    raw_ratios = raw["image_area_ratios"]
-    raw_lines = raw["lines"]
-    if (
-        not isinstance(raw_ratios, list)
-        or len(raw_ratios) > _MAX_PDF_LINE_CHARACTERS
-        or not isinstance(raw_lines, list)
-        or len(raw_lines) > _MAX_PDF_PAGE_LINES
-    ):
-        raise ValueError
-    ratios = tuple(_checkpoint_float(value, minimum=0, maximum=100) for value in raw_ratios)
-    lines = tuple(_line_from_checkpoint(line, page_number) for line in raw_lines)
-    return _PdfPage(
-        number=page_number,
-        lines=lines,
-        has_images=raw["has_images"],
-        image_area_ratios=ratios,
-        has_table=raw["has_table"],
-        image_orientation_mismatch=raw["image_orientation_mismatch"],
-    )
-
-
-def _line_from_checkpoint(raw: object, page_number: int) -> _PdfLine:
-    if not isinstance(raw, dict) or set(raw) != {
-        "page_width",
-        "page_height",
-        "text",
-        "chars",
-        "x0",
-        "x1",
-        "top",
-        "bottom",
-        "font_size",
-        "bold",
-        "links",
-        "soft_hyphen_end",
-        "hard_hyphen_end",
-        "rotated",
-    }:
-        raise ValueError
-    text = raw["text"]
-    raw_chars = raw["chars"]
-    raw_links = raw["links"]
-    if (
-        not isinstance(text, str)
-        or not text
-        or "\0" in text
-        or not isinstance(raw_chars, list)
-        or len(raw_chars) > _MAX_PDF_LINE_CHARACTERS
-        or not isinstance(raw_links, list)
-        or len(raw_links) > _MAX_PDF_LINE_LINKS
-        or type(raw["bold"]) is not bool
-        or type(raw["soft_hyphen_end"]) is not bool
-        or type(raw["hard_hyphen_end"]) is not bool
-        or type(raw["rotated"]) is not bool
-    ):
-        raise ValueError
-    page_width = _checkpoint_float(raw["page_width"], minimum=0.01)
-    page_height = _checkpoint_float(raw["page_height"], minimum=0.01)
-    return _PdfLine(
-        page_number=page_number,
-        page_width=page_width,
-        page_height=page_height,
-        text=text,
-        chars=tuple(_character_from_checkpoint(value) for value in raw_chars),
-        x0=_checkpoint_float(raw["x0"]),
-        x1=_checkpoint_float(raw["x1"]),
-        top=_checkpoint_float(raw["top"]),
-        bottom=_checkpoint_float(raw["bottom"]),
-        font_size=_checkpoint_float(raw["font_size"], minimum=0.01),
-        bold=raw["bold"],
-        links=tuple(_link_from_checkpoint(value) for value in raw_links),
-        soft_hyphen_end=raw["soft_hyphen_end"],
-        hard_hyphen_end=raw["hard_hyphen_end"],
-        rotated=raw["rotated"],
-    )
-
-
-def _character_from_checkpoint(raw: object) -> _PdfCharacter:
-    if not isinstance(raw, list) or len(raw) != 7:
-        raise ValueError
-    text = raw[0]
-    if not isinstance(text, str) or "\0" in text or len(text) > 4_096 or type(raw[6]) is not bool:
-        raise ValueError
-    return _PdfCharacter(
-        text=text,
-        x0=_checkpoint_float(raw[1]),
-        x1=_checkpoint_float(raw[2]),
-        top=_checkpoint_float(raw[3]),
-        bottom=_checkpoint_float(raw[4]),
-        size=_checkpoint_float(raw[5], minimum=0),
-        upright=raw[6],
-    )
-
-
-def _link_from_checkpoint(raw: object) -> _PdfLink:
-    if not isinstance(raw, list) or len(raw) != 5:
-        raise ValueError
-    target = raw[0]
-    if not isinstance(target, str) or not target or "\0" in target or len(target) > 32_768:
-        raise ValueError
-    return _PdfLink(
-        target=target,
-        x0=_checkpoint_float(raw[1]),
-        x1=_checkpoint_float(raw[2]),
-        top=_checkpoint_float(raw[3]),
-        bottom=_checkpoint_float(raw[4]),
-    )
-
-
-def _checkpoint_float(
-    value: object,
-    *,
-    minimum: float = -10_000_000,
-    maximum: float = 10_000_000,
-) -> float:
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        raise ValueError
-    converted = float(value)
-    if not math.isfinite(converted) or not minimum <= converted <= maximum:
-        raise ValueError
-    return converted
 
 
 def _validate_page_range_values(page_range: PdfPageRange) -> None:
@@ -1083,6 +865,14 @@ def _exportable_image_boxes(
         x0, top, x1, bottom = bbox
         ratio = (x1 - x0) * (bottom - top) / page_area
         candidates.append((ratio, bbox))
+
+    for table in model.tables:
+        if table.rendering is not _TableRendering.STRUCTURED_TEXT:
+            continue
+        x0, top, x1, bottom = table.bbox
+        ratio = (x1 - x0) * (bottom - top) / page_area
+        if _MIN_EXPORTED_IMAGE_AREA_RATIO <= ratio < _MAX_EXPORTED_IMAGE_AREA_RATIO:
+            candidates.append((ratio, table.bbox))
 
     # A page-sized image is normally a scan or decorative background. Keep at most one only
     # when the page contains almost no readable content (for example, a cover or plate).
@@ -1253,22 +1043,93 @@ def _render_pdf_image(
 
 
 def _has_table_candidate(page: Any) -> bool:
+    return bool(_extract_tables(page))
+
+
+def _extract_tables(page: Any) -> tuple[_PdfTable, ...]:
+    """Extract bounded tables and choose the least lossy portable representation."""
+
     if len(page.lines) + len(page.rects) < 4:
-        return False
+        return ()
     try:
         tables = page.find_tables()
     except (PdfminerException, TypeError, ValueError):
-        return False
+        return ()
+    extracted: list[_PdfTable] = []
     for table in tables:
         data = table.extract() or []
-        row_count = len(data)
-        column_count = max((len(row) for row in data), default=0)
-        populated_cells = sum(
-            bool(str(cell).strip()) for row in data for cell in row if cell is not None
+        rows = tuple(tuple(_normalize_table_cell(cell) for cell in row) for row in data)
+        column_count = max((len(row) for row in rows), default=0)
+        populated_cells = sum(bool(cell) for row in rows for cell in row)
+        if (
+            len(rows) < 2
+            or len(rows) > _MAX_PDF_TABLE_ROWS
+            or column_count < 2
+            or column_count > _MAX_PDF_TABLE_COLUMNS
+            or populated_cells < 4
+            or any(len(cell) > _MAX_PDF_TABLE_CELL_CHARACTERS for row in rows for cell in row)
+        ):
+            continue
+        try:
+            bbox = tuple(float(value) for value in table.bbox)
+        except (TypeError, ValueError):
+            continue
+        if (
+            len(bbox) != 4
+            or not all(math.isfinite(value) for value in bbox)
+            or bbox[0] < 0
+            or bbox[1] < 0
+            or bbox[0] >= bbox[2]
+            or bbox[1] >= bbox[3]
+            or bbox[2] > float(page.width)
+            or bbox[3] > float(page.height)
+        ):
+            continue
+        normalized_rows = tuple(row + ("",) * (column_count - len(row)) for row in rows)
+        rendering = _table_rendering(normalized_rows, column_count)
+        extracted.append(
+            _PdfTable(
+                (bbox[0], bbox[1], bbox[2], bbox[3]),
+                normalized_rows,
+                rendering,
+            )
         )
-        if row_count >= 2 and column_count >= 2 and populated_cells >= 4:
-            return True
-    return False
+    return tuple(extracted)
+
+
+def _normalize_table_cell(value: object) -> str:
+    if value is None:
+        return ""
+    normalized = str(value).replace("\r", "").replace("\u00ad\n", "").replace("\u00ad", "")
+    return re.sub(r"[ \t]+", " ", normalized).strip()
+
+
+def _render_table_cell(value: str) -> str:
+    source_lines = value.split("\n")
+    normalized_lines: list[str] = []
+    for line in source_lines:
+        if not normalized_lines:
+            normalized_lines.append(line)
+        elif normalized_lines[-1].endswith("-") and _hard_hyphen_wraps_word(
+            normalized_lines[-1], line
+        ):
+            normalized_lines[-1] = f"{normalized_lines[-1][:-1]}{line.lstrip()}"
+        else:
+            normalized_lines.append(line)
+    return "\n".join(normalized_lines)
+
+
+def _table_rendering(
+    rows: tuple[tuple[str, ...], ...],
+    column_count: int,
+) -> _TableRendering:
+    longest = max((len(cell) for row in rows for cell in row), default=0)
+    multiline = any("\n" in cell for row in rows for cell in row)
+    if len(rows) > 80 or column_count > 16 or longest > 2_000:
+        return _TableRendering.STRUCTURED_TEXT
+    if column_count <= 8 and longest <= 220 and not multiline:
+        return _TableRendering.MARKDOWN
+    return _TableRendering.HTML
 
 
 def _deduplicated_page(page: Any) -> Any:
@@ -1618,7 +1479,7 @@ def _split_wide_line(line: _PdfLine) -> tuple[_PdfLine, ...]:
     )
     if len(visible) < 4:
         return (line,)
-    split_threshold = max(line.page_width * 0.1, line.font_size * 5)
+    split_threshold = max(line.page_width * 0.045, line.font_size * 3)
     boundaries = [
         (previous.x1 + current.x0) / 2
         for previous, current in zip(visible, visible[1:], strict=False)
@@ -1632,7 +1493,7 @@ def _split_wide_line(line: _PdfLine) -> tuple[_PdfLine, ...]:
         center = (character.x0 + character.x1) / 2
         group_index = sum(center > boundary for boundary in boundaries)
         groups[group_index].append(character)
-    if any(sum(character.text.isalpha() for character in group) < 2 for group in groups):
+    if any(not any(character.text.isalnum() for character in group) for group in groups):
         return (line,)
 
     parts: list[_PdfLine] = []
@@ -1684,9 +1545,15 @@ def _reading_order_lines(lines: list[_PdfLine]) -> list[_PdfLine]:
     ordered = sorted(lines, key=lambda line: (line.top, line.x0, line.bottom))
     result: list[_PdfLine] = []
     band: list[_PdfLine] = []
+    font_sizes = [line.font_size for line in lines if line.font_size > 0]
+    typical_font_size = median(font_sizes) if font_sizes else 10.0
     for line in ordered:
         width = max(0.0, line.x1 - line.x0)
-        separator = width >= page_width * 0.58 or (line.centered and width >= page_width * 0.25)
+        separator = width >= page_width * 0.58 or (
+            line.centered
+            and width >= page_width * 0.25
+            and (line.bold or line.font_size >= typical_font_size * 1.15)
+        )
         if separator:
             result.extend(_order_column_band(band, page_width))
             band.clear()
@@ -1700,23 +1567,252 @@ def _reading_order_lines(lines: list[_PdfLine]) -> list[_PdfLine]:
 def _order_column_band(lines: list[_PdfLine], page_width: float) -> list[_PdfLine]:
     if len(lines) < _MIN_COLUMN_LINES * 2:
         return sorted(lines, key=lambda line: (line.top, line.x0, line.bottom))
-    left = [line for line in lines if (line.x0 + line.x1) / 2 <= page_width * 0.47]
-    right = [line for line in lines if (line.x0 + line.x1) / 2 >= page_width * 0.53]
-    if len(left) < _MIN_COLUMN_LINES or len(right) < _MIN_COLUMN_LINES:
+    ordered = sorted(lines, key=lambda line: (line.x0, line.top, line.bottom))
+    groups: list[list[_PdfLine]] = [[ordered[0]]]
+    minimum_column_gap = page_width * 0.12
+    for line in ordered[1:]:
+        if line.x0 - groups[-1][-1].x0 >= minimum_column_gap:
+            groups.append([line])
+        else:
+            groups[-1].append(line)
+    if not 2 <= len(groups) <= 4 or any(len(group) < _MIN_COLUMN_LINES for group in groups):
         return sorted(lines, key=lambda line: (line.top, line.x0, line.bottom))
-    if set(left).intersection(right):
-        return sorted(lines, key=lambda line: (line.top, line.x0, line.bottom))
-    left_top, left_bottom = min(line.top for line in left), max(line.bottom for line in left)
-    right_top, right_bottom = min(line.top for line in right), max(line.bottom for line in right)
-    if min(left_bottom, right_bottom) <= max(left_top, right_top):
-        return sorted(lines, key=lambda line: (line.top, line.x0, line.bottom))
-    unassigned = [line for line in lines if line not in left and line not in right]
-    if unassigned:
+
+    for group, following in zip(groups, groups[1:], strict=False):
+        next_column_start = min(line.x0 for line in following)
+        crossing_lines = sum(line.x1 + page_width * 0.01 > next_column_start for line in group)
+        if crossing_lines > max(1, round(len(group) * 0.08)):
+            return sorted(lines, key=lambda line: (line.top, line.x0, line.bottom))
+    vertical_spans = [
+        (min(line.top for line in group), max(line.bottom for line in group)) for group in groups
+    ]
+    if min(bottom for _top, bottom in vertical_spans) <= max(
+        top for top, _bottom in vertical_spans
+    ):
         return sorted(lines, key=lambda line: (line.top, line.x0, line.bottom))
     return [
-        *sorted(left, key=lambda line: (line.top, line.x0, line.bottom)),
-        *sorted(right, key=lambda line: (line.top, line.x0, line.bottom)),
+        line
+        for group in groups
+        for line in sorted(group, key=lambda item: (item.top, item.x0, item.bottom))
     ]
+
+
+def _normalize_toc_entry_rows(lines: list[_PdfLine]) -> list[_PdfLine]:
+    """Pair a detached page-number column with its TOC entries by geometry."""
+
+    if len(lines) < 6:
+        return lines
+    page_width = max((line.page_width for line in lines), default=0.0)
+    if page_width <= 0:
+        return lines
+    number_indices = [
+        index
+        for index, line in enumerate(lines)
+        if not line.rotated
+        and line.x0 >= page_width * 0.35
+        and _is_page_number(re.sub(r"\s+", "", line.text))
+    ]
+    if len(number_indices) < 3:
+        return lines
+
+    entry_to_number: dict[int, int] = {}
+    used_entries: set[int] = set()
+    for number_index in number_indices:
+        number = lines[number_index]
+        candidates = [
+            (index, line)
+            for index, line in enumerate(lines)
+            if index not in used_entries
+            and index not in number_indices
+            and not line.rotated
+            and _heading_letter_count(line.text) >= 2
+            and line.x0 < number.x0
+            and line.x1 <= number.x0 + max(2.0, line.font_size * 0.4)
+            and number.x0 - line.x0 >= page_width * 0.18
+            and _toc_lines_share_row(line, number)
+        ]
+        if not candidates:
+            continue
+        entry_index, _entry = min(
+            candidates,
+            key=lambda item: (
+                abs((item[1].top + item[1].bottom) - (number.top + number.bottom)),
+                -item[1].x0,
+                -item[1].x1,
+            ),
+        )
+        entry_to_number[entry_index] = number_index
+        used_entries.add(entry_index)
+
+    if len(entry_to_number) < 3 or len(entry_to_number) / len(number_indices) < 0.75:
+        return lines
+
+    paired_number_indices = set(entry_to_number.values())
+    normalized: list[_PdfLine] = []
+    for index, line in enumerate(lines):
+        if index in paired_number_indices:
+            continue
+        matched_number_index = entry_to_number.get(index)
+        if matched_number_index is None:
+            normalized.append(line)
+            continue
+        normalized.append(_merge_toc_entry_number_line(line, lines[matched_number_index]))
+    # Keep the extractor's already validated column order. Only remove the
+    # detached folio column; sorting by row here would interleave a genuine
+    # two-column contents page.
+    return normalized
+
+
+def _toc_lines_share_row(entry: _PdfLine, number: _PdfLine) -> bool:
+    entry_height = max(0.1, entry.bottom - entry.top)
+    number_height = max(0.1, number.bottom - number.top)
+    shorter_height = min(entry_height, number_height)
+    overlap = min(entry.bottom, number.bottom) - max(entry.top, number.top)
+    entry_center = (entry.top + entry.bottom) / 2
+    number_center = (number.top + number.bottom) / 2
+    return overlap >= shorter_height * 0.55 or abs(entry_center - number_center) <= max(
+        1.5,
+        shorter_height * 0.35,
+    )
+
+
+def _merge_toc_entry_number_line(entry: _PdfLine, number: _PdfLine) -> _PdfLine:
+    merged_x0 = min(entry.x0, number.x0)
+    merged_x1 = max(entry.x1, number.x1)
+    merged_top = min(entry.top, number.top)
+    merged_bottom = max(entry.bottom, number.bottom)
+    links = tuple(
+        dict.fromkeys(
+            sorted(
+                (*entry.links, *number.links),
+                key=lambda link: (link.x0, link.top, link.x1, link.bottom, link.target),
+            )
+        )
+    )
+    targets = {link.target for link in links}
+    if len(targets) == 1:
+        links = (
+            _PdfLink(
+                target=next(iter(targets)),
+                x0=merged_x0,
+                x1=merged_x1,
+                top=merged_top,
+                bottom=merged_bottom,
+            ),
+        )
+    return replace(
+        entry,
+        text=f"{entry.text.rstrip()} {number.text.strip()}",
+        chars=tuple(sorted((*entry.chars, *number.chars), key=lambda char: (char.x0, char.top))),
+        x0=merged_x0,
+        x1=merged_x1,
+        top=merged_top,
+        bottom=merged_bottom,
+        links=links,
+        soft_hyphen_end=False,
+        hard_hyphen_end=False,
+    )
+
+
+def _native_toc_heading_references(
+    pages: list[_PdfPage],
+    body_size: float,
+    heading_sizes: dict[float, int],
+    repeated_margins: set[str],
+) -> tuple[dict[str, frozenset[str]], dict[str, frozenset[str]]]:
+    """Index reliable native headings without using TOC text as its own donor."""
+
+    exact: defaultdict[str, set[str]] = defaultdict(set)
+    romans: defaultdict[str, set[str]] = defaultdict(set)
+    for page in pages:
+        if _is_toc_page(list(page.lines)):
+            continue
+        previous: _PdfLine | None = None
+        for line in page.lines:
+            if line.rotated or _omit_margin_line(
+                line,
+                repeated_margins,
+                previous,
+                body_size,
+            ):
+                continue
+            gap_before = line.top - previous.bottom if previous is not None else body_size * 2
+            text = _display_heading_text(line).strip()
+            heading = (
+                _heading_level(
+                    line,
+                    body_size,
+                    heading_sizes,
+                    gap_before,
+                    False,
+                )
+                is not None
+            )
+            table_caption = bool(
+                re.match(r"^(?:table|tabla|cuadro)\s+\d+\s*[.\-:]", text, re.IGNORECASE)
+            )
+            if heading or table_caption:
+                _prefix, label = _split_toc_reference_label(text)
+                key = _toc_reference_key(label)
+                if len(key) >= 8:
+                    exact[key].add(label)
+                roman_match = _ROMAN_HEADING_REFERENCE_PATTERN.match(label)
+                if roman_match is not None:
+                    prefix_key = _toc_reference_key(roman_match.group("prefix"))
+                    if len(prefix_key) >= 3:
+                        romans[prefix_key].add(roman_match.group("roman"))
+            previous = line
+    return (
+        {key: frozenset(values) for key, values in exact.items()},
+        {key: frozenset(values) for key, values in romans.items()},
+    )
+
+
+def _repair_toc_entries_from_native_headings(
+    lines: list[_PdfLine],
+    exact_references: dict[str, frozenset[str]],
+    roman_references: dict[str, frozenset[str]],
+) -> list[_PdfLine]:
+    """Repair only spacing/case or 1/I glyphs confirmed by body headings."""
+
+    repaired: list[_PdfLine] = []
+    for line in lines:
+        folio = _toc_entry_page_number(line.text)
+        if folio is None:
+            repaired.append(line)
+            continue
+        entry, _folio = line.text.strip().rsplit(maxsplit=1)
+        enumeration, label = _split_toc_reference_label(entry)
+        candidates = exact_references.get(_toc_reference_key(label), frozenset())
+        if len(candidates) == 1:
+            label = next(iter(candidates))
+
+        ordinal = re.match(r"^(?P<prefix>.+[^\W\d_])\s+(?P<ones>1{1,3})$", label)
+        if ordinal is not None:
+            roman = "I" * len(ordinal.group("ones"))
+            prefix = ordinal.group("prefix")
+            if roman in roman_references.get(_toc_reference_key(prefix), frozenset()):
+                label = f"{prefix} {roman}"
+
+        text = f"{enumeration}{label} {folio}"
+        repaired.append(replace(line, text=text) if text != line.text else line)
+    return repaired
+
+
+def _split_toc_reference_label(text: str) -> tuple[str, str]:
+    match = _TOC_REFERENCE_PREFIX_PATTERN.match(text.strip())
+    if match is None:
+        return "", text.strip()
+    return match.group("prefix"), match.group("label").strip()
+
+
+def _toc_reference_key(text: str) -> str:
+    decomposed = unicodedata.normalize("NFKD", text.casefold())
+    return "".join(
+        character
+        for character in decomposed
+        if not unicodedata.combining(character) and character.isalnum()
+    )
 
 
 def _compact_character(raw: dict[str, Any]) -> _PdfCharacter | None:
@@ -1795,6 +1891,415 @@ def _pages_requiring_ocr(pages: list[_PdfPage]) -> set[int]:
     return selected
 
 
+def _has_spatial_table_candidate(lines: tuple[_PdfLine, ...]) -> bool:
+    """Cheaply preselect pages whose text may form a table without vector rules."""
+
+    useful = tuple(
+        line
+        for line in lines
+        if not line.rotated
+        and line.x1 - line.x0 >= 2
+        and any(not character.isspace() for character in line.text)
+    )
+    if len(useful) < 8:
+        return False
+    page_width = max((line.page_width for line in useful), default=0)
+    if page_width <= 0:
+        return False
+    side_by_side = _side_by_side_line_indexes(useful, page_width)
+    return len(side_by_side) >= 6 and len(side_by_side) / len(useful) >= 0.20
+
+
+def _side_by_side_line_indexes(
+    lines: tuple[_PdfLine, ...],
+    page_width: float,
+) -> set[int]:
+    """Return lines participating in repeated horizontal cell relationships."""
+
+    side_by_side: set[int] = set()
+    minimum_gutter = page_width * 0.025
+    for left_index, left in enumerate(lines):
+        for right_index in range(left_index + 1, len(lines)):
+            right = lines[right_index]
+            vertical_overlap = min(left.bottom, right.bottom) - max(left.top, right.top)
+            minimum_height = max(1.0, min(left.bottom - left.top, right.bottom - right.top))
+            horizontally_separated = (
+                left.x1 + minimum_gutter <= right.x0 or right.x1 + minimum_gutter <= left.x0
+            )
+            if vertical_overlap >= minimum_height * 0.35 and horizontally_separated:
+                side_by_side.update((left_index, right_index))
+    return side_by_side
+
+
+def _extract_spatial_tables(page: Any, lines: tuple[_PdfLine, ...]) -> tuple[_PdfTable, ...]:
+    """Recover a raster-ruled table only when every visible character is conserved."""
+
+    useful = tuple(
+        line
+        for line in lines
+        if not line.rotated
+        and line.x1 - line.x0 >= 2
+        and any(not character.isspace() for character in line.text)
+    )
+    if len(useful) < 8:
+        return ()
+    page_width = max((line.page_width for line in useful), default=0)
+    page_height = max((line.page_height for line in useful), default=0)
+    if page_width <= 0 or page_height <= 0:
+        return ()
+    rule_groups = _spatial_table_rule_groups(_raster_horizontal_rules(page), useful)
+    tables: list[_PdfTable] = []
+    previous_bottom = 0.0
+    for original_rules in rule_groups:
+        rules = original_rules
+        region_top = max(previous_bottom, rules[0].top - page_height * 0.10)
+        region_bottom = rules[-1].top + 1.0
+        region_lines = tuple(
+            line for line in useful if region_top <= (line.top + line.bottom) / 2 <= region_bottom
+        )
+        previous_bottom = rules[-1].top
+        has_caption = any(
+            _TABLE_CAPTION_LINE_PATTERN.match(line.text.strip()) for line in region_lines
+        )
+        if len(rules) == 2 and has_caption:
+            completed_rules = _complete_sparse_table_rules(rules, region_lines, page_width)
+            if completed_rules is not None:
+                rules = completed_rules
+        if len(rules) < 3:
+            continue
+        side_by_side = _side_by_side_line_indexes(region_lines, page_width)
+        minimum_side_by_side_lines = 4 if has_caption else 6
+        if len(side_by_side) < minimum_side_by_side_lines:
+            continue
+        boundaries = _spatial_table_boundaries(
+            region_lines,
+            side_by_side,
+            page_width,
+            page_height,
+            rules,
+            allow_singleton_columns=has_caption and len(rules) <= 3,
+        )
+        if boundaries is None:
+            continue
+        vertical, horizontal = boundaries
+        try:
+            found = page.find_tables(
+                {
+                    "vertical_strategy": "explicit",
+                    "horizontal_strategy": "explicit",
+                    "explicit_vertical_lines": vertical,
+                    "explicit_horizontal_lines": horizontal,
+                    "snap_tolerance": 2,
+                    "join_tolerance": 2,
+                    "intersection_tolerance": 5,
+                    "text_tolerance": 3,
+                }
+            )
+        except (PdfminerException, TypeError, ValueError):
+            continue
+        if len(found) != 1:
+            continue
+        table = found[0]
+        data = table.extract() or []
+        rows = tuple(tuple(_normalize_table_cell(cell) for cell in row) for row in data)
+        column_count = max((len(row) for row in rows), default=0)
+        populated = sum(bool(cell) for row in rows for cell in row)
+        minimum_rows = 2 if has_caption else 4
+        if (
+            not minimum_rows <= len(rows) <= _MAX_PDF_TABLE_ROWS
+            or not 2 <= column_count <= 8
+            or populated / (len(rows) * column_count) < 0.60
+            or any(len(row) != column_count for row in rows)
+            or any(len(cell) > _MAX_PDF_TABLE_CELL_CHARACTERS for row in rows for cell in row)
+        ):
+            continue
+        try:
+            bbox = tuple(float(value) for value in table.bbox)
+        except (TypeError, ValueError):
+            continue
+        if (
+            len(bbox) != 4
+            or not all(math.isfinite(value) for value in bbox)
+            or bbox[0] < 0
+            or bbox[1] < 0
+            or bbox[0] >= bbox[2]
+            or bbox[1] >= bbox[3]
+            or bbox[2] > page_width
+            or bbox[3] > page_height
+            or not _table_has_exact_character_coverage(page, bbox, rows)
+        ):
+            continue
+        model = _PdfTable((bbox[0], bbox[1], bbox[2], bbox[3]), (), _TableRendering.HTML)
+        if any(line.links and _line_inside_table(line, model) for line in lines):
+            continue
+        tables.append(_PdfTable(model.bbox, rows, _table_rendering(rows, column_count)))
+    return tuple(tables)
+
+
+def _complete_sparse_table_rules(
+    rules: tuple[_RasterHorizontalRule, ...],
+    lines: tuple[_PdfLine, ...],
+    page_width: float,
+) -> tuple[_RasterHorizontalRule, ...] | None:
+    """Infer missing inner rules for a short, explicitly captioned table fragment."""
+
+    if len(rules) != 2:
+        return None
+    side_by_side = _side_by_side_line_indexes(lines, page_width)
+    aligned = sorted((lines[index] for index in side_by_side), key=lambda line: line.x0)
+    if len(aligned) < 6:
+        return None
+    tolerance = page_width * 0.045
+    first_column = [aligned[0]]
+    for line in aligned[1:]:
+        if line.x0 - median(item.x0 for item in first_column) > tolerance:
+            break
+        first_column.append(line)
+    row_lines = sorted(
+        (
+            line
+            for line in first_column
+            if rules[0].top < (line.top + line.bottom) / 2 < rules[-1].top
+        ),
+        key=lambda line: line.top,
+    )
+    starts: list[float] = []
+    for line in row_lines:
+        if not starts or line.top - starts[-1] > max(2.0, line.font_size * 0.45):
+            starts.append(line.top)
+    if not 3 <= len(starts) <= _MAX_PDF_TABLE_ROWS:
+        return None
+    boundaries: list[float] = []
+    for current, following in zip(starts, starts[1:], strict=False):
+        row_tolerance = max(
+            4.0,
+            median(line.font_size for line in row_lines) * 0.75,
+        )
+        next_top = min(
+            (
+                line.top
+                for line in lines
+                if following - row_tolerance <= line.top <= following + row_tolerance
+            ),
+            default=following,
+        )
+        previous_bottom = max(
+            (
+                line.bottom
+                for line in lines
+                if line.top >= current - row_tolerance and line.top < next_top - 1.0
+            ),
+            default=current,
+        )
+        if previous_bottom >= next_top:
+            return None
+        boundaries.append(float((previous_bottom + next_top) / 2))
+    x0 = float(median(rule.x0 for rule in rules))
+    x1 = float(median(rule.x1 for rule in rules))
+    return (
+        rules[0],
+        *(_RasterHorizontalRule(x0, top, x1) for top in boundaries),
+        rules[-1],
+    )
+
+
+def _spatial_table_rule_groups(
+    rules: tuple[_RasterHorizontalRule, ...],
+    lines: tuple[_PdfLine, ...],
+) -> tuple[tuple[_RasterHorizontalRule, ...], ...]:
+    """Split consecutive ruled tables only at an explicit caption between their rule sets."""
+
+    if not rules:
+        return ()
+    split_after: set[int] = set()
+    for index, (upper, lower) in enumerate(zip(rules, rules[1:], strict=False)):
+        if index + 1 < 3 or len(rules) - index - 1 < 2:
+            continue
+        if any(
+            upper.top < (line.top + line.bottom) / 2 < lower.top
+            and _TABLE_CAPTION_LINE_PATTERN.match(line.text.strip())
+            for line in lines
+        ):
+            split_after.add(index)
+    groups: list[tuple[_RasterHorizontalRule, ...]] = []
+    start = 0
+    for index in sorted(split_after):
+        groups.append(rules[start : index + 1])
+        start = index + 1
+    groups.append(rules[start:])
+    return tuple(groups)
+
+
+def _raster_horizontal_rules(page: Any) -> tuple[_RasterHorizontalRule, ...]:
+    """Locate long horizontal rules that exist only in the rendered page image."""
+
+    try:
+        image = page.to_image(resolution=144, antialias=True).original.convert("L")
+    except (OSError, TypeError, ValueError):
+        return ()
+    width, height = image.size
+    if width <= 0 or height <= 0:
+        return ()
+    data = image.tobytes()
+    grouped: list[list[tuple[int, tuple[int, int]]]] = []
+    current: list[tuple[int, tuple[int, int]]] = []
+    for y in range(height + 1):
+        span = _long_dark_horizontal_span(data, width, height, y) if y < height else None
+        if span is not None and y / height < 0.97:
+            current.append((y, span))
+        elif current:
+            grouped.append(current)
+            current = []
+    scale_x = float(page.width) / width
+    scale_y = float(page.height) / height
+    return tuple(
+        _RasterHorizontalRule(
+            float(median(span[0] for _y, span in group)) * scale_x,
+            float(median(y for y, _span in group)) * scale_y,
+            float(median(span[1] for _y, span in group)) * scale_x,
+        )
+        for group in grouped
+    )
+
+
+def _long_dark_horizontal_span(
+    data: bytes,
+    width: int,
+    height: int,
+    y: int,
+) -> tuple[int, int] | None:
+    dark_x = bytearray(width)
+    for scan_y in range(max(0, y - 2), min(height, y + 3)):
+        row = data[scan_y * width : (scan_y + 1) * width]
+        for x, value in enumerate(row):
+            if value < 200:
+                dark_x[x] = 1
+    best: tuple[int, int] | None = None
+    start: int | None = None
+    previous = -1
+    gap = 0
+    for x, is_dark in enumerate(dark_x):
+        if is_dark:
+            if start is None or gap > 3:
+                if start is not None and (best is None or previous + 1 - start > best[1] - best[0]):
+                    best = (start, previous + 1)
+                start = x
+            previous = x
+            gap = 0
+        elif start is not None:
+            gap += 1
+    if start is not None and (best is None or previous + 1 - start > best[1] - best[0]):
+        best = (start, previous + 1)
+    if best is None or best[1] - best[0] < width * 0.70:
+        return None
+    return best
+
+
+def _spatial_table_boundaries(
+    lines: tuple[_PdfLine, ...],
+    side_by_side: set[int],
+    page_width: float,
+    page_height: float,
+    rules: tuple[_RasterHorizontalRule, ...],
+    *,
+    allow_singleton_columns: bool = False,
+) -> tuple[tuple[float, ...], tuple[float, ...]] | None:
+    if len(rules) < 3:
+        return None
+    tolerance = page_width * 0.045
+    aligned = sorted((lines[index] for index in side_by_side), key=lambda line: line.x0)
+    clusters: list[list[_PdfLine]] = []
+    for line in aligned:
+        if not clusters or line.x0 - median(item.x0 for item in clusters[-1]) > tolerance:
+            clusters.append([line])
+        else:
+            clusters[-1].append(line)
+    clusters = [cluster for cluster in clusters if len(cluster) >= 2 or allow_singleton_columns]
+    if not 2 <= len(clusters) <= 8:
+        return None
+    anchors = tuple(float(median(line.x0 for line in cluster)) for cluster in clusters)
+    internal_boundaries: list[float] = []
+    minimum_gutter = 0.01
+    for left_cluster, right_cluster in zip(clusters, clusters[1:], strict=False):
+        right_edge = min(line.x0 for line in right_cluster)
+        character_edges = [
+            character.x1
+            for line in aligned
+            for character in line.chars
+            if character.x0 < right_edge and character.x1 <= right_edge
+        ]
+        left_edge = (
+            max(character_edges) if character_edges else max(line.x1 for line in left_cluster)
+        )
+        if right_edge - left_edge < minimum_gutter:
+            return None
+        internal_boundaries.append(float((left_edge + right_edge) / 2))
+    table_row_lines = tuple(
+        line for line in lines if rules[0].top < (line.top + line.bottom) / 2 < rules[-1].top
+    )
+    outer_left = min(
+        float(median(rule.x0 for rule in rules)),
+        min((line.x0 for line in table_row_lines), default=page_width),
+    )
+    outer_right = max(
+        float(median(rule.x1 for rule in rules)),
+        max((line.x1 for line in table_row_lines), default=0.0),
+    )
+    vertical = (
+        outer_left,
+        *internal_boundaries,
+        outer_right,
+    )
+    if any(left >= right for left, right in zip(vertical, vertical[1:], strict=False)):
+        return None
+    horizontal = [rule.top for rule in rules]
+    first = horizontal[0]
+    near_above = tuple(
+        line
+        for line in lines
+        if not line.rotated
+        and line.bottom <= first + 1
+        and line.top >= max(0.0, first - page_height * 0.10)
+        and _LETTER_PATTERN.search(line.text)
+    )
+    aligned_columns = {
+        min(range(len(anchors)), key=lambda index: abs(line.x0 - anchors[index]))
+        for line in near_above
+        if min(abs(line.x0 - anchor) for anchor in anchors) <= page_width * 0.025
+    }
+    if len(_side_by_side_line_indexes(near_above, page_width)) >= 2 and len(aligned_columns) >= 2:
+        horizontal.insert(0, min(line.top for line in near_above))
+    if len(horizontal) < 3 or any(
+        top >= bottom for top, bottom in zip(horizontal, horizontal[1:], strict=False)
+    ):
+        return None
+    return vertical, tuple(horizontal)
+
+
+def _table_has_exact_character_coverage(
+    page: Any,
+    bbox: tuple[float, float, float, float],
+    rows: tuple[tuple[str, ...], ...],
+) -> bool:
+    x0, top, x1, bottom = bbox
+    source = "".join(
+        str(character.get("text", ""))
+        for character in page.chars
+        if x0 <= (float(character["x0"]) + float(character["x1"])) / 2 < x1
+        and top <= (float(character["top"]) + float(character["bottom"])) / 2 < bottom
+    )
+    extracted = "".join(cell for row in rows for cell in row)
+    return _significant_character_counts(source) == _significant_character_counts(extracted)
+
+
+def _significant_character_counts(value: str) -> Counter[str]:
+    return Counter(
+        character
+        for character in unicodedata.normalize("NFKC", value).casefold()
+        if unicodedata.category(character)[0] in {"L", "N", "P", "S"}
+    )
+
+
 def _page_letter_count(page: _PdfPage) -> int:
     return sum(_heading_letter_count(line.text) for line in page.lines if not line.rotated)
 
@@ -1807,6 +2312,200 @@ def _referenced_pages(lines: list[_PdfLine]) -> set[int]:
             if match:
                 referenced.add(int(match.group(1)))
     return referenced
+
+
+def _repair_repeated_front_matter_ocr_titles(
+    pages: list[_PdfPage],
+    ocr_pages: dict[int, str],
+    body_size: float,
+) -> dict[int, str]:
+    """Trust one unique, prominent native title over a short OCR insertion."""
+
+    rendered = dict(ocr_pages)
+    if not rendered or not pages:
+        return rendered
+
+    reliable_native_tokens: set[str] = set()
+    references: list[tuple[int, str, tuple[str, ...], float, float]] = []
+    for page in pages:
+        page_quality = _native_page_quality(page)
+        if page_quality >= 0.75:
+            for line in page.lines:
+                if not line.rotated:
+                    reliable_native_tokens.update(_title_word_tokens(line.text))
+        if (
+            not 2 <= page.number <= _OCR_TITLE_REFERENCE_LAST_PAGE
+            or page_quality < 0.75
+            or _is_toc_page(list(page.lines))
+        ):
+            continue
+        for line in page.lines:
+            reference_text = _normalize_text(line.text)
+            reference_tokens = _title_word_tokens(reference_text)
+            if not _is_reliable_native_title_line(
+                page,
+                line,
+                reference_text,
+                reference_tokens,
+                body_size,
+            ):
+                continue
+            references.append(
+                (
+                    page.number,
+                    reference_text,
+                    reference_tokens,
+                    page_quality,
+                    line.font_size / max(body_size, 0.01),
+                )
+            )
+    if not references:
+        return rendered
+
+    pages_by_number = {page.number: page for page in pages}
+    for page_number, markdown in ocr_pages.items():
+        target_page = pages_by_number.get(page_number)
+        if (
+            target_page is None
+            or page_number > _OCR_TITLE_TARGET_LAST_PAGE
+            or not _should_replace_with_ocr(target_page, markdown)
+            or not (
+                _page_letter_count(target_page) < _GRAPHIC_WARNING_LETTER_LIMIT
+                or _native_page_quality(target_page) < _LOW_NATIVE_QUALITY_THRESHOLD
+                or max(target_page.image_area_ratios, default=0.0) >= _FULL_PAGE_IMAGE_AREA_RATIO
+            )
+        ):
+            continue
+
+        lines = markdown.splitlines(keepends=True)
+        candidate_indices = [index for index, line in enumerate(lines) if line.strip()][:4]
+        for index in candidate_indices:
+            parts = _markdown_title_line_parts(lines[index])
+            if parts is None:
+                continue
+            prefix, target_text, suffix = parts
+            target_tokens = _title_word_tokens(target_text)
+            if not 5 <= len(target_tokens) <= 20 or not 20 <= len(target_text) <= 160:
+                continue
+
+            candidates: list[tuple[tuple[str, ...], str, float, float]] = []
+            for reference_page, reference_text, reference_tokens, quality, prominence in references:
+                if reference_page == page_number:
+                    continue
+                target_counts = Counter(target_tokens)
+                reference_counts = Counter(reference_tokens)
+                extras = tuple((target_counts - reference_counts).elements())
+                missing = tuple((reference_counts - target_counts).elements())
+                if not 1 <= len(extras) <= 2 or len(missing) > 2:
+                    continue
+                substantive_extras = [
+                    token for token in extras if token not in _OCR_TITLE_CONNECTORS
+                ]
+                if (
+                    len(substantive_extras) != 1
+                    or len(substantive_extras[0]) > 5
+                    or re.fullmatch(r"[ivxlcdm]+", substantive_extras[0], re.IGNORECASE)
+                    or substantive_extras[0] in reliable_native_tokens
+                    or any(token not in _OCR_TITLE_CONNECTORS for token in missing)
+                ):
+                    continue
+                if _content_number_tokens(target_text) != _content_number_tokens(reference_text):
+                    continue
+                target_unique = set(target_tokens)
+                reference_unique = set(reference_tokens)
+                unique_coverage = len(target_unique & reference_unique) / max(
+                    1, len(target_unique | reference_unique)
+                )
+                sequence_similarity = SequenceMatcher(
+                    None,
+                    reference_tokens,
+                    target_tokens,
+                    autojunk=False,
+                ).ratio()
+                if unique_coverage < 0.85 or sequence_similarity < 0.87:
+                    continue
+                candidates.append((reference_tokens, reference_text, quality, prominence))
+            candidate_groups = {candidate[0] for candidate in candidates}
+            if len(candidate_groups) != 1:
+                continue
+            chosen = max(candidates, key=lambda candidate: (candidate[2], candidate[3]))
+            lines[index] = f"{prefix}{chosen[1]}{suffix}"
+            rendered[page_number] = "".join(lines)
+            break
+    return rendered
+
+
+def _is_reliable_native_title_line(
+    page: _PdfPage,
+    line: _PdfLine,
+    text: str,
+    tokens: tuple[str, ...],
+    body_size: float,
+) -> bool:
+    if (
+        line.rotated
+        or line.links
+        or line.top <= line.page_height * 0.10
+        or line.bottom >= line.page_height * 0.84
+        or any(_line_inside_table(line, table) for table in page.tables)
+        or not 5 <= len(tokens) <= 18
+        or not 20 <= len(text) <= 160
+        or _text_quality_score(text) < 0.75
+        or _suspicious_glyph_count(text)
+        or "\ufffd" in text
+        or any(
+            ord(character) not in {0x9, 0xA, 0xD}
+            and (ord(character) < 0x20 or 0xD800 <= ord(character) <= 0xDFFF)
+            for character in text
+        )
+    ):
+        return False
+    size_ratio = line.font_size / max(body_size, 0.01)
+    return (
+        size_ratio >= 1.45
+        or (line.centered and size_ratio >= 0.95)
+        or (line.bold and size_ratio >= 1.05)
+    )
+
+
+def _title_word_tokens(text: str) -> tuple[str, ...]:
+    normalized = unicodedata.normalize("NFKD", _normalize_text(text).casefold())
+    without_accents = "".join(
+        character for character in normalized if not unicodedata.combining(character)
+    )
+    return tuple(re.findall(r"[^\W\d_]+", without_accents, flags=re.UNICODE))
+
+
+def _markdown_title_line_parts(line: str) -> tuple[str, str, str] | None:
+    ending_match = re.search(r"(?:\r\n|\r|\n)$", line)
+    ending = ending_match.group(0) if ending_match is not None else ""
+    content = line[: -len(ending)] if ending else line
+    stripped = content.strip()
+    if not stripped or any(marker in stripped for marker in ("|", "![", "<", ">")):
+        return None
+
+    start = content.index(stripped)
+    end = start + len(stripped)
+    prefix = content[:start]
+    suffix = f"{content[end:]}{ending}"
+    visible = stripped
+    heading = re.match(r"#{1,6}[ \t]+", visible)
+    if heading is not None:
+        prefix += heading.group(0)
+        visible = visible[heading.end() :]
+    for marker in ("***", "___", "**", "__", "*", "_", "`"):
+        if (
+            visible.startswith(marker)
+            and visible.endswith(marker)
+            and len(visible) > len(marker) * 2
+        ):
+            prefix += marker
+            suffix = f"{marker}{suffix}"
+            visible = visible[len(marker) : -len(marker)].strip()
+            break
+    if not visible or any(marker in visible for marker in ("[", "]", "`")):
+        return None
+    return prefix, visible, suffix
 
 
 def _render_document(
@@ -1822,6 +2521,12 @@ def _render_document(
 ) -> tuple[str, tuple[PdfReviewIssue, ...]]:
     blocks: list[_MarkdownBlock] = []
     previous_body_line: _PdfLine | None = None
+    toc_heading_references, toc_roman_references = _native_toc_heading_references(
+        pages,
+        body_size,
+        heading_sizes,
+        repeated_margins,
+    )
 
     total_pages = len(pages)
     for current, page in enumerate(pages, start=1):
@@ -1875,18 +2580,32 @@ def _render_document(
                 on_progress(PdfProgressPhase.STRUCTURING, current, total_pages)
             continue
 
-        visible_lines: list[_PdfLine] = []
-        previous_margin_candidate: _PdfLine | None = None
+        candidate_lines: list[_PdfLine] = []
         skipped_rotated = False
         for line in page.lines:
             if line.rotated:
                 skipped_rotated = True
                 continue
+            candidate_lines.append(line)
+
+        toc_page = _is_toc_page(candidate_lines)
+        if toc_page and not page.has_table:
+            candidate_lines = _normalize_toc_entry_rows(candidate_lines)
+            candidate_lines = _repair_toc_entries_from_native_headings(
+                candidate_lines,
+                toc_heading_references,
+                toc_roman_references,
+            )
+
+        visible_lines: list[_PdfLine] = []
+        previous_margin_candidate: _PdfLine | None = None
+        for line in candidate_lines:
             if _omit_margin_line(
                 line,
                 repeated_margins,
                 previous_margin_candidate,
                 body_size,
+                toc_page=toc_page,
             ):
                 continue
             visible_lines.append(line)
@@ -1895,6 +2614,11 @@ def _render_document(
         visible_lines = _merge_drop_caps(visible_lines, body_size)
         visible_lines, skipped_vertical = _remove_vertical_stacks(visible_lines, body_size)
         visible_lines, skipped_noise = _remove_decorative_noise(visible_lines, body_size)
+        visible_lines = [
+            line
+            for line in visible_lines
+            if not any(_line_inside_table(line, table) for table in page.tables)
+        ]
         skipped_rotated = skipped_rotated or skipped_vertical or skipped_noise
         if page.number in referenced_pages:
             blocks.append(
@@ -1906,9 +2630,12 @@ def _render_document(
             )
             previous_body_line = None
 
-        toc_page = _is_toc_page(visible_lines)
         previous_in_page: _PdfLine | None = None
+        pending_tables = list(sorted(page.tables, key=lambda table: table.bbox[1]))
         for line in visible_lines:
+            while pending_tables and pending_tables[0].bbox[1] <= line.top:
+                _append_pdf_table(blocks, page.number, pending_tables.pop(0))
+                previous_body_line = None
             gap_before = (
                 line.top - previous_in_page.bottom
                 if previous_in_page is not None
@@ -1933,6 +2660,8 @@ def _render_document(
                 rendered = _apply_links(line)
                 if line.bold and _heading_letter_count(line.text) >= 4:
                     rendered = f"**{rendered}**"
+                if _toc_entry_page_number(line.text) is not None:
+                    rendered = f"- {rendered}"
                 blocks.append(
                     _MarkdownBlock(
                         kind="toc",
@@ -1976,6 +2705,10 @@ def _render_document(
                 previous_body_line = line
             previous_in_page = line
 
+        for table in pending_tables:
+            _append_pdf_table(blocks, page.number, table)
+            previous_body_line = None
+
         if _append_unplaced_page_links(blocks, visible_lines, page.number):
             previous_body_line = None
         warning = _page_conversion_warning(page, visible_lines, skipped_rotated, ocr_markdown)
@@ -2012,7 +2745,9 @@ def _render_document(
         if on_progress is not None:
             on_progress(PdfProgressPhase.STRUCTURING, current, total_pages)
 
-    normalized_blocks = _join_hyphenated_block_continuations(blocks)
+    normalized_blocks = _conservative_container_hierarchy(
+        _join_hyphenated_block_continuations(blocks),
+    )
     return (
         _normalized_blocks_to_markdown(normalized_blocks),
         _review_issues(normalized_blocks),
@@ -2036,13 +2771,113 @@ def _append_page_images(
         )
 
 
+def _conservative_container_hierarchy(blocks: list[_MarkdownBlock]) -> list[_MarkdownBlock]:
+    """Nest explicit chapter labels only when a container has two siblings."""
+
+    normalized = [replace(block) for block in blocks]
+    containers = [
+        index
+        for index, block in enumerate(normalized)
+        if block.kind == "heading" and _CONTAINER_HEADING_PATTERN.match(block.text.strip())
+    ]
+    if not containers:
+        return normalized
+    boundaries = [*containers, len(normalized)]
+    for start, end in zip(boundaries[:-1], boundaries[1:], strict=True):
+        chapter_positions = [
+            index
+            for index in range(start + 1, end)
+            if normalized[index].kind == "heading"
+            and _CHAPTER_HEADING_PATTERN.match(normalized[index].text.strip())
+        ]
+        if len(chapter_positions) >= 2:
+            normalized[start].level = 2
+            for index in chapter_positions:
+                normalized[index].level = 3
+    return normalized
+
+
+def _line_inside_table(line: _PdfLine, table: _PdfTable) -> bool:
+    x0, top, x1, bottom = table.bbox
+    center_x = (line.x0 + line.x1) / 2
+    center_y = (line.top + line.bottom) / 2
+    return x0 <= center_x <= x1 and top <= center_y <= bottom
+
+
+def _append_pdf_table(
+    blocks: list[_MarkdownBlock],
+    page_number: int,
+    table: _PdfTable,
+) -> None:
+    if table.rendering is _TableRendering.MARKDOWN:
+        markdown = _markdown_table(table.rows)
+    elif table.rendering is _TableRendering.HTML:
+        markdown = _html_table(table.rows)
+    else:
+        markdown = _structured_table_text(table.rows)
+        blocks.append(
+            _MarkdownBlock(
+                kind="warning",
+                text=(
+                    f"> **Aviso de conversión (página {page_number}):** la tabla es demasiado "
+                    "compleja para representarla con seguridad. Se ha conservado como texto "
+                    "estructurado; compárala con el original."
+                ),
+                page_number=page_number,
+            )
+        )
+    blocks.append(_MarkdownBlock(kind="raw", text=markdown, page_number=page_number))
+
+
+def _markdown_table(rows: tuple[tuple[str, ...], ...]) -> str:
+    header = tuple(_render_table_cell(cell) for cell in rows[0])
+
+    def row(cells: tuple[str, ...]) -> str:
+        return (
+            "| " + " | ".join(_render_table_cell(cell).replace("|", "\\|") for cell in cells) + " |"
+        )
+
+    return "\n".join(
+        (row(header), row(tuple("---" for _ in header)), *(row(item) for item in rows[1:]))
+    )
+
+
+def _html_table(rows: tuple[tuple[str, ...], ...]) -> str:
+    header = "".join(f"<th>{escape(_render_table_cell(cell))}</th>" for cell in rows[0])
+    body = "".join(
+        "<tr>"
+        + "".join(
+            f"<td>{escape(_render_table_cell(cell)).replace(chr(10), '<br>')}</td>" for cell in row
+        )
+        + "</tr>"
+        for row in rows[1:]
+    )
+    return f"<table>\n<thead><tr>{header}</tr></thead>\n<tbody>{body}</tbody>\n</table>"
+
+
+def _structured_table_text(rows: tuple[tuple[str, ...], ...]) -> str:
+    headers = tuple(cell or f"Columna {index}" for index, cell in enumerate(rows[0], start=1))
+    rendered = ["**Tabla recuperada**"]
+    for row_number, row in enumerate(rows[1:], start=1):
+        cells = "; ".join(
+            f"{header}: {_render_table_cell(value)}"
+            for header, value in zip(headers, row, strict=True)
+            if value
+        )
+        rendered.append(f"- Fila {row_number}: {cells or 'sin contenido'}")
+    return "\n".join(rendered)
+
+
 def _should_replace_with_ocr(page: _PdfPage, ocr_markdown: str) -> bool:
     native_letters = _page_letter_count(page)
     ocr_letters = _heading_letter_count(ocr_markdown)
     native_quality = _native_page_quality(page)
     ocr_quality = _text_quality_score(ocr_markdown)
     if page.has_table and _MARKDOWN_TABLE_PATTERN.search(ocr_markdown):
-        return ocr_quality >= max(0.42, native_quality - 0.08)
+        return ocr_quality >= max(0.42, native_quality - 0.08) and _table_ocr_is_faithful(
+            page,
+            ocr_markdown,
+        )
     if native_letters < _MIN_USABLE_NATIVE_LETTERS:
         return ocr_letters >= 10 and ocr_quality >= 0.42
     if _has_suspicious_glyph_encoding(page):
@@ -2057,6 +2892,46 @@ def _should_replace_with_ocr(page: _PdfPage, ocr_markdown: str) -> bool:
             _MIN_OCR_REPLACEMENT_QUALITY, native_quality + 0.12
         )
     return False
+
+
+def _table_ocr_is_faithful(page: _PdfPage, ocr_markdown: str) -> bool:
+    if page.tables:
+        native_shapes = tuple(
+            (len(table.rows), len(table.rows[0]))
+            for table in page.tables
+            if table.rows and table.rows[0]
+        )
+        ocr_shapes = tuple(
+            (rows - 1, columns) for rows, columns in markdown_table_shapes(ocr_markdown)
+        )
+        if native_shapes != ocr_shapes:
+            return False
+
+    native_text = _native_page_text(page)
+    native_letters = _heading_letter_count(native_text)
+    ocr_letters = _heading_letter_count(ocr_markdown)
+    if native_letters < _MIN_USABLE_NATIVE_LETTERS:
+        return ocr_letters >= 10
+    if ocr_letters < native_letters * 0.65 or ocr_letters > native_letters * 3.2:
+        return False
+
+    native_tokens = _comparison_tokens(native_text)
+    ocr_tokens = _comparison_tokens(ocr_markdown)
+    overlap = native_tokens & ocr_tokens
+    if native_tokens and len(overlap) / len(native_tokens) < 0.60:
+        return False
+    if ocr_tokens and len(overlap) / len(ocr_tokens) < 0.45:
+        return False
+    return _content_number_tokens(native_text) == _content_number_tokens(ocr_markdown)
+
+
+def _content_number_tokens(text: str) -> Counter[str]:
+    visible_lines = (
+        line
+        for line in text.splitlines()
+        if not _is_page_number(re.sub(r"[^0-9ivxlcdm]", "", line, flags=re.IGNORECASE))
+    )
+    return Counter(re.findall(r"\d+(?:[.,]\d+)*", "\n".join(visible_lines)))
 
 
 def _has_suspicious_glyph_encoding(page: _PdfPage) -> bool:
@@ -2551,6 +3426,8 @@ def _heading_level(
         or text.startswith(("-", "–", "—", "―"))
     ):
         return None
+    if toc_page and _toc_entry_page_number(text) is not None:
+        return None
     if _SECTION_HEADING_PATTERN.match(text):
         return 2
     if level := heading_sizes.get(round(line.font_size, 1)):
@@ -2572,7 +3449,11 @@ def _omit_margin_line(
     repeated_margins: set[str],
     previous: _PdfLine | None,
     body_size: float,
+    *,
+    toc_page: bool = False,
 ) -> bool:
+    if toc_page and _toc_entry_page_number(line.text) is not None:
+        return False
     in_top_margin = line.top <= line.page_height * 0.1
     in_top_folio_band = _is_top_outer_folio_line(line)
     in_top_numbered_running_header = _is_top_numbered_running_header(line, body_size)
@@ -2657,12 +3538,15 @@ def _page_conversion_warning(
 
 
 def _blocks_to_markdown(blocks: list[_MarkdownBlock]) -> str:
-    return _normalized_blocks_to_markdown(_join_hyphenated_block_continuations(blocks))
+    normalized_blocks = _conservative_container_hierarchy(
+        _join_hyphenated_block_continuations(blocks),
+    )
+    return _normalized_blocks_to_markdown(normalized_blocks)
 
 
 def _normalized_blocks_to_markdown(blocks: list[_MarkdownBlock]) -> str:
     parts: list[str] = []
-    previous_kind: str | None = None
+    previous_compact_group: str | None = None
     previous_page_number: int | None = None
     for block in blocks:
         if block.kind == "warning":
@@ -2671,16 +3555,22 @@ def _normalized_blocks_to_markdown(blocks: list[_MarkdownBlock]) -> str:
             rendered = f"{'#' * (block.level or 1)} {block.text}"
         else:
             rendered = block.text
+        compact_group = (
+            "list"
+            if block.kind in {"list", "toc"}
+            and re.match(r"^[ \t]{0,3}(?:[-+*]|\d+[.)])[ \t]+", rendered)
+            else None
+        )
         if (
-            block.kind in {"list", "toc"}
-            and previous_kind == block.kind
+            compact_group is not None
+            and previous_compact_group == compact_group
             and previous_page_number == block.page_number
             and parts
         ):
             parts[-1] = f"{parts[-1]}\n{rendered}"
         else:
             parts.append(rendered)
-        previous_kind = block.kind
+        previous_compact_group = compact_group
         previous_page_number = block.page_number
     markdown = "\n\n".join(part for part in parts if part).strip()
     return _join_page_boundary_hyphenations(markdown)
@@ -2908,6 +3798,14 @@ def _is_toc_page(lines: list[_PdfLine]) -> bool:
         for line in lines
     )
     return entry_count >= 4 and entry_count / len(lines) >= 0.3
+
+
+def _toc_entry_page_number(text: str) -> str | None:
+    parts = text.strip().rsplit(maxsplit=1)
+    if len(parts) != 2 or _heading_letter_count(parts[0]) < 2:
+        return None
+    candidate = re.sub(r"\s+", "", parts[1])
+    return candidate if _is_page_number(candidate) else None
 
 
 def _escape_link_label(label: str) -> str:

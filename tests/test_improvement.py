@@ -7,6 +7,7 @@ import httpx
 import pytest
 
 import parsezen.improvement as improvement_module
+import parsezen.local_ai_transport as transport_module
 from parsezen.cancellation import CancellationToken
 from parsezen.errors import (
     ImprovementError,
@@ -24,6 +25,7 @@ from parsezen.improvement import (
     ImprovementMode,
     build_instructions,
     improve_markdown,
+    review_translation_markdown,
 )
 from parsezen.settings import AppSettings
 
@@ -32,6 +34,838 @@ LOCAL_SETTINGS = AppSettings(
     context_window=8_192,
     timeout_seconds=30,
 )
+
+
+def test_bilingual_review_corrects_a_mistranslated_title_from_its_source() -> None:
+    source = "# The History, Astrology and Magic of the Decans\n\nBy\n\nAustin Coppock\n"
+    translated = (
+        "# Historia del Ajedrez; Astrología y Magia de los Decanos\n\nKor\n\nAustin Coppock\n"
+    )
+    corrected = "# Historia, Astrología y Magia de los Decanos\n\nPor\n\nAustin Coppock\n"
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        assert source.strip() not in payload["messages"][0]["content"]
+        assert source.strip() in payload["messages"][1]["content"]
+        assert translated.splitlines()[0] in payload["messages"][1]["content"]
+        corrections = [
+            {
+                "old": "Historia del Ajedrez; Astrología y Magia de los Decanos",
+                "new": "Historia, Astrología y Magia de los Decanos",
+            },
+            {"old": "Kor", "new": "Por"},
+        ]
+        return httpx.Response(200, json={"message": {"content": json.dumps(corrections)}})
+
+    result = review_translation_markdown(
+        source,
+        translated,
+        LOCAL_SETTINGS,
+        "es",
+        transport=httpx.MockTransport(respond),
+    )
+
+    assert result == corrected
+
+
+def test_bilingual_review_minimizes_verbose_patch_and_preserves_byline_layout() -> None:
+    source = "By\nAustin Coppock\n"
+    translated = "Kor\nAustin Coppock\n"
+
+    def respond(_request: httpx.Request) -> httpx.Response:
+        corrections = [
+            {
+                "old": "Kor\nAustin Coppock",
+                "new": "Por Austin Coppock",
+            }
+        ]
+        return httpx.Response(200, json={"message": {"content": json.dumps(corrections)}})
+
+    result = review_translation_markdown(
+        source,
+        translated,
+        LOCAL_SETTINGS,
+        "es",
+        transport=httpx.MockTransport(respond),
+    )
+
+    assert result == "Por\nAustin Coppock\n"
+
+
+def test_bilingual_review_retranslates_a_title_after_a_partial_patch_duplicates_it() -> None:
+    source = "# The History, Astrology and Magic of the Decans\n"
+    translated = "# Historia del Ajedrez; Astrología y Magia de los Decanos\n"
+    calls = 0
+
+    def respond(_request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            content = json.dumps([{"old": "del Ajedrez", "new": "de los Decanos"}])
+        else:
+            content = "Historia, Astrología y Magia de los Decanos"
+        return httpx.Response(200, json={"message": {"content": content}})
+
+    result = review_translation_markdown(
+        source,
+        translated,
+        LOCAL_SETTINGS,
+        "es",
+        transport=httpx.MockTransport(respond),
+        priority_block_count=1,
+    )
+
+    assert result == "# Historia, Astrología y Magia de los Decanos\n"
+    assert calls == 2
+
+
+def test_bilingual_review_rechecks_unchanged_front_matter_in_a_focused_group() -> None:
+    source = "# The History, Astrology and Magic of the Decans\n\nBy\nAustin Coppock\n"
+    translated = (
+        "# Historia del Ajedrez; Astrología y Magia de los Decanos\n\nKor\nAustin Coppock\n"
+    )
+    corrected = "# Historia, Astrología y Magia de los Decanos\n\nPor\nAustin Coppock\n"
+    calls = 0
+    progress: list[tuple[int, int]] = []
+
+    def respond(_request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        corrections: list[dict[str, str]] = []
+        if calls == 2:
+            corrections = [
+                {
+                    "old": "Historia del Ajedrez; Astrología y Magia de los Decanos",
+                    "new": "Historia, Astrología y Magia de los Decanos",
+                }
+            ]
+        elif calls == 3:
+            corrections = [{"old": "Kor", "new": "Por"}]
+        return httpx.Response(200, json={"message": {"content": json.dumps(corrections)}})
+
+    result = review_translation_markdown(
+        source,
+        translated,
+        LOCAL_SETTINGS,
+        "es",
+        transport=httpx.MockTransport(respond),
+        priority_block_count=3,
+        on_progress=lambda current, total: progress.append((current, total)),
+    )
+
+    assert result == corrected
+    assert calls == 3
+    assert progress == [(1, 4), (2, 4), (3, 4), (4, 4)]
+
+
+def test_bilingual_review_runs_a_focused_second_pass_for_embedded_source_words() -> None:
+    source = "The decans preserve a body of scholarship that remains important to this chapter.\n"
+    translated = (
+        "Los decans conservan un cuerpo de scholarship que sigue siendo importante "
+        "para este capÃ­tulo.\n"
+    )
+    calls = 0
+    progress: list[tuple[int, int]] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        payload = json.loads(request.content)
+        if calls == 1:
+            content = "[]"
+        else:
+            assert "forma FOCUS" in payload["messages"][0]["content"]
+            content = json.dumps(
+                [
+                    {"old": "decans", "new": "decanos"},
+                    {"old": "scholarship", "new": "tradiciÃ³n acadÃ©mica"},
+                ]
+            )
+        return httpx.Response(200, json={"message": {"content": content}})
+
+    result = review_translation_markdown(
+        source,
+        translated,
+        LOCAL_SETTINGS,
+        "es",
+        transport=httpx.MockTransport(respond),
+        on_progress=lambda current, total: progress.append((current, total)),
+    )
+
+    assert "Los decanos" in result
+    assert "tradiciÃ³n acadÃ©mica" in result
+    assert calls == 3
+    assert progress == [(1, 2), (2, 2)]
+
+
+def test_residual_review_sends_only_each_aligned_line_with_residue() -> None:
+    source = (
+        "The decans preserve the first tradition.\nThe gaggles preserve a body of scholarship.\n"
+    )
+    translated = (
+        "Los decans conservan la primera tradición.\n"
+        "Los gaggles conservan un cuerpo de scholarship.\n"
+    )
+    calls = 0
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        payload = json.loads(request.content)
+        prompt = payload["messages"][1]["content"]
+        if calls == 1:
+            content = "[]"
+        elif calls == 2:
+            assert "decans" in prompt
+            assert "gaggles" not in prompt
+            assert 'FOCUS="decans"' in prompt
+            content = json.dumps(
+                [
+                    {"old": "decans", "new": "decanos"},
+                    {"old": "primera", "new": "inicial"},
+                    {"old": "Los decans", "new": "Los decans tradicionales"},
+                ]
+            )
+        elif calls == 3:
+            assert "gaggles" in prompt
+            assert "decans" not in prompt
+            assert 'FOCUS="gaggles"' in prompt
+            content = json.dumps(
+                [
+                    {"old": "gaggles", "new": "grupos"},
+                    {"old": "scholarship", "new": "tradición académica"},
+                ]
+            )
+        else:
+            assert "scholarship" in prompt
+            assert 'FOCUS="scholarship"' in prompt
+            content = json.dumps([{"old": "scholarship", "new": "tradición académica"}])
+        return httpx.Response(200, json={"message": {"content": content}})
+
+    result = review_translation_markdown(
+        source,
+        translated,
+        LOCAL_SETTINGS,
+        "es",
+        transport=httpx.MockTransport(respond),
+    )
+
+    assert result == (
+        "Los decanos conservan la primera tradición.\n"
+        "Los grupos conservan un cuerpo de tradición académica.\n"
+    )
+    assert calls == 4
+
+
+def test_residual_review_prioritizes_a_rare_one_edit_variant() -> None:
+    part = improvement_module._TranslationReviewPart(
+        "Gods and Spirits of the 36 Airs of the Zodiac.\n",
+        "Dioses y espÃ­ritus de los 36 Airees del ZodÃ­aco.\n",
+    )
+
+    selected = improvement_module._plan_residual_translation_review_part_indexes(
+        (part,),
+        "Aires " * 12 + part.translated,
+        source_language="en",
+        target_language="es",
+    )
+
+    assert selected == (0,)
+
+
+def test_residual_review_prioritizes_the_final_report_source_text_signal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    noisy = improvement_module._TranslationReviewPart(
+        "The decans scholarship grimoires gaggles minutiae traditions symbols planets spirits "
+        "zodiac remain relevant.\n",
+        "En la tradición siguen presentes zodiac spirits planets symbols traditions minutiae "
+        "gaggles grimoires scholarship y decans.\n",
+    )
+    untranslated = improvement_module._TranslationReviewPart(
+        "A short English sentence remains entirely untranslated.\n",
+        "A short English sentence remains entirely untranslated.\n",
+    )
+    translated = ("decans scholarship grimoires gaggles minutiae " * 12) + noisy.translated
+    monkeypatch.setattr(improvement_module, "MAX_RESIDUAL_TRANSLATION_REVIEW_PARTS", 1)
+
+    selected = improvement_module._plan_residual_translation_review_part_indexes(
+        (noisy, untranslated),
+        translated,
+        source_language="en",
+        target_language="es",
+    )
+
+    assert selected == (1,)
+
+
+def test_residual_review_does_not_retranslate_a_reference_catalogue() -> None:
+    catalogue = (
+        "BIBLIOGRAPHY. Ada Author. The Complete Book of Stars, translated by Bea Editor, "
+        "University Press. Carla Writer. Ancient Astronomy, edited by Dan Scholar, London "
+        "Academic Press. Eva Researcher. The Planetary Journal, revised edition, Cambridge "
+        "University Press."
+    )
+    part = improvement_module._TranslationReviewPart(catalogue, catalogue)
+
+    units = improvement_module._exact_source_text_review_units(
+        part,
+        source_language="en",
+    )
+
+    assert units == ()
+
+
+def test_residual_review_keeps_prose_repairable_after_an_index_heading() -> None:
+    residual = "The following section explains how planetary conditions shape daily decisions."
+    source = f"INDEX\n\n{residual}\n"
+    part = improvement_module._TranslationReviewPart(source, source)
+
+    units = improvement_module._exact_source_text_review_units(
+        part,
+        source_language="en",
+    )
+
+    assert len(units) == 1
+    assert residual in units[0].source
+
+
+def test_exact_retranslation_requires_positive_target_language_evidence() -> None:
+    improvement_module._validate_exact_retranslation_target_language(
+        "Esta frase completa está escrita claramente en español.",
+        "es",
+    )
+
+    with pytest.raises(ImprovementError, match="idioma solicitado"):
+        improvement_module._validate_exact_retranslation_target_language(
+            "Zorble quaxen mivra plestun drovaki senfar ulmato krivens.",
+            "es",
+        )
+
+
+def test_exact_retranslation_rejects_a_fluent_third_language_response() -> None:
+    source = "This complete English sentence remains entirely untranslated."
+    part = improvement_module._TranslationReviewPart(source, source)
+    calls = 0
+
+    def respond(_request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(
+            200,
+            json={
+                "message": {
+                    "content": json.dumps(
+                        {
+                            "translation": (
+                                "Cette phrase anglaise complète reste entièrement non traduite."
+                            )
+                        }
+                    )
+                }
+            },
+        )
+
+    with httpx.Client(transport=httpx.MockTransport(respond)) as client:
+        candidate, cacheable = improvement_module._retranslate_exact_source_text_unit(
+            client,
+            "local-model",
+            4096,
+            part,
+            source_language="en",
+            target_language="es",
+            translated_markdown=source,
+            cancellation=None,
+        )
+
+    assert candidate == source
+    assert cacheable
+    assert calls == 2
+
+
+def test_exact_source_units_include_a_long_heading_on_a_mixed_page() -> None:
+    heading = (
+        "THE COMPLETE PRACTICAL GUIDE TO PLANETARY CONDITIONS AND THEIR MANY EFFECTS ON "
+        "EVERY IMPORTANT DECISION THROUGHOUT ORDINARY DAILY LIFE AND WORK"
+    )
+    part = improvement_module._TranslationReviewPart(
+        f"{heading}\n\nThis paragraph explains the first consequence.",
+        f"{heading}\n\nEste párrafo explica la primera consecuencia.",
+    )
+
+    units = improvement_module._exact_source_text_review_units(
+        part,
+        source_language="en",
+    )
+
+    assert len(units) == 1
+    assert units[0].source == heading
+
+
+def test_exact_source_offsets_survive_expansive_unicode_casefolding() -> None:
+    residual = "Dieser vollständige deutsche Satz bleibt unverändert erhalten."
+    prefix = "La Straße es larga. "
+    source = f"{prefix}{residual} Fin."
+    part = improvement_module._TranslationReviewPart(source, source)
+
+    units = improvement_module._exact_source_text_review_units(
+        part,
+        source_language="de",
+    )
+
+    assert len(units) == 1
+    assert units[0].source == residual
+    assert units[0].translated == residual
+    assert units[0].translated_start == len(prefix)
+    assert source[: units[0].translated_start] == prefix
+
+
+def test_residual_source_text_review_retranslates_the_complete_focused_unit() -> None:
+    source_residue = "This complete English sentence remains entirely untranslated."
+    source = (
+        "A carefully translated Spanish sentence provides enough surrounding context.\n"
+        f"{source_residue}\n"
+    )
+    translated = (
+        "Una frase traducida cuidadosamente al español aporta suficiente contexto alrededor.\n"
+        f"{source_residue}\n"
+    )
+    calls = 0
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        payload = json.loads(request.content)
+        if calls == 1:
+            content = "[]"
+        else:
+            assert "una unica frase o titulo" in payload["messages"][0]["content"]
+            assert "FOCUS=" not in payload["messages"][1]["content"]
+            assert "suficiente contexto alrededor" not in payload["messages"][1]["content"]
+            content = json.dumps(
+                {"translation": "Esta frase completa en inglés seguía enteramente sin traducir."}
+            )
+        return httpx.Response(200, json={"message": {"content": content}})
+
+    result = review_translation_markdown(
+        source,
+        translated,
+        LOCAL_SETTINGS,
+        "es",
+        transport=httpx.MockTransport(respond),
+    )
+
+    assert result == (
+        "Una frase traducida cuidadosamente al español aporta suficiente contexto alrededor.\n"
+        "Esta frase completa en inglés seguía enteramente sin traducir.\n"
+    )
+    assert calls == 2
+
+
+def test_residual_source_text_candidate_must_clear_the_report_signal() -> None:
+    source = "This complete English sentence remains entirely untranslated.\n"
+    part = improvement_module._TranslationReviewPart(source, source)
+    candidate = "That complete English sentence remains entirely untranslated.\n"
+
+    with pytest.raises(ImprovementError, match="texto detectado"):
+        improvement_module._validate_residual_translation_review_candidate(
+            part,
+            candidate,
+            source,
+            source_language="en",
+            target_language="es",
+        )
+
+
+def test_residual_review_rejects_a_new_source_word_even_when_other_residue_decreases() -> None:
+    part = improvement_module._TranslationReviewPart(
+        "The decans and gaggles preserve a body of scholarship.\n",
+        "Los decans y gaggles conservan un cuerpo académico.\n",
+    )
+    candidate = "Los decanos y grupos conservan un cuerpo de scholarship.\n"
+
+    with pytest.raises(ImprovementError, match="introdujo texto"):
+        improvement_module._validate_residual_translation_review_candidate(
+            part,
+            candidate,
+            part.translated,
+            source_language="en",
+            target_language="es",
+        )
+
+
+def test_residual_review_accepts_a_candidate_that_only_removes_source_residue() -> None:
+    part = improvement_module._TranslationReviewPart(
+        "The decans and gaggles preserve a body of scholarship.\n",
+        "Los decans y gaggles conservan un cuerpo académico.\n",
+    )
+    candidate = "Los decanos y grupos conservan un cuerpo académico.\n"
+
+    improvement_module._validate_residual_translation_review_candidate(
+        part,
+        candidate,
+        part.translated,
+        source_language="en",
+        target_language="es",
+    )
+
+
+def test_residual_micro_candidate_defers_language_detection_to_the_full_document(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    part = improvement_module._TranslationReviewPart(
+        "The decans preserve a tradition.\n",
+        "Los decans conservan una tradición.\n",
+    )
+    target_languages: list[str | None] = []
+
+    def validate(*_args: object, target_language: str | None, **_kwargs: object) -> None:
+        target_languages.append(target_language)
+
+    monkeypatch.setattr(improvement_module, "validate_translation_quality", validate)
+
+    improvement_module._validate_translation_review_candidate(
+        part,
+        "Los decanos conservan una tradición.\n",
+        source_language="en",
+        target_language="es",
+        require_target_language=False,
+    )
+
+    assert target_languages == [None]
+
+
+def test_bilingual_review_candidate_cannot_add_a_lowercase_source_word() -> None:
+    part = improvement_module._TranslationReviewPart(
+        "The chapter preserves a careful body of scholarship.\n",
+        "El capítulo conserva un cuerpo académico cuidadoso.\n",
+    )
+    candidate = "El capítulo conserva un cuerpo de scholarship cuidadoso.\n"
+
+    with pytest.raises(ImprovementError, match="introdujo texto"):
+        improvement_module._validate_translation_review_candidate(
+            part,
+            candidate,
+            source_language="en",
+            target_language="es",
+        )
+
+
+def test_bilingual_review_candidate_cannot_restore_an_uppercase_source_heading() -> None:
+    part = improvement_module._TranslationReviewPart(
+        "# TABLES OF CORRESPONDENCE\n",
+        "# TABLAS DE CORRESPONDENCIA\n",
+    )
+    candidate = "# TABLAS DE CORRESPONDENCIA TABLES\n"
+
+    with pytest.raises(ImprovementError, match="introdujo texto"):
+        improvement_module._validate_translation_review_candidate(
+            part,
+            candidate,
+            source_language="en",
+            target_language="es",
+        )
+
+
+def test_document_review_reverts_only_a_cumulatively_unsafe_block() -> None:
+    original = "Uno dos tres cuatro cinco seis.\n\nEste bloque conserva una errrata menor.\n"
+    candidate = "Siete ocho nueve diez once doce.\n\nEste bloque conserva una errata menor.\n"
+
+    repaired, preserved = improvement_module._preserve_unsafe_review_content_blocks(
+        original,
+        candidate,
+    )
+
+    assert preserved == 1
+    assert repaired == (
+        "Uno dos tres cuatro cinco seis.\n\nEste bloque conserva una errata menor.\n"
+    )
+    improvement_module._validate_mode_output(
+        original,
+        repaired,
+        ImprovementMode.REVIEW_CONTENT,
+    )
+
+
+def test_bilingual_review_resumes_an_unchanged_validated_chunk() -> None:
+    source = "A careful translation keeps every statement and number 42.\n"
+    translated = "Una traducción cuidadosa conserva cada afirmación y el número 42.\n"
+    cache: dict[str, str] = {}
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        json.loads(request.content)
+        return httpx.Response(200, json={"message": {"content": "[]"}})
+
+    def save_checkpoint(key: str, value: str) -> bool:
+        cache[key] = value
+        return True
+
+    first = review_translation_markdown(
+        source,
+        translated,
+        LOCAL_SETTINGS,
+        "es",
+        transport=httpx.MockTransport(respond),
+        load_checkpoint=cache.get,
+        save_checkpoint=save_checkpoint,
+    )
+
+    def reject_network(_request: httpx.Request) -> httpx.Response:
+        raise AssertionError("Una revisión bilingüe validada debe reanudarse desde caché.")
+
+    resumed = review_translation_markdown(
+        source,
+        translated,
+        LOCAL_SETTINGS,
+        "es",
+        transport=httpx.MockTransport(reject_network),
+        load_checkpoint=cache.get,
+    )
+
+    assert first == resumed == translated
+    assert cache
+
+
+def test_bilingual_review_caches_safe_preservation_after_two_unsafe_responses() -> None:
+    source = "The document keeps two complete paragraphs.\n"
+    translated = "El documento conserva dos párrafos completos.\n"
+    cache: dict[str, str] = {}
+    calls = 0
+
+    def respond(_request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(200, json={"message": {"content": "Texto inventado."}})
+
+    def save_checkpoint(key: str, value: str) -> bool:
+        cache[key] = value
+        return True
+
+    first = review_translation_markdown(
+        source,
+        translated,
+        LOCAL_SETTINGS,
+        "es",
+        transport=httpx.MockTransport(respond),
+        load_checkpoint=cache.get,
+        save_checkpoint=save_checkpoint,
+    )
+
+    resumed = review_translation_markdown(
+        source,
+        translated,
+        LOCAL_SETTINGS,
+        "es",
+        transport=httpx.MockTransport(
+            lambda _request: pytest.fail("La preservación segura debe reanudarse desde caché.")
+        ),
+        load_checkpoint=cache.get,
+    )
+
+    assert first == resumed == translated
+    assert calls == 2
+    assert cache
+
+
+def test_bilingual_review_recognizes_an_explicit_cached_preservation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = "The source-language fragment remains intentionally unchanged.\n"
+    translated = "El fragmento conservado permanece intencionadamente sin cambios.\n"
+    part = improvement_module._TranslationReviewPart(source, translated)
+    cache = {improvement_module._translation_review_checkpoint_key(part): translated}
+
+    monkeypatch.setattr(
+        improvement_module,
+        "_validate_translation_review_candidate",
+        lambda *_args, **_kwargs: pytest.fail(
+            "Una preservación explícita no debe reinterpretarse como propuesta del modelo."
+        ),
+    )
+
+    result = review_translation_markdown(
+        source,
+        translated,
+        LOCAL_SETTINGS,
+        "es",
+        transport=httpx.MockTransport(
+            lambda _request: pytest.fail("La preservación explícita debe reanudarse sin red.")
+        ),
+        load_checkpoint=cache.get,
+    )
+
+    assert result == translated
+
+
+def test_residual_review_caches_safe_preservation_after_rejected_cleanup() -> None:
+    source = "The decans preserve a body of scholarship that remains important.\n"
+    translated = "Los decans conservan un cuerpo de scholarship que sigue siendo importante.\n"
+    cache: dict[str, str] = {}
+    calls = 0
+
+    def respond(_request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        content = "[]" if calls == 1 else "Texto inventado."
+        return httpx.Response(200, json={"message": {"content": content}})
+
+    def save_checkpoint(key: str, value: str) -> bool:
+        cache[key] = value
+        return True
+
+    first = review_translation_markdown(
+        source,
+        translated,
+        LOCAL_SETTINGS,
+        "es",
+        transport=httpx.MockTransport(respond),
+        load_checkpoint=cache.get,
+        save_checkpoint=save_checkpoint,
+    )
+    resumed = review_translation_markdown(
+        source,
+        translated,
+        LOCAL_SETTINGS,
+        "es",
+        transport=httpx.MockTransport(
+            lambda _request: pytest.fail("La preservación residual debe reanudarse desde caché.")
+        ),
+        load_checkpoint=cache.get,
+    )
+
+    assert first == resumed == translated
+    assert calls == 3
+    assert len(cache) == 2
+
+
+def test_bilingual_review_logs_a_private_document_validation_reason(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    source = "Private source sentence that must never be logged.\n"
+    translated = "Frase privada traducida que nunca debe registrarse.\n"
+
+    def reject_quality(*_args: object, **_kwargs: object) -> None:
+        raise improvement_module.TranslationQualityError(
+            "La traducción cambió la separación de párrafos."
+        )
+
+    monkeypatch.setattr(improvement_module, "validate_translation_quality", reject_quality)
+
+    result = review_translation_markdown(
+        source,
+        translated,
+        LOCAL_SETTINGS,
+        "es",
+        transport=httpx.MockTransport(
+            lambda _request: httpx.Response(200, json={"message": {"content": "[]"}})
+        ),
+    )
+
+    assert result == translated
+    assert "error_type=TranslationQualityError" in caplog.text
+    assert "reason=La traducción cambió la separación de párrafos." in caplog.text
+    assert source.strip() not in caplog.text
+    assert translated.strip() not in caplog.text
+
+
+def test_bilingual_review_rejects_unaligned_source_and_translation() -> None:
+    with pytest.raises(ImprovementError, match="alinear"):
+        review_translation_markdown(
+            "First.\n\nSecond.\n",
+            "Primero y segundo en un solo bloque.\n",
+            LOCAL_SETTINGS,
+            "es",
+            transport=httpx.MockTransport(lambda _request: pytest.fail("Unexpected request")),
+        )
+
+
+def test_bilingual_review_splits_aligned_long_line_sequences_without_loss() -> None:
+    source = "".join(
+        f"Source row {index} preserves its aligned meaning and structure.\n" for index in range(80)
+    )
+    translated = "".join(
+        f"La fila {index} conserva su significado y su estructura alineados.\n"
+        for index in range(80)
+    )
+
+    parts = improvement_module._plan_translation_review_parts(source, translated)
+
+    assert len(parts) > 1
+    assert "".join(part.source for part in parts) == source
+    assert "".join(part.translated for part in parts) == translated
+    assert max(len(part.translated) for part in parts) <= 1_400
+    assert max(len(part.source) + len(part.translated) for part in parts) <= 2_800
+
+
+def test_bilingual_review_keeps_safe_patches_when_another_patch_changes_a_number() -> None:
+    source = "The careful report keeps number 42 and uses an accurate title.\n"
+    translated = "El informe cuidadoso conserva el número 42 y usa un título inexacto.\n"
+    patches = [
+        {"old": "42", "new": "43"},
+        {"old": "título inexacto", "new": "título exacto"},
+    ]
+
+    result = review_translation_markdown(
+        source,
+        translated,
+        LOCAL_SETTINGS,
+        "es",
+        transport=httpx.MockTransport(
+            lambda _request: httpx.Response(
+                200,
+                json={"message": {"content": f"```json\n{json.dumps(patches)}\n```"}},
+            )
+        ),
+    )
+
+    assert result == translated.replace("inexacto", "exacto")
+    assert "42" in result
+    assert "43" not in result
+
+
+def test_bilingual_review_rejects_a_moved_toc_folio_but_keeps_safe_patches() -> None:
+    source = "- Appendices 258\n\nThe careful report uses an accurate title.\n"
+    translated = "- Apéndices 258\n\nEl informe cuidadoso usa un título inexacto.\n"
+    patches = [
+        {"old": "Apéndices 258", "new": "258 Apéndices"},
+        {"old": "título inexacto", "new": "título exacto"},
+    ]
+
+    result = review_translation_markdown(
+        source,
+        translated,
+        LOCAL_SETTINGS,
+        "es",
+        transport=httpx.MockTransport(
+            lambda _request: httpx.Response(
+                200,
+                json={"message": {"content": json.dumps(patches)}},
+            )
+        ),
+    )
+
+    assert result == translated.replace("inexacto", "exacto")
+    assert "Apéndices 258" in result
+    assert "258 Apéndices" not in result
+
+
+def test_bilingual_review_recovers_complete_patches_from_a_truncated_array() -> None:
+    source = "The careful report uses an accurate title.\n"
+    translated = "El informe cuidadoso usa un título inexacto.\n"
+    truncated = '[{"old":"título inexacto","new":"título exacto"},{"old":"unfinished","new":"cor'
+
+    result = review_translation_markdown(
+        source,
+        translated,
+        LOCAL_SETTINGS,
+        "es",
+        transport=httpx.MockTransport(
+            lambda _request: httpx.Response(200, json={"message": {"content": truncated}})
+        ),
+    )
+
+    assert result == translated.replace("inexacto", "exacto")
 
 
 def test_validated_chunks_resume_without_calling_ollama_again() -> None:
@@ -104,7 +938,7 @@ def test_legacy_position_based_checkpoint_is_validated_and_migrated() -> None:
     )
 
 
-def test_unchanged_optional_review_is_not_cached_as_a_validated_change() -> None:
+def test_validated_unchanged_optional_review_resumes_without_calling_ollama_again() -> None:
     source = "This paragraph is already correct and should remain unchanged."
     cache: dict[str, str] = {}
 
@@ -119,9 +953,44 @@ def test_unchanged_optional_review_is_not_cached_as_a_validated_change() -> None
         cache[key] = value
         return True
 
-    result = improve_markdown(
+    first = improve_markdown(
         source,
         ImprovementMode.REVIEW_CONTENT,
+        LOCAL_SETTINGS,
+        transport=httpx.MockTransport(respond),
+        load_checkpoint=cache.get,
+        save_checkpoint=save_checkpoint,
+    )
+
+    def reject_network(_request: httpx.Request) -> httpx.Response:
+        raise AssertionError("Un resultado sin cambios ya validado debe poder reanudarse.")
+
+    resumed = improve_markdown(
+        source,
+        ImprovementMode.REVIEW_CONTENT,
+        LOCAL_SETTINGS,
+        transport=httpx.MockTransport(reject_network),
+        load_checkpoint=cache.get,
+    )
+
+    assert first == resumed == source
+    assert cache
+
+
+def test_optional_review_preserved_after_validation_failure_is_not_cached() -> None:
+    source = "Chapter title\n\nA complete paragraph that must remain unchanged."
+    cache: dict[str, str] = {}
+
+    def respond(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"message": {"content": "not-a-directive"}})
+
+    def save_checkpoint(key: str, value: str) -> bool:
+        cache[key] = value
+        return True
+
+    result = improve_markdown(
+        source,
+        ImprovementMode.REVIEW_STRUCTURE,
         LOCAL_SETTINGS,
         transport=httpx.MockTransport(respond),
         load_checkpoint=cache.get,
@@ -147,6 +1016,38 @@ def test_validation_requires_internal_structure_markers() -> None:
 
     with pytest.raises(ImprovementError, match="marcadores internos"):
         improvement_module._validate_output(f"Antes\n{marker}\nDespués", "Antes\nDespués")
+
+
+def test_validation_allows_translation_around_an_inline_private_marker() -> None:
+    marker = "`PZDOC_EPUB_XML_RETRY_A_A_XZQ`"
+
+    improvement_module._validate_internal_markers(
+        f"{marker}Opening chapter{marker}",
+        f"{marker}Capítulo inicial{marker}",
+    )
+
+
+def test_validation_rejects_a_changed_inline_private_marker() -> None:
+    source = "`PZDOC_EPUB_XML_RETRY_A_A_XZQ` Opening chapter"
+    changed = "`PZDOC_EPUB_XML_RETRY_A_B_XZQ` Capítulo inicial"
+
+    with pytest.raises(ImprovementError, match="comentario interno"):
+        improvement_module._validate_internal_markers(source, changed)
+
+
+def test_validation_rejects_an_unquoted_private_marker_leak() -> None:
+    with pytest.raises(ImprovementError, match="comentario interno"):
+        improvement_module._validate_internal_markers(
+            "Opening chapter",
+            "Capítulo inicial PZDOC_LEAK_XZQ",
+        )
+
+
+def test_validation_locks_private_phrases_without_locking_their_whole_line() -> None:
+    improvement_module._validate_internal_markers(
+        "An internal comentario interno remains protected.",
+        "Un comentario interno permanece protegido.",
+    )
 
 
 @pytest.mark.parametrize(
@@ -1032,7 +1933,7 @@ def test_combined_mode_uses_one_operation_per_safe_fragment() -> None:
     assert payload["options"] == {
         "temperature": 0,
         "num_ctx": 8_192,
-        "num_predict": improvement_module._prediction_token_limit(
+        "num_predict": transport_module.prediction_token_limit(
             len(source.split("\n\n", 1)[1]),
             8_192,
         ),
@@ -1054,10 +1955,34 @@ def test_combined_mode_uses_one_operation_per_safe_fragment() -> None:
 
 
 def test_prediction_limit_scales_with_the_fragment_and_context() -> None:
-    assert improvement_module._prediction_token_limit(5, 8_192) == 259
-    assert improvement_module._prediction_token_limit(3_000, 8_192) == 1_756
-    assert improvement_module._prediction_token_limit(20_000, 8_192) == 4_096
-    assert improvement_module._prediction_token_limit(20_000, 2_048) == 1_024
+    assert transport_module.prediction_token_limit(5, 8_192) == 130
+    assert transport_module.prediction_token_limit(3_000, 8_192) == 1_128
+    assert transport_module.prediction_token_limit(20_000, 8_192) == 2_048
+    assert transport_module.prediction_token_limit(20_000, 2_048) == 1_024
+
+
+def test_streaming_request_has_a_total_wall_clock_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = iter((0.0, 31.0))
+    monkeypatch.setattr(transport_module, "monotonic", clock.__next__)
+    transport = httpx.MockTransport(
+        lambda _request: httpx.Response(
+            200,
+            content=b'{"message":{"content":"partial"}}\n',
+        )
+    )
+
+    with httpx.Client(timeout=30, transport=transport) as client:
+        with pytest.raises(ImprovementError, match="tiempo máximo"):
+            transport_module.request_local_ai(
+                client,
+                "parsezen-local",
+                8_192,
+                "Return the content.",
+                "Content",
+                None,
+            )
 
 
 def test_missing_model_is_rejected_before_any_request() -> None:
@@ -1264,6 +2189,34 @@ def test_tables_are_never_split_between_model_requests() -> None:
 
     assert len(requests) >= 2
     assert sum(table in chunk for chunk in requests) == 1
+
+
+def test_structure_review_preserves_an_oversized_table_without_sending_it_to_model() -> None:
+    rows = "\n".join(
+        f"| Entry {index} | This complete indexed description remains unchanged. |"
+        for index in range(180)
+    )
+    table = f"| Name | Description |\n| --- | --- |\n{rows}"
+    source = f"Chapter One\n\n{table}\n\nChapter Two"
+    requests: list[str] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        numbered = payload["messages"][1]["content"]
+        requests.append(numbered)
+        assert "| --- | --- |" not in numbered
+        return httpx.Response(200, json={"message": {"content": "PZL1=1"}})
+
+    result = improve_markdown(
+        source,
+        ImprovementMode.REVIEW_STRUCTURE,
+        LOCAL_SETTINGS,
+        transport=httpx.MockTransport(respond),
+    )
+
+    assert len(table) > MAX_INPUT_CHARACTERS
+    assert requests == ["PZL1 CANDIDATA: Chapter One", "PZL1 CANDIDATA: Chapter Two"]
+    assert result == f"# Chapter One\n\n{table}\n\n# Chapter Two"
 
 
 def test_translation_recovers_table_rows_when_a_full_response_breaks_the_table() -> None:

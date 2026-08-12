@@ -16,10 +16,10 @@ from tempfile import gettempdir
 from platformdirs import user_cache_path, user_log_path
 
 from parsezen import APP_DISPLAY_NAME, APP_STORAGE_NAME, __version__
-from parsezen.job_sessions import (
+from parsezen.domain.attempt_activity import AttemptPhase
+from parsezen.recent_activity import (
     RecentJobStatus,
     get_history_path,
-    get_session_path,
     load_recent_jobs,
 )
 from parsezen.settings import AppSettings
@@ -38,21 +38,32 @@ _OLLAMA_STATUS_TEXT = {
     "unavailable": "No disponible",
 }
 _PROCESS_STAGE_TEXT = {
-    "validating": "validación",
+    "validating": "validaci\u00f3n",
     "reading": "lectura",
-    "converting": "conversión",
+    "converting": "conversi\u00f3n",
     "ocr": "OCR",
-    "preserving_images": "imágenes",
+    "preserving_images": "im\u00e1genes",
     "structuring": "estructura inicial",
-    "preparing_translation": "preparación de traducción",
-    "improving": "traducción o mejora",
-    "reviewing_content": "revisión de contenido",
-    "organizing_structure": "personalización",
-    "translating": "traducción",
-    "building_epub": "creación del EPUB",
+    "preparing_translation": "preparaci\u00f3n de traducci\u00f3n",
+    "improving": "traducci\u00f3n o mejora",
+    "reviewing_content": "revisi\u00f3n de contenido",
+    "organizing_structure": "personalizaci\u00f3n",
+    "translating": "traducci\u00f3n",
+    "building_epub": "creaci\u00f3n del EPUB",
     "writing": "guardado",
-    "completed": "finalización",
+    "completed": "finalizaci\u00f3n",
     "not_started": "inicio",
+}
+_PROCESS_PHASE_TEXT = {
+    AttemptPhase.PREPARATION.value: "preparaci\u00f3n",
+    AttemptPhase.EARLY_CHECK.value: "comprobaci\u00f3n temprana",
+    AttemptPhase.TRANSLATION.value: "traducci\u00f3n",
+    AttemptPhase.CORRECTION.value: "correcci\u00f3n",
+    AttemptPhase.PERSONALIZATION.value: "personalizaci\u00f3n",
+    AttemptPhase.PUBLICATION.value: "publicaci\u00f3n",
+    AttemptPhase.COMPLETION.value: "finalizaci\u00f3n",
+    AttemptPhase.CANCELLATION.value: "cancelaci\u00f3n",
+    AttemptPhase.PAUSE.value: "pausa",
 }
 
 
@@ -62,17 +73,11 @@ def build_diagnostic_report(
     ollama_status: str | None,
     installed_models: int,
     queued_documents: int | None = None,
-    session_path: Path | None = None,
     history_path: Path | None = None,
     work_checkpoint_root: Path | None = None,
     log_path: Path | None = None,
 ) -> str:
     """Return a copyable report without paths, document names, prompts or converted text."""
-    actual_session_path = (
-        (session_path if session_path is not None else get_session_path())
-        if queued_documents is None
-        else None
-    )
     actual_history_path = history_path if history_path is not None else get_history_path()
     jobs = load_recent_jobs(path=actual_history_path)
     outcomes = Counter(job.status for job in jobs)
@@ -83,13 +88,12 @@ def build_diagnostic_report(
     latest_failure = _latest_safe_failure(log_path)
     ocr_available = _module_available("docling") and _module_available("easyocr")
     argos_available = _module_available("argostranslate")
-    recoverable_session = actual_session_path is not None and actual_session_path.is_file()
     system = platform.system() or "Desconocido"
     release = platform.release() or ""
     return "\n".join(
         (
-            f"{APP_DISPLAY_NAME} — diagnóstico local",
-            f"Versión: {__version__}",
+            f"{APP_DISPLAY_NAME} \u2014 diagn\u00f3stico local",
+            f"Versi\u00f3n: {__version__}",
             f"Sistema: {system} {release}".rstrip(),
             f"Python: {sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}",
             "",
@@ -97,33 +101,30 @@ def build_diagnostic_report(
             f"Modelo seleccionado: {selected_model}",
             f"Modelos instalados detectados: {max(installed_models, 0)}",
             f"OCR local: {'Disponible' if ocr_available else 'No disponible'}",
-            f"Traducción local: {'Disponible' if argos_available else 'No disponible'}",
+            f"Traducci\u00f3n local: {'Disponible' if argos_available else 'No disponible'}",
             f"Espacio temporal disponible: {_format_bytes(free_bytes)}",
             "",
-            (
-                f"Documentos guardados en la cola: {max(queued_documents, 0)}"
-                if queued_documents is not None
-                else (f"Trabajo recuperable activo: {'Sí' if recoverable_session else 'No'}")
-            ),
+            f"Documentos guardados en la cola: {max(queued_documents or 0, 0)}",
             (
                 "Actividad reciente: "
-                f"{len(jobs)} total · {outcomes[RecentJobStatus.COMPLETED]} completadas · "
-                f"{outcomes[RecentJobStatus.FAILED]} con error · "
+                f"{len(jobs)} total \u00b7 "
+                f"{outcomes[RecentJobStatus.COMPLETED]} completadas \u00b7 "
+                f"{outcomes[RecentJobStatus.FAILED]} con error \u00b7 "
                 f"{outcomes[RecentJobStatus.CANCELLED]} canceladas"
             ),
             (
-                f"Checkpoints: {checkpoint_jobs} trabajos · {checkpoint_files} partes · "
+                f"Checkpoints: {checkpoint_jobs} trabajos \u00b7 {checkpoint_files} partes \u00b7 "
                 f"{_format_bytes(checkpoint_bytes)}"
             ),
             (
-                "Retención cifrada de trabajo: "
+                "Retenci\u00f3n cifrada de trabajo: "
                 + (
                     "solo hasta finalizar"
                     if settings.checkpoint_retention_days == 0
-                    else f"{settings.checkpoint_retention_days} días"
+                    else f"{settings.checkpoint_retention_days} d\u00edas"
                 )
             ),
-            f"Último fallo registrado: {latest_failure or 'Ninguno'}",
+            f"\u00daltimo fallo registrado: {latest_failure or 'Ninguno'}",
             "",
             "Privacidad: este informe no incluye rutas, nombres ni contenido de documentos.",
         )
@@ -211,19 +212,31 @@ def _latest_safe_failure(log_path: Path | None) -> str | None:
             continue
         expected_type = _log_value(line, "error_type")
         stage = _safe_stage_text(_log_value(line, "stage"))
-        if expected_type is not None:
-            return f"{expected_type}{f' · etapa {stage}' if stage is not None else ''}"
         incident = _log_value(line, "incident")
+        diagnostic_reference = _log_value(line, "diagnostic_reference")
         error_type = _log_value(line, "unexpected_error_type")
         module = _log_value(line, "module")
         function = _log_value(line, "function")
         line_number = _log_value(line, "line")
+        if expected_type is not None:
+            phase = _safe_phase_text(_log_value(line, "phase"))
+            location = diagnostic_reference or incident
+            reference_text = f" \u00b7 referencia {location}" if location else ""
+            phase_text = phase or stage
+            phase_suffix = f" \u00b7 etapa {phase_text}" if phase_text is not None else ""
+            return f"{expected_type}{reference_text}{phase_suffix}"
         if all((incident, error_type, module, function, line_number)):
-            stage_text = f" · etapa {stage}" if stage is not None else ""
+            stage_text = f" \u00b7 etapa {stage}" if stage is not None else ""
             return (
-                f"{error_type} · referencia {incident}{stage_text} · "
+                f"{error_type} \u00b7 referencia {incident}{stage_text} \u00b7 "
                 f"{module}.{function}:{line_number}"
             )
+        error_code = _log_value(line, "error_code") or _log_value(line, "error_kind")
+        if error_code is not None:
+            phase = _safe_phase_text(_log_value(line, "phase")) or stage
+            display_code = _safe_error_code_text(error_code)
+            phase_suffix = f" \u00b7 etapa {phase}" if phase is not None else ""
+            return f"{display_code}{phase_suffix}"
     return None
 
 
@@ -231,6 +244,20 @@ def _safe_stage_text(value: str | None) -> str | None:
     if value is None:
         return None
     return _PROCESS_STAGE_TEXT.get(value)
+
+
+def _safe_phase_text(value: str | None) -> str | None:
+    if value is None:
+        return None
+    return _PROCESS_PHASE_TEXT.get(value)
+
+
+def _safe_error_code_text(value: str) -> str:
+    return {
+        "early_check": "EarlyCheckError",
+        "cancellation": "ProcesamientoCancelado",
+        "unexpected": "UnexpectedProcessingError",
+    }.get(value, value)
 
 
 def _log_value(line: str, name: str) -> str | None:

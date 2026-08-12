@@ -56,10 +56,19 @@ def test_book_document_rejects_duplicate_source_filenames() -> None:
 
 
 def test_book_metadata_accepts_only_normalized_bounded_values() -> None:
-    metadata = BookMetadata("Book", identifier=str(uuid4()))
+    metadata = BookMetadata(
+        "Book",
+        identifier=str(uuid4()),
+        identifiers=("primary-id", "secondary-id"),
+        publisher="Local Publisher",
+        publication_date="2024-03-14",
+    )
     assert metadata.title == "Book"
+    assert metadata.identifiers == ("primary-id", "secondary-id")
     with pytest.raises(ValueError, match="language"):
         BookMetadata("Book", language="EN")
+    with pytest.raises(ValueError, match="identifiers"):
+        BookMetadata("Book", identifiers=("duplicate", "duplicate"))
 
 
 def test_book_model_rejects_unsafe_resources_and_wrong_reading_order() -> None:

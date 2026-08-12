@@ -1,8 +1,166 @@
 # Historial de cambios
 
-## En desarrollo
+## 1.2.0 - 2026-08-12
 
-- Sin cambios todavía.
+- Configurar deja de sustituir la cola por un formulario largo: una ventana compacta pide únicamente
+  Markdown/EPUB y traducción. Procesamiento directo, Argos y OCR automático son valores implícitos;
+  revisión completa, IA para traducir, glosario, páginas y OCR forzado quedan en `Más opciones`, que
+  se abre sola cuando una configuración existente ya usa alguna excepción.
+- El modo directo escala de forma progresiva: tras las comprobaciones puede recomendar, sin ejecutar
+  IA, una revisión local de hasta 64 bloques afectados. La recomendación no persiste texto, sobrevive
+  al reinicio y, si se acepta, conserva intactos tanto los bloques no señalados como el resultado
+  publicado hasta que la propuesta se confirme. Fallar o cancelar devuelve el trabajo a Completado.
+- La configuración distingue Procesamiento directo y Revisión semántica con IA local, muestra el
+  recorrido y las pasadas reales y mantiene el primero como opción recomendada. La revisión sigue
+  siendo explícita: las pruebas privadas mostraron correcciones conservadoras, pero no una mejora
+  universal que justifique imponer IA a todos los documentos.
+- La validación local añade perfiles comparables de conversión y traducción directa/revisada,
+  registra el trabajo de texto e IA previsto y separa las propuestas de contenido y estructura sin
+  guardar títulos, rutas ni fragmentos documentales.
+- La mejora con IA separa contratos, transporte local y guardas Markdown; PDF separa su modelo de
+  página y el codec de checkpoints; y la ventana delega el flujo de modelos en un coordinador de
+  presentación sin alterar su única base `QMainWindow`.
+- La validación real puede aislar traducción con IA para comparar modelos. Qwen 3.5 deja de
+  confundirse con los tags de razonamiento de Qwen 3, mientras la selección efectiva continúa
+  limitada a `/api/tags`; la comparativa local no sustituye automáticamente el modelo equilibrado.
+- La traducción permite elegir de forma explícita entre Argos offline e IA local con Ollama. El plan
+  Revisado permanece independiente y ambos motores comparten glosario y guardas de fidelidad.
+- La cola persistida y `JobQueue` son ahora la única fuente de verdad; se retiran la sesión JSON y
+  los modelos de lote duplicados. La ejecución física conserva solo estado transitorio.
+- El producto publica únicamente Markdown o EPUB. TXT y DOCX continúan admitidos como entrada, pero
+  se retiran las rutas de salida y las instantáneas específicas de formatos antiguos.
+- El procesamiento separa preparación, transformación y publicación, incluida la preparación del
+  editor EPUB. El OCR limita cada lote a dos páginas y cuatro hilos para contener el pico de memoria
+  sin reducir resolución ni precisión de tablas.
+- Las referencias privadas de rendimiento pueden calibrarse ahora con varias repeticiones: rechazan
+  resultados estructuralmente inestables y calculan los márgenes desde el peor tiempo y pico de
+  memoria observado, evitando falsos positivos por variación del OCR.
+- La arquitectura separa ahora los casos de uso de configuración de cola, persistencia, recuperación
+  y materialización de revisiones de la ventana Qt. Los diálogos antiguos viven definitivamente en
+  `presentation`, se eliminan las fachadas anteriores y una prueba automática impide nuevas
+  dependencias de Qt o infraestructura dentro del dominio y la aplicación.
+- El preflight y sus pronósticos se calculan fuera del hilo gráfico; restaurar revisiones largas
+  evita el diff cuadrático y los EPUB copian en streaming los recursos binarios sin cambios.
+- Los errores durables conservan solo plantillas sin contenido y `llmfit` exige hashes fijados por
+  versión, recibe un entorno mínimo y deja de heredar credenciales o proxies.
+- Los locks actualizan `cryptography` a la versión corregida y el workflow de Windows audita sus
+  dependencias, valida que la etiqueta pertenece a `main` y prepara la Release en borrador.
+- El nuevo icono oficial con contorno blanco identifica ahora la aplicación, el instalador, las
+  cabeceras clara y oscura y el README mediante derivados transparentes reproducibles.
+- Errores de procesamiento explicados por fase en la cola y en Actividad reciente, con trabajo
+  reutilizable, recorrido temporal, recuperación contextual mientras el documento siga en la cola y
+  diagnóstico copiable sin nombres, rutas, contenido ni secretos.
+- La confirmación previa a trabajos largos presenta ahora un resumen compacto del recorrido, la
+  duración y la revisión necesaria, y mantiene los detalles técnicos ocultos hasta solicitarlos.
+- Salida Markdown portable configurable como archivo único o índice con un archivo por capítulo,
+  con metadatos y referencias a páginas PDF opcionales, enlaces de recursos relativos y
+  regeneración coherente después de una revisión.
+- La comprobación temprana elige ahora hasta cinco páginas distribuidas por diversidad real de texto,
+  imágenes y tablas; las páginas visuales inicial y final preservadas cuentan como advertencia, no
+  como bloqueo material, mientras que los fallos interiores repetidos sí bloquean. Las
+  transformaciones siguen activadas y reutilizan la extracción/OCR en el recorrido completo.
+- Las tablas PDF se publican como Markdown, HTML o texto estructurado según su complejidad; los
+  casos inseguros generan revisión y un recorte visual de respaldo cuando se conservan imágenes.
+- Las tablas HTML generadas para celdas multilínea llegan ahora al EPUB como tablas XHTML reales.
+  Solo se admite la estructura cerrada, sin atributos y saneada que produce Parsezen; cualquier
+  HTML arbitrario continúa desactivado y se muestra como texto inerte.
+- La traducción y la revisión comparan además la secuencia ordenada de etiquetas de cada tabla HTML.
+  Una propuesta no puede eliminar una columna cuya primera celda esté vacía ni compensar esa
+  pérdida alterando otra tabla con la misma forma global.
+- Las tablas cuyas reglas quedaron rasterizadas se reconstruyen localmente combinando esas reglas
+  visuales con las posiciones de la capa de texto. El resultado solo se acepta si conserva exactamente
+  letras, cifras y signos; columnas numéricas, celdas vacías, texto posterior y enlaces ya no pueden
+  perderse dentro de una caja aproximada. El OCR solo puede sustituir una tabla si supera además sus
+  guardas de cobertura y tamaño y conserva en orden las filas y columnas de cada tabla nativa. Los
+  índices de hasta cuatro columnas mantienen un orden de lectura
+  contiguo y vuelven a asociar cada folio separado con su entrada antes de publicarla como una fila
+  semántica, aun cuando el OCR visual se rechaza.
+- Las fronteras de esas tablas se sitúan ahora en el hueco real entre glifos, no a mitad de los
+  comienzos de columna, para no partir palabras anchas entre celdas. Dos tablas consecutivas en una
+  página se separan por su rótulo explícito y conservan geometrías independientes.
+- Los fragmentos tabulares cortos al final de una página también se recuperan cuando un rótulo
+  `Table/Tabla/Cuadro n` y las reglas exteriores ofrecen evidencia suficiente. Las divisiones
+  interiores se infieren entre filas reales, una celda vacía en la primera fila no elimina su
+  columna y los guiones discrecionales o de final de línea se recomponen antes de publicar.
+- Las respuestas en streaming de Ollama respetan ahora un límite total de tiempo además del tiempo
+  entre tokens, y su presupuesto de salida escala de forma más estricta con el fragmento. Una
+  generación local desbocada se cancela y conserva el contenido anterior en vez de monopolizar el
+  flujo indefinidamente.
+- La publicación de una revisión vuelve a validar la combinación completa de decisiones: un cambio
+  estructural que altere cifras pasa a riesgo alto y ninguna mezcla entre original y propuesta puede
+  inventar o perder ocurrencias numéricas fuera de ambas versiones. El archivo anterior permanece
+  intacto si el ensamblado no supera esta guarda.
+- El arranque deja de importar por anticipado la pila de conversión y MarkItDown: la importación del
+  punto de entrada baja de unos 2,6 s y 67 MiB de pico a unos 0,1 s y 5 MiB en el equipo de prueba.
+- La revisión pasa a mostrar el progreso de la fase activa sobre sus decisiones materializadas,
+  conserva ediciones activas al guardar y salir, y reanuda en la siguiente unidad pendiente.
+- Las incidencias de traducción comparan ahora extractos legibles y equivalentes, sin ampliar una
+  frase truncada a toda la página. El resultado dudoso deja de presentarse como recomendación y las
+  reparaciones locales seguras se conservan aunque otro fragmento todavía requiera revisión.
+- La corrección de traducciones Argos compara ahora original y resultado mediante Ollama local, que
+  propone sustituciones JSON mínimas: cada cambio se valida y aplica por separado, una propuesta mala
+  no descarta las buenas y una respuesta truncada nunca puede reescribir el resto del documento.
+- Una segunda pasada bilingüe acotada revisa mezclas residuales de idioma y variantes ortográficas
+  raras sobre un máximo de cuatro líneas o párrafos Markdown alineados por bloque; los nombres propios
+  no activan falsos positivos y las correcciones que requieren una inserción dentro de una palabra
+  pasan ya por las mismas guardas que el resto de parches. La detección de idioma se aplica al
+  documento completo y no rechaza una microunidad correcta solo por carecer de contexto suficiente;
+  cada forma detectada usa una solicitud de cero o un parche y el analizador descarta cambios cuyo
+  texto nuevo no reduzca realmente su recuento.
+- Las oraciones completas que Argos haya conservado por error se retraducen como unidades aisladas y
+  solo se sustituyen si superan todas las guardas compartidas. Bibliografías, índices y catálogos de
+  nombres se excluyen por entrada o fila, nunca por página completa, por lo que la prosa mezclada
+  sigue siendo revisable. La salida aislada requiere evidencia local positiva del idioma solicitado
+  y sus límites se calculan sobre las posiciones Unicode originales, sin recortes ante caracteres
+  cuyo plegado cambia de longitud; las referencias conservadas siguen sometidas a los controles de
+  fidelidad, longitud y estructura.
+- Ninguna corrección bilingüe puede aumentar palabras suficientemente largas tomadas literalmente
+  del original, tampoco en encabezados en mayúsculas; la pasada residual debe reducir además la señal
+  que motivó su selección, por lo que arreglar un anglicismo mientras se introduce otro deja de ser
+  una propuesta aceptable.
+- La validación acumulativa conserva solo el bloque que haya superado el límite de reescritura tras
+  varias correcciones sucesivas, vuelve a comprobar el documento completo y mantiene las mejoras
+  independientes seguras en vez de descartar toda la revisión bilingüe.
+- Una reanudación ya no repite dos respuestas bilingües rechazadas: guarda únicamente la decisión
+  segura de conservar la traducción validada, nunca el contenido propuesto que incumplió las guardas.
+- El informe de traducción se recalcula sobre la propuesta posterior a la corrección y la estructura,
+  por lo que deja de contar incidencias ya resueltas y puede señalar una regresión introducida después.
+- Los folios situados al final de entradas de lista o índice permanecen fuera del texto enviado a
+  Argos; las guardas compartidas rechazan también cualquier corrección que los desplace a otra
+  posición, aunque conserve todas las cifras.
+- Argos conserva también la caja de los números romanos en encabezados, sin proteger por error el
+  pronombre `I` de la prosa normal.
+- Si una sustitución parcial introduce una frase repetida en un título bilingüe, Parsezen vuelve a
+  evaluar únicamente el título completo y acepta la reparación solo si supera las mismas guardas de
+  fidelidad, estructura e idioma.
+- La restauración de títulos conservados en un tercer idioma vuelve a comprobar todas las cifras del
+  resultado reparado; si una coincidencia ambigua de un índice desplaza una referencia, conserva la
+  reparación previa en vez de publicar el valor alterado.
+- Las continuaciones puramente numéricas de un índice ya no se interpretan como listas CommonMark:
+  una línea que empiece por una referencia alta como `202.` conserva ese valor literal en el EPUB en
+  vez de ser renumerada según una entrada anterior.
+- El OCR de páginas gráficas completas descarta rótulos aislados cuya escala sea muy inferior a la
+  tipografía dominante, pero conserva siempre la imagen original y el resto del texto reconocido.
+- Una versión antigua de un checkpoint OCR etiquetado se vuelve a calcular en vez de exponerse como
+  texto del documento; los controles no válidos para XML se neutralizan tanto al limpiar OCR como en
+  la frontera de publicación EPUB.
+- En las primeras páginas, un título OCR con un único término corto espurio puede recuperar la
+  variante nativa repetida solo cuando existe un donante tipográfico fiable y único; cualquier
+  ambigüedad conserva el OCR para revisión.
+- Si el OCR une el rótulo `Tabla n` con la primera fila, Parsezen vuelve a separarlo antes de evaluar
+  la tabla para conservar el título y generar celdas XHTML reales.
+- Los encabezados generados en EPUB evitan partirse internamente entre dos páginas compatibles con
+  paginación CSS, mantienen una separación superior no colapsable al abrir un capítulo y ajustan
+  palabras excepcionalmente largas sin desbordar el ancho de lectura.
+- Una revisión regenerada sobre un resultado antiguo vuelve ahora a su fase correcta, invalida solo
+  las decisiones posteriores dependientes y reutiliza toda la transformación ya completada.
+- Los paneles de traducción terminan ahora en la misma frontera de frase y explican que solo debe
+  traducirse el fragmento editable visible; volver a la fase anterior acepta correctamente la
+  confirmación del usuario.
+- Los EPUB parciales conservan como texto las etiquetas de enlaces cuyo destino queda fuera del
+  intervalo seleccionado; quitar un ancla durante la edición tampoco bloquea la publicación.
+- La revisión final del EPUB explicita que el original no se modifica, guarda el borrador con
+  `Guardar y salir` y confirma antes de `Descartar cambios` cuando existen cambios.
 
 ## 1.1.0 - 2026-07-30
 

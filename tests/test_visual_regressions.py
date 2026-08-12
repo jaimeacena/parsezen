@@ -2,25 +2,43 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
 from PySide6.QtCore import QEvent, QPoint, QRect, QSize, Qt
-from PySide6.QtWidgets import QApplication, QLabel, QWidget
+from PySide6.QtWidgets import QApplication, QWidget
 
-from parsezen.application.recovery import RecoveryAction, RecoveryPlan
+from parsezen.application.book_editor import create_book_from_markdown
+from parsezen.application.planner import activate_next_stage
+from parsezen.domain.attempt_activity import (
+    AttemptEvent,
+    AttemptEventStatus,
+    AttemptPhase,
+    AttemptTimeline,
+    FailureSnapshot,
+    ReusableWork,
+)
 from parsezen.domain.jobs import (
     DocumentJob,
     DocumentSource,
     JobConfiguration,
     OutputConfiguration,
 )
-from parsezen.domain.stages import StageKind
+from parsezen.domain.reviews import ReviewKind, ReviewSession, ReviewUnit
+from parsezen.domain.stages import StageKind, StageStatus
+from parsezen.epub_builder import EpubBookMetadata
+from parsezen.failure_recovery import RecoveryAction, RecoveryPlan
+from parsezen.infrastructure.artifact_store import ArtifactStore
 from parsezen.local_models import OllamaModel, OllamaStatus
-from parsezen.model_manager import ModelManagerDialog
+from parsezen.presentation.activity_view import ActivityView
+from parsezen.presentation.book_editor_dialog import BookEditorDialog
 from parsezen.presentation.design_system import ThemeMode, apply_parsezen_theme
 from parsezen.presentation.job_configuration_dialog import JobConfigurationDialog
+from parsezen.presentation.model_manager import ModelManagerDialog
+from parsezen.presentation.phase_review_dialog import PhaseReviewDialog
 from parsezen.presentation.workspace import InternalBackButton, ParsezenWorkspace
+from parsezen.recent_activity import RecentJob, RecentJobStatus
 
 
 def _make_job(path: Path) -> DocumentJob:
@@ -30,6 +48,10 @@ def _make_job(path: Path) -> DocumentJob:
         JobConfiguration(output=OutputConfiguration(configured=True)),
         order=0,
     )
+
+
+def _reversible(payload: bytes) -> bytes:
+    return bytes(value ^ 0x31 for value in payload)
 
 
 def _relative_rect(widget: QWidget, ancestor: QWidget) -> QRect:
@@ -43,6 +65,111 @@ def _assert_fully_visible(widget: QWidget, ancestor: QWidget) -> None:
     assert bounds.top() >= 0
     assert bounds.right() < ancestor.width()
     assert bounds.bottom() < ancestor.height()
+
+
+def _failed_recent_job(path: Path) -> RecentJob:
+    timestamp = datetime(2026, 8, 3, 10, 0, tzinfo=UTC)
+    return RecentJob(
+        path,
+        RecentJobStatus.FAILED,
+        timestamp,
+        attempt_id="attempt-visual",
+        timeline=AttemptTimeline(
+            (
+                AttemptEvent(
+                    AttemptPhase.PREPARATION,
+                    AttemptEventStatus.STARTED,
+                    timestamp=timestamp,
+                ),
+                AttemptEvent(
+                    AttemptPhase.PREPARATION,
+                    AttemptEventStatus.COMPLETED,
+                    timestamp=timestamp,
+                ),
+                AttemptEvent(
+                    AttemptPhase.TRANSLATION,
+                    AttemptEventStatus.STARTED,
+                    timestamp=timestamp,
+                ),
+                AttemptEvent(
+                    AttemptPhase.TRANSLATION,
+                    AttemptEventStatus.FAILED,
+                    timestamp=timestamp,
+                ),
+            )
+        ),
+        failure=FailureSnapshot(
+            AttemptPhase.TRANSLATION,
+            "transformation",
+            "La traducción local se detuvo.",
+            diagnostic_reference="visual-ref",
+            reusable_work=ReusableWork.PREVIOUS_PHASES,
+        ),
+    )
+
+
+@pytest.mark.parametrize("theme", [ThemeMode.LIGHT, ThemeMode.DARK])
+@pytest.mark.parametrize("width", [320, 768])
+def test_activity_render_matrix_keeps_failed_and_completed_states_inside_viewport(
+    qtbot,
+    tmp_path: Path,
+    theme: ThemeMode,
+    width: int,
+) -> None:
+    application = QApplication.instance()
+    assert isinstance(application, QApplication)
+    apply_parsezen_theme(application, theme)
+    completed_source = tmp_path / f"completed-{theme.value}-{width}.txt"
+    completed_source.write_text("Original", encoding="utf-8")
+    completed_result = tmp_path / f"completed-{theme.value}-{width}.md"
+    completed_result.write_text("Resultado", encoding="utf-8")
+    failed_current_source = tmp_path / f"failed-current-{theme.value}-{width}.txt"
+    failed_current_source.write_text("Original", encoding="utf-8")
+    failed_historical_source = tmp_path / f"failed-historical-{theme.value}-{width}.txt"
+    failed_historical_source.write_text("Original", encoding="utf-8")
+    cancelled_source = tmp_path / f"cancelled-{theme.value}-{width}.txt"
+    cancelled_source.write_text("Original", encoding="utf-8")
+    jobs = (
+        RecentJob(
+            completed_source,
+            RecentJobStatus.COMPLETED,
+            datetime(2026, 8, 3, 9, 0, tzinfo=UTC),
+            completed_result,
+        ),
+        _failed_recent_job(failed_current_source),
+        _failed_recent_job(failed_historical_source),
+        RecentJob(
+            cancelled_source,
+            RecentJobStatus.CANCELLED,
+            datetime(2026, 8, 3, 9, 30, tzinfo=UTC),
+        ),
+    )
+    view = ActivityView(
+        jobs,
+        current_job_ids={failed_current_source: "current-job"},
+    )
+    qtbot.addWidget(view)
+    view.resize(width, 720)
+    view.show()
+    qtbot.waitExposed(view)
+    QApplication.processEvents()
+
+    assert "Completado" in view.jobs_list.item(0).text()
+    assert "Error en traducción" in view.jobs_list.item(1).text()
+    assert "Error en traducción" in view.jobs_list.item(2).text()
+    assert "Cancelado" in view.jobs_list.item(3).text()
+    assert view._compact is (width <= 760)  # noqa: SLF001
+    for row in range(len(jobs)):
+        view.jobs_list.setCurrentRow(row)
+        QApplication.processEvents()
+        snapshot = view.grab()
+        assert snapshot.size() == QSize(width, 720)
+        assert snapshot.save(str(tmp_path / f"activity-{theme.value}-{width}-{row}.png"))
+        assert view.jobs_list.horizontalScrollBar().maximum() == 0
+        for widget in (view.jobs_list, view.details):
+            bounds = _relative_rect(widget, view)
+            assert bounds.left() >= 0
+            assert bounds.right() < view.width()
 
 
 @pytest.mark.parametrize("theme", [ThemeMode.LIGHT, ThemeMode.DARK])
@@ -93,6 +220,119 @@ def test_workspace_render_matrix_keeps_core_actions_inside_the_viewport(
 
 
 @pytest.mark.parametrize("theme", [ThemeMode.LIGHT, ThemeMode.DARK])
+@pytest.mark.parametrize("width", [320, 768, 1440])
+def test_running_row_render_matrix_keeps_progress_inside_the_row(
+    qtbot,
+    tmp_path: Path,
+    theme: ThemeMode,
+    width: int,
+) -> None:
+    application = QApplication.instance()
+    assert isinstance(application, QApplication)
+    apply_parsezen_theme(application, theme)
+    job = _make_job(tmp_path / f"running-{theme.value}-{width}.txt")
+    ready = activate_next_stage(job)
+    running = ready.replace_stage(
+        ready.stage(StageKind.PREPARE)
+        .transition(StageStatus.RUNNING)
+        .with_progress(25, 100, "Extrayendo")
+    )
+    workspace = ParsezenWorkspace()
+    qtbot.addWidget(workspace)
+    workspace.set_jobs((running,))
+    workspace.resize(width, 760)
+    workspace.show()
+    qtbot.waitExposed(workspace)
+    QApplication.processEvents()
+
+    snapshot = workspace.grab()
+    assert snapshot.size() == QSize(width, 760)
+    assert snapshot.save(str(tmp_path / f"running-{theme.value}-{width}.png"))
+    assert workspace.job_table.horizontalScrollBarPolicy() == Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+
+
+@pytest.mark.parametrize("theme", [ThemeMode.LIGHT, ThemeMode.DARK])
+@pytest.mark.parametrize("width", [320, 768, 1440])
+def test_phase_review_render_matrix_keeps_current_session_progress_and_actions_visible(
+    qtbot,
+    tmp_path: Path,
+    theme: ThemeMode,
+    width: int,
+) -> None:
+    application = QApplication.instance()
+    assert isinstance(application, QApplication)
+    apply_parsezen_theme(application, theme)
+    store = ArtifactStore(
+        tmp_path / f"phase-artifacts-{theme.value}-{width}",
+        protect=_reversible,
+        unprotect=_reversible,
+    )
+    original = store.put_text(job_id="job", text="Texto actual")
+    proposed = store.put_text(job_id="job", text="Texto propuesto")
+    review = ReviewSession.create(
+        job_id="job",
+        stage=StageKind.REFINE,
+        kind=ReviewKind.REFINEMENT,
+        input_artifact_id=original.id,
+        input_version=1,
+        units=(ReviewUnit("unit", original.id, proposed.id),),
+    )
+    dialog = PhaseReviewDialog(review, store)
+    qtbot.addWidget(dialog)
+    dialog.resize(width, 760)
+    dialog.show()
+    qtbot.waitExposed(dialog)
+    QApplication.processEvents()
+
+    snapshot = dialog.grab()
+    assert snapshot.size() == QSize(width, 760)
+    assert snapshot.save(str(tmp_path / f"phase-{theme.value}-{width}.png"))
+    assert "0 de 1 decisiones" in dialog.progress_indicator.accessibleDescription()
+    assert dialog.next_button.isVisible()
+    assert dialog.save_later_button.isVisible()
+    assert dialog.proposed_pane.editor.accessibleName()
+
+
+@pytest.mark.parametrize("theme", [ThemeMode.LIGHT, ThemeMode.DARK])
+@pytest.mark.parametrize("width", [320, 768, 1440])
+def test_epub_editor_render_matrix_keeps_safe_exit_and_helper_visible(
+    qtbot,
+    tmp_path: Path,
+    theme: ThemeMode,
+    width: int,
+) -> None:
+    application = QApplication.instance()
+    assert isinstance(application, QApplication)
+    apply_parsezen_theme(application, theme)
+    store = ArtifactStore(
+        tmp_path / f"epub-artifacts-{theme.value}-{width}",
+        protect=_reversible,
+        unprotect=_reversible,
+    )
+    book = create_book_from_markdown(
+        "# Chapter\n\nReadable content.",
+        (),
+        EpubBookMetadata("Book", "en"),
+        store,
+        job_id="job",
+    )
+    dialog = BookEditorDialog(book, store, job_id="job", destination=None)
+    qtbot.addWidget(dialog)
+    dialog.resize(width, 760)
+    dialog.show()
+    qtbot.waitExposed(dialog)
+    QApplication.processEvents()
+
+    snapshot = dialog.grab()
+    assert snapshot.size() == QSize(width, 760)
+    assert snapshot.save(str(tmp_path / f"epub-{theme.value}-{width}.png"))
+    assert dialog.dialog_title.text() == "Revisión final del EPUB"
+    assert dialog.review_helper.isVisible()
+    assert dialog.save_later_button.text() == "Guardar y salir"
+    assert dialog.cancel_button.text() == "Descartar cambios"
+
+
+@pytest.mark.parametrize("theme", [ThemeMode.LIGHT, ThemeMode.DARK])
 @pytest.mark.parametrize("width", [320, 768])
 def test_recovery_actions_remain_visible_without_overlap(
     qtbot,
@@ -134,7 +374,7 @@ def test_recovery_actions_remain_visible_without_overlap(
 
 
 @pytest.mark.parametrize("theme", [ThemeMode.LIGHT, ThemeMode.DARK])
-def test_configuration_navigation_renders_switch_inside_one_interaction_surface(
+def test_configuration_result_cards_render_as_one_progressive_choice(
     qtbot,
     tmp_path: Path,
     theme: ThemeMode,
@@ -144,36 +384,59 @@ def test_configuration_navigation_renders_switch_inside_one_interaction_surface(
     apply_parsezen_theme(application, theme)
     editor = JobConfigurationDialog(
         _make_job(tmp_path / f"{theme.value}.txt"),
-        embedded=True,
+        embedded=False,
     )
     qtbot.addWidget(editor)
-    editor.resize(980, 680)
+    editor.resize(680, 520)
     editor.show()
     qtbot.waitExposed(editor)
     QApplication.processEvents()
 
-    for row in (editor.translation_navigation, editor.refinement_navigation):
-        switch = row.activation
-        assert switch is not None
-        switch_rect = _relative_rect(switch, row)
-        button_rect = _relative_rect(row.button, row)
-        assert row.rect().contains(switch_rect)
-        assert row.rect().contains(button_rect)
-        assert not button_rect.intersects(switch_rect)
-        assert switch.height() >= switch.sizeHint().height()
-
-        row.setProperty("hovered", True)
-        row.style().unpolish(row)
-        row.style().polish(row)
-        snapshot = row.grab()
+    for card in (editor.markdown_card, editor.epub_card):
+        snapshot = card.grab()
         assert not snapshot.isNull()
-        assert snapshot.width() == row.width()
-        assert snapshot.height() == row.height()
+        assert snapshot.width() == card.width()
+        assert snapshot.height() == card.height()
 
-    editor._select_section(editor.refinement_tab_index)
-    assert editor.refinement_navigation.property("selected") is True
-    assert editor.refinement_navigation.button.styleSheet() == ""
-    assert editor.refinement_navigation.button.autoDefault() is False
+    assert editor.markdown_card.property("selected") is True
+    assert not editor.advanced_panel.isVisible()
+    editor.output_epub.setChecked(True)
+    assert editor.epub_card.property("selected") is True
+    assert not editor.output_markdown.isChecked()
+    assert editor.grab().save(str(tmp_path / f"configuration-sheet-{theme.value}.png"))
+    editor.accept()
+
+
+@pytest.mark.parametrize("theme", [ThemeMode.LIGHT, ThemeMode.DARK])
+def test_configuration_advanced_exceptions_stay_in_one_vertical_disclosure(
+    qtbot,
+    tmp_path: Path,
+    theme: ThemeMode,
+) -> None:
+    application = QApplication.instance()
+    assert isinstance(application, QApplication)
+    apply_parsezen_theme(application, theme)
+    editor = JobConfigurationDialog(
+        _make_job(tmp_path / f"advanced-{theme.value}.pdf"),
+        embedded=False,
+        default_ai_model="qwen3:4b",
+        models=(("qwen3:4b", "Qwen 3 4B"),),
+        ollama_status=OllamaStatus.READY,
+    )
+    qtbot.addWidget(editor)
+    editor.resize(680, 620)
+    editor.translation_target.setCurrentIndex(editor.translation_target.findData("es"))
+    editor.advanced_toggle.setChecked(True)
+    editor.show()
+    qtbot.waitExposed(editor)
+    QApplication.processEvents()
+
+    assert editor.advanced_panel.isVisible()
+    assert editor.translation_method_row.isVisible()
+    assert editor.pdf_options.isVisible()
+    assert editor.scroll_area.horizontalScrollBar().maximum() == 0
+    assert editor.grab().save(str(tmp_path / f"configuration-advanced-{theme.value}.png"))
+    editor.accept()
 
 
 @pytest.mark.parametrize("theme", [ThemeMode.LIGHT, ThemeMode.DARK])
@@ -196,8 +459,7 @@ def test_batch_configuration_label_wraps_without_clipping_below_its_separator(
     qtbot.waitExposed(editor)
     QApplication.processEvents()
 
-    label = editor.apply_compatible_row.findChild(QLabel)
-    assert label is not None
+    label = editor.apply_compatible_label
     text_bounds = label.fontMetrics().boundingRect(
         QRect(0, 0, label.width(), 1_000),
         Qt.TextFlag.TextWordWrap | Qt.AlignmentFlag.AlignLeft,
@@ -205,14 +467,8 @@ def test_batch_configuration_label_wraps_without_clipping_below_its_separator(
     )
 
     assert label.height() >= text_bounds.height()
-    assert editor.apply_compatible_separator.isVisible()
-    assert (
-        editor.apply_compatible_separator.geometry().bottom()
-        < editor.apply_compatible_row.geometry().top()
-    )
-    assert editor.apply_compatible_section.grab().save(
-        str(tmp_path / f"batch-configuration-{theme.value}.png")
-    )
+    assert editor.apply_compatible.isVisible()
+    assert editor.grab().save(str(tmp_path / f"batch-configuration-{theme.value}.png"))
 
 
 def test_internal_back_action_has_icon_only_hover_growth(qtbot) -> None:
@@ -240,8 +496,8 @@ def test_switch_remains_keyboard_operable_without_clipping(qtbot, tmp_path: Path
     editor.resize(980, 680)
     editor.show()
     qtbot.waitExposed(editor)
-    editor._select_section(editor.translation_tab_index)
-    switch = editor.translation_enabled
+    editor.advanced_toggle.setChecked(True)
+    switch = editor.plan_reviewed
     switch.setFocus()
     QApplication.processEvents()
     assert switch.hasFocus()

@@ -10,16 +10,15 @@ from parsezen.application.scheduler import (
     start_selected_stage,
 )
 from parsezen.domain.jobs import (
+    AIProfileConfiguration,
     DocumentFormat,
     DocumentJob,
     DocumentSource,
     JobConfiguration,
     JobStatus,
     OutputConfiguration,
-    RefinementConfiguration,
-    StructureConfiguration,
+    ProcessingPlan,
     TranslationConfiguration,
-    effective_ai_profile,
 )
 from parsezen.domain.stages import StageAvailability, StageKind, StageStatus
 
@@ -38,44 +37,46 @@ def complete(job: DocumentJob, kind: StageKind) -> DocumentJob:
     )
 
 
-def test_job_builds_independent_stage_availability() -> None:
+def test_reviewed_epub_enables_text_and_structure_as_one_plan() -> None:
     job = DocumentJob.create(
         source(),
         JobConfiguration(
             output=OutputConfiguration(format=DocumentFormat.EPUB),
             translation=TranslationConfiguration(enabled=True),
-            refinement=RefinementConfiguration(enabled=False),
-            structure=StructureConfiguration(enabled=True),
+            plan=ProcessingPlan.LOCAL_AI_REVIEWED,
         ),
         order=0,
         job_id="one",
     )
 
     assert job.stage(StageKind.TRANSLATE).availability is StageAvailability.ENABLED
-    assert job.stage(StageKind.REFINE).availability is StageAvailability.DISABLED
+    assert job.stage(StageKind.REFINE).availability is StageAvailability.ENABLED
     assert job.stage(StageKind.STRUCTURE).availability is StageAvailability.ENABLED
 
 
-def test_structure_is_unavailable_for_non_epub_output() -> None:
+def test_standard_plan_disables_ai_phases() -> None:
+    job = DocumentJob.create(source(), JobConfiguration(), order=0)
+
+    assert job.stage(StageKind.REFINE).availability is StageAvailability.DISABLED
+    assert job.stage(StageKind.STRUCTURE).availability is StageAvailability.UNAVAILABLE
+
+
+def test_reviewed_markdown_has_text_review_but_no_structure_phase() -> None:
     job = DocumentJob.create(
         source(),
-        JobConfiguration(
-            output=OutputConfiguration(format=DocumentFormat.MARKDOWN),
-            structure=StructureConfiguration(enabled=True),
-        ),
+        JobConfiguration(plan=ProcessingPlan.LOCAL_AI_REVIEWED),
         order=0,
     )
 
+    assert job.stage(StageKind.REFINE).availability is StageAvailability.ENABLED
     assert job.stage(StageKind.STRUCTURE).availability is StageAvailability.UNAVAILABLE
 
 
 def test_job_status_is_derived_from_its_stages() -> None:
     job = activate_next_stage(DocumentJob.create(source(), JobConfiguration(), order=0))
     assert job.status is JobStatus.QUEUED
-
     running = job.replace_stage(job.stage(StageKind.PREPARE).transition(StageStatus.RUNNING))
     assert running.status is JobStatus.RUNNING
-
     blocked = running.replace_stage(
         running.stage(StageKind.PREPARE).transition(
             StageStatus.BLOCKED_FOR_REVIEW,
@@ -94,12 +95,7 @@ def test_scheduler_skips_review_blocked_job_without_starting_in_parallel() -> No
         .transition(StageStatus.RUNNING)
         .transition(StageStatus.BLOCKED_FOR_REVIEW, review_id="review")
     )
-    second = DocumentJob.create(
-        source("two.pdf"),
-        JobConfiguration(),
-        order=1,
-        job_id="two",
-    )
+    second = DocumentJob.create(source("two.pdf"), JobConfiguration(), order=1, job_id="two")
     prepared = prepare_runnable_jobs((first, second))
     decision = select_next_stage(prepared)
 
@@ -116,8 +112,7 @@ def test_completed_upstream_edit_invalidates_only_downstream_phases() -> None:
         JobConfiguration(
             output=OutputConfiguration(format=DocumentFormat.EPUB),
             translation=TranslationConfiguration(enabled=True),
-            refinement=RefinementConfiguration(enabled=True),
-            structure=StructureConfiguration(enabled=True),
+            plan=ProcessingPlan.LOCAL_AI_REVIEWED,
         ),
         order=0,
     )
@@ -147,16 +142,10 @@ def test_running_job_cannot_be_reconfigured() -> None:
         job.with_configuration(replace(job.configuration, force_pdf_ocr=True))
 
 
-def test_legacy_phase_models_remain_available_through_the_shared_ai_profile() -> None:
+def test_ai_profile_is_only_a_global_snapshot() -> None:
     configuration = JobConfiguration(
-        translation=TranslationConfiguration(
-            enabled=True,
-            model="legacy-model",
-            context_window=4096,
-        )
+        ai=AIProfileConfiguration(model="global-model", context_window=4096)
     )
 
-    profile = effective_ai_profile(configuration)
-
-    assert profile.model == "legacy-model"
-    assert profile.context_window == 4096
+    assert configuration.ai.model == "global-model"
+    assert configuration.ai.context_window == 4096

@@ -16,9 +16,25 @@ from PySide6.QtWidgets import (
 import parsezen.presentation.main_window as main_window_module
 from parsezen.application.job_execution import JobExecutionController
 from parsezen.application.job_queue import JobQueue
+from parsezen.application.job_runtime import JobRuntime
+from parsezen.application.quality_review_adapter import create_translation_review
+from parsezen.application.review_materialization import (
+    phase_plan_with_materialized_reviews,
+    review_for_current_candidate,
+)
+from parsezen.application.revision_materializer import create_revision_review
 from parsezen.application.run_preparation import PreparedQueueRun
+from parsezen.application.run_validation import BatchValidationIssue
 from parsezen.application.scheduler import QueueRunPlan, RunMode
-from parsezen.batch import BatchStatus, BatchValidationIssue
+from parsezen.domain.attempt_activity import (
+    AttemptEvent,
+    AttemptEventStatus,
+    AttemptPhase,
+    AttemptTimeline,
+    FailureSnapshot,
+    ReusableWork,
+    durable_failure_message,
+)
 from parsezen.domain.jobs import (
     AIProfileConfiguration,
     DocumentFormat,
@@ -27,16 +43,16 @@ from parsezen.domain.jobs import (
     JobConfiguration,
     JobStatus,
     OutputConfiguration,
-    RefinementConfiguration,
-    StructureConfiguration,
+    ProcessingPlan,
     TranslationConfiguration,
 )
+from parsezen.domain.reviews import ReviewChoice, ReviewKind, ReviewSession, ReviewUnit
 from parsezen.domain.stages import StageKind, StageStatus
 from parsezen.epub_builder import EpubBookMetadata
 from parsezen.errors import LocalModelUnavailableError
+from parsezen.failure_recovery import FailureKind, ProcessingFailure
 from parsezen.final_integrity import FinalIntegrityReport
 from parsezen.infrastructure.state_store import StateStore, StateStoreError
-from parsezen.job_sessions import load_recent_jobs
 from parsezen.local_models import OllamaConnection, OllamaModel, OllamaStatus
 from parsezen.model_recommendations import ModelRecommendation, ModelRecommendations
 from parsezen.pdf_conversion import PdfQualityReport, PdfReviewIssue
@@ -55,13 +71,211 @@ from parsezen.presentation.job_table import (
 from parsezen.presentation.local_ai_controller import LocalAIAction
 from parsezen.presentation.main_window import ParsezenMainWindow
 from parsezen.processing import ProcessResult, ProcessStage
-from parsezen.revision import RevisionKind, build_revision_draft
+from parsezen.recent_activity import load_recent_jobs
+from parsezen.revision import RevisionChange, RevisionDraft, RevisionKind, build_revision_draft
 from parsezen.settings import AppSettings
 from parsezen.translation_quality import (
     TranslationIssueKind,
     TranslationQualityIssue,
     TranslationQualityReport,
 )
+
+
+class ProjectedStatus:
+    """Old labels mapped to the authoritative domain state for concise UI tests."""
+
+    PENDING = JobStatus.QUEUED
+    PROCESSING = JobStatus.RUNNING
+    COMPLETED = JobStatus.COMPLETED
+    FAILED = JobStatus.FAILED
+    PAUSED = JobStatus.PAUSED
+    REVIEW_PENDING = JobStatus.WAITING_REVIEW
+
+
+class _RuntimeView:
+    def __init__(self, window: ParsezenMainWindow, job_id: str) -> None:
+        object.__setattr__(self, "window", window)
+        object.__setattr__(self, "job_id", job_id)
+
+    @property
+    def job(self) -> DocumentJob:
+        job = self.window._job_queue.get(self.job_id)  # noqa: SLF001
+        assert job is not None
+        return job
+
+    @property
+    def runtime(self):
+        return self.window._runtime_by_job[self.job_id]  # noqa: SLF001
+
+    @property
+    def path(self) -> Path:
+        return self.job.source.path
+
+    @property
+    def status(self) -> JobStatus:
+        return self.job.status
+
+    @status.setter
+    def status(self, status: JobStatus) -> None:
+        job = self.job
+        fresh = DocumentJob.create(
+            job.source,
+            job.configuration,
+            order=job.order,
+            job_id=job.id,
+        )
+        fresh = replace(
+            fresh,
+            configuration_revision=job.configuration_revision,
+            warnings=job.warnings,
+        )
+        self.window._job_queue.replace(fresh)  # noqa: SLF001
+        if status is JobStatus.QUEUED:
+            return
+        controller = JobExecutionController(self.window._job_queue)  # noqa: SLF001
+        running = controller.start_next(job.id)
+        active = next(stage for stage in running.stages if stage.status is StageStatus.RUNNING)
+        if status is JobStatus.RUNNING:
+            return
+        if status is JobStatus.PAUSED:
+            controller.pause(job.id)
+        elif status is JobStatus.FAILED:
+            controller.fail(
+                job.id,
+                active.kind,
+                error_code="test_failure",
+                error_message="Test failure",
+            )
+        elif status is JobStatus.CANCELLED:
+            controller.cancel(job.id)
+        elif status is JobStatus.WAITING_REVIEW:
+            controller.block_for_review(job.id, active.kind, review_id="test-review")
+        elif status is JobStatus.COMPLETED:
+            destination = (
+                self.runtime.result.final_path
+                if self.runtime.result is not None
+                else job.source.path
+            )
+            controller.complete(job.id, destination)
+        else:
+            raise AssertionError(f"Unsupported fixture status: {status}")
+
+    @property
+    def request(self):
+        return None
+
+    @property
+    def settings(self):
+        return None
+
+    @property
+    def error(self) -> str | None:
+        failed = next(
+            (stage.error_message for stage in self.job.stages if stage.error_message),
+            None,
+        )
+        return failed or (self.job.warnings[-1] if self.job.warnings else None)
+
+    def __getattr__(self, name: str):
+        return getattr(self.runtime, name)
+
+    def __setattr__(self, name: str, value) -> None:
+        if name in {"window", "job_id", "status"}:
+            object.__setattr__(self, name, value)
+            return
+        setattr(self.runtime, name, value)
+
+    def __eq__(self, other: object) -> bool:
+        return (
+            isinstance(other, _RuntimeView)
+            and other.window is self.window
+            and other.job_id == self.job_id
+        )
+
+
+class _RuntimeViews:
+    def __init__(self, window: ParsezenMainWindow) -> None:
+        self.window = window
+
+    def __iter__(self):
+        return iter(tuple(_RuntimeView(self.window, job.id) for job in self.window._job_queue.jobs))  # noqa: SLF001
+
+    def __getitem__(self, index: int) -> _RuntimeView:
+        job = self.window._job_queue.jobs[index]  # noqa: SLF001
+        return _RuntimeView(self.window, job.id)
+
+    def __len__(self) -> int:
+        return len(self.window._job_queue)  # noqa: SLF001
+
+    def clear(self) -> None:
+        self.window._job_queue.clear()  # noqa: SLF001
+        self.window._runtime_by_job.clear()  # noqa: SLF001
+
+
+def _entries(window: ParsezenMainWindow) -> _RuntimeViews:
+    return _RuntimeViews(window)
+
+
+def test_phase_plan_uses_materialized_review_units_and_excludes_structure() -> None:
+    result = ProcessResult(
+        Path("book.epub"),
+        revision_draft=RevisionDraft(
+            "Original\n",
+            "Propuesta\n",
+            (
+                RevisionChange(
+                    "content",
+                    RevisionKind.CONTENT,
+                    0,
+                    1,
+                    "Original\n",
+                    "Propuesta\n",
+                    "CorrecciÃ³n",
+                ),
+                RevisionChange(
+                    "structure",
+                    RevisionKind.STRUCTURE,
+                    0,
+                    1,
+                    "Propuesta\n",
+                    "# Propuesta\n",
+                    "Estructura",
+                ),
+            ),
+            frozenset({RevisionKind.CONTENT, RevisionKind.STRUCTURE}),
+        ),
+        review_required=True,
+        revision_epub_metadata=EpubBookMetadata("Book", "en"),
+    )
+    configuration = JobConfiguration(
+        output=OutputConfiguration(format=DocumentFormat.EPUB),
+        plan=ProcessingPlan.LOCAL_AI_REVIEWED,
+    )
+    refinement_review = ReviewSession.create(
+        job_id="job",
+        stage=StageKind.REFINE,
+        kind=ReviewKind.REFINEMENT,
+        input_artifact_id="input",
+        input_version=1,
+        units=(ReviewUnit("refinement", "original", "proposed"),),
+    )
+    structure_review = ReviewSession.create(
+        job_id="job",
+        stage=StageKind.STRUCTURE,
+        kind=ReviewKind.STRUCTURE,
+        input_artifact_id="input",
+        input_version=1,
+        units=(ReviewUnit("structure", "original", "proposed"),),
+    )
+
+    assert phase_plan_with_materialized_reviews(
+        result,
+        configuration,
+        (
+            (ReviewKind.REFINEMENT, refinement_review),
+            (ReviewKind.STRUCTURE, structure_review),
+        ),
+    ) == ((ReviewKind.REFINEMENT, 1),)
 
 
 def test_main_window_has_no_legacy_shell_or_hidden_form(qtbot, tmp_path: Path) -> None:
@@ -233,14 +447,14 @@ def test_main_window_uses_independent_configuration_and_persists_queue(
         second_job.configuration.__class__(
             output=OutputConfiguration(format=DocumentFormat.EPUB),
             translation=second_job.configuration.translation,
-            refinement=second_job.configuration.refinement,
-            structure=second_job.configuration.structure,
+            plan=second_job.configuration.plan,
         ),
     )
     window._prepare_independent_requests()  # noqa: SLF001
+    qtbot.waitUntil(lambda: window._prepared_run is not None, timeout=3_000)  # noqa: SLF001
     window._sync_workspace(force_persist=True)  # noqa: SLF001
 
-    entries = tuple(window._batch_entries)  # noqa: SLF001
+    entries = tuple(_entries(window))  # noqa: SLF001
     prepared = window._prepared_run  # noqa: SLF001
     status_column = COLUMNS.index(JobColumn.NEXT_STEP)
     assert all(
@@ -252,7 +466,7 @@ def test_main_window_uses_independent_configuration_and_persists_queue(
     )
     window.parsezen_workspace.set_preparing_jobs(())
     assert prepared is not None
-    assert prepared.items[0].request.output_format.value == "text"
+    assert prepared.items[0].request.output_format.value == "markdown"
     assert prepared.items[1].request.output_format.value == "epub"
     assert prepared.items[0].settings is not prepared.items[1].settings
     assert all(entry.request is None and entry.settings is None for entry in entries)
@@ -263,7 +477,7 @@ def test_main_window_uses_independent_configuration_and_persists_queue(
         state_path=state_path,
     )
     qtbot.addWidget(restored)
-    assert tuple(entry.path for entry in restored._batch_entries) == (first, second)  # noqa: SLF001
+    assert tuple(entry.path for entry in _entries(restored)) == (first, second)  # noqa: SLF001
 
 
 def test_primary_button_launches_prepared_runtime_from_domain_configuration(
@@ -297,10 +511,10 @@ def test_primary_button_launches_prepared_runtime_from_domain_configuration(
             output=OutputConfiguration(format=DocumentFormat.MARKDOWN),
         ),
     )
-    entry = window._batch_entries[0]  # noqa: SLF001
+    entry = _entries(window)[0]  # noqa: SLF001
     window._sync_workspace()  # noqa: SLF001
     window.parsezen_workspace.primary_button.click()
-    assert window.is_processing
+    qtbot.waitUntil(lambda: bool(captured), timeout=3_000)
     qtbot.waitUntil(lambda: not window.is_processing, timeout=3_000)
 
     assert len(captured) == 1
@@ -354,7 +568,10 @@ def test_completed_processing_records_summary_and_exposes_batch_feedback(
     window._sync_workspace()  # noqa: SLF001
 
     window.parsezen_workspace.primary_button.click()
-    qtbot.waitUntil(lambda: not window.is_processing, timeout=3_000)
+    qtbot.waitUntil(
+        lambda: history.exists() and len(load_recent_jobs(path=history)) == 1,
+        timeout=3_000,
+    )
 
     recent = load_recent_jobs(path=history)
     assert len(recent) == 1
@@ -397,9 +614,7 @@ def test_main_window_inspects_each_source_only_when_its_snapshot_is_created(
         state_path=tmp_path / "workspace.sqlite3",
     )
     qtbot.addWidget(window)
-    window.set_source_paths((source,))
     window._projection_timer.stop()
-    window._job_queue.clear()
     inspected: list[Path] = []
     original_inspect = main_window_module._source_from_path
 
@@ -409,11 +624,12 @@ def test_main_window_inspects_each_source_only_when_its_snapshot_is_created(
 
     monkeypatch.setattr(main_window_module, "_source_from_path", inspect_once)
 
+    window.set_source_paths((source,))
     window._ensure_configurations()
     window._ensure_configurations()
 
     assert inspected == [source]
-    window._batch_entries.clear()
+    _entries(window).clear()
 
 
 def test_main_window_prunes_unrecoverable_review_artifacts_on_startup(
@@ -473,16 +689,16 @@ def test_main_window_reorders_and_removes_pending_jobs(qtbot, tmp_path: Path) ->
     jobs = window._project_jobs()  # noqa: SLF001
 
     window._move_job(jobs[0].id, 2)  # noqa: SLF001
-    assert tuple(entry.path for entry in window._batch_entries) == (  # noqa: SLF001
+    assert tuple(entry.path for entry in _entries(window)) == (  # noqa: SLF001
         paths[1],
         paths[2],
         paths[0],
     )
-    assert all(entry.status is BatchStatus.PENDING for entry in window._batch_entries)  # noqa: SLF001
+    assert all(entry.status is ProjectedStatus.PENDING for entry in _entries(window))  # noqa: SLF001
 
     moved_id = window._project_jobs()[1].id  # noqa: SLF001
     window._remove_job(moved_id)  # noqa: SLF001
-    assert len(window._batch_entries) == 2  # noqa: SLF001
+    assert len(_entries(window)) == 2  # noqa: SLF001
 
 
 def test_main_window_recovers_exact_pending_review(qtbot, tmp_path: Path) -> None:
@@ -506,9 +722,9 @@ def test_main_window_recovers_exact_pending_review(qtbot, tmp_path: Path) -> Non
             output=replace(job.configuration.output, configured=True),
         ),
     )
-    entry = window._batch_entries[0]  # noqa: SLF001
-    entry.status = BatchStatus.PROCESSING
-    window._current_batch_entry = entry  # noqa: SLF001
+    entry = _entries(window)[0]  # noqa: SLF001
+    entry.status = ProjectedStatus.PROCESSING
+    window._current_job_id = entry.job_id  # noqa: SLF001
 
     window._processing_succeeded(  # noqa: SLF001
         ProcessResult(
@@ -525,13 +741,129 @@ def test_main_window_recovers_exact_pending_review(qtbot, tmp_path: Path) -> Non
         state_path=state_path,
     )
     qtbot.addWidget(restored)
-    recovered = restored._batch_entries[0]  # noqa: SLF001
-    assert recovered.status is BatchStatus.REVIEW_PENDING
+    recovered = _entries(restored)[0]  # noqa: SLF001
+    assert recovered.status is ProjectedStatus.REVIEW_PENDING
     assert recovered.result is not None
     assert recovered.result.review_markdown == "Propuesta"
     recovered_job = restored._project_jobs()[0]  # noqa: SLF001
     assert recovered_job.status is JobStatus.WAITING_REVIEW
     assert recovered_job.stage(StageKind.PREPARE).status is StageStatus.BLOCKED_FOR_REVIEW
+
+
+def test_completed_direct_result_can_start_recommended_targeted_review(
+    qtbot,
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    source = tmp_path / "notes.txt"
+    source.write_text("Texto original.", encoding="utf-8")
+    final_path = tmp_path / "notes.md"
+    final_path.write_text("Texto con �.\n", encoding="utf-8")
+    window = ParsezenMainWindow(
+        settings=AppSettings(model="local-model"),
+        auto_discover_ai=False,
+        state_path=tmp_path / "workspace.sqlite3",
+    )
+    qtbot.addWidget(window)
+    window.set_source_paths((source,))
+    job = window._project_jobs()[0]  # noqa: SLF001
+    window._job_queue.configure(  # noqa: SLF001
+        job.id,
+        replace(
+            job.configuration,
+            output=replace(job.configuration.output, configured=True),
+        ),
+    )
+    entry = _entries(window)[0]  # noqa: SLF001
+    entry.status = ProjectedStatus.PROCESSING
+    window._current_job_id = job.id  # noqa: SLF001
+    window._processing_succeeded(  # noqa: SLF001
+        ProcessResult(
+            final_path,
+            review_original_path=source,
+            review_markdown="Texto con �.\n",
+        )
+    )
+
+    recommended = window._job_queue.get(job.id)  # noqa: SLF001
+    assert recommended is not None
+    assert recommended.status is JobStatus.COMPLETED
+    assert recommended.review_recommendation is not None
+    starts: list[tuple[object, object, dict[str, object]]] = []
+    monkeypatch.setattr(
+        window._processing_runner,  # noqa: SLF001
+        "start",
+        lambda request, settings, **kwargs: starts.append((request, settings, kwargs)),
+    )
+
+    window._start_targeted_ai_review(job.id)  # noqa: SLF001
+
+    reviewing = window._job_queue.get(job.id)  # noqa: SLF001
+    assert reviewing is not None
+    assert reviewing.stage(StageKind.REFINE).status is StageStatus.READY
+    assert starts and callable(starts[0][2]["processor"])
+    assert entry.result is not None
+    assert entry.result.review_markdown == "Texto con �.\n"
+    assert window.is_processing
+    assert final_path.read_text(encoding="utf-8") == "Texto con �.\n"
+    warnings: list[str] = []
+    monkeypatch.setattr(
+        QMessageBox,
+        "warning",
+        lambda _parent, _title, text, *_args, **_kwargs: warnings.append(str(text)),
+    )
+
+    window._processing_failed("Ollama no disponible")  # noqa: SLF001
+
+    restored = window._job_queue.get(job.id)  # noqa: SLF001
+    assert restored is not None
+    assert restored.status is JobStatus.COMPLETED
+    assert restored.review_recommendation == recommended.review_recommendation
+    assert final_path.read_text(encoding="utf-8") == "Texto con �.\n"
+    assert warnings and "sigue intacto" in warnings[0]
+    window._finish_batch()  # noqa: SLF001
+
+
+def test_direct_quality_recommendation_survives_an_existing_manual_review(
+    qtbot,
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "scan.pdf"
+    source.write_bytes(b"local source")
+    final_path = tmp_path / "scan.md"
+    final_path.write_text("word word word.\n", encoding="utf-8")
+    window = ParsezenMainWindow(
+        settings=AppSettings(),
+        auto_discover_ai=False,
+        state_path=tmp_path / "workspace.sqlite3",
+    )
+    qtbot.addWidget(window)
+    window.set_source_paths((source,))
+    job = window._project_jobs()[0]  # noqa: SLF001
+    window._job_queue.configure(  # noqa: SLF001
+        job.id,
+        replace(
+            job.configuration,
+            output=replace(job.configuration.output, configured=True),
+        ),
+    )
+    entry = _entries(window)[0]  # noqa: SLF001
+    entry.status = ProjectedStatus.PROCESSING
+    window._current_job_id = job.id  # noqa: SLF001
+
+    window._processing_succeeded(  # noqa: SLF001
+        ProcessResult(
+            final_path,
+            review_original_path=source,
+            review_markdown="word word word.\n",
+            review_required=True,
+        )
+    )
+
+    pending = window._job_queue.get(job.id)  # noqa: SLF001
+    assert pending is not None
+    assert pending.status is JobStatus.WAITING_REVIEW
+    assert pending.review_recommendation is not None
 
 
 def test_main_window_worker_events_update_authoritative_job_state(
@@ -547,9 +879,7 @@ def test_main_window_worker_events_update_authoritative_job_state(
     )
     qtbot.addWidget(window)
     window.set_source_paths((source,))
-    entry = window._batch_entries[0]  # noqa: SLF001
-    entry.status = BatchStatus.PROCESSING
-    window._current_batch_entry = entry  # noqa: SLF001
+    entry = _entries(window)[0]  # noqa: SLF001
     job = window._project_jobs()[0]  # noqa: SLF001
     job = window._job_queue.configure(  # noqa: SLF001
         job.id,
@@ -558,6 +888,8 @@ def test_main_window_worker_events_update_authoritative_job_state(
             output=replace(job.configuration.output, configured=True),
         ),
     )
+    entry.status = ProjectedStatus.PROCESSING
+    window._current_job_id = entry.job_id  # noqa: SLF001
     window._job_execution.start_next(job.id)  # noqa: SLF001
 
     window._show_stage(ProcessStage.CONVERTING)  # noqa: SLF001
@@ -607,8 +939,8 @@ def test_main_window_launch_order_comes_from_application_run_plan(
         )
     window._job_execution.begin_run()  # noqa: SLF001
 
-    first_entry = window._next_pending_batch_entry()  # noqa: SLF001
-    assert first_entry is not None
+    first_running = window._next_pending_job()  # noqa: SLF001
+    assert first_running is not None
     first_job = window._job_queue.for_source(first)  # noqa: SLF001
     assert first_job is not None
     window._job_execution.fail(  # noqa: SLF001
@@ -617,13 +949,11 @@ def test_main_window_launch_order_comes_from_application_run_plan(
         error_code="failed",
         error_message="Error",
     )
-    first_entry.status = BatchStatus.FAILED
+    second_running = window._next_pending_job()  # noqa: SLF001
 
-    second_entry = window._next_pending_batch_entry()  # noqa: SLF001
-
-    assert first_entry.path == first
-    assert second_entry is not None
-    assert second_entry.path == second
+    assert first_running.source.path == first
+    assert second_running is not None
+    assert second_running.source.path == second
     failed = window._job_queue.for_source(first)  # noqa: SLF001
     running = window._job_queue.for_source(second)  # noqa: SLF001
     assert failed is not None
@@ -660,7 +990,7 @@ def test_main_window_restores_interrupted_domain_execution_as_paused(
     assert restored is not None
     assert restored.status is JobStatus.PAUSED
     assert restored.stage(StageKind.PREPARE).status is StageStatus.PAUSED
-    assert window._batch_entries[0].status is BatchStatus.PAUSED  # noqa: SLF001
+    assert _entries(window)[0].status is ProjectedStatus.PAUSED  # noqa: SLF001
 
 
 def test_main_window_invalidates_review_when_original_changed(
@@ -687,9 +1017,9 @@ def test_main_window_invalidates_review_when_original_changed(
             output=replace(job.configuration.output, configured=True),
         ),
     )
-    entry = window._batch_entries[0]
-    entry.status = BatchStatus.PROCESSING
-    window._current_batch_entry = entry
+    entry = _entries(window)[0]
+    entry.status = ProjectedStatus.PROCESSING
+    window._current_job_id = entry.job_id
     window._processing_succeeded(
         ProcessResult(
             final_path=final_path,
@@ -712,9 +1042,9 @@ def test_main_window_invalidates_review_when_original_changed(
         state_path=state_path,
     )
     qtbot.addWidget(restored)
-    recovered = restored._batch_entries[0]
+    recovered = _entries(restored)[0]
 
-    assert recovered.status is BatchStatus.PAUSED
+    assert recovered.status is ProjectedStatus.PAUSED
     assert recovered.result is None
     assert recovered.error is not None
     assert "El original cambió" in recovered.error
@@ -737,9 +1067,9 @@ def test_main_window_blocks_stale_review_before_opening_it(
     )
     qtbot.addWidget(window)
     window.set_source_paths((source,))
-    entry = window._batch_entries[0]
-    entry.status = BatchStatus.PROCESSING
-    window._current_batch_entry = entry
+    entry = _entries(window)[0]
+    entry.status = ProjectedStatus.PROCESSING
+    window._current_job_id = entry.job_id
     window._processing_succeeded(
         ProcessResult(
             final_path=final_path,
@@ -759,7 +1089,7 @@ def test_main_window_blocks_stale_review_before_opening_it(
 
     window._review_job(job_id, None)
 
-    assert entry.status is BatchStatus.PAUSED
+    assert entry.status is ProjectedStatus.PAUSED
     assert entry.result is None
     assert entry.error is not None
     assert "El original cambió" in entry.error
@@ -782,9 +1112,9 @@ def test_main_window_keeps_review_pending_when_finalization_cannot_be_recorded(
     )
     qtbot.addWidget(window)
     window.set_source_paths((source,))
-    entry = window._batch_entries[0]  # noqa: SLF001
-    entry.status = BatchStatus.PROCESSING
-    window._current_batch_entry = entry  # noqa: SLF001
+    entry = _entries(window)[0]  # noqa: SLF001
+    entry.status = ProjectedStatus.PROCESSING
+    window._current_job_id = entry.job_id  # noqa: SLF001
     result = ProcessResult(
         final_path,
         review_original_path=source,
@@ -804,9 +1134,9 @@ def test_main_window_keeps_review_pending_when_finalization_cannot_be_recorded(
         lambda _parent, _title, message: warnings.append(message),
     )
 
-    window._apply_reviewed_text(entry, result, "Proposal", ())  # noqa: SLF001
+    window._apply_reviewed_text(entry.runtime, result, "Proposal", ())  # noqa: SLF001
 
-    assert entry.status is BatchStatus.REVIEW_PENDING
+    assert entry.status is ProjectedStatus.REVIEW_PENDING
     assert entry.error == "disk unavailable"
     job = window._job_queue.for_source(source)  # noqa: SLF001
     assert job is not None
@@ -839,12 +1169,11 @@ def test_main_window_warns_and_retries_when_state_write_fails(
     assert not window.parsezen_workspace.recovery_warning.isHidden()
 
     monkeypatch.setattr(window._state_store, "replace_jobs", original_replace)
-    window._last_persisted_at = 0.0
 
     assert window._sync_workspace()
     assert window.parsezen_workspace.recovery_warning.isHidden()
     window._projection_timer.stop()
-    window._batch_entries.clear()
+    _entries(window).clear()
 
 
 def test_main_window_preserves_unreadable_queue_before_starting_clean(
@@ -878,13 +1207,13 @@ def test_main_window_preserves_unreadable_queue_before_starting_clean(
             state_path=state_path,
         )
         qtbot.addWidget(window)
-        assert not window._state_restore_failed
+        assert not window._queue_persistence.unavailable
         assert not window.parsezen_workspace.recovery_warning.isHidden()
         assert "Se conservó una copia local segura" in (
             window.parsezen_workspace.recovery_warning.text()
         )
         window._projection_timer.stop()
-        window._batch_entries.clear()
+        _entries(window).clear()
 
     backups = tuple(tmp_path.glob("workspace.unreadable-*.sqlite3"))
     artifact_backups = tuple(tmp_path.glob("artifacts.unreadable-*"))
@@ -929,10 +1258,10 @@ def test_main_window_never_overwrites_unreadable_queue_if_backup_fails(
             state_path=state_path,
         )
         qtbot.addWidget(window)
-        assert window._state_restore_failed
+        assert window._queue_persistence.unavailable
         assert not window.parsezen_workspace.recovery_warning.isHidden()
         window._projection_timer.stop()
-        window._batch_entries.clear()
+        _entries(window).clear()
 
     assert StateStore(state_path).load_jobs() == (saved_job,)
     assert tuple(tmp_path.glob("workspace.unreadable-*.sqlite3")) == ()
@@ -965,7 +1294,7 @@ def test_main_window_quarantines_structurally_corrupted_state(
     assert not window.parsezen_workspace.recovery_warning.isHidden()
     assert "estado anterior estaba dañado" in window.parsezen_workspace.recovery_warning.text()
     window._projection_timer.stop()
-    window._batch_entries.clear()
+    _entries(window).clear()
 
 
 def test_main_window_confirms_close_when_recovery_is_unavailable(
@@ -984,7 +1313,7 @@ def test_main_window_confirms_close_when_recovery_is_unavailable(
     window.set_source_paths((source,))
     window.show()
     qtbot.waitExposed(window)
-    window._state_restore_failed = True
+    window._queue_persistence.mark_unavailable()
     monkeypatch.setattr(
         QMessageBox,
         "question",
@@ -996,7 +1325,7 @@ def test_main_window_confirms_close_when_recovery_is_unavailable(
     window.closeEvent(event)
 
     assert not event.isAccepted()
-    window._state_restore_failed = False
+    window._queue_persistence.mark_available()
 
 
 def test_main_window_routes_configuration_review_and_primary_actions(
@@ -1016,7 +1345,7 @@ def test_main_window_routes_configuration_review_and_primary_actions(
     qtbot.addWidget(window)
     window.set_source_paths((source,))
     job = window._project_jobs()[0]
-    entry = window._batch_entries[0]
+    entry = _entries(window)[0]
     notices: list[str] = []
     monkeypatch.setattr(
         QMessageBox,
@@ -1024,40 +1353,40 @@ def test_main_window_routes_configuration_review_and_primary_actions(
         lambda _parent, _title, text: notices.append(text),
     )
 
-    entry.status = BatchStatus.PROCESSING
+    entry.status = ProjectedStatus.PROCESSING
     window._configure_job(job.id, None)
     assert notices
-    entry.status = BatchStatus.PENDING
+    entry.status = ProjectedStatus.PENDING
 
     configured = job.configuration.__class__(
         output=job.configuration.output,
         translation=job.configuration.translation,
-        refinement=RefinementConfiguration(enabled=True, model="qwen3:4b"),
-        structure=job.configuration.structure,
+        ai=AIProfileConfiguration(model="qwen3:4b"),
+        plan=ProcessingPlan.LOCAL_AI_REVIEWED,
     )
 
     window._configure_job(job.id, None)
-    editor = window.parsezen_workspace.configuration_layout.itemAt(0).widget()
+    editor = window._active_configuration_dialog  # noqa: SLF001
     assert isinstance(editor, JobConfigurationDialog)
     monkeypatch.setattr(editor, "configuration", lambda: configured)
     editor.save_requested.emit()
     updated_job = window._job_queue.get(job.id)  # noqa: SLF001
     assert updated_job is not None
-    assert updated_job.configuration.refinement.enabled
+    assert updated_job.configuration.plan is ProcessingPlan.LOCAL_AI_REVIEWED
     assert entry.request is None
     assert entry.settings is None
 
     window._add_dropped_paths("not-a-tuple")
     window._add_dropped_paths((second,))
-    assert tuple(item.path for item in window._batch_entries) == (source, second)
+    assert tuple(item.path for item in _entries(window)) == (source, second)
 
     entry.result = ProcessResult(tmp_path / "notes.md", review_markdown="Reviewed")
-    entry.status = BatchStatus.REVIEW_PENDING
+    entry.status = ProjectedStatus.REVIEW_PENDING
     reviewed_cards: list[str] = []
     monkeypatch.setattr(window, "_review_quality_phases", lambda *_args: ("Reviewed", ()))
-    monkeypatch.setattr(window, "_review_result_card", reviewed_cards.append)
+    monkeypatch.setattr(window, "_open_local_path", lambda path: reviewed_cards.append(str(path)))
     window._review_job(job.id, None)
-    assert reviewed_cards == [str(source)]
+    assert reviewed_cards == [str(entry.result.final_path)]
 
     actions: list[str] = []
     monkeypatch.setattr(window, "_pause_processing", lambda: actions.append("pause"))
@@ -1083,7 +1412,7 @@ def test_main_window_routes_configuration_review_and_primary_actions(
 
     window._run_primary_action("pause")
     window._run_primary_action("review")
-    entry.status = BatchStatus.COMPLETED
+    entry.status = ProjectedStatus.COMPLETED
     window._run_primary_action("open_folder")
     window._run_primary_action("process")
     window._batch_running = False
@@ -1091,7 +1420,7 @@ def test_main_window_routes_configuration_review_and_primary_actions(
     assert actions == ["pause", "review", "select", "folder", "prepare", "start"]
 
 
-def test_table_click_opens_the_complete_internal_configuration(
+def test_table_click_opens_the_compact_configuration_sheet(
     qtbot,
     tmp_path: Path,
     monkeypatch,
@@ -1126,23 +1455,62 @@ def test_table_click_opens_the_complete_internal_configuration(
 
     table._cell_clicked(index)
 
-    editor = window.parsezen_workspace.configuration_layout.itemAt(0).widget()
+    editor = window._active_configuration_dialog  # noqa: SLF001
     assert isinstance(editor, JobConfigurationDialog)
-    assert not editor.refinement_enabled.isHidden()
-    assert not editor.translation_enabled.isHidden()
-    assert not editor.output_group.isHidden()
-    assert not editor.processing_group.isHidden()
+    assert editor.isVisible()
+    assert not editor.advanced_panel.isVisible()
+    assert editor.translation_target.isVisible()
+    assert editor.summary_card.isVisible()
+    assert window.parsezen_workspace.current_internal_widget is None
     assert index.data(CONFIGURING_ROLE) is True
-    assert discovery == [True]
+    assert discovery == []
 
     window._ollama_models = (OllamaModel("qwen3:4b-instruct", "Qwen3 4B Instruct"),)
+    editor.plan_reviewed.setChecked(True)
     window._select_model_from_manager("qwen3:4b-instruct")
 
-    assert editor.refinement_model.currentData() == "qwen3:4b-instruct"
+    assert "Qwen3 4B Instruct" in editor.ai_summary.text()
 
-    editor.cancel_requested.emit()
+    editor.reject()
 
     assert index.data(CONFIGURING_ROLE) is False
+
+
+def test_configuration_sheet_resumes_after_local_ai_settings(
+    qtbot,
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    source = tmp_path / "notes.txt"
+    source.write_text("Original", encoding="utf-8")
+    window = ParsezenMainWindow(
+        settings=AppSettings(),
+        auto_discover_ai=False,
+        state_path=tmp_path / "workspace.sqlite3",
+    )
+    qtbot.addWidget(window)
+    monkeypatch.setattr(window, "_start_model_discovery", lambda *, automatic: None)
+    monkeypatch.setattr(window, "_start_model_recommendations", lambda: None)
+    window.set_source_paths((source,))
+    job = window._project_jobs()[0]
+
+    window._configure_job(job.id, None)
+    editor = window._active_configuration_dialog  # noqa: SLF001
+    assert editor is not None
+
+    editor.models_requested.emit()
+
+    manager = window._model_manager  # noqa: SLF001
+    assert manager is not None
+    assert not editor.isVisible()
+    assert window.parsezen_workspace.current_internal_widget is manager
+
+    manager.reject()
+    qtbot.waitUntil(editor.isVisible)
+
+    assert window._active_configuration_dialog is editor  # noqa: SLF001
+    assert window.parsezen_workspace.current_internal_widget is None
+    editor.reject()
 
 
 def test_model_manager_opens_before_discovery_and_starts_it(
@@ -1279,7 +1647,6 @@ def test_contextual_retry_targets_only_the_failed_document(
     )
     failed_entry = window._entry_for_job_id(failed_job.id)  # noqa: SLF001
     assert failed_entry is not None
-    failed_entry.status = BatchStatus.FAILED
     started: list[QueueRunPlan] = []
     monkeypatch.setattr(
         window,
@@ -1289,6 +1656,7 @@ def test_contextual_retry_targets_only_the_failed_document(
 
     window._retry_failed_job(failed_job.id)  # noqa: SLF001
 
+    qtbot.waitUntil(lambda: bool(started), timeout=3_000)
     assert started == [QueueRunPlan(RunMode.RETRY, (failed_job.id,))]
 
 
@@ -1310,8 +1678,8 @@ def test_main_window_keeps_previous_configuration_when_runtime_mapping_fails(
     changed = job.configuration.__class__(
         output=replace(job.configuration.output, configured=True),
         translation=job.configuration.translation,
-        refinement=RefinementConfiguration(enabled=True, model="qwen3:4b"),
-        structure=job.configuration.structure,
+        ai=AIProfileConfiguration(model="qwen3:4b"),
+        plan=ProcessingPlan.LOCAL_AI_REVIEWED,
     )
 
     monkeypatch.setattr(
@@ -1322,7 +1690,7 @@ def test_main_window_keeps_previous_configuration_when_runtime_mapping_fails(
     monkeypatch.setattr(QMessageBox, "warning", lambda *_args, **_kwargs: None)
 
     window._configure_job(job.id, None)
-    editor = window.parsezen_workspace.configuration_layout.itemAt(0).widget()
+    editor = window._active_configuration_dialog  # noqa: SLF001
     assert isinstance(editor, JobConfigurationDialog)
     monkeypatch.setattr(editor, "configuration", lambda: changed)
     editor.save_requested.emit()
@@ -1344,7 +1712,7 @@ def test_main_window_handles_unknown_jobs_and_empty_drop_queue(
     qtbot.addWidget(window)
 
     window._add_dropped_paths((source,))
-    assert tuple(entry.path for entry in window._batch_entries) == (source,)
+    assert tuple(entry.path for entry in _entries(window)) == (source,)
     assert window._entry_for_job_id("missing") is None
     assert window._job_for_id("missing") is None
     window._configure_job("missing", None)
@@ -1375,7 +1743,7 @@ def test_main_window_confirms_and_cleans_progress_before_removing_paused_job(
             output=replace(job.configuration.output, configured=True),
         ),
     )
-    window._batch_entries[0].status = BatchStatus.PAUSED
+    _entries(window)[0].status = ProjectedStatus.PAUSED
     cleaned: list[Path] = []
     monkeypatch.setattr(
         QMessageBox,
@@ -1392,7 +1760,7 @@ def test_main_window_confirms_and_cleans_progress_before_removing_paused_job(
 
     assert cleaned == [source]
     assert window._job_queue.get(configured.id) is None
-    assert tuple(window._batch_entries) == ()
+    assert tuple(_entries(window)) == ()
     assert source.read_text(encoding="utf-8") == "Original intact"
 
 
@@ -1411,7 +1779,7 @@ def test_main_window_confirms_before_discarding_pending_review(
     qtbot.addWidget(window)
     window.set_source_paths((source,))
     job = window._project_jobs()[0]
-    window._batch_entries[0].status = BatchStatus.REVIEW_PENDING
+    _entries(window)[0].status = ProjectedStatus.REVIEW_PENDING
     prompts: list[tuple[str, str]] = []
 
     def confirm(_parent, title, message, *_args):
@@ -1426,7 +1794,7 @@ def test_main_window_confirms_before_discarding_pending_review(
     assert "pendiente de revisión" in prompts[0][0]
     assert "revisión pendiente" in prompts[0][1]
     assert window._job_queue.get(job.id) is None
-    assert tuple(window._batch_entries) == ()
+    assert tuple(_entries(window)) == ()
     assert source.read_text(encoding="utf-8") == "Original intact"
 
 
@@ -1446,9 +1814,9 @@ def test_main_window_opens_completed_result_and_its_folder(
     )
     qtbot.addWidget(window)
     window.set_source_paths((source,))
-    entry = window._batch_entries[0]
+    entry = _entries(window)[0]
     job_id = window._project_jobs()[0].id
-    entry.status = BatchStatus.COMPLETED
+    entry.status = ProjectedStatus.COMPLETED
     entry.result = ProcessResult(final_path)
     actions: list[Path] = []
     monkeypatch.setattr(
@@ -1479,7 +1847,7 @@ def test_main_window_materializes_and_applies_each_quality_review_phase(
     )
     qtbot.addWidget(window)
     window.set_source_paths((source,))
-    entry = window._batch_entries[0]
+    entry = _entries(window)[0]
     job = window._project_jobs()[0]
     job = window._job_queue.configure(
         job.id,
@@ -1533,7 +1901,7 @@ def test_main_window_materializes_and_applies_each_quality_review_phase(
 
     monkeypatch.setattr(main_window_module, "PhaseReviewDialog", AcceptedReviewDialog)
 
-    reviewed = window._review_quality_phases(entry, job)
+    reviewed = window._review_quality_phases(entry.runtime, job)
 
     assert reviewed is not None
     text, reviews = reviewed
@@ -1542,7 +1910,444 @@ def test_main_window_materializes_and_applies_each_quality_review_phase(
     assert reviews[0].units[0].choice is main_window_module.ReviewChoice.PROPOSED
 
 
-def test_main_window_opens_epub_editor_even_without_ai_structure_changes(
+def test_review_resume_replaces_stale_units_but_keeps_the_durable_review_id() -> None:
+    candidate = ReviewSession.create(
+        job_id="job",
+        stage=StageKind.REFINE,
+        kind=ReviewKind.REFINEMENT,
+        input_artifact_id="current-input",
+        input_version=3,
+        units=(ReviewUnit("current-one", "original", "proposal"),),
+    )
+    stale = ReviewSession.create(
+        job_id="job",
+        stage=StageKind.REFINE,
+        kind=ReviewKind.REFINEMENT,
+        input_artifact_id="old-input",
+        input_version=3,
+        units=(ReviewUnit("old-one", "original", "proposal"),),
+    )
+
+    resumed = review_for_current_candidate(stale, candidate)
+
+    assert resumed.id == stale.id
+    assert resumed.input_artifact_id == "current-input"
+    assert tuple(unit.id for unit in resumed.units) == ("current-one",)
+    assert resumed.units[0].choice is None
+
+
+def test_translation_resume_does_not_reuse_a_legacy_original_replacement() -> None:
+    candidate = ReviewSession.create(
+        job_id="job",
+        stage=StageKind.TRANSLATE,
+        kind=ReviewKind.TRANSLATION,
+        input_artifact_id="current-input",
+        input_version=3,
+        units=(ReviewUnit("segment", "source", "translation"),),
+    )
+    saved = replace(
+        candidate,
+        id="saved-review",
+        status=main_window_module.ReviewStatus.APPLIED,
+        units=(
+            replace(
+                candidate.units[0],
+                choice=main_window_module.ReviewChoice.ORIGINAL,
+                original_selectable=True,
+            ),
+        ),
+    )
+
+    resumed = review_for_current_candidate(saved, candidate)
+
+    assert resumed.status is main_window_module.ReviewStatus.PENDING
+    assert resumed.units[0].choice is None
+    assert not resumed.units[0].original_selectable
+
+
+def test_quality_review_rebuilds_revision_candidate_after_applied_quality_choice(
+    qtbot,
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "book.md"
+    source.write_text("source", encoding="utf-8")
+    window = ParsezenMainWindow(
+        settings=AppSettings(),
+        auto_discover_ai=False,
+        state_path=tmp_path / "workspace.sqlite3",
+    )
+    qtbot.addWidget(window)
+    window.set_source_paths((source,))
+    job = window._job_queue.jobs[0]  # noqa: SLF001
+    entry = _entries(window)[0]  # noqa: SLF001
+
+    raw_text = "# Title\n\nRaw paragraph.\n\nAnchor paragraph.\n\nStable paragraph.\n"
+    reviewed_text = "# Title\n\nRaw paragraph.\n\nAnchor paragraph.\n\nStable correction.\n"
+    proposed_text = "# Title\n\nRaw correction.\n\nAnchor paragraph.\n\nStable correction.\n"
+    raw_draft = build_revision_draft(
+        raw_text,
+        proposed_text,
+        kinds=frozenset({RevisionKind.CONTENT}),
+    )
+    post_quality_draft = build_revision_draft(
+        reviewed_text,
+        proposed_text,
+        kinds=frozenset({RevisionKind.CONTENT}),
+    )
+    raw_candidate = create_revision_review(
+        raw_draft,
+        revision_kind=RevisionKind.CONTENT,
+        job_id=job.id,
+        configuration_revision=job.configuration_revision,
+        artifacts=window._artifact_store,  # noqa: SLF001
+    )
+    saved_refinement = create_revision_review(
+        post_quality_draft,
+        revision_kind=RevisionKind.CONTENT,
+        job_id=job.id,
+        configuration_revision=job.configuration_revision,
+        artifacts=window._artifact_store,  # noqa: SLF001
+    )
+    assert raw_candidate is not None
+    assert saved_refinement is not None
+    assert tuple(unit.id for unit in raw_candidate.units) != tuple(
+        unit.id for unit in saved_refinement.units
+    )
+    assert len(raw_candidate.units) != len(saved_refinement.units)
+    saved_refinement = saved_refinement.decide(
+        saved_refinement.units[0].id,
+        ReviewChoice.PROPOSED,
+    )
+
+    quality_report = TranslationQualityReport(
+        "en",
+        "Español",
+        "es",
+        1,
+        len(raw_text),
+        len(raw_text),
+        1,
+        (
+            TranslationQualityIssue(
+                1,
+                TranslationIssueKind.ALIGNMENT,
+                "Revisar",
+                "Stable paragraph.",
+                "Stable paragraph.",
+                "quality-choice",
+            ),
+        ),
+    )
+    quality_input = window._artifact_store.put_text(  # noqa: SLF001
+        job_id=job.id,
+        text=raw_text,
+    )
+    quality_candidate = create_translation_review(
+        quality_report,
+        job_id=job.id,
+        configuration_revision=job.configuration_revision,
+        input_artifact_id=quality_input.id,
+        artifacts=window._artifact_store,  # noqa: SLF001
+    )
+    assert quality_candidate is not None
+    edited = window._artifact_store.put_text(  # noqa: SLF001
+        job_id=job.id,
+        text="Stable correction.",
+    )
+    applied_quality = quality_candidate.decide(
+        quality_candidate.units[0].id,
+        ReviewChoice.EDITED,
+        edited_artifact_id=edited.id,
+    ).apply()
+    window._state_store.save_review(applied_quality)  # noqa: SLF001
+    window._state_store.save_review(saved_refinement)  # noqa: SLF001
+
+    entry.result = ProcessResult(
+        tmp_path / "book.md.out",
+        review_markdown=raw_text,
+        translation_quality_report=quality_report,
+        revision_draft=raw_draft,
+        review_required=True,
+    )
+
+    reviewed = window._review_quality_phases(entry.runtime, job)  # noqa: SLF001
+
+    assert reviewed is not None
+    assert reviewed[0] == reviewed_text
+    resumed = tuple(
+        review
+        for review in window._state_store.load_reviews(job_id=job.id)  # noqa: SLF001
+        if review.kind is ReviewKind.REFINEMENT
+    )
+    assert len(resumed) == 1
+    assert tuple(unit.id for unit in resumed[0].units) == tuple(
+        unit.id for unit in saved_refinement.units
+    )
+    assert resumed[0].units[0].choice is ReviewChoice.PROPOSED
+
+
+def test_pending_quality_review_does_not_replace_later_progress_before_reconcile(
+    qtbot,
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    source = tmp_path / "book.md"
+    source.write_text("source", encoding="utf-8")
+    window = ParsezenMainWindow(
+        settings=AppSettings(),
+        auto_discover_ai=False,
+        state_path=tmp_path / "workspace.sqlite3",
+    )
+    qtbot.addWidget(window)
+    window.set_source_paths((source,))
+    job = window._job_queue.configure(  # noqa: SLF001
+        window._job_queue.jobs[0].id,  # noqa: SLF001
+        JobConfiguration(
+            translation=TranslationConfiguration(enabled=True, target_language="es"),
+        ),
+    )
+    entry = _entries(window)[0]  # noqa: SLF001
+
+    raw_text = "# Title\n\nRaw paragraph.\n\nAnchor paragraph.\n\nStable paragraph.\n"
+    reviewed_text = "# Title\n\nRaw paragraph.\n\nAnchor paragraph.\n\nStable correction.\n"
+    proposed_text = "# Title\n\nRaw correction.\n\nAnchor paragraph.\n\nStable correction.\n"
+    raw_draft = build_revision_draft(
+        raw_text,
+        proposed_text,
+        kinds=frozenset({RevisionKind.CONTENT}),
+    )
+    post_quality_draft = build_revision_draft(
+        reviewed_text,
+        proposed_text,
+        kinds=frozenset({RevisionKind.CONTENT}),
+    )
+    raw_candidate = create_revision_review(
+        raw_draft,
+        revision_kind=RevisionKind.CONTENT,
+        job_id=job.id,
+        configuration_revision=job.configuration_revision,
+        artifacts=window._artifact_store,  # noqa: SLF001
+    )
+    saved_refinement = create_revision_review(
+        post_quality_draft,
+        revision_kind=RevisionKind.CONTENT,
+        job_id=job.id,
+        configuration_revision=job.configuration_revision,
+        artifacts=window._artifact_store,  # noqa: SLF001
+    )
+    assert raw_candidate is not None
+    assert saved_refinement is not None
+    assert len(raw_candidate.units) != len(saved_refinement.units)
+    saved_refinement = saved_refinement.decide(
+        saved_refinement.units[0].id,
+        ReviewChoice.PROPOSED,
+    ).apply()
+    window._state_store.save_review(saved_refinement)  # noqa: SLF001
+
+    quality_report = TranslationQualityReport(
+        "en",
+        "Español",
+        "es",
+        1,
+        len(raw_text),
+        len(raw_text),
+        1,
+        (
+            TranslationQualityIssue(
+                1,
+                TranslationIssueKind.ALIGNMENT,
+                "Revisar",
+                "Stable paragraph.",
+                "Stable paragraph.",
+                "quality-choice",
+            ),
+        ),
+    )
+    quality_input = window._artifact_store.put_text(  # noqa: SLF001
+        job_id=job.id,
+        text=raw_text,
+    )
+    quality_candidate = create_translation_review(
+        quality_report,
+        job_id=job.id,
+        configuration_revision=job.configuration_revision,
+        input_artifact_id=quality_input.id,
+        artifacts=window._artifact_store,  # noqa: SLF001
+    )
+    assert quality_candidate is not None
+    window._state_store.save_review(quality_candidate)  # noqa: SLF001
+    window._job_execution.start_next(job.id)  # noqa: SLF001
+    window._job_execution.advance(job.id, StageKind.PUBLISH)  # noqa: SLF001
+    window._job_execution.block_completed_result_for_review(  # noqa: SLF001
+        job.id,
+        StageKind.TRANSLATE,
+        review_id="translation-gate",
+    )
+
+    entry.result = ProcessResult(
+        tmp_path / "book.md.out",
+        review_markdown=raw_text,
+        translation_quality_report=quality_report,
+        revision_draft=raw_draft,
+        review_required=True,
+    )
+
+    class DeferredReviewDialog:
+        def __init__(self, review, _artifacts, **_kwargs) -> None:
+            self.review = review
+
+        def exec(self):
+            return QDialog.DialogCode.Rejected
+
+    monkeypatch.setattr(main_window_module, "PhaseReviewDialog", DeferredReviewDialog)
+
+    assert window._review_quality_phases(entry.runtime, job) is None  # noqa: SLF001
+    resumed = next(
+        review
+        for review in window._state_store.load_reviews(job_id=job.id)  # noqa: SLF001
+        if review.kind is ReviewKind.REFINEMENT
+    )
+    assert resumed.id == saved_refinement.id
+    assert resumed.status is main_window_module.ReviewStatus.APPLIED
+    assert tuple(unit.id for unit in resumed.units) == tuple(
+        unit.id for unit in saved_refinement.units
+    )
+
+
+def test_stale_post_quality_revision_candidate_is_replaced_safely(
+    qtbot,
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "book.md"
+    source.write_text("source", encoding="utf-8")
+    window = ParsezenMainWindow(
+        settings=AppSettings(),
+        auto_discover_ai=False,
+        state_path=tmp_path / "workspace.sqlite3",
+    )
+    qtbot.addWidget(window)
+    window.set_source_paths((source,))
+    job = window._job_queue.jobs[0]  # noqa: SLF001
+    stale_draft = build_revision_draft(
+        "# Title\n\nOld paragraph.\n",
+        "# Title\n\nOld correction.\n",
+        kinds=frozenset({RevisionKind.CONTENT}),
+    )
+    current_draft = build_revision_draft(
+        "# Title\n\nCurrent paragraph.\n\nSecond paragraph.\n",
+        "# Title\n\nCurrent correction.\n\nSecond correction.\n",
+        kinds=frozenset({RevisionKind.CONTENT}),
+    )
+    stale = create_revision_review(
+        stale_draft,
+        revision_kind=RevisionKind.CONTENT,
+        job_id=job.id,
+        configuration_revision=job.configuration_revision,
+        artifacts=window._artifact_store,  # noqa: SLF001
+    )
+    current = create_revision_review(
+        current_draft,
+        revision_kind=RevisionKind.CONTENT,
+        job_id=job.id,
+        configuration_revision=job.configuration_revision,
+        artifacts=window._artifact_store,  # noqa: SLF001
+    )
+    assert stale is not None
+    assert current is not None
+    stale = replace(
+        stale.decide(stale.units[0].id, ReviewChoice.PROPOSED),
+        id="saved-stale-review",
+    )
+    window._state_store.save_review(stale)  # noqa: SLF001
+
+    window._review_materialization.ensure_revision_candidates(  # noqa: SLF001
+        current_draft,
+        job,
+        (stale,),
+    )
+
+    resumed = next(
+        review
+        for review in window._state_store.load_reviews(job_id=job.id)  # noqa: SLF001
+        if review.kind is ReviewKind.REFINEMENT
+    )
+    assert resumed.id == stale.id
+    assert tuple(unit.id for unit in resumed.units) == tuple(unit.id for unit in current.units)
+    assert all(unit.choice is None for unit in resumed.units)
+
+
+def test_unanchorable_translation_does_not_overwrite_saved_review_with_empty_session(
+    qtbot,
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    source = tmp_path / "book.md"
+    source.write_text("source", encoding="utf-8")
+    window = ParsezenMainWindow(
+        settings=AppSettings(),
+        auto_discover_ai=False,
+        state_path=tmp_path / "workspace.sqlite3",
+    )
+    qtbot.addWidget(window)
+    window.set_source_paths((source,))
+    job = window._job_queue.jobs[0]  # noqa: SLF001
+    entry = _entries(window)[0]  # noqa: SLF001
+    original = window._artifact_store.put_text(job_id=job.id, text="context")  # noqa: SLF001
+    proposed = window._artifact_store.put_text(job_id=job.id, text="translation")  # noqa: SLF001
+    saved = ReviewSession.create(
+        job_id=job.id,
+        stage=StageKind.TRANSLATE,
+        kind=ReviewKind.TRANSLATION,
+        input_artifact_id=original.id,
+        input_version=job.configuration_revision,
+        units=(ReviewUnit("saved-translation", original.id, proposed.id),),
+    )
+    window._state_store.save_review(saved)  # noqa: SLF001
+    report = TranslationQualityReport(
+        "en",
+        "Español",
+        "es",
+        1,
+        10,
+        10,
+        1,
+        (
+            TranslationQualityIssue(
+                1,
+                TranslationIssueKind.ALIGNMENT,
+                "No se pudo alinear",
+                "Missing source",
+                "Missing translated...",
+                "unanchorable",
+            ),
+        ),
+    )
+    entry.result = ProcessResult(
+        tmp_path / "book.md.out",
+        review_markdown="Current translated text.",
+        translation_quality_report=report,
+        review_required=True,
+    )
+    warnings: list[str] = []
+    monkeypatch.setattr(
+        QMessageBox,
+        "warning",
+        lambda _parent, _title, text, *_args, **_kwargs: warnings.append(str(text)),
+    )
+
+    assert window._review_quality_phases(entry.runtime, job) is None  # noqa: SLF001
+    reviews = tuple(
+        review
+        for review in window._state_store.load_reviews(job_id=job.id)  # noqa: SLF001
+        if review.kind is ReviewKind.TRANSLATION
+    )
+    assert len(reviews) == 1
+    assert tuple(unit.id for unit in reviews[0].units) == ("saved-translation",)
+    assert reviews[0].units
+    assert warnings
+
+
+def test_main_window_always_confirms_epub_even_without_ai_structure_changes(
     qtbot,
     tmp_path: Path,
     monkeypatch,
@@ -1563,18 +2368,15 @@ def test_main_window_opens_epub_editor_even_without_ai_structure_changes(
         original.id,
         JobConfiguration(
             output=OutputConfiguration(format=DocumentFormat.EPUB),
-            structure=StructureConfiguration(enabled=False, manual_review=True),
         ),
     )
-    entry = window._batch_entries[0]  # noqa: SLF001
-    entry.status = BatchStatus.REVIEW_PENDING
+    entry = _entries(window)[0]  # noqa: SLF001
     entry.result = ProcessResult(
         destination,
         review_markdown="# Chapter\n\nBody.",
         review_required=True,
         revision_epub_metadata=EpubBookMetadata("Book", "en"),
     )
-    window._job_execution.start_next(job.id)  # noqa: SLF001
     window._job_execution.block_completed_result_for_review(  # noqa: SLF001
         job.id,
         StageKind.PUBLISH,
@@ -1582,33 +2384,26 @@ def test_main_window_opens_epub_editor_even_without_ai_structure_changes(
     )
     opened: list[str] = []
 
-    class AcceptedEditor:
-        saved_for_later = False
+    def confirm(book, **_kwargs):
+        opened.append(book.metadata.title)
+        return book, None
 
-        def __init__(self, book, *_args, **_kwargs) -> None:
-            self.book = book
-            opened.append(book.metadata.title)
-
-        def exec(self):
-            return QDialog.DialogCode.Accepted
-
-    monkeypatch.setattr(main_window_module, "BookEditorDialog", AcceptedEditor)
+    monkeypatch.setattr(window, "_confirm_epub_book", confirm)
 
     window._review_job(job.id, None)  # noqa: SLF001
 
     assert opened == ["Book"]
-    assert entry.status is BatchStatus.COMPLETED
+    assert entry.status is ProjectedStatus.COMPLETED
     assert destination.read_bytes().startswith(b"PK")
 
 
-def test_global_destination_updates_only_jobs_that_inherit_it(
+def test_global_destination_updates_every_editable_job(
     qtbot,
     tmp_path: Path,
     monkeypatch,
 ) -> None:
     old_destination = tmp_path / "old"
     new_destination = tmp_path / "new"
-    custom_destination = tmp_path / "custom"
     sources = (tmp_path / "one.txt", tmp_path / "two.txt")
     for source in sources:
         source.write_text("Text", encoding="utf-8")
@@ -1619,19 +2414,6 @@ def test_global_destination_updates_only_jobs_that_inherit_it(
     )
     qtbot.addWidget(window)
     window.set_source_paths(sources)
-    second = window._job_queue.jobs[1]
-    window._job_queue.replace(
-        second.with_configuration(
-            replace(
-                second.configuration,
-                output=replace(
-                    second.configuration.output,
-                    directory=custom_destination,
-                    directory_is_custom=True,
-                ),
-            )
-        )
-    )
     monkeypatch.setattr(
         window,
         "_select_output_directory",
@@ -1646,9 +2428,7 @@ def test_global_destination_updates_only_jobs_that_inherit_it(
 
     one, two = window._job_queue.jobs
     assert one.configuration.output.directory == new_destination
-    assert not one.configuration.output.directory_is_custom
-    assert two.configuration.output.directory == custom_destination
-    assert two.configuration.output.directory_is_custom
+    assert two.configuration.output.directory == new_destination
 
 
 def test_complete_configuration_can_be_applied_to_same_format_documents(
@@ -1672,9 +2452,9 @@ def test_complete_configuration_can_be_applied_to_same_format_documents(
     first = window._job_queue.jobs[0]
 
     window._configure_job(first.id, None)
-    editor = window.parsezen_workspace.configuration_layout.itemAt(0).widget()
+    editor = window._active_configuration_dialog  # noqa: SLF001
     assert isinstance(editor, JobConfigurationDialog)
-    editor.output_format.setCurrentIndex(editor.output_format.findData(DocumentFormat.MARKDOWN))
+    editor.output_markdown.setChecked(True)
     editor.apply_compatible.setChecked(True)
     editor._submit()
 
@@ -1686,7 +2466,7 @@ def test_complete_configuration_can_be_applied_to_same_format_documents(
     assert not markdown.configuration.output.configured
 
 
-def test_global_ai_default_updates_only_queued_inherited_profiles(
+def test_global_ai_default_updates_every_editable_profile(
     qtbot,
     tmp_path: Path,
 ) -> None:
@@ -1703,18 +2483,6 @@ def test_global_ai_default_updates_only_queued_inherited_profiles(
     qtbot.addWidget(window)
     window.set_source_paths(sources)
     inherited, custom, failed = window._job_queue.jobs
-    window._job_queue.replace(
-        custom.with_configuration(
-            replace(
-                custom.configuration,
-                ai=AIProfileConfiguration(
-                    model="custom-model",
-                    context_window=2048,
-                    is_custom=True,
-                ),
-            )
-        )
-    )
     failed = failed.replace_stage(
         failed.stage(StageKind.PREPARE)
         .transition(StageStatus.READY)
@@ -1727,10 +2495,8 @@ def test_global_ai_default_updates_only_queued_inherited_profiles(
 
     inherited, custom, failed = window._job_queue.jobs
     assert inherited.configuration.ai == new
-    assert not inherited.configuration.ai.is_custom
-    assert custom.configuration.ai.model == "custom-model"
-    assert custom.configuration.ai.is_custom
-    assert failed.configuration.ai.model == "old-model"
+    assert custom.configuration.ai == new
+    assert failed.configuration.ai == new
 
 
 def test_model_in_use_by_unfinished_work_cannot_be_deleted_silently(
@@ -1753,7 +2519,7 @@ def test_model_in_use_by_unfinished_work_cannot_be_deleted_silently(
             replace(
                 job.configuration,
                 ai=AIProfileConfiguration(model="qwen3:4b-instruct"),
-                refinement=RefinementConfiguration(enabled=True),
+                plan=ProcessingPlan.LOCAL_AI_REVIEWED,
             )
         )
     )
@@ -1960,6 +2726,7 @@ def test_processing_controller_projects_progress_success_failure_and_pause(
         ),
     )
     window._prepare_independent_requests()  # noqa: SLF001
+    qtbot.waitUntil(lambda: window._prepared_run is not None, timeout=3_000)  # noqa: SLF001
     starts: list[object] = []
     monkeypatch.setattr(
         window._processing_runner,  # noqa: SLF001
@@ -1969,10 +2736,10 @@ def test_processing_controller_projects_progress_success_failure_and_pause(
 
     window._start_processing()  # noqa: SLF001
 
-    entry = window._batch_entries[0]  # noqa: SLF001
+    entry = _entries(window)[0]  # noqa: SLF001
     assert starts
     assert window.is_processing
-    assert entry.status is BatchStatus.PROCESSING
+    assert entry.status is ProjectedStatus.PROCESSING
     window._show_stage(ProcessStage.IMPROVING)  # noqa: SLF001
     window._show_improvement_progress(-1, 2)  # noqa: SLF001
     window._show_improvement_progress(1, 2)  # noqa: SLF001
@@ -1980,10 +2747,11 @@ def test_processing_controller_projects_progress_success_failure_and_pause(
     assert (entry.progress_current, entry.progress_total) == (1, 2)
 
     window._processing_succeeded(ProcessResult(final_path))  # noqa: SLF001
-    assert entry.status is BatchStatus.COMPLETED
+    assert entry.status is ProjectedStatus.COMPLETED
     assert entry.result is not None
     window._processing_worker_finished()  # noqa: SLF001
     assert not window.is_processing
+
     assert window._prepared_run is None  # noqa: SLF001
 
     failed_source = tmp_path / "failure.txt"
@@ -2002,11 +2770,12 @@ def test_processing_controller_projects_progress_success_failure_and_pause(
         ),
     )
     window._prepare_independent_requests()  # noqa: SLF001
+    qtbot.waitUntil(lambda: window._prepared_run is not None, timeout=3_000)  # noqa: SLF001
     window._start_processing()  # noqa: SLF001
-    failed_entry = window._batch_entries[0]  # noqa: SLF001
+    failed_entry = _entries(window)[0]  # noqa: SLF001
     window._show_stage(ProcessStage.READING)  # noqa: SLF001
     window._processing_failed("Lectura fallida")  # noqa: SLF001
-    assert failed_entry.status is BatchStatus.FAILED
+    assert failed_entry.status is ProjectedStatus.FAILED
     assert failed_entry.error == "Lectura fallida"
     window._processing_worker_finished()  # noqa: SLF001
 
@@ -2026,13 +2795,87 @@ def test_processing_controller_projects_progress_success_failure_and_pause(
         ),
     )
     window._prepare_independent_requests()  # noqa: SLF001
+    qtbot.waitUntil(lambda: window._prepared_run is not None, timeout=3_000)  # noqa: SLF001
     window._start_processing()  # noqa: SLF001
-    paused_entry = window._batch_entries[0]  # noqa: SLF001
+    paused_entry = _entries(window)[0]  # noqa: SLF001
     window._pause_requested = True  # noqa: SLF001
     window._processing_cancelled()  # noqa: SLF001
-    assert paused_entry.status is BatchStatus.PAUSED
+    assert paused_entry.status is ProjectedStatus.PAUSED
     window._processing_worker_finished()  # noqa: SLF001
     assert not window.is_processing
+
+
+def test_recent_failure_captures_the_runner_attempt_before_history_is_written(
+    qtbot,
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "failed.txt"
+    source.write_text("Original", encoding="utf-8")
+    history = tmp_path / "recent.json"
+    window = ParsezenMainWindow(
+        auto_discover_ai=False,
+        state_path=tmp_path / "workspace.sqlite3",
+        history_path=history,
+    )
+    qtbot.addWidget(window)
+    window.set_source_paths((source,))
+    job = window._job_queue.jobs[0]  # noqa: SLF001
+    window._job_queue.configure(  # noqa: SLF001
+        job.id,
+        replace(
+            job.configuration,
+            output=replace(
+                job.configuration.output,
+                format=DocumentFormat.MARKDOWN,
+                configured=True,
+            ),
+            translation=TranslationConfiguration(enabled=True, target_language="es"),
+        ),
+    )
+    entry = _entries(window)[0]  # noqa: SLF001
+    entry.status = ProjectedStatus.PROCESSING
+    window._current_job_id = entry.job_id  # noqa: SLF001
+    window._job_execution.start_next(job.id)  # noqa: SLF001
+    window._show_stage(ProcessStage.TRANSLATING)  # noqa: SLF001
+
+    timestamp = datetime(2026, 8, 3, 9, 0, tzinfo=UTC)
+    runner = window._processing_runner  # noqa: SLF001
+    runner._attempt_id = "attempt-for-this-job"  # noqa: SLF001
+    runner._timeline = AttemptTimeline(  # noqa: SLF001
+        (
+            AttemptEvent(AttemptPhase.TRANSLATION, AttemptEventStatus.STARTED, timestamp=timestamp),
+            AttemptEvent(
+                AttemptPhase.TRANSLATION,
+                AttemptEventStatus.FAILED,
+                timestamp=timestamp,
+            ),
+        )
+    )
+    runner._failure_snapshot = FailureSnapshot(  # noqa: SLF001
+        AttemptPhase.TRANSLATION,
+        "transformation",
+        "La traducción local se detuvo.",
+        diagnostic_reference="reference-for-this-job",
+        reusable_work=ReusableWork.PREVIOUS_PHASES,
+    )
+
+    window._processing_failed(  # noqa: SLF001
+        ProcessingFailure(
+            FailureKind.TRANSFORMATION,
+            "La traducción local se detuvo.",
+            "TranslationError",
+        )
+    )
+
+    recent = load_recent_jobs(path=history)
+    assert len(recent) == 1
+    assert recent[0].attempt_id == "attempt-for-this-job"
+    assert recent[0].timeline.events == runner.timeline.events
+    assert recent[0].failure == replace(
+        runner.failure_snapshot,
+        message=durable_failure_message("transformation"),
+    )
+    assert "Error en traducción" in window.parsezen_workspace.job_message.message.text()
 
 
 def test_revision_pipeline_applies_content_and_structure_before_publication(
@@ -2059,8 +2902,7 @@ def test_revision_pipeline_applies_content_and_structure_before_publication(
                 format=DocumentFormat.MARKDOWN,
                 configured=True,
             ),
-            refinement=RefinementConfiguration(enabled=True),
-            structure=StructureConfiguration(enabled=True),
+            plan=ProcessingPlan.LOCAL_AI_REVIEWED,
         ),
     )
     draft = build_revision_draft(
@@ -2068,8 +2910,7 @@ def test_revision_pipeline_applies_content_and_structure_before_publication(
         "## New title\n\nImproved paragraph.\n",
         kinds=frozenset({RevisionKind.CONTENT, RevisionKind.STRUCTURE}),
     )
-    entry = window._batch_entries[0]  # noqa: SLF001
-    entry.status = BatchStatus.REVIEW_PENDING
+    entry = _entries(window)[0]  # noqa: SLF001
     entry.result = ProcessResult(
         destination,
         revision_draft=draft,
@@ -2098,9 +2939,9 @@ def test_revision_pipeline_applies_content_and_structure_before_publication(
 
     monkeypatch.setattr(main_window_module, "PhaseReviewDialog", AcceptedReviewDialog)
 
-    window._review_revision_by_phase(entry, job, draft=draft)  # noqa: SLF001
+    window._review_revision_by_phase(entry.runtime, job, draft=draft)  # noqa: SLF001
 
-    assert entry.status is BatchStatus.COMPLETED
+    assert entry.status is ProjectedStatus.COMPLETED
     assert entry.result is not None
     assert "New title" in destination.read_text(encoding="utf-8")
 
@@ -2129,8 +2970,7 @@ def test_revision_pipeline_publishes_reviewed_epub_through_the_editor(
                 format=DocumentFormat.EPUB,
                 configured=True,
             ),
-            refinement=RefinementConfiguration(enabled=True),
-            structure=StructureConfiguration(enabled=True),
+            plan=ProcessingPlan.LOCAL_AI_REVIEWED,
         ),
     )
     draft = build_revision_draft(
@@ -2138,8 +2978,7 @@ def test_revision_pipeline_publishes_reviewed_epub_through_the_editor(
         "## New title\n\nImproved paragraph.\n",
         kinds=frozenset({RevisionKind.CONTENT, RevisionKind.STRUCTURE}),
     )
-    entry = window._batch_entries[0]  # noqa: SLF001
-    entry.status = BatchStatus.REVIEW_PENDING
+    entry = _entries(window)[0]  # noqa: SLF001
     entry.result = ProcessResult(
         destination,
         revision_draft=draft,
@@ -2169,23 +3008,17 @@ def test_revision_pipeline_publishes_reviewed_epub_through_the_editor(
 
     opened: list[str] = []
 
-    class AcceptedBookEditor:
-        saved_for_later = False
-
-        def __init__(self, book, *_args, **_kwargs) -> None:
-            self.book = book
-            opened.append(book.metadata.title)
-
-        def exec(self):
-            return QDialog.DialogCode.Accepted
-
     monkeypatch.setattr(main_window_module, "PhaseReviewDialog", AcceptedReviewDialog)
-    monkeypatch.setattr(main_window_module, "BookEditorDialog", AcceptedBookEditor)
+    monkeypatch.setattr(
+        window,
+        "_confirm_epub_book",
+        lambda book, **_kwargs: (opened.append(book.metadata.title) or book, None),
+    )
 
-    window._review_revision_by_phase(entry, job, draft=draft)  # noqa: SLF001
+    window._review_revision_by_phase(entry.runtime, job, draft=draft)  # noqa: SLF001
 
     assert opened == ["Book"]
-    assert entry.status is BatchStatus.COMPLETED
+    assert entry.status is ProjectedStatus.COMPLETED
     assert destination.read_bytes().startswith(b"PK")
 
 
@@ -2215,8 +3048,7 @@ def test_quality_pipeline_applies_pdf_review_before_later_phases(
             ),
         ),
     )
-    entry = window._batch_entries[0]  # noqa: SLF001
-    entry.status = BatchStatus.REVIEW_PENDING
+    entry = _entries(window)[0]  # noqa: SLF001
     entry.result = ProcessResult(
         destination,
         review_markdown="<!-- page -->\nOld OCR",
@@ -2268,12 +3100,111 @@ def test_quality_pipeline_applies_pdf_review_before_later_phases(
 
     monkeypatch.setattr(main_window_module, "PhaseReviewDialog", AcceptedReviewDialog)
 
-    reviewed = window._review_quality_phases(entry, job)  # noqa: SLF001
+    reviewed = window._review_quality_phases(entry.runtime, job)  # noqa: SLF001
 
     assert reviewed is not None
     text, reviews = reviewed
     assert "Corrected OCR" in text
     assert tuple(review.kind for review in reviews) == (main_window_module.ReviewKind.OCR,)
+
+
+def test_translation_review_can_reopen_the_previous_ocr_phase(
+    qtbot,
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    source = tmp_path / "scan.pdf"
+    source.write_bytes(b"%PDF")
+    window = ParsezenMainWindow(
+        settings=AppSettings(),
+        auto_discover_ai=False,
+        state_path=tmp_path / "workspace.sqlite3",
+    )
+    qtbot.addWidget(window)
+    window.set_source_paths((source,))
+    original = window._job_queue.jobs[0]  # noqa: SLF001
+    job = window._job_queue.configure(  # noqa: SLF001
+        original.id,
+        JobConfiguration(
+            output=OutputConfiguration(
+                format=DocumentFormat.MARKDOWN,
+                configured=True,
+            ),
+            translation=TranslationConfiguration(enabled=True, target_language="es"),
+        ),
+    )
+    entry = _entries(window)[0]  # noqa: SLF001
+    marker = "<!-- PZDOC PDF PAGE 1 -->"
+    review_text = f"{marker}\n\nHola."
+    entry.result = ProcessResult(
+        tmp_path / "scan.md",
+        review_markdown=review_text,
+        pdf_quality_report=PdfQualityReport(
+            (1,),
+            (1,),
+            (PdfReviewIssue(1, "OCR dudoso", "Hola.", "page-one", True, marker),),
+        ),
+        translation_quality_report=TranslationQualityReport(
+            "en",
+            "Español",
+            "es",
+            1,
+            5,
+            5,
+            1,
+            (
+                TranslationQualityIssue(
+                    1,
+                    TranslationIssueKind.ALIGNMENT,
+                    "Revisar",
+                    "Hello.",
+                    "Hola.",
+                    "translation-one",
+                ),
+            ),
+        ),
+        review_required=True,
+    )
+    window._job_execution.start_next(job.id)  # noqa: SLF001
+    window._job_execution.advance(job.id, StageKind.PUBLISH)  # noqa: SLF001
+    window._job_execution.block_completed_result_for_review(  # noqa: SLF001
+        job.id,
+        StageKind.PREPARE,
+        review_id="ocr-gate",
+    )
+    monkeypatch.setattr(
+        "parsezen.application.quality_review_adapter.render_pdf_page_cover",
+        lambda *_args: b"jpeg-page",
+    )
+    opened: list[ReviewKind] = []
+
+    class BackwardReviewDialog:
+        def __init__(self, review, _artifacts, **kwargs) -> None:
+            self.review = review
+            self._previous = kwargs.get("previous_phase_callback")
+            opened.append(review.kind)
+
+        def exec(self):
+            if opened == [ReviewKind.OCR]:
+                for unit in self.review.units:
+                    self.review = self.review.decide(unit.id, ReviewChoice.PROPOSED)
+                return QDialog.DialogCode.Accepted
+            if opened == [ReviewKind.OCR, ReviewKind.TRANSLATION]:
+                assert self._previous is not None
+                assert self._previous()
+                return QDialog.DialogCode.Rejected
+            return QDialog.DialogCode.Rejected
+
+    monkeypatch.setattr(main_window_module, "PhaseReviewDialog", BackwardReviewDialog)
+
+    assert window._review_quality_phases(entry.runtime, job) is None  # noqa: SLF001
+    assert opened == [ReviewKind.OCR, ReviewKind.TRANSLATION, ReviewKind.OCR]
+    saved = {
+        review.kind: review
+        for review in window._state_store.load_reviews(job_id=job.id)  # noqa: SLF001
+    }
+    assert saved[ReviewKind.OCR].status is main_window_module.ReviewStatus.PENDING
+    assert saved[ReviewKind.TRANSLATION].status is main_window_module.ReviewStatus.PENDING
 
 
 def test_main_window_boundary_actions_fail_safely_without_hidden_state(
@@ -2297,13 +3228,11 @@ def test_main_window_boundary_actions_fail_safely_without_hidden_state(
     window.add_source_paths((source, source))
     window.add_source_paths((source, second))
     window.add_source_paths((second,))
-    assert tuple(entry.path for entry in window._batch_entries) == (source, second)  # noqa: SLF001
+    assert tuple(entry.path for entry in _entries(window)) == (source, second)  # noqa: SLF001
     window._add_dropped_paths(["not", "a", "tuple"])  # noqa: SLF001
     assert window._validate_pending_requests(()) == ()  # noqa: SLF001
     assert window._pending_runtime_items(window._settings) == ()  # noqa: SLF001
-    assert (
-        window._runtime_for_entry(main_window_module.BatchEntry(tmp_path / "missing.txt")) is None
-    )  # noqa: SLF001
+    assert window._runtime_for_entry("missing") is None  # noqa: SLF001
     queued = window._job_queue.jobs[0]  # noqa: SLF001
     window._job_queue.configure(  # noqa: SLF001
         queued.id,
@@ -2316,13 +3245,13 @@ def test_main_window_boundary_actions_fail_safely_without_hidden_state(
             ),
         ),
     )
-    assert window._runtime_for_entry(window._batch_entries[0]) is not None  # noqa: SLF001
+    assert window._runtime_for_entry(_entries(window)[0].job_id) is not None  # noqa: SLF001
     assert window._processing_run_flags() == (False, False)  # noqa: SLF001
     assert not window._local_ai_required()  # noqa: SLF001
 
     window._prepared_run = None  # noqa: SLF001
     window._start_processing()  # noqa: SLF001
-    window._current_batch_entry = None  # noqa: SLF001
+    window._current_job_id = None  # noqa: SLF001
     window._show_stage(ProcessStage.READING)  # noqa: SLF001
     window._show_improvement_progress(2, 1)  # noqa: SLF001
     window._processing_succeeded(ProcessResult(tmp_path / "orphan.md"))  # noqa: SLF001
@@ -2411,16 +3340,11 @@ def test_main_window_boundary_actions_fail_safely_without_hidden_state(
     window._review_result_card("missing")  # noqa: SLF001
     assert warnings
 
-    window._remove_batch_entry(tmp_path / "unknown.txt")  # noqa: SLF001
-    first_entry = window._batch_entries[0]  # noqa: SLF001
-    first_entry.status = BatchStatus.PROCESSING
-    window._remove_batch_entry(first_entry.path)  # noqa: SLF001
-    assert first_entry in window._batch_entries  # noqa: SLF001
-    window._reorder_batch_entry(-1, 0)  # noqa: SLF001
-    window._reorder_batch_entry(0, 0)  # noqa: SLF001
-    window._is_processing = True  # noqa: SLF001
-    window._reorder_batch_entry(0, 1)  # noqa: SLF001
-    window._is_processing = False  # noqa: SLF001
+    first_entry = _entries(window)[0]  # noqa: SLF001
+    first_entry.status = ProjectedStatus.PROCESSING
+    window._move_job("missing", 0)  # noqa: SLF001
+    window._move_job(first_entry.job_id, 1)  # noqa: SLF001
+    assert first_entry in _entries(window)  # noqa: SLF001
 
     cancellations = iter((False, True))
     monkeypatch.setattr(
@@ -2611,12 +3535,17 @@ def test_review_surfaces_preserve_work_across_editor_and_storage_failures(
     qtbot.addWidget(window)
     window.set_source_paths((source,))
     job = window._job_queue.jobs[0]  # noqa: SLF001
-    entry = window._batch_entries[0]  # noqa: SLF001
+    entry = _entries(window)[0]  # noqa: SLF001
     result = ProcessResult(
         destination,
         review_markdown="# Book\n\nText.",
         revision_epub_metadata=EpubBookMetadata("Book", "en"),
         review_required=True,
+    )
+    window._job_execution.block_completed_result_for_review(  # noqa: SLF001
+        job.id,
+        StageKind.PREPARE,
+        review_id="epub-review",
     )
     warnings: list[tuple[str, str]] = []
     monkeypatch.setattr(
@@ -2627,42 +3556,37 @@ def test_review_surfaces_preserve_work_across_editor_and_storage_failures(
     monkeypatch.setattr(window, "_keep_review_pending", Mock())
 
     entry.result = None
-    window._personalize_epub(entry, job, "", ())  # noqa: SLF001
+    window._personalize_epub(entry.runtime, job, "", ())  # noqa: SLF001
 
     entry.result = result
     publication = Mock()
     publication.prepare_book.side_effect = ValueError("No se pudo preparar")
     window._review_publication = publication  # noqa: SLF001
-    window._personalize_epub(entry, job, result.review_markdown or "", ())  # noqa: SLF001
-    assert entry.status is BatchStatus.REVIEW_PENDING
+    window._personalize_epub(entry.runtime, job, result.review_markdown or "", ())  # noqa: SLF001
+    assert entry.status is ProjectedStatus.REVIEW_PENDING
 
     publication.prepare_book.side_effect = None
     publication.prepare_book.return_value = Mock()
     monkeypatch.setattr(
-        main_window_module,
-        "BookEditorDialog",
+        window,
+        "_confirm_epub_book",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(ValueError("Editor no disponible")),
     )
-    window._personalize_epub(entry, job, result.review_markdown or "", ())  # noqa: SLF001
+    window._personalize_epub(entry.runtime, job, result.review_markdown or "", ())  # noqa: SLF001
     assert warnings[-1][0] == "No se pudo abrir el editor"
 
-    class DeferredEditor:
-        saved_for_later = True
-        book = Mock()
-
-        def __init__(self, *_args, **_kwargs) -> None:
-            pass
-
-        def exec(self):
-            return QDialog.DialogCode.Rejected
-
-    monkeypatch.setattr(main_window_module, "BookEditorDialog", DeferredEditor)
+    saved_book = Mock()
+    monkeypatch.setattr(
+        window,
+        "_confirm_epub_book",
+        lambda *_args, **_kwargs: (None, saved_book),
+    )
     publication.save_book.side_effect = OSError("Disco lleno")
-    window._personalize_epub(entry, job, result.review_markdown or "", ())  # noqa: SLF001
+    window._personalize_epub(entry.runtime, job, result.review_markdown or "", ())  # noqa: SLF001
     assert warnings[-1][0] == "No se pudo guardar el borrador"
-    assert entry.status is BatchStatus.REVIEW_PENDING
+    assert entry.status is ProjectedStatus.REVIEW_PENDING
 
-    empty_entry = main_window_module.BatchEntry(source)
+    empty_entry = JobRuntime()
     assert window._review_quality_phases(empty_entry, job) is None  # noqa: SLF001
     empty_entry.result = ProcessResult(destination)
     assert window._review_quality_phases(empty_entry, job) == ("", ())  # noqa: SLF001
@@ -2674,9 +3598,9 @@ def test_review_surfaces_preserve_work_across_editor_and_storage_failures(
         lambda **_kwargs: (_ for _ in ()).throw(StateStoreError("Estado no disponible")),
     )
     entry.result = result
-    assert window._review_quality_phases(entry, job) is None  # noqa: SLF001
+    assert window._review_quality_phases(entry.runtime, job) is None  # noqa: SLF001
     monkeypatch.setattr(window._state_store, "load_reviews", original_load_reviews)  # noqa: SLF001
-    assert warnings[-1][0] == "No se pudo abrir la revisión"
+    assert warnings[-1][0] == "No se pudo preparar la revisión"
 
 
 def test_workspace_commands_route_through_the_active_surface(
@@ -2726,7 +3650,7 @@ def test_workspace_commands_route_through_the_active_surface(
     window.settings_menu.hide()
 
     window._add_dropped_paths((extra,))  # noqa: SLF001
-    assert tuple(entry.path for entry in window._batch_entries) == (source, extra)  # noqa: SLF001
+    assert tuple(entry.path for entry in _entries(window)) == (source, extra)  # noqa: SLF001
 
     window._configure_job(job.id, None)  # noqa: SLF001
     editor = window._active_configuration_editor()  # noqa: SLF001
@@ -2736,11 +3660,12 @@ def test_workspace_commands_route_through_the_active_surface(
         OllamaConnection(OllamaStatus.READY, (model,))
     )
     window._select_model_from_manager(model.model_id)  # noqa: SLF001
-    assert editor.refinement_model.findData(model.model_id) >= 0
-    editor.cancel_requested.emit()
+    editor.plan_reviewed.setChecked(True)
+    assert model.display_name in editor.ai_summary.text()
+    editor.reject()
 
-    entry = window._batch_entries[0]  # noqa: SLF001
-    entry.status = BatchStatus.REVIEW_PENDING
+    entry = _entries(window)[0]  # noqa: SLF001
+    entry.status = ProjectedStatus.REVIEW_PENDING
     entry.result = ProcessResult(tmp_path / "result.md")
     reviewed: list[str] = []
     opened: list[Path] = []

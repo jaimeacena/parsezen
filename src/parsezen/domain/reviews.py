@@ -30,6 +30,7 @@ class ReviewChoice(StrEnum):
     ORIGINAL = "original"
     PROPOSED = "proposed"
     EDITED = "edited"
+    NO_TEXT = "no_text"
 
 
 class ReviewSeverity(StrEnum):
@@ -64,6 +65,7 @@ class ReviewUnit:
     recommended_choice: ReviewChoice | None = None
     warning: str | None = None
     severity: ReviewSeverity = ReviewSeverity.MEDIUM
+    proposed_selectable: bool = True
 
     @property
     def resolved(self) -> bool:
@@ -167,6 +169,16 @@ class ReviewSession:
                 continue
             if choice is ReviewChoice.EDITED and not edited_artifact_id:
                 raise ValueError("An edited choice must reference the edited artifact.")
+            if choice is ReviewChoice.PROPOSED and not unit.proposed_selectable:
+                raise ValueError("Esta propuesta está en cuarentena y no se puede seleccionar.")
+            if choice is ReviewChoice.EDITED and not unit.proposed_selectable:
+                raise ValueError("Esta propuesta está en cuarentena y no se puede editar.")
+            if choice is ReviewChoice.NO_TEXT and self.kind is not ReviewKind.OCR:
+                raise ValueError("La opción de texto vacío solo está disponible para OCR.")
+            if choice is ReviewChoice.NO_TEXT and (
+                unit.proposed_artifact_id is None or not unit.proposed_selectable
+            ):
+                raise ValueError("La unidad OCR no tiene una propuesta seleccionable.")
             units[index] = replace(
                 unit,
                 choice=choice,
@@ -182,5 +194,27 @@ class ReviewSession:
         return replace(
             self,
             status=ReviewStatus.APPLIED,
+            updated_at=now if now is not None else datetime.now(UTC),
+        )
+
+    def reopen(self, *, now: datetime | None = None) -> ReviewSession:
+        """Reopen an applied decision set without discarding its choices."""
+
+        if self.status is not ReviewStatus.APPLIED:
+            raise ValueError("Only an applied review can be reopened.")
+        return replace(
+            self,
+            status=ReviewStatus.PENDING,
+            updated_at=now if now is not None else datetime.now(UTC),
+        )
+
+    def dismiss(self, *, now: datetime | None = None) -> ReviewSession:
+        """Inactivate a downstream review after an earlier phase changes."""
+
+        if self.status is ReviewStatus.DISMISSED:
+            return self
+        return replace(
+            self,
+            status=ReviewStatus.DISMISSED,
             updated_at=now if now is not None else datetime.now(UTC),
         )

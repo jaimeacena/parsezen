@@ -11,6 +11,7 @@ from parsezen.revision import (
     markdown_headings,
     set_heading_level,
     split_markdown_blocks,
+    validate_revision_selection,
 )
 
 
@@ -50,6 +51,34 @@ def test_extreme_heading_level_change_is_rejected_by_default() -> None:
     assert draft.changes[0].risk is RevisionRisk.HIGH
     assert draft.changes[0].recommended_decision is RevisionDecision.REJECTED
     assert draft.render() == draft.original_markdown
+
+
+def test_structure_revision_that_changes_a_number_is_rejected_by_default() -> None:
+    draft = build_revision_draft(
+        "Entrada del índice 202.\n",
+        "# Entrada del índice 260.\n",
+        kinds=frozenset({RevisionKind.STRUCTURE}),
+    )
+
+    assert draft.changes[0].kind is RevisionKind.STRUCTURE
+    assert draft.changes[0].risk is RevisionRisk.HIGH
+    assert draft.changes[0].recommended_decision is RevisionDecision.REJECTED
+    assert draft.render() == draft.original_markdown
+
+
+def test_revision_selection_rejects_numeric_counts_outside_both_safe_versions() -> None:
+    draft = build_revision_draft(
+        "Primera referencia 202.\n\nSegunda referencia 260.\n",
+        "Primera referencia 202.\n\n## Segunda referencia 260.\n",
+        kinds=frozenset({RevisionKind.STRUCTURE}),
+    )
+
+    validate_revision_selection(draft, draft.render())
+    with pytest.raises(ImprovementError, match="numéricos de forma insegura"):
+        validate_revision_selection(
+            draft,
+            "Primera referencia 260.\n\n## Segunda referencia 260.\n",
+        )
 
 
 def test_markdown_blocks_do_not_split_inside_fences() -> None:
@@ -125,6 +154,73 @@ def test_revision_keeps_risky_numbers_names_and_large_rewrites_original_by_defau
     assert numbered.render() == numbered.original_markdown
     assert shortened.changes[0].risk is RevisionRisk.HIGH
     assert shortened.render() == shortened.original_markdown
+
+
+def test_heading_word_change_is_high_risk_and_bulk_default_keeps_original() -> None:
+    draft = build_revision_draft(
+        "# The History\n",
+        "# Che History\n",
+        kinds=frozenset({RevisionKind.CONTENT}),
+    )
+
+    assert draft.changes[0].risk is RevisionRisk.HIGH
+    assert draft.changes[0].recommended_decision is RevisionDecision.REJECTED
+    assert draft.render() == draft.original_markdown
+
+
+def test_validated_bilingual_heading_correction_is_recommended() -> None:
+    source = "# The History, Astrology and Magic of the Decans\n\nBy\n\nAustin Coppock\n"
+    original = (
+        "# Historia del Ajedrez; Astrología y Magia de los Decanos\n\nKor\n\nAustin Coppock\n"
+    )
+    proposed = "# Historia, Astrología y Magia de los Decanos\n\nPor\n\nAustin Coppock\n"
+
+    draft = build_revision_draft(
+        original,
+        proposed,
+        kinds=frozenset({RevisionKind.CONTENT}),
+        translation_source_markdown=source,
+        translation_target_language="es",
+        protected_translation_terms=("Austin Coppock",),
+    )
+
+    assert draft.changes[0].risk is RevisionRisk.LOW
+    assert draft.changes[0].recommended_decision is RevisionDecision.ACCEPTED
+    assert draft.render() == proposed
+
+
+def test_validated_bilingual_correction_remains_recommended_with_safe_heading_changes() -> None:
+    source = "# The History, Astrology and Magic of the Decans\n\nBy\n\nAustin Coppock\n"
+    original = (
+        "# Historia del Ajedrez; Astrología y Magia de los Decanos\n\nKor\n\nAustin Coppock\n"
+    )
+    proposed = "## Historia, Astrología y Magia de los Decanos\n\n# Por\n\nAustin Coppock\n"
+
+    draft = build_revision_draft(
+        original,
+        proposed,
+        kinds=frozenset({RevisionKind.CONTENT, RevisionKind.STRUCTURE}),
+        translation_source_markdown=source,
+        translation_target_language="es",
+        protected_translation_terms=("Austin Coppock",),
+    )
+
+    assert draft.changes[0].risk is RevisionRisk.LOW
+    assert draft.changes[0].recommended_decision is RevisionDecision.ACCEPTED
+    assert draft.render() == proposed
+
+
+def test_bilingual_correction_cannot_change_a_shared_source_name() -> None:
+    draft = build_revision_draft(
+        "Austin Coppock escribió este libro.\n",
+        "Austin Cooper escribió este libro.\n",
+        kinds=frozenset({RevisionKind.CONTENT}),
+        translation_source_markdown="Austin Coppock wrote this book.\n",
+        translation_target_language="es",
+    )
+
+    assert draft.changes[0].risk is RevisionRisk.HIGH
+    assert draft.changes[0].recommended_decision is RevisionDecision.REJECTED
 
 
 def test_revision_still_recommends_a_bounded_typographical_correction() -> None:

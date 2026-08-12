@@ -14,7 +14,6 @@ from platformdirs import user_log_path
 from parsezen import APP_DISPLAY_NAME, APP_STORAGE_NAME, __version__
 from parsezen.branding import APP_ICON_PATH
 from parsezen.errors import SettingsError
-from parsezen.job_sessions import get_history_path
 from parsezen.settings import AppSettings, load_settings, save_settings
 
 if TYPE_CHECKING:
@@ -86,7 +85,6 @@ def configure_logging(log_directory: Path | None = None) -> Path:
 def build_main_window() -> ParsezenMainWindow:
     """Build the application window."""
     window_type = _main_window_type()
-
     startup_message: str | None = None
     try:
         settings = load_settings()
@@ -100,6 +98,14 @@ def build_main_window() -> ParsezenMainWindow:
         startup_message=startup_message,
         history_path=get_history_path(),
     )
+
+
+def get_history_path() -> Path:
+    """Resolve the activity file without importing processing code during module import."""
+
+    from parsezen.recent_activity import get_history_path as resolve_history_path
+
+    return resolve_history_path()
 
 
 def _main_window_type() -> type[ParsezenMainWindow]:

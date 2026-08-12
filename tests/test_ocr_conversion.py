@@ -24,11 +24,17 @@ def test_ocr_covers_every_supported_latin_translation_language() -> None:
 
 
 def test_groups_only_contiguous_pages_into_ranges() -> None:
-    assert _page_ranges({7, 2, 3, 4, 10, 11, 0}) == [(2, 4), (7, 7), (10, 11)]
+    assert _page_ranges({7, 2, 3, 4, 10, 11, 0}) == [(2, 3), (4, 4), (7, 7), (10, 11)]
 
 
 def test_limits_ocr_ranges_to_safe_cancellation_batches() -> None:
-    assert _page_ranges(set(range(1, 11))) == [(1, 4), (5, 8), (9, 10)]
+    assert _page_ranges(set(range(1, 11))) == [
+        (1, 2),
+        (3, 4),
+        (5, 6),
+        (7, 8),
+        (9, 10),
+    ]
 
 
 def test_cleans_placeholders_page_numbers_and_shadowed_headings() -> None:
@@ -42,6 +48,128 @@ Useful text.
 """
 
     assert _clean_ocr_markdown(markdown) == "## CREATE YO' VISION\n\nUseful text."
+
+
+def test_ocr_cleaning_replaces_xml_forbidden_controls_without_joining_words() -> None:
+    assert _clean_ocr_markdown("First\x1fSecond\n\nThird\x01Fourth") == (
+        "First Second\n\nThird Fourth"
+    )
+
+
+def test_ocr_cleaning_detaches_a_caption_merged_into_a_table_header() -> None:
+    markdown = (
+        "TABLE 11. Local comparison | First | Second | Third |\n"
+        "| --- | --- | --- |\n"
+        "| Row one | A | B |\n"
+    )
+
+    assert _clean_ocr_markdown(markdown) == (
+        "TABLE 11. Local comparison\n\n"
+        "| First | Second | Third |\n"
+        "| --- | --- | --- |\n"
+        "| Row one | A | B |"
+    )
+
+
+def test_full_page_recovery_drops_only_tiny_isolated_ocr_labels() -> None:
+    def cell(text: str, height: float, width: float = 160.0):
+        box = SimpleNamespace(height=height, width=width)
+        return SimpleNamespace(
+            text=text,
+            from_ocr=True,
+            to_bounding_box=lambda: box,
+        )
+
+    cells = [
+        cell("Main title", 70.0, 500.0),
+        cell("A complete descriptive subtitle", 48.0, 620.0),
+        cell("Zqx", 12.0, 45.0),
+        cell("Author Name", 44.0, 280.0),
+        cell("Publisher", 40.0, 180.0),
+    ]
+    result = SimpleNamespace(
+        pages=[
+            SimpleNamespace(
+                size=SimpleNamespace(width=1_000.0, height=1_400.0),
+                assembled=SimpleNamespace(
+                    elements=[SimpleNamespace(cluster=SimpleNamespace(cells=cells))]
+                ),
+            )
+        ]
+    )
+    markdown = "# Main title\n\nA complete descriptive subtitle\n\nZqx\n\nAuthor Name\n"
+
+    cleaned = ocr_module._strip_low_prominence_ocr_lines(markdown, result)
+
+    assert "Zqx" not in cleaned
+    assert "Main title" in cleaned
+    assert "Author Name" in cleaned
+
+
+def test_full_page_recovery_keeps_uniform_short_ocr_labels() -> None:
+    def cell(text: str):
+        box = SimpleNamespace(height=30.0, width=80.0)
+        return SimpleNamespace(
+            text=text,
+            from_ocr=True,
+            to_bounding_box=lambda: box,
+        )
+
+    cells = [cell("One"), cell("Two"), cell("Act"), cell("Name")]
+    result = SimpleNamespace(
+        pages=[
+            SimpleNamespace(
+                size=SimpleNamespace(width=1_000.0, height=1_400.0),
+                assembled=SimpleNamespace(
+                    elements=[SimpleNamespace(cluster=SimpleNamespace(cells=cells))]
+                ),
+            )
+        ]
+    )
+
+    assert ocr_module._strip_low_prominence_ocr_lines("Act\n", result) == "Act\n"
+
+
+def test_low_prominence_filter_uses_only_the_requested_batch_page() -> None:
+    def page(label: str, label_height: float):
+        def cell(text: str, height: float, width: float):
+            box = SimpleNamespace(height=height, width=width)
+            return SimpleNamespace(
+                text=text,
+                from_ocr=True,
+                to_bounding_box=lambda: box,
+            )
+
+        cells = [
+            cell("Main title", 60.0, 500.0),
+            cell("Subtitle", 48.0, 300.0),
+            cell(label, label_height, 45.0),
+            cell("Author Name", 44.0, 260.0),
+        ]
+        return SimpleNamespace(
+            size=SimpleNamespace(width=1_000.0, height=1_400.0),
+            assembled=SimpleNamespace(
+                elements=[SimpleNamespace(cluster=SimpleNamespace(cells=cells))]
+            ),
+        )
+
+    result = SimpleNamespace(pages=[page("Act", 44.0), page("Zqx", 10.0)])
+
+    first = ocr_module._strip_low_prominence_ocr_lines(
+        "Act\n",
+        result,
+        page_number=1,
+        fallback_index=0,
+    )
+    second = ocr_module._strip_low_prominence_ocr_lines(
+        "Zqx\n",
+        result,
+        page_number=2,
+        fallback_index=1,
+    )
+
+    assert first == "Act\n"
+    assert second == ""
 
 
 def test_public_ocr_boundary_delegates_to_the_private_worker(
@@ -133,7 +261,7 @@ def test_ocr_cancellation_is_not_wrapped_as_a_conversion_failure(
             cancellation=cancellation,
         )
 
-    assert calls == [(1, 4)]
+    assert calls == [(1, 2)]
 
 
 def test_uses_an_ascii_file_path_for_unicode_pdf_paths(

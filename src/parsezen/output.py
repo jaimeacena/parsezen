@@ -10,51 +10,13 @@ from tempfile import mkdtemp, mkstemp
 
 from parsezen.conversion import materialize_converted_markdown
 from parsezen.document_model import ConvertedResource
+from parsezen.domain.jobs import MarkdownOrganization
 from parsezen.errors import OutputWriteError
-
-
-def write_text_output(
-    source_path: Path,
-    text: str,
-    output_directory: Path | None = None,
-    *,
-    validate_staged: Callable[[Path], None] | None = None,
-) -> Path:
-    """Write transformed UTF-8 text beside the source without overwriting anything."""
-    directory = output_directory if output_directory is not None else source_path.parent
-    for index in count(1):
-        collision_suffix = "" if index == 1 else f"-{index}"
-        destination = directory / f"{source_path.stem}{collision_suffix}.mended.txt"
-        try:
-            _write_exclusively(destination, text, validate_staged=validate_staged)
-        except FileExistsError:
-            continue
-        return destination
-    raise AssertionError("The collision search is intentionally unbounded.")
-
-
-def write_docx_output(
-    source_path: Path,
-    content: bytes,
-    output_directory: Path | None = None,
-    *,
-    validate_staged: Callable[[Path], None] | None = None,
-) -> Path:
-    """Write a transformed DOCX package without touching the original document."""
-    directory = output_directory if output_directory is not None else source_path.parent
-    for index in count(1):
-        collision_suffix = "" if index == 1 else f"-{index}"
-        destination = directory / f"{source_path.stem}{collision_suffix}.mended.docx"
-        try:
-            _write_bytes_exclusively(
-                destination,
-                content,
-                validate_staged=validate_staged,
-            )
-        except FileExistsError:
-            continue
-        return destination
-    raise AssertionError("The collision search is intentionally unbounded.")
+from parsezen.markdown_export import (
+    MarkdownChapter,
+    prepare_markdown_export,
+    rebase_relative_markdown_links,
+)
 
 
 def write_epub_translation_output(
@@ -103,24 +65,68 @@ def write_epub_output(
     raise AssertionError("The collision search is intentionally unbounded.")
 
 
-def replace_text_output(
+def replace_markdown_output(
     destination: Path,
-    text: str,
+    markdown: str,
     *,
+    organization: MarkdownOrganization,
+    source_name: str,
+    include_metadata: bool,
+    include_page_references: bool,
     validate_staged: Callable[[Path], None] | None = None,
 ) -> None:
-    """Atomically replace one app-created text result after local review."""
-    staged_path = _stage_markdown(destination.parent, text)
-    temporary_path: Path | None = staged_path
+    """Replace a reviewed Markdown publication and keep its chapter companion in sync."""
+
+    chapters_directory = destination.with_suffix(".chapters")
+    export = prepare_markdown_export(
+        markdown,
+        organization=organization,
+        source_name=source_name,
+        include_metadata=include_metadata,
+        include_page_references=include_page_references,
+        chapter_directory=chapters_directory.name,
+    )
+    staged_chapters: Path | None = None
+    staged_primary: Path | None = None
+    backup_chapters: Path | None = None
+    chapters_published = False
+    manage_chapters = organization is MarkdownOrganization.BY_CHAPTER
     try:
+        if export.chapters:
+            staged_chapters = _stage_chapter_directory(
+                chapters_directory.parent,
+                export.chapters,
+                None,
+            )
         if validate_staged is not None:
-            validate_staged(staged_path)
-        os.replace(staged_path, destination)
-        temporary_path = None
-    except OSError as exc:
+            _validate_canonical_markdown(destination.parent, markdown, validate_staged)
+        staged_primary = _stage_markdown(destination.parent, export.primary_markdown)
+
+        if manage_chapters and chapters_directory.exists():
+            backup_chapters = Path(
+                mkdtemp(dir=chapters_directory.parent, prefix=".parsezen-previous-chapters-")
+            )
+            backup_chapters.rmdir()
+            chapters_directory.rename(backup_chapters)
+        if staged_chapters is not None:
+            staged_chapters.rename(chapters_directory)
+            staged_chapters = None
+            chapters_published = True
+        os.replace(staged_primary, destination)
+        staged_primary = None
+        _remove_resource_directory(backup_chapters)
+    except (OSError, UnicodeError) as exc:
+        if chapters_published:
+            _remove_resource_directory(chapters_directory)
+        if backup_chapters is not None and backup_chapters.exists():
+            try:
+                backup_chapters.rename(chapters_directory)
+            except OSError:
+                pass
         raise OutputWriteError(f"No se pudo actualizar el resultado {destination.name}.") from exc
     finally:
-        _remove_if_present(temporary_path)
+        _remove_resource_directory(staged_chapters)
+        _remove_if_present(staged_primary)
 
 
 def replace_binary_output(
@@ -161,6 +167,9 @@ def write_conversion_output(
     resources: tuple[ConvertedResource, ...] = (),
     image_output_directory: Path | None = None,
     validate_staged: Callable[[Path], None] | None = None,
+    markdown_organization: MarkdownOrganization = MarkdownOrganization.SINGLE_FILE,
+    markdown_include_metadata: bool = False,
+    markdown_include_page_references: bool = False,
 ) -> Path:
     """Write a conversion result without overwriting any existing file."""
     directory = output_directory if output_directory is not None else source_path.parent
@@ -172,31 +181,57 @@ def write_conversion_output(
         resources_directory = (
             (image_output_directory or directory) / f"{stem}{suffix}.assets" if resources else None
         )
-        if destination.exists() or (
-            resources_directory is not None and resources_directory.exists()
+        chapters_directory = directory / f"{stem}{suffix}.chapters"
+        export = prepare_markdown_export(
+            markdown,
+            organization=markdown_organization,
+            source_name=source_path.name,
+            include_metadata=markdown_include_metadata,
+            include_page_references=markdown_include_page_references,
+            chapter_directory=chapters_directory.name,
+        )
+        has_chapters = bool(export.chapters)
+        manage_chapters = markdown_organization is MarkdownOrganization.BY_CHAPTER
+        derived_export = (
+            has_chapters or markdown_include_metadata or markdown_include_page_references
+        )
+        if (
+            destination.exists()
+            or (resources_directory is not None and resources_directory.exists())
+            or (manage_chapters and chapters_directory.exists())
         ):
             continue
         resources_written = False
+        chapters_written = False
         try:
             if resources_directory is not None:
                 _write_resource_directory(resources_directory, resources)
                 resources_written = True
+            if has_chapters:
+                _write_chapter_directory(chapters_directory, export.chapters, resources_directory)
+                chapters_written = True
             resolved_markdown = materialize_converted_markdown(
-                markdown,
+                export.primary_markdown,
                 _resource_reference(destination.parent, resources_directory),
             )
+            if derived_export and validate_staged is not None:
+                _validate_canonical_markdown(destination.parent, markdown, validate_staged)
             _write_exclusively(
                 destination,
                 resolved_markdown,
-                validate_staged=validate_staged,
+                validate_staged=None if derived_export else validate_staged,
             )
         except FileExistsError:
             if resources_written:
                 _remove_resource_directory(resources_directory)
+            if chapters_written:
+                _remove_resource_directory(chapters_directory)
             continue
         except Exception:
             if resources_written:
                 _remove_resource_directory(resources_directory)
+            if chapters_written:
+                _remove_resource_directory(chapters_directory)
             raise
         return destination
 
@@ -214,6 +249,9 @@ def write_improvement_outputs(
     resources: tuple[ConvertedResource, ...] = (),
     image_output_directory: Path | None = None,
     validate_staged: Callable[[Path], None] | None = None,
+    markdown_organization: MarkdownOrganization = MarkdownOrganization.SINGLE_FILE,
+    markdown_include_metadata: bool = False,
+    markdown_include_page_references: bool = False,
 ) -> tuple[Path, Path | None]:
     """Write a collision-free `.mended.md` and its optional paired `.raw.md`."""
     directory = output_directory if output_directory is not None else source_path.parent
@@ -226,10 +264,25 @@ def write_improvement_outputs(
         resources_directory = (
             (image_output_directory or directory) / f"{stem}{suffix}.assets" if resources else None
         )
+        chapters_directory = directory / f"{stem}{suffix}.mended.chapters"
+        export = prepare_markdown_export(
+            improved_markdown,
+            organization=markdown_organization,
+            source_name=source_path.name,
+            include_metadata=markdown_include_metadata,
+            include_page_references=markdown_include_page_references,
+            chapter_directory=chapters_directory.name,
+        )
+        has_chapters = bool(export.chapters)
+        manage_chapters = markdown_organization is MarkdownOrganization.BY_CHAPTER
+        derived_export = (
+            has_chapters or markdown_include_metadata or markdown_include_page_references
+        )
         if (
             final_path.exists()
             or (raw_path is not None and raw_path.exists())
             or (resources_directory is not None and resources_directory.exists())
+            or (manage_chapters and chapters_directory.exists())
         ):
             continue
 
@@ -238,6 +291,8 @@ def write_improvement_outputs(
         staged_resources: Path | None = None
         staged_raw: Path | None = None
         staged_final: Path | None = None
+        staged_chapters: Path | None = None
+        chapters_written = False
         try:
             if resources_directory is not None:
                 staged_resources = _stage_resource_directory(
@@ -249,13 +304,21 @@ def write_improvement_outputs(
                 _resource_reference(final_path.parent, resources_directory),
             )
             resolved_improved = materialize_converted_markdown(
-                improved_markdown,
+                export.primary_markdown,
                 _resource_reference(final_path.parent, resources_directory),
             )
+            if has_chapters:
+                staged_chapters = _stage_chapter_directory(
+                    chapters_directory.parent,
+                    export.chapters,
+                    resources_directory,
+                )
             if raw_path is not None:
                 staged_raw = _stage_markdown(raw_path.parent, resolved_raw)
             staged_final = _stage_markdown(final_path.parent, resolved_improved)
-            if validate_staged is not None:
+            if derived_export and validate_staged is not None:
+                _validate_canonical_markdown(final_path.parent, improved_markdown, validate_staged)
+            elif validate_staged is not None:
                 validate_staged(staged_final)
 
             if resources_directory is not None and staged_resources is not None:
@@ -266,6 +329,10 @@ def write_improvement_outputs(
                 _publish_staged_file(staged_raw, raw_path)
                 staged_raw = None
                 raw_written = True
+            if has_chapters and staged_chapters is not None:
+                staged_chapters.rename(chapters_directory)
+                staged_chapters = None
+                chapters_written = True
             _publish_staged_file(staged_final, final_path)
             staged_final = None
         except FileExistsError:
@@ -273,17 +340,22 @@ def write_improvement_outputs(
                 _remove_if_present(raw_path)
             if resources_written:
                 _remove_resource_directory(resources_directory)
+            if chapters_written:
+                _remove_resource_directory(chapters_directory)
             continue
         except Exception:
             if raw_written:
                 _remove_if_present(raw_path)
             if resources_written:
                 _remove_resource_directory(resources_directory)
+            if chapters_written:
+                _remove_resource_directory(chapters_directory)
             raise
         finally:
             _remove_resource_directory(staged_resources)
             _remove_if_present(staged_raw)
             _remove_if_present(staged_final)
+            _remove_resource_directory(staged_chapters)
         return final_path, raw_path
 
     raise AssertionError("The collision search is intentionally unbounded.")
@@ -463,6 +535,55 @@ def _stage_resource_directory(
     except OSError as exc:
         _remove_resource_directory(staging_directory)
         raise OutputWriteError("No se pudieron preparar las imágenes del documento.") from exc
+
+
+def _write_chapter_directory(
+    destination: Path,
+    chapters: tuple[MarkdownChapter, ...],
+    resources_directory: Path | None,
+) -> None:
+    staging = _stage_chapter_directory(destination.parent, chapters, resources_directory)
+    try:
+        staging.rename(destination)
+    except OSError as exc:
+        _remove_resource_directory(staging)
+        raise OutputWriteError("No se pudieron guardar los capítulos Markdown.") from exc
+
+
+def _stage_chapter_directory(
+    parent: Path,
+    chapters: tuple[MarkdownChapter, ...],
+    resources_directory: Path | None,
+) -> Path:
+    staging: Path | None = None
+    try:
+        staging = Path(mkdtemp(dir=parent, prefix=".parsezen-chapters-"))
+        for chapter in chapters:
+            resource_reference = _resource_reference(staging, resources_directory)
+            content = materialize_converted_markdown(chapter.markdown, resource_reference)
+            if resources_directory is None:
+                content = rebase_relative_markdown_links(content)
+            destination = staging / chapter.filename
+            with destination.open("x", encoding="utf-8", newline="\n") as output_file:
+                output_file.write(content)
+                output_file.flush()
+                os.fsync(output_file.fileno())
+        return staging
+    except (OSError, UnicodeError) as exc:
+        _remove_resource_directory(staging)
+        raise OutputWriteError("No se pudieron preparar los capítulos Markdown.") from exc
+
+
+def _validate_canonical_markdown(
+    directory: Path,
+    markdown: str,
+    validate_staged: Callable[[Path], None],
+) -> None:
+    staged = _stage_markdown(directory, markdown)
+    try:
+        validate_staged(staged)
+    finally:
+        _remove_if_present(staged)
 
 
 def _validate_resource_path(relative_path: PurePosixPath) -> PurePosixPath:

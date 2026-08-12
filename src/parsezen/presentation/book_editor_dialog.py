@@ -43,10 +43,10 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from parsezen.application.artifact_repository import ArtifactRepository
 from parsezen.application.book_editor import BookEditor, publish_book
 from parsezen.domain.books import BookDocument, BookSection
 from parsezen.errors import ParsezenError
-from parsezen.infrastructure.artifact_store import ArtifactStore
 from parsezen.output import replace_binary_output
 from parsezen.presentation.components import HorizontalToolStrip
 from parsezen.presentation.design_system import (
@@ -74,7 +74,7 @@ class _BookTextDocument(QTextDocument):
     def __init__(
         self,
         book: BookDocument,
-        artifacts: ArtifactStore,
+        artifacts: ArtifactRepository,
         *,
         job_id: str,
         parent: QWidget,
@@ -121,7 +121,7 @@ class BookEditorDialog(QDialog):
     def __init__(
         self,
         book: BookDocument,
-        artifacts: ArtifactStore,
+        artifacts: ArtifactRepository,
         *,
         job_id: str,
         destination: Path | None,
@@ -137,8 +137,11 @@ class BookEditorDialog(QDialog):
         self._loading = False
         self._current_section_id: str | None = None
         self._saved_for_later = False
+        self._discarding = False
+        self._dirty = False
+        self._initial_book = book
         self._zoom_percent = 100
-        self.setWindowTitle("Editar libro EPUB · Parsezen")
+        self.setWindowTitle("Revisión final del EPUB · Parsezen")
         self.resize(1320, 820)
 
         layout = QVBoxLayout(self)
@@ -147,12 +150,20 @@ class BookEditorDialog(QDialog):
         layout.setContentsMargins(14, 12, 14, 12)
         layout.setSpacing(8)
         header = QHBoxLayout()
-        title = QLabel("Estructura y contenido del libro", self)
-        title.setObjectName("dialogTitle")
-        title.setWordWrap(True)
-        header.addWidget(title)
+        self.dialog_title = QLabel("Revisión final del EPUB", self)
+        self.dialog_title.setObjectName("dialogTitle")
+        self.dialog_title.setWordWrap(True)
+        header.addWidget(self.dialog_title)
         header.addStretch(1)
         layout.addLayout(header)
+        self.review_helper = QLabel(
+            "Revisa capítulos, portada y contenido. El original no se modificará.",
+            self,
+        )
+        self.review_helper.setObjectName("editorReviewHelper")
+        self.review_helper.setWordWrap(True)
+        self.review_helper.setAccessibleName("Ayuda de la revisión final del EPUB")
+        layout.addWidget(self.review_helper)
 
         self.metadata_button = QPushButton("Metadatos", self)
         self.metadata_button.setObjectName("metadataToggle")
@@ -192,6 +203,9 @@ class BookEditorDialog(QDialog):
         self._populate_cover_selector()
         self.cover_selector.activated.connect(self._cover_choice)
         metadata.addRow("Portada", self.cover_selector)
+        self.title_input.textChanged.connect(self._mark_dirty)
+        self.author_input.textChanged.connect(self._mark_dirty)
+        self.language_input.textChanged.connect(self._mark_dirty)
         layout.addWidget(self.metadata_panel)
         self.metadata_panel.hide()
         self.metadata_button.toggled.connect(self._toggle_metadata)
@@ -375,6 +389,7 @@ class BookEditorDialog(QDialog):
         self.editor.setAcceptRichText(True)
         self.editor.setAccessibleName("Contenido editable del capítulo")
         self.editor.cursorPositionChanged.connect(self._cursor_changed)
+        self.editor.textChanged.connect(self._mark_dirty)
         # The editor must exist before wiring commands that call its native
         # undo/redo slots.
         self.undo_button.clicked.connect(self.editor.undo)
@@ -389,12 +404,23 @@ class BookEditorDialog(QDialog):
 
         footer = QGridLayout()
         self.footer_layout = footer
-        self.save_later_button = QPushButton("Guardar y continuar después", self)
-        self.save_later_button.setAccessibleName("Guardar y continuar después")
+        self.save_later_button = QPushButton("Guardar y salir", self)
+        self.save_later_button.setAccessibleName("Guardar y salir")
+        self.save_later_button.setAccessibleDescription(
+            "Guarda metadatos, portada y el capítulo actual para reanudar la revisión después."
+        )
+        self.save_later_button.setToolTip(
+            "Guardar metadatos, portada y el capítulo actual para reanudar después"
+        )
         self.save_later_button.clicked.connect(self._save_and_close)
         footer.addWidget(self.save_later_button, 0, 0)
         footer.setColumnStretch(1, 1)
-        self.cancel_button = QPushButton("Cancelar", self)
+        self.cancel_button = QPushButton("Descartar cambios", self)
+        self.cancel_button.setAccessibleName("Descartar cambios")
+        self.cancel_button.setAccessibleDescription(
+            "Descarta el borrador del editor sin publicar ni modificar el original."
+        )
+        self.cancel_button.setProperty("dangerAction", True)
         self.cancel_button.clicked.connect(self._cancel)
         footer.addWidget(self.cancel_button, 0, 2)
         self.publish_button = QPushButton("Generar EPUB definitivo", self)
@@ -434,7 +460,7 @@ class BookEditorDialog(QDialog):
             self.footer_layout.addWidget(self.save_later_button, 0, 0, 1, 2)
             self.footer_layout.addWidget(self.cancel_button, 1, 0)
             self.footer_layout.addWidget(self.publish_button, 1, 1)
-            self.save_later_button.setText("Guardar borrador")
+            self.save_later_button.setText("Guardar y salir")
             self.publish_button.setText("Generar EPUB")
         else:
             self.root_layout.setContentsMargins(14, 12, 14, 12)
@@ -444,7 +470,7 @@ class BookEditorDialog(QDialog):
             self.footer_layout.setColumnStretch(1, 1)
             self.footer_layout.addWidget(self.cancel_button, 0, 2)
             self.footer_layout.addWidget(self.publish_button, 0, 3)
-            self.save_later_button.setText("Guardar y continuar después")
+            self.save_later_button.setText("Guardar y salir")
             self.publish_button.setText("Generar EPUB definitivo")
 
     def apply_theme(self) -> None:
@@ -493,6 +519,7 @@ class BookEditorDialog(QDialog):
         try:
             path = Path(selected)
             self._book = self._service().replace_cover(path.name, path.read_bytes())
+            self._dirty = True
         except (ParsezenError, ValueError, OSError) as exc:
             QMessageBox.warning(self, "No se pudo cambiar la portada", str(exc))
             self.cover_selector.setCurrentIndex(0)
@@ -506,6 +533,14 @@ class BookEditorDialog(QDialog):
     @property
     def saved_for_later(self) -> bool:
         return self._saved_for_later
+
+    def reject(self) -> None:  # noqa: D401
+        """Use the same safe draft save for Escape, Back and external rejection."""
+
+        if self._discarding:
+            super().reject()
+            return
+        self._save_and_close()
 
     def _service(self) -> BookEditor:
         return BookEditor(self._book, self._artifacts, job_id=self._job_id)
@@ -550,6 +585,7 @@ class BookEditorDialog(QDialog):
                 self._populate_cover_selector()
             body = _body_from_qt_html(self.editor.toHtml())
             self._book = self._service().update_content(self._current_section_id, body)
+            self._dirty = False
             return True
         except (ParsezenError, ValueError, OSError) as exc:
             QMessageBox.warning(self, "No se pudo guardar el capítulo", str(exc))
@@ -601,6 +637,7 @@ class BookEditorDialog(QDialog):
             except ValueError as exc:
                 QMessageBox.warning(self, "Título no válido", str(exc))
                 return
+            self._dirty = True
             self._populate(section_id)
 
     def _add(self) -> None:
@@ -615,6 +652,7 @@ class BookEditorDialog(QDialog):
         except ValueError as exc:
             QMessageBox.warning(self, "No se pudo crear", str(exc))
             return
+        self._dirty = True
         new_id = self._book.spine[self._book.spine.index(section_id) + 1]
         self._populate(new_id)
 
@@ -653,6 +691,7 @@ class BookEditorDialog(QDialog):
         except ValueError as exc:
             QMessageBox.warning(self, "No se pudo dividir", str(exc))
             return
+        self._dirty = True
         new_id = self._book.spine[self._book.spine.index(section_id) + 1]
         self._populate(new_id)
 
@@ -671,6 +710,7 @@ class BookEditorDialog(QDialog):
             return
         previous = self._book.spine[self._book.spine.index(section_id) - 1]
         self._book = self._service().merge_with_previous(section_id)
+        self._dirty = True
         self._populate(previous)
 
     def _move_up(self) -> None:
@@ -697,6 +737,7 @@ class BookEditorDialog(QDialog):
             if action == "indent"
             else service.outdent(section_id)
         )
+        self._dirty = True
         self._populate(section_id)
 
     def _navigate(self, offset: int) -> None:
@@ -728,11 +769,39 @@ class BookEditorDialog(QDialog):
     def _save_and_close(self) -> None:
         if self._save_current():
             self._saved_for_later = True
-            self.reject()
+            super().reject()
 
     def _cancel(self) -> None:
+        if self._has_changes():
+            answer = QMessageBox.question(
+                self,
+                "Descartar cambios",
+                "Se perderán los cambios del borrador y no se publicará el EPUB. "
+                "¿Descartar cambios?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if answer is not QMessageBox.StandardButton.Yes:
+                return
+        self._discarding = True
         self._saved_for_later = False
-        self.reject()
+        super().reject()
+
+    def _mark_dirty(self) -> None:
+        if not self._loading:
+            self._dirty = True
+
+    def _has_changes(self) -> bool:
+        if self._dirty or self._book != self._initial_book:
+            return True
+        if self._current_section_id is None:
+            return False
+        try:
+            return _body_from_qt_html(self.editor.toHtml()) != self._service().editable_html(
+                self._current_section_id
+            )
+        except (ParsezenError, OSError, ValueError):
+            return True
 
     def _publish(self) -> None:
         if not self._save_current():
