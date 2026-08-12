@@ -1,29 +1,27 @@
-# Parsezen
-
 ![Parsezen](assets/branding/generated/parsezen-readme.png)
 
-**Convierte documentos complejos en contenido útil.**
+## ***Convierte documentos complejos en contenido útil.***
 
-El nombre *Parsezen* viene de *parse* (extraer y estructurar información) con *zen* (hacerlo de
-forma sencilla y fluida).
+El nombre *Parsezen* proviene de *parse* (extraer y estructurar información) con *zen* (hacerlo de forma sencilla y fluida).
 
 Parsezen transforma PDFs, documentos de Word y otros archivos con texto, imágenes y tablas en
 Markdown limpio o en un EPUB organizado. El procesamiento directo comprueba el resultado y, solo si
 encuentra señales concretas, puede proponerte una revisión local de los bloques afectados. También
 puedes elegir de antemano una revisión completa; la traducción opcional usa Argos o un modelo local
-de Ollama y nunca envía el documento fuera del equipo.
+de Ollama y nunca envía el documento fuera del equipo. Es open source, privado y gratuito.
 
-Es open source, privado y 100 % gratuito: utiliza herramientas e IA local, sin suscripciones ni
-pagos por uso.
 
 ## Principales características
 
-- **Dos resultados realmente útiles.** Convierte tus documentos en Markdown estructurado para tus
-  notas, tu sistema de conocimiento o tu IA; o crea un EPUB organizado por capítulos y preparado
-  para leer.
+- **Obtén Markdown o EPUB listos para usar**. Obtén Markdown limpio y estructurado para tus notas, tu base de conocimiento o tus herramientas de IA, o crea EPUB por capítulos con control total sobre portada, metadatos, estructura, contenido y formato.
 
-- **Preparado para documentos reales.** Extrae texto, imágenes y tablas de PDF complejos, reconoce
-  páginas escaneadas mediante OCR y te permite procesar únicamente las páginas que necesites.
+- **Procesamiento avanzado de documentos**. Extrae texto, imágenes y tablas, aplica OCR a páginas escaneadas, selecciona únicamente las páginas que te interesen y mejora el resultado con IA local.
+  
+- **Traducción y revisión precisas**. Combina el procesamiento con traducción (algorítmica o mediante IA), usando glosarios y memoria terminológica para mantener nombres y términos consistentes. Revisa los cambios dudosos y valida el resultado antes de finalizar.
+  
+- **Escalable y preparado para trabajos largos**. Trabaja con varios documentos, consulta el tiempo estimado, pausa el proceso y reanúdalo cuando quieras o repite solo la fase que haya fallado.
+  
+- **Gratis, con IA local fácil de configurar**. Todo se procesa gratis en tu equipo, sin modificar los archivos originales. Instala Ollama, comprueba si tu equipo es compatible y elige un modelo adecuado mediante una configuración guiada y sin comandos.
 
 - **Dos traducciones locales.** Elige Argos cuando priorices rapidez y consumo predecible, o el
   modelo local de Ollama cuando quieras una traducción dependiente de su contexto. Ambos recorridos usan el glosario,
@@ -53,8 +51,8 @@ pagos por uso.
 
 ## Cómo usar Parsezen
 
-1. **[Descarga la última versión](https://github.com/jaimeacena/parsezen/releases/latest).**
-   Necesitas Windows de 64 bits, pero no tienes que instalar Python.
+1. **[Descarga la última versión](https://github.com/jaimeacena/parsezen/releases/latest).** Necesitas Windows de 64 bits, pero no tienes que instalar Python.
+   
 2. **Añade tu documento.** Puedes trabajar con PDF, Word, EPUB, Markdown y archivos de texto.
 3. **Configura el resultado.** En la ventana breve sobre la cola solo eliges Markdown o EPUB y, si
    quieres, el idioma de traducción. Parsezen usa el recorrido directo, Argos y OCR automático por
@@ -63,18 +61,16 @@ pagos por uso.
 4. **Procesa y revisa.** Parsezen extrae y organiza el contenido, conserva las imágenes y tablas
    compatibles y te muestra cualquier decisión pendiente antes de publicar.
 
-> Windows puede mostrar «Editor desconocido» porque Parsezen todavía no utiliza una firma
-> comercial. Asegúrate de descargarlo desde este repositorio.
+> Windows puede mostrar «Editor desconocido» porque Parsezen todavía no utiliza una firma comercial. Asegúrate de descargarlo desde este repositorio.
+
 
 ## Lo que debes saber
 
-- Parsezen transforma el contenido de un PDF; no intenta reproducir exactamente el diseño de cada
-  página.
-- Los documentos escaneados, las tablas complejas y las maquetaciones poco habituales pueden
-  requerir una revisión final.
+- Parsezen transforma el contenido de un PDF; no intenta reproducir exactamente el diseño de cada página.
+- Los documentos escaneados, las tablas complejas y las maquetaciones poco habituales pueden requerir una revisión final.
 - Los modelos de IA son opcionales y pueden ocupar varios gigabytes.
-- Necesitas conexión a Internet para descargar Parsezen, Ollama, los modelos o las herramientas
-  opcionales. Después, el procesamiento se realiza localmente.
+- Necesitas conexión a Internet para descargar Parsezen, Ollama, los modelos o las herramientas opcionales. Después, el procesamiento se realiza localmente.
+
 
 ## Ayuda
 
