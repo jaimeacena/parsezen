@@ -103,7 +103,12 @@ jobs:
             "$($installer[0].FullName).sha256",
             (Resolve-Path "outputs\python-environment.json").Path
           )
-          if (gh release view $env:GITHUB_REF_NAME 2>$null) {
+          $nativeErrorPreference = $PSNativeCommandUseErrorActionPreference
+          $PSNativeCommandUseErrorActionPreference = $false
+          gh release view $env:GITHUB_REF_NAME 2>$null
+          $releaseExists = $LASTEXITCODE -eq 0
+          $PSNativeCommandUseErrorActionPreference = $nativeErrorPreference
+          if ($releaseExists) {
             gh release upload $env:GITHUB_REF_NAME @releaseFiles --clobber
           } else {
             gh release create $env:GITHUB_REF_NAME @releaseFiles --draft --verify-tag --generate-notes --title "Parsezen $env:GITHUB_REF_NAME"
