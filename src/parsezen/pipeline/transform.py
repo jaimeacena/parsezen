@@ -13,7 +13,7 @@ from parsezen.cancellation import CancellationToken, check_cancelled
 from parsezen.domain.jobs import ReviewRecommendation
 from parsezen.domain.process_lifecycle import ProcessStage
 from parsezen.errors import ParsezenError, ProcessingCancelledError
-from parsezen.glossary import GlossaryEntry, protect_glossary
+from parsezen.glossary import GlossaryEntry, glossary_fingerprint, protect_glossary
 from parsezen.improvement import (
     ImprovementMode,
     improve_markdown,
@@ -30,10 +30,12 @@ from parsezen.pipeline.contracts import (
 )
 from parsezen.revision import RevisionDraft, RevisionKind, build_revision_draft
 from parsezen.semantic_blocks import (
+    DocumentTerm,
     SemanticBlock,
     SemanticDocument,
     SemanticRole,
     analyze_markdown,
+    terminology_fingerprint,
 )
 from parsezen.settings import AppSettings
 from parsezen.translation_quality import (
@@ -414,6 +416,29 @@ def effective_ai_improvement_mode(request: ProcessRequest) -> ImprovementMode | 
     return request.improvement_mode
 
 
+def epub_translation_resume_key(
+    request: ProcessRequest,
+    settings: AppSettings | None,
+    language_code: str,
+    terminology: tuple[DocumentTerm, ...] = (),
+) -> str:
+    """Identify text-changing settings for resumable EPUB transformations."""
+
+    effective_mode = effective_ai_improvement_mode(request)
+    return repr(
+        (
+            "epub-translation-v10",
+            language_code,
+            effective_mode.value if effective_mode is not None else "none",
+            request.offline_translation_language is not None,
+            settings.model if settings is not None else None,
+            settings.context_window if settings is not None else None,
+            glossary_fingerprint(request.glossary),
+            terminology_fingerprint(terminology),
+        )
+    )
+
+
 def _content_review_was_fused(
     request: ProcessRequest,
     effective_mode: ImprovementMode | None,
@@ -698,6 +723,7 @@ def _announce(on_stage: StageCallback | None, stage: ProcessStage) -> None:
 
 __all__ = [
     "effective_ai_improvement_mode",
+    "epub_translation_resume_key",
     "improve_with_checkpoints",
     "linguistic_review_coverage",
     "repair_translation_warnings",

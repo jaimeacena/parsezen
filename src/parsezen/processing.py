@@ -66,7 +66,6 @@ from parsezen.final_integrity import (
 )
 from parsezen.glossary import (
     GlossaryEntry,
-    glossary_fingerprint,
     protect_glossary,
     validate_glossary,
 )
@@ -112,6 +111,10 @@ from parsezen.pipeline.transform import (
     effective_ai_improvement_mode as _effective_ai_improvement_mode,
 )
 from parsezen.pipeline.transform import (
+    epub_translation_resume_key,
+    transform_prepared_document,
+)
+from parsezen.pipeline.transform import (
     improve_with_checkpoints as _improve_with_checkpoints,
 )
 from parsezen.pipeline.transform import (
@@ -130,9 +133,6 @@ from parsezen.pipeline.transform import (
     reviewable_semantic_blocks as _reviewable_semantic_blocks,
 )
 from parsezen.pipeline.transform import (
-    transform_prepared_document,
-)
-from parsezen.pipeline.transform import (
     translation_quality_report as _translation_quality_report,
 )
 from parsezen.revision import (
@@ -142,10 +142,8 @@ from parsezen.revision import (
     validate_revision_selection,
 )
 from parsezen.semantic_blocks import (
-    DocumentTerm,
     SemanticRole,
     analyze_markdown,
-    terminology_fingerprint,
 )
 from parsezen.settings import AppSettings, validate_settings
 from parsezen.translation_quality import (
@@ -954,7 +952,7 @@ def _process_epub_translation(
         _notify(on_stage, ProcessStage.TRANSLATING)
     checkpoints = open_epub_translation_checkpoints(
         request.source_path,
-        _epub_translation_resume_key(
+        epub_translation_resume_key(
             request,
             settings,
             language_code,
@@ -1225,32 +1223,6 @@ def _review_source_markdown(
         ).markdown
     except (OSError, ParsezenError, ValueError):
         return None
-
-
-def _epub_translation_resume_key(
-    request: ProcessRequest,
-    settings: AppSettings | None,
-    language_code: str,
-    terminology: tuple[DocumentTerm, ...] = (),
-) -> str:
-    """Identify settings that can materially change translated EPUB text."""
-
-    effective_mode = _effective_ai_improvement_mode(request)
-    mode = effective_mode.value if effective_mode is not None else "none"
-    model = settings.model if settings is not None else None
-    context_window = settings.context_window if settings is not None else None
-    return repr(
-        (
-            "epub-translation-v10",
-            language_code,
-            mode,
-            request.offline_translation_language is not None,
-            model,
-            context_window,
-            glossary_fingerprint(request.glossary),
-            terminology_fingerprint(terminology),
-        )
-    )
 
 
 def _uses_general_work_checkpoints(request: ProcessRequest) -> bool:

@@ -89,7 +89,7 @@ def test_linguistic_coverage_keeps_unaligned_blocks_out_of_automatic_checks() ->
         translated_blocks=3,
     )
 
-    coverage = processing_module._linguistic_review_coverage(  # noqa: SLF001
+    coverage = transform_module.linguistic_review_coverage(
         report,
         mode=LinguisticReviewMode.NOT_REVIEWED,
     )
@@ -314,11 +314,11 @@ def test_epub_translation_checkpoint_key_includes_fused_content_review() -> None
         review_content=True,
     )
 
-    assert processing_module._epub_translation_resume_key(  # noqa: SLF001
+    assert transform_module.epub_translation_resume_key(
         translation,
         LOCAL_SETTINGS,
         "es",
-    ) != processing_module._epub_translation_resume_key(  # noqa: SLF001
+    ) != transform_module.epub_translation_resume_key(
         translated_and_corrected,
         LOCAL_SETTINGS,
         "es",
