@@ -2,6 +2,8 @@
 
 ## Próxima versión
 
+- El flujo de IA local posee ahora su estado de presentación y expone operaciones explícitas. La
+  ventana deja de duplicar estado y elimina el proxy dinámico basado en `__getattr__` y `Any`.
 - Una tabla exhaustiva proyecta cada etapa física a fase de dominio, fase de actividad y etiqueta de
   diagnóstico. Los logs distinguen trabajo físico (`processing_*`) del intento Qt
   (`processing_attempt_*`) para eliminar eventos terminales conceptualmente duplicados.

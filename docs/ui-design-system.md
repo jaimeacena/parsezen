@@ -42,6 +42,8 @@ Piezas principales:
 - `presentation/main_window.py`: composición de la aplicación y proyección del estado de dominio.
 - `presentation/processing_runner.py`: ejecución física, cancelación y eventos de procesamiento.
 - `presentation/local_ai_controller.py`: descubrimiento, recomendaciones e instalación de IA local.
+- `presentation/local_ai_workflow.py`: propietario del estado y de la coordinación visible de IA
+  local mediante señales y callbacks explícitos.
 - `presentation/workspace.py`: layout, navegación interna, foco y reflow global.
 - `presentation/job_table.py`: proyección responsive de la cola.
 - `presentation/job_configuration_dialog.py`: transacción de configuración por documento.

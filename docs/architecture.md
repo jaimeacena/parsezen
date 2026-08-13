@@ -52,9 +52,11 @@ propias ya no están mezclados:
   inmutable de página y `pdf_checkpoints.py` serializa y valida su reanudación sin abrir PDFs ni
   invocar OCR.
 
-En presentación, `local_ai_workflow.py` posee el flujo de descubrir, instalar, seleccionar y borrar
-modelos. `main_window.py` sigue siendo la raíz de composición y propietaria del estado visual, pero
-delega esas acciones en el coordinador y hereda únicamente de `QMainWindow`.
+En presentación, `local_ai_workflow.py` posee tanto el estado visible como el flujo de descubrir,
+recomendar, instalar, seleccionar y borrar modelos. Recibe dependencias y callbacks tipados, conecta
+explícitamente las señales del controlador y proyecta sus cambios al workspace. `main_window.py`
+permanece como raíz de composición, pero ya no replica ese estado ni reenvía métodos mediante
+`__getattr__`; solo consume la interfaz pública del coordinador y hereda de `QMainWindow`.
 
 Los casos de uso extraídos de la ventana tienen propietarios explícitos:
 

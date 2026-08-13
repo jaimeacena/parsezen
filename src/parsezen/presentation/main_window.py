@@ -9,7 +9,7 @@ from datetime import UTC, datetime
 from functools import partial
 from pathlib import Path
 from time import monotonic
-from typing import Any, Protocol
+from typing import Protocol
 from uuid import NAMESPACE_URL, uuid5
 
 from platformdirs import user_data_path
@@ -116,12 +116,7 @@ from parsezen.failure_recovery import ProcessingFailure, recovery_plan
 from parsezen.infrastructure.artifact_store import ArtifactStore
 from parsezen.infrastructure.result_snapshots import ResultSnapshotStore
 from parsezen.infrastructure.state_store import StateStore, StateStoreError
-from parsezen.local_models import (
-    OllamaModel,
-    OllamaStatus,
-    is_reasoning_model_id,
-)
-from parsezen.model_recommendations import ModelRecommendations
+from parsezen.local_models import is_reasoning_model_id
 from parsezen.presentation.activity_view import ActivityView
 from parsezen.presentation.book_editor_dialog import BookEditorDialog
 from parsezen.presentation.design_system import (
@@ -132,12 +127,8 @@ from parsezen.presentation.design_system import (
 from parsezen.presentation.diagnostics_dialog import DiagnosticsDialog
 from parsezen.presentation.epub_confirmation_dialog import EpubConfirmationDialog
 from parsezen.presentation.job_configuration_dialog import JobConfigurationDialog
-from parsezen.presentation.local_ai_controller import LocalAIAction, LocalAIController
-from parsezen.presentation.local_ai_workflow import (
-    LOCAL_AI_WORKFLOW_METHODS,
-    LocalAIWorkflow,
-)
-from parsezen.presentation.model_manager import ModelManagerDialog
+from parsezen.presentation.local_ai_controller import LocalAIController
+from parsezen.presentation.local_ai_workflow import LocalAIWorkflow
 from parsezen.presentation.phase_review_dialog import PhaseReviewDialog
 from parsezen.presentation.preflight_dialog import PreflightDialog
 from parsezen.presentation.preflight_runner import (
@@ -213,19 +204,8 @@ class ParsezenMainWindow(QMainWindow):
         self._pause_requested = False
         self._is_processing = False
         self._targeted_review_active = False
-        self._is_discovering_models = False
-        self._is_recommending_models = False
-        self._is_ai_setup_active = False
         self._auto_discover_ai = auto_discover_ai
-        self._ollama_status: OllamaStatus | None = None
-        self._ollama_models: tuple[OllamaModel, ...] = ()
-        self._model_recommendations: ModelRecommendations | None = None
-        self._model_manager: ModelManagerDialog | None = None
         self._active_configuration_dialog: JobConfigurationDialog | None = None
-        self._ai_setup_action: LocalAIAction | None = None
-        self._pending_ai_model: str | None = None
-        self._pending_deleted_model: str | None = None
-        self._ai_setup_succeeded = False
         self._sleep_blocker = SystemSleepBlocker()
         self._notification_tray: QSystemTrayIcon | None = None
         self._active_run_job_ids: tuple[str, ...] = ()
@@ -235,8 +215,6 @@ class ParsezenMainWindow(QMainWindow):
         # One terminal snapshot per job keeps delayed review tied to its attempt.
         # It is pruned against the live queue in ``_sync_workspace``.
         self._terminal_attempt_activity: dict[str, _AttemptActivity] = {}
-        self._local_ai_workflow = LocalAIWorkflow(self)
-
         self._processing_runner = ProcessingRunner(self)
         self._processing_runner.stage_changed.connect(self._show_stage)
         self._processing_runner.improvement_progress.connect(self._show_improvement_progress)
@@ -248,17 +226,6 @@ class ParsezenMainWindow(QMainWindow):
         self._processing_runner.cancelled.connect(self._processing_cancelled)
         self._processing_runner.finished.connect(self._processing_worker_finished)
         self._local_ai = LocalAIController(self)
-        self._local_ai.discovery_succeeded.connect(self._model_discovery_succeeded)
-        self._local_ai.discovery_failed.connect(self._model_discovery_failed)
-        self._local_ai.discovery_finished.connect(self._model_discovery_finished)
-        self._local_ai.recommendations_succeeded.connect(self._model_recommendations_succeeded)
-        self._local_ai.recommendations_failed.connect(self._model_recommendations_failed)
-        self._local_ai.recommendations_finished.connect(self._model_recommendations_finished)
-        self._local_ai.setup_progress.connect(self._ai_setup_progress_changed)
-        self._local_ai.setup_succeeded.connect(self._ai_setup_succeeded_slot)
-        self._local_ai.setup_cancelled.connect(self._ai_setup_cancelled)
-        self._local_ai.setup_failed.connect(self._ai_setup_failed)
-        self._local_ai.setup_finished.connect(self._ai_setup_finished)
 
         self.setWindowTitle(APP_DISPLAY_NAME)
         app_icon = QIcon(str(APP_ICON_PATH))
@@ -351,6 +318,18 @@ class ParsezenMainWindow(QMainWindow):
 
         self.parsezen_workspace = ParsezenWorkspace(self)
         self.setCentralWidget(self.parsezen_workspace)
+        self._local_ai_workflow = LocalAIWorkflow(
+            self._local_ai,
+            self.parsezen_workspace,
+            settings=lambda: self._settings,
+            apply_settings=self._apply_settings,
+            jobs=lambda: self._job_queue.jobs,
+            processing_active=lambda: self._is_processing,
+            active_editor=lambda: self._active_configuration_dialog,
+            propagate_ai_profile=self._queue_configuration.propagate_ai_profile,
+            parent=self,
+        )
+        self._local_ai_workflow.state_changed.connect(self._local_ai_state_changed)
         self.setMinimumSize(320, 520)
         self.resize(1440, 860)
         self._connect_workspace()
@@ -364,25 +343,9 @@ class ParsezenMainWindow(QMainWindow):
         self._projection_timer.start()
         self._sync_workspace(force_persist=True)
 
-    def __getattr__(self, name: str) -> Any:
-        workflow = self.__dict__.get("_local_ai_workflow")
-        if workflow is not None and name in LOCAL_AI_WORKFLOW_METHODS:
-            return getattr(workflow, name)
-        raise AttributeError(f"{type(self).__name__!s} has no attribute {name!r}")
-
-    def _start_ai_setup(
-        self,
-        action: LocalAIAction,
-        *,
-        model_id: str | None = None,
-        expected_download_size_bytes: int | None = None,
-    ) -> None:
-        """Retain the established window hook while delegating the local-AI workflow."""
-        self._local_ai_workflow._start_ai_setup(
-            action,
-            model_id=model_id,
-            expected_download_size_bytes=expected_download_size_bytes,
-        )
+    @Slot(bool)
+    def _local_ai_state_changed(self, persist: bool) -> None:
+        self._sync_workspace(force_persist=persist)
 
     @property
     def is_processing(self) -> bool:
@@ -464,9 +427,7 @@ class ParsezenMainWindow(QMainWindow):
             or prepared.issues
             or self._batch_running
             or self._processing_runner.is_active
-            or self._is_discovering_models
-            or self._is_recommending_models
-            or self._is_ai_setup_active
+            or self._local_ai_workflow.busy
         ):
             self.parsezen_workspace.set_preparing_jobs(())
             return
@@ -728,7 +689,7 @@ class ParsezenMainWindow(QMainWindow):
                 )
             event.ignore()
             return
-        if self._is_discovering_models or self._is_recommending_models or self._is_ai_setup_active:
+        if self._local_ai_workflow.busy:
             if self.isVisible():
                 QMessageBox.information(
                     self,
@@ -905,7 +866,7 @@ class ParsezenMainWindow(QMainWindow):
         workspace.add_requested.connect(self._select_file)
         workspace.files_dropped.connect(self._add_dropped_paths)
         workspace.settings_requested.connect(self._show_parsezen_settings)
-        workspace.local_ai_requested.connect(self._show_model_manager)
+        workspace.local_ai_requested.connect(self._local_ai_workflow.show_model_manager)
         workspace.theme_toggle_requested.connect(self._toggle_theme)
         workspace.output_directory_requested.connect(self._choose_global_output_directory)
         workspace.output_directory_reset_requested.connect(self._reset_global_output_directory)
@@ -926,7 +887,7 @@ class ParsezenMainWindow(QMainWindow):
     def _install_settings_actions(self) -> None:
         self.settings_menu.clear()
         self.models_settings_action = QAction("IA local", self.settings_menu)
-        self.models_settings_action.triggered.connect(self._show_model_manager)
+        self.models_settings_action.triggered.connect(self._local_ai_workflow.show_model_manager)
         self.settings_menu.addAction(self.models_settings_action)
         self.activity_action = QAction("Actividad reciente", self.settings_menu)
         self.activity_action.triggered.connect(self._show_recent_activity)
@@ -1006,7 +967,7 @@ class ParsezenMainWindow(QMainWindow):
         self._settings = settings
         self.parsezen_workspace.set_output_directory(settings.output_directory)
         self.parsezen_workspace.set_local_ai_status(
-            self._ollama_status,
+            self._local_ai_workflow.status,
             settings.model,
         )
         return settings
@@ -1089,8 +1050,12 @@ class ParsezenMainWindow(QMainWindow):
     def _show_diagnostics(self) -> None:
         report = build_diagnostic_report(
             self._settings,
-            ollama_status=(self._ollama_status.value if self._ollama_status is not None else None),
-            installed_models=len(self._ollama_models),
+            ollama_status=(
+                self._local_ai_workflow.status.value
+                if self._local_ai_workflow.status is not None
+                else None
+            ),
+            installed_models=len(self._local_ai_workflow.models),
             queued_documents=len(self._job_queue.jobs),
             history_path=self._history_path,
             work_checkpoint_root=self._work_checkpoint_root,
@@ -1192,7 +1157,7 @@ class ParsezenMainWindow(QMainWindow):
                 "Hace falta un modelo local",
                 "Instala o elige un modelo de IA local antes de revisar estas señales.",
             )
-            self._show_model_manager()
+            self._local_ai_workflow.show_model_manager()
             return
         try:
             base_result = (
@@ -1264,7 +1229,7 @@ class ParsezenMainWindow(QMainWindow):
             return
         models = tuple(
             (model.model_id, model.display_name)
-            for model in self._ollama_models
+            for model in self._local_ai_workflow.models
             if not is_reasoning_model_id(model.model_id)
         )
         configured_model = job.configuration.ai.model
@@ -1286,7 +1251,7 @@ class ParsezenMainWindow(QMainWindow):
             default_output_directory=self._settings.output_directory,
             default_ai_model=self._settings.model,
             default_ai_context=self._settings.context_window,
-            ollama_status=self._ollama_status,
+            ollama_status=self._local_ai_workflow.status,
             parent=self.parsezen_workspace,
         )
         self._active_configuration_dialog = dialog
@@ -1308,12 +1273,10 @@ class ParsezenMainWindow(QMainWindow):
         if (
             self._auto_discover_ai
             and (dialog.review_enabled or requires_ai(job.configuration))
-            and not self._ollama_models
-            and not self._is_discovering_models
-            and not self._is_recommending_models
-            and not self._is_ai_setup_active
+            and not self._local_ai_workflow.models
+            and not self._local_ai_workflow.busy
         ):
-            self._start_model_discovery(automatic=True)
+            self._local_ai_workflow.start_model_discovery(automatic=True)
 
     def _configuration_dialog_finished(self, dialog: JobConfigurationDialog) -> None:
         if self._active_configuration_dialog is not dialog:
@@ -1325,8 +1288,8 @@ class ParsezenMainWindow(QMainWindow):
     def _open_models_from_configuration(self, dialog: JobConfigurationDialog) -> None:
         if self._active_configuration_dialog is not dialog:
             return
-        self._show_model_manager()
-        manager = self._model_manager
+        self._local_ai_workflow.show_model_manager()
+        manager = self._local_ai_workflow.manager
         if manager is None:
             return
         manager.finished.connect(
@@ -1339,7 +1302,7 @@ class ParsezenMainWindow(QMainWindow):
         dialog.set_models(
             tuple(
                 (model.model_id, model.display_name)
-                for model in self._ollama_models
+                for model in self._local_ai_workflow.models
                 if not is_reasoning_model_id(model.model_id)
             )
         )
@@ -1347,7 +1310,7 @@ class ParsezenMainWindow(QMainWindow):
             self._settings.model,
             self._settings.context_window,
         )
-        dialog.set_ai_status(self._ollama_status)
+        dialog.set_ai_status(self._local_ai_workflow.status)
         dialog.persist_if_valid()
 
     @Slot(object)
@@ -2515,9 +2478,7 @@ class ParsezenMainWindow(QMainWindow):
             self._is_processing
             or self._batch_running
             or self._processing_runner.is_active
-            or self._is_discovering_models
-            or self._is_recommending_models
-            or self._is_ai_setup_active
+            or self._local_ai_workflow.busy
             or self._preflight_runner.preparing
         ):
             return
@@ -2788,7 +2749,7 @@ class ParsezenMainWindow(QMainWindow):
         self._prune_terminal_attempt_activity(jobs)
         self.parsezen_workspace.set_output_directory(self._settings.output_directory)
         self.parsezen_workspace.set_local_ai_status(
-            self._ollama_status,
+            self._local_ai_workflow.status,
             self._settings.model,
         )
         integrity_reports = {

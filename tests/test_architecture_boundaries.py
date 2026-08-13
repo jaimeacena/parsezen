@@ -129,8 +129,7 @@ def test_main_window_delegates_the_local_ai_workflow() -> None:
         "ParsezenMainWindow",
     )
 
-    assert {"_show_model_manager", "_start_model_discovery", "_select_model_from_manager"} <= (
-        delegated
-    )
-    workflow_actions = {name for name in delegated if not name.startswith("__")}
-    assert (workflow_actions - {"_start_ai_setup"}).isdisjoint(window_methods)
+    assert {"show_model_manager", "start_model_discovery", "select_model"} <= delegated
+    workflow_actions = {name for name in delegated if not name.startswith("_")}
+    assert workflow_actions.isdisjoint(window_methods)
+    assert "__getattr__" not in window_methods
