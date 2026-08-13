@@ -133,3 +133,13 @@ def test_main_window_delegates_the_local_ai_workflow() -> None:
     workflow_actions = {name for name in delegated if not name.startswith("_")}
     assert workflow_actions.isdisjoint(window_methods)
     assert "__getattr__" not in window_methods
+
+
+def test_main_window_does_not_own_queue_session_flags() -> None:
+    source = (_PACKAGE_ROOT / "presentation" / "main_window.py").read_text(encoding="utf-8")
+
+    assert "self._is_processing" not in source
+    assert "self._batch_running" not in source
+    assert "self._pause_requested" not in source
+    assert "self._current_job_id" not in source
+    assert "self._runtime_by_job" not in source

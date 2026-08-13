@@ -2,6 +2,8 @@
 
 ## Próxima versión
 
+- La nueva `QueueSession` Qt-free posee el plan preparado, runtimes, documento activo, pausa y cierre
+  del lote. La ventana principal deja de duplicar las banderas de su máquina de estados.
 - El flujo de IA local posee ahora su estado de presentación y expone operaciones explícitas. La
   ventana deja de duplicar estado y elimina el proxy dinámico basado en `__getattr__` y `Any`.
 - Una tabla exhaustiva proyecta cada etapa física a fase de dominio, fase de actividad y etiqueta de

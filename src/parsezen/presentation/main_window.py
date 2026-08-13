@@ -29,9 +29,7 @@ from PySide6.QtWidgets import (
 from parsezen import APP_DISPLAY_NAME, APP_STORAGE_NAME
 from parsezen.application.configuration_rules import requires_ai
 from parsezen.application.early_check import run_early_check
-from parsezen.application.job_execution import JobExecutionController
 from parsezen.application.job_outcomes import JobOutcomeCoordinator, OutcomeWarning
-from parsezen.application.job_queue import JobQueue
 from parsezen.application.job_runtime import JobRuntime
 from parsezen.application.outcome_summary import build_outcome_summary
 from parsezen.application.phase_review_sequence import PhaseReviewSequenceCoordinator
@@ -53,6 +51,7 @@ from parsezen.application.queue_persistence import (
     QueuePersistenceCoordinator,
     QueuePersistenceStatus,
 )
+from parsezen.application.queue_session import QueueSession, SessionTermination
 from parsezen.application.review_finalization import (
     ReviewFinalizationCoordinator,
     ReviewFinalizationWarning,
@@ -195,20 +194,15 @@ class ParsezenMainWindow(QMainWindow):
         self._startup_message = startup_message
         self._history_path = history_path
         self._work_checkpoint_root = work_checkpoint_root
-        self._job_queue = JobQueue()
-        self._runtime_by_job: dict[str, JobRuntime] = {}
-        self._current_job_id: str | None = None
-        self._batch_running = False
+        self._queue_session = QueueSession()
+        self._job_queue = self._queue_session.queue
+        self._job_execution = self._queue_session.execution
         self._result: ProcessResult | None = None
         self._selected_result_job_id: str | None = None
-        self._pause_requested = False
-        self._is_processing = False
-        self._targeted_review_active = False
         self._auto_discover_ai = auto_discover_ai
         self._active_configuration_dialog: JobConfigurationDialog | None = None
         self._sleep_blocker = SystemSleepBlocker()
         self._notification_tray: QSystemTrayIcon | None = None
-        self._active_run_job_ids: tuple[str, ...] = ()
         self._early_check_reports: dict[str, EarlyCheckReport] = {}
         self._outcome_summaries: dict[str, OutcomeSummary] = {}
         self._latest_forecasts: dict[str, DocumentPreflight] = {}
@@ -238,8 +232,6 @@ class ParsezenMainWindow(QMainWindow):
         self.settings_menu = QMenu(self)
         self.settings_menu.setObjectName("settingsMenu")
         self._queue_configuration = QueueConfigurationService(self._job_queue)
-        self._job_execution = JobExecutionController(self._job_queue)
-        self._prepared_run: PreparedQueueRun | None = None
         self._last_projection: tuple[DocumentJob, ...] = ()
         self._state_recovery_notice: str | None = startup_message
         state_destination = (
@@ -324,7 +316,7 @@ class ParsezenMainWindow(QMainWindow):
             settings=lambda: self._settings,
             apply_settings=self._apply_settings,
             jobs=lambda: self._job_queue.jobs,
-            processing_active=lambda: self._is_processing,
+            processing_active=lambda: self._queue_session.running,
             active_editor=lambda: self._active_configuration_dialog,
             propagate_ai_profile=self._queue_configuration.propagate_ai_profile,
             parent=self,
@@ -349,15 +341,14 @@ class ParsezenMainWindow(QMainWindow):
 
     @property
     def is_processing(self) -> bool:
-        return self._is_processing
+        return self._queue_session.running
 
     def set_source_paths(self, paths: Sequence[str | Path]) -> None:
         selected = _unique_paths(Path(path) for path in paths)
         if not selected:
             return
         self._replace_sources(tuple(selected))
-        self._current_job_id = None
-        self._batch_running = False
+        self._queue_session.reset_idle_selection()
         self.parsezen_workspace.clear_batch_summary()
         self._ensure_configurations()
         self._sync_workspace(force_persist=True)
@@ -385,31 +376,19 @@ class ParsezenMainWindow(QMainWindow):
                 _default_configuration(path, self._settings),
                 job_id=uuid5(NAMESPACE_URL, key).hex,
             )
-            self._runtime_by_job[job.id] = JobRuntime()
+            self._queue_session.ensure_runtime(job.id)
         self._job_queue.order_sources(paths)
         active_ids = {job.id for job in self._job_queue.jobs}
-        self._runtime_by_job = {
-            job_id: runtime
-            for job_id, runtime in self._runtime_by_job.items()
-            if job_id in active_ids
-        }
-        for job_id in active_ids:
-            self._runtime_by_job.setdefault(job_id, JobRuntime())
+        self._queue_session.retain_runtime(active_ids)
         if self._selected_result_job_id not in active_ids:
             self._selected_result_job_id = None
             self._result = None
 
     def _current_job(self) -> DocumentJob | None:
-        return (
-            self._job_queue.get(self._current_job_id) if self._current_job_id is not None else None
-        )
+        return self._queue_session.current_job
 
     def _current_runtime(self) -> JobRuntime | None:
-        return (
-            self._runtime_by_job.get(self._current_job_id)
-            if self._current_job_id is not None
-            else None
-        )
+        return self._queue_session.current_runtime
 
     def _current_source_path(self) -> Path | None:
         current = self._current_job()
@@ -420,40 +399,25 @@ class ParsezenMainWindow(QMainWindow):
 
     @Slot()
     def _start_processing(self) -> None:
-        prepared = self._prepared_run
+        prepared = self._queue_session.prepared_run
         if (
             prepared is None
             or not prepared.plan.job_ids
             or prepared.issues
-            or self._batch_running
+            or self._queue_session.running
             or self._processing_runner.is_active
             or self._local_ai_workflow.busy
         ):
             self.parsezen_workspace.set_preparing_jobs(())
             return
         try:
-            self._job_execution.begin_run(
-                prepared.plan,
-                allow_subset=prepared.explicit_plan,
-            )
+            self._queue_session.begin_prepared_run()
         except (RuntimeError, ValueError):
             self.parsezen_workspace.set_preparing_jobs(())
-            self._job_execution.finish_run()
-            self._prepared_run = None
+            self._queue_session.finish(SessionTermination.CANCELLED)
             return
-        resumable = set(prepared.plan.job_ids)
-        for job_id in resumable:
-            runtime = self._runtime_by_job.get(job_id)
-            if runtime is None:
-                continue
-            runtime.reset_for_run()
-        self._pause_requested = False
-        self._batch_running = True
-        self._is_processing = True
-        self._active_run_job_ids = prepared.plan.job_ids
         self.parsezen_workspace.clear_batch_summary()
         self._sleep_blocker.start()
-        self._current_job_id = None
         self._start_next_batch_entry()
 
     def _validate_pending_requests(
@@ -461,14 +425,15 @@ class ParsezenMainWindow(QMainWindow):
         items: tuple[tuple[ProcessRequest, AppSettings], ...],
     ) -> tuple[BatchValidationIssue, ...]:
         del items
-        return self._prepared_run.issues if self._prepared_run is not None else ()
+        prepared = self._queue_session.prepared_run
+        return prepared.issues if prepared is not None else ()
 
     def _pending_runtime_items(
         self,
         settings: AppSettings,
     ) -> tuple[tuple[ProcessRequest, AppSettings], ...]:
         del settings
-        prepared = self._prepared_run
+        prepared = self._queue_session.prepared_run
         return (
             tuple((item.request, item.settings) for item in prepared.items)
             if prepared is not None
@@ -479,7 +444,7 @@ class ParsezenMainWindow(QMainWindow):
         self,
         job_id: str,
     ) -> tuple[ProcessRequest, AppSettings] | None:
-        prepared = self._prepared_run
+        prepared = self._queue_session.prepared_run
         job = self._job_queue.get(job_id)
         if prepared is not None and job is not None:
             item = prepared.item(job_id)
@@ -494,8 +459,7 @@ class ParsezenMainWindow(QMainWindow):
         )
 
     def _processing_run_flags(self) -> tuple[bool, bool]:
-        plan = self._prepared_run.plan if self._prepared_run is not None else None
-        mode = plan.mode if plan is not None else self._job_execution.plan_run().mode
+        mode = self._queue_session.run_mode
         return mode is RunMode.RESUME, mode is RunMode.RETRY
 
     def _local_ai_required(self) -> bool:
@@ -504,16 +468,12 @@ class ParsezenMainWindow(QMainWindow):
             for job in self._job_queue.jobs
         )
 
-    def _next_pending_job(self) -> DocumentJob | None:
-        """Claim the next domain job before constructing its physical worker."""
-
-        return self._job_execution.start_next_available()
-
     def _start_next_batch_entry(self) -> None:
-        job = self._next_pending_job()
-        if job is None:
+        claimed = self._queue_session.claim_next()
+        if claimed is None:
             self._finish_batch()
             return
+        job, runtime = claimed
         physical = self._runtime_for_entry(job.id)
         if physical is None:
             self._job_execution.fail(
@@ -525,11 +485,8 @@ class ParsezenMainWindow(QMainWindow):
             self._finish_batch()
             return
         request, settings = physical
-        self._current_job_id = job.id
-        runtime = self._runtime_by_job.setdefault(job.id, JobRuntime())
-        runtime.reset_for_run()
-        runtime.started_at = monotonic()
-        prepared_item = self._prepared_run.item(job.id) if self._prepared_run is not None else None
+        prepared = self._queue_session.prepared_run
+        prepared_item = prepared.item(job.id) if prepared is not None else None
         early_check = (
             run_early_check
             if prepared_item is not None
@@ -556,15 +513,7 @@ class ParsezenMainWindow(QMainWindow):
         )
 
     def _finish_batch(self) -> None:
-        active_ids = self._active_run_job_ids
-        self._job_execution.finish_run()
-        self._prepared_run = None
-        self._batch_running = False
-        self._is_processing = False
-        self._targeted_review_active = False
-        self._pause_requested = False
-        self._current_job_id = None
-        self._active_run_job_ids = ()
+        active_ids = self._queue_session.finish()
         self._sleep_blocker.stop()
         self.parsezen_workspace.set_preparing_jobs(())
         self._show_finished_batch_summary(active_ids)
@@ -680,7 +629,7 @@ class ParsezenMainWindow(QMainWindow):
                 )
             event.ignore()
             return
-        if self._is_processing:
+        if self._queue_session.running:
             if self.isVisible():
                 QMessageBox.information(
                     self,
@@ -701,7 +650,7 @@ class ParsezenMainWindow(QMainWindow):
         persisted = self._sync_workspace(force_persist=True)
         if (
             not persisted
-            and not self._is_processing
+            and not self._queue_session.running
             and self.isVisible()
             and self._has_unfinished_jobs()
             and QMessageBox.question(
@@ -728,7 +677,7 @@ class ParsezenMainWindow(QMainWindow):
 
         job = self._current_job()
         runtime = self._current_runtime()
-        targeted_review = self._targeted_review_active
+        targeted_review = self._queue_session.targeted_review
         activity = self._capture_terminal_attempt_activity(job.id if job is not None else None)
         self._remember_processing_duration(job, result)
         if job is not None:
@@ -784,7 +733,7 @@ class ParsezenMainWindow(QMainWindow):
                 stage=stage_kind,
             )
         )
-        if self._targeted_review_active and job is not None:
+        if self._queue_session.targeted_review and job is not None:
             self._job_execution.abort_targeted_review(job.id)
             if runtime is not None:
                 runtime.finished_at = monotonic()
@@ -816,11 +765,11 @@ class ParsezenMainWindow(QMainWindow):
 
     @Slot()
     def _processing_cancelled(self) -> None:
-        pause_requested = self._pause_requested
+        pause_requested = self._queue_session.pause_requested
         job = self._current_job()
         runtime = self._current_runtime()
         activity = self._capture_terminal_attempt_activity(job.id if job is not None else None)
-        if self._targeted_review_active and job is not None:
+        if self._queue_session.targeted_review and job is not None:
             self._job_execution.abort_targeted_review(job.id)
             if runtime is not None:
                 runtime.finished_at = monotonic()
@@ -852,11 +801,11 @@ class ParsezenMainWindow(QMainWindow):
 
     @Slot()
     def _processing_worker_finished(self) -> None:
-        if self._pause_requested:
+        if self._queue_session.pause_requested:
             self._finish_batch()
             return
-        if self._batch_running and self._job_execution.plan_run().job_ids:
-            self._current_job_id = None
+        if self._queue_session.has_next():
+            self._queue_session.release_current()
             self._start_next_batch_entry()
             return
         self._finish_batch()
@@ -1136,7 +1085,7 @@ class ParsezenMainWindow(QMainWindow):
     def _start_targeted_ai_review(self, job_id: str) -> None:
         """Act on a quality recommendation without reprocessing unaffected content."""
 
-        if self._is_processing or self._processing_runner.is_active:
+        if self._queue_session.running or self._processing_runner.is_active:
             return
         job = self._job_for_id(job_id)
         entry = self._entry_for_job_id(job_id)
@@ -1176,25 +1125,12 @@ class ParsezenMainWindow(QMainWindow):
                 context_window=self._settings.context_window or job.configuration.ai.context_window,
             )
             validate_settings(runtime_settings)
-            self._job_execution.begin_targeted_review(job.id)
-        except (OSError, ParsezenError, ValueError) as exc:
+            entry = self._queue_session.begin_targeted_review(job.id)
+        except (OSError, ParsezenError, RuntimeError, ValueError) as exc:
             QMessageBox.warning(self, "No se pudo iniciar la revisión", str(exc))
             return
 
         entry.result = base_result
-        entry.stage = None
-        entry.progress_current = 0
-        entry.progress_total = 0
-        entry.stages_seen = []
-        entry.started_at = monotonic()
-        entry.stage_started_at = None
-        entry.finished_at = None
-        self._current_job_id = job.id
-        self._targeted_review_active = True
-        self._batch_running = True
-        self._is_processing = True
-        self._active_run_job_ids = (job.id,)
-        self._pause_requested = False
         self.parsezen_workspace.clear_batch_summary()
         self.parsezen_workspace.show_batch_summary(
             "Revisión local iniciada. " + recommendation_summary(job.review_recommendation),
@@ -1965,7 +1901,7 @@ class ParsezenMainWindow(QMainWindow):
             (
                 candidate
                 for candidate in self._job_queue.jobs
-                if self._runtime_by_job.get(candidate.id) is entry
+                if self._queue_session.runtime_for(candidate.id) is entry
             ),
             None,
         )
@@ -2270,7 +2206,7 @@ class ParsezenMainWindow(QMainWindow):
         )
         if job is None:
             return
-        entry = self._runtime_by_job.get(job.id)
+        entry = self._queue_session.runtime_for(job.id)
         if entry is None:
             return
         self._result = entry.result
@@ -2286,7 +2222,7 @@ class ParsezenMainWindow(QMainWindow):
             (candidate for candidate in self._job_queue.jobs if str(candidate.source.path) == key),
             None,
         )
-        entry = self._runtime_by_job.get(job.id) if job is not None else None
+        entry = self._queue_session.runtime_for(job.id) if job is not None else None
         if entry is not None and entry.result is not None:
             self._open_local_path(entry.result.final_path)
 
@@ -2328,7 +2264,7 @@ class ParsezenMainWindow(QMainWindow):
                 except (OSError, ValueError):
                     LOGGER.warning("paused_job_checkpoint_cleanup_failed")
         self._job_queue.remove(job_id)
-        self._runtime_by_job.pop(job_id, None)
+        self._queue_session.remove_runtime(job_id)
         if self._selected_result_job_id == job_id:
             self._selected_result_job_id = None
             self._result = None
@@ -2352,11 +2288,10 @@ class ParsezenMainWindow(QMainWindow):
             self._start_after_preparation = False
             self._preflight_runner.cancel_preparation()
             return
-        if not self._is_processing:
+        if not self._queue_session.request_pause():
             return
-        self._pause_requested = True
         if not self._processing_runner.pause():
-            self._pause_requested = False
+            self._queue_session.reject_pause()
 
     @Slot(str)
     def _run_primary_action(self, mode: str) -> None:
@@ -2380,7 +2315,7 @@ class ParsezenMainWindow(QMainWindow):
                 (
                     candidate
                     for candidate in self._job_queue.jobs
-                    if (runtime := self._runtime_by_job.get(candidate.id)) is not None
+                    if (runtime := self._queue_session.runtime_for(candidate.id)) is not None
                     and runtime.result is not None
                 ),
                 None,
@@ -2407,14 +2342,14 @@ class ParsezenMainWindow(QMainWindow):
                 "No se pudo preparar el procesamiento",
                 str(exc),
             )
-            self._prepared_run = None
+            self._queue_session.set_prepared_run(None)
             return
-        if self._prepared_run is not None:
+        if self._queue_session.prepared_run is not None:
             self._start_after_preparation = False
             self._start_prepared_run()
 
     def _start_prepared_run(self) -> None:
-        prepared = self._prepared_run
+        prepared = self._queue_session.prepared_run
         if prepared is None or not prepared.plan.job_ids:
             self.parsezen_workspace.set_preparing_jobs(())
             QMessageBox.information(
@@ -2431,7 +2366,7 @@ class ParsezenMainWindow(QMainWindow):
                 "Revisa la configuración",
                 f"{first_issue.document_name}: {first_issue.message}",
             )
-            self._prepared_run = None
+            self._queue_session.set_prepared_run(None)
             return
         if (
             prepared.preflight is not None
@@ -2448,11 +2383,11 @@ class ParsezenMainWindow(QMainWindow):
             != QDialog.DialogCode.Accepted
         ):
             self.parsezen_workspace.set_preparing_jobs(())
-            self._prepared_run = None
+            self._queue_session.set_prepared_run(None)
             self._sync_workspace()
             return
         self._start_processing()
-        failed_to_start = not self._batch_running and any(
+        failed_to_start = not self._queue_session.running and any(
             (job := self._job_queue.get(job_id)) is not None
             and job.status
             in {
@@ -2475,8 +2410,7 @@ class ParsezenMainWindow(QMainWindow):
     @Slot(str)
     def _retry_failed_job(self, job_id: str) -> None:
         if (
-            self._is_processing
-            or self._batch_running
+            self._queue_session.running
             or self._processing_runner.is_active
             or self._local_ai_workflow.busy
             or self._preflight_runner.preparing
@@ -2494,7 +2428,7 @@ class ParsezenMainWindow(QMainWindow):
         self._begin_queue_preparation(plan, error_title="No se pudo preparar el reintento")
 
     def _begin_queue_preparation(self, plan: QueueRunPlan, *, error_title: str) -> None:
-        self._prepared_run = None
+        self._queue_session.set_prepared_run(None)
         self._preparation_error_title = error_title
         self.parsezen_workspace.set_preparing_jobs(plan.job_ids, can_pause=True)
         try:
@@ -2521,7 +2455,7 @@ class ParsezenMainWindow(QMainWindow):
                 "La preparaci\u00f3n devolvi\u00f3 un resultado no v\u00e1lido."
             )
             return
-        self._prepared_run = value
+        self._queue_session.set_prepared_run(value)
         for item in value.items:
             job = self._job_queue.get(item.job_id)
             if job is not None:
@@ -2557,14 +2491,14 @@ class ParsezenMainWindow(QMainWindow):
     def _preparation_failed(self, message: str) -> None:
         self.parsezen_workspace.set_preparing_jobs(())
         self._start_after_preparation = False
-        self._prepared_run = None
+        self._queue_session.set_prepared_run(None)
         QMessageBox.warning(self, self._preparation_error_title, message)
         self._sync_workspace()
 
     @Slot()
     def _preparation_cancelled(self) -> None:
         self.parsezen_workspace.set_preparing_jobs(())
-        self._prepared_run = None
+        self._queue_session.set_prepared_run(None)
         self._start_after_preparation = False
         self._sync_workspace()
 
@@ -2677,7 +2611,7 @@ class ParsezenMainWindow(QMainWindow):
         now = monotonic()
         estimates = {}
         for job in self._job_queue.jobs:
-            entry = self._runtime_by_job.get(job.id)
+            entry = self._queue_session.runtime_for(job.id)
             if job.status is not JobStatus.RUNNING or entry is None or entry.started_at is None:
                 continue
             forecast = self._latest_forecasts.get(job.id)
@@ -2701,7 +2635,8 @@ class ParsezenMainWindow(QMainWindow):
     ) -> None:
         if job is None or result.telemetry is None:
             return
-        item = self._prepared_run.item(job.id) if self._prepared_run is not None else None
+        prepared = self._queue_session.prepared_run
+        item = prepared.item(job.id) if prepared is not None else None
         profile = item.workload_profile if item is not None else None
         if profile is None:
             if self._current_runtime() is None:
@@ -2738,7 +2673,7 @@ class ParsezenMainWindow(QMainWindow):
 
     def _ensure_configurations(self) -> None:
         for job in self._job_queue.jobs:
-            self._runtime_by_job.setdefault(job.id, JobRuntime())
+            self._queue_session.ensure_runtime(job.id)
 
     def _project_jobs(self) -> tuple[DocumentJob, ...]:
         self._ensure_configurations()
@@ -2754,7 +2689,7 @@ class ParsezenMainWindow(QMainWindow):
         )
         integrity_reports = {
             job_id: entry.result.final_integrity_report
-            for job_id, entry in self._runtime_by_job.items()
+            for job_id, entry in self._queue_session.runtime.items()
             if entry.result is not None
             and entry.result.final_integrity_report is not None
             and self._job_queue.get(job_id) is not None
@@ -2798,7 +2733,7 @@ class ParsezenMainWindow(QMainWindow):
                     )
             for job_id in recovered.interrupted_job_ids:
                 self._job_execution.recover_interrupted(job_id)
-            self._runtime_by_job = dict(recovered.runtime)
+            self._queue_session.replace_runtime(dict(recovered.runtime))
         return recovered.retained_artifact_job_ids
 
     def _backup_and_reset_unreadable_state(self) -> bool:
@@ -2865,11 +2800,19 @@ class ParsezenMainWindow(QMainWindow):
             LOGGER.info("orphaned_review_artifacts_removed count=%d", len(removed))
 
     def _entry_for_job_id(self, job_id: str) -> JobRuntime | None:
-        return self._runtime_by_job.get(job_id) if self._job_queue.get(job_id) is not None else None
+        return (
+            self._queue_session.runtime_for(job_id)
+            if self._job_queue.get(job_id) is not None
+            else None
+        )
 
     def _job_for_runtime(self, runtime: JobRuntime) -> DocumentJob | None:
         return next(
-            (job for job in self._job_queue.jobs if self._runtime_by_job.get(job.id) is runtime),
+            (
+                job
+                for job in self._job_queue.jobs
+                if self._queue_session.runtime_for(job.id) is runtime
+            ),
             None,
         )
 

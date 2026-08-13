@@ -106,7 +106,9 @@ class _RuntimeView:
 
     @property
     def runtime(self):
-        return self.window._runtime_by_job[self.job_id]  # noqa: SLF001
+        runtime = self.window._queue_session.runtime_for(self.job_id)  # noqa: SLF001
+        assert runtime is not None
+        return runtime
 
     @property
     def path(self) -> Path:
@@ -210,7 +212,7 @@ class _RuntimeViews:
 
     def clear(self) -> None:
         self.window._job_queue.clear()  # noqa: SLF001
-        self.window._runtime_by_job.clear()  # noqa: SLF001
+        self.window._queue_session.replace_runtime({})  # noqa: SLF001
 
 
 def _entries(window: ParsezenMainWindow) -> _RuntimeViews:
@@ -452,11 +454,14 @@ def test_main_window_uses_independent_configuration_and_persists_queue(
         ),
     )
     window._prepare_independent_requests()  # noqa: SLF001
-    qtbot.waitUntil(lambda: window._prepared_run is not None, timeout=3_000)  # noqa: SLF001
+    qtbot.waitUntil(
+        lambda: window._queue_session.prepared_run is not None,  # noqa: SLF001
+        timeout=3_000,
+    )
     window._sync_workspace(force_persist=True)  # noqa: SLF001
 
     entries = tuple(_entries(window))  # noqa: SLF001
-    prepared = window._prepared_run  # noqa: SLF001
+    prepared = window._queue_session.prepared_run  # noqa: SLF001
     status_column = COLUMNS.index(JobColumn.NEXT_STEP)
     assert all(
         window.parsezen_workspace.job_table.job_model.index(row, status_column)
@@ -725,7 +730,7 @@ def test_main_window_recovers_exact_pending_review(qtbot, tmp_path: Path) -> Non
     )
     entry = _entries(window)[0]  # noqa: SLF001
     entry.status = ProjectedStatus.PROCESSING
-    window._current_job_id = entry.job_id  # noqa: SLF001
+    window._queue_session._current_job_id = entry.job_id  # noqa: SLF001
 
     window._processing_succeeded(  # noqa: SLF001
         ProcessResult(
@@ -777,7 +782,7 @@ def test_completed_direct_result_can_start_recommended_targeted_review(
     )
     entry = _entries(window)[0]  # noqa: SLF001
     entry.status = ProjectedStatus.PROCESSING
-    window._current_job_id = job.id  # noqa: SLF001
+    window._queue_session._current_job_id = job.id  # noqa: SLF001
     window._processing_succeeded(  # noqa: SLF001
         ProcessResult(
             final_path,
@@ -850,7 +855,7 @@ def test_direct_quality_recommendation_survives_an_existing_manual_review(
     )
     entry = _entries(window)[0]  # noqa: SLF001
     entry.status = ProjectedStatus.PROCESSING
-    window._current_job_id = job.id  # noqa: SLF001
+    window._queue_session._current_job_id = job.id  # noqa: SLF001
 
     window._processing_succeeded(  # noqa: SLF001
         ProcessResult(
@@ -890,7 +895,7 @@ def test_main_window_worker_events_update_authoritative_job_state(
         ),
     )
     entry.status = ProjectedStatus.PROCESSING
-    window._current_job_id = entry.job_id  # noqa: SLF001
+    window._queue_session._current_job_id = entry.job_id  # noqa: SLF001
     window._job_execution.start_next(job.id)  # noqa: SLF001
 
     window._show_stage(ProcessStage.CONVERTING)  # noqa: SLF001
@@ -938,10 +943,15 @@ def test_main_window_launch_order_comes_from_application_run_plan(
                 output=replace(job.configuration.output, configured=True),
             ),
         )
-    window._job_execution.begin_run()  # noqa: SLF001
+    plan = window._job_execution.plan_run()  # noqa: SLF001
+    window._queue_session.set_prepared_run(  # noqa: SLF001
+        PreparedQueueRun(plan, (), ())
+    )
+    window._queue_session.begin_prepared_run()  # noqa: SLF001
 
-    first_running = window._next_pending_job()  # noqa: SLF001
-    assert first_running is not None
+    first_claim = window._queue_session.claim_next()  # noqa: SLF001
+    assert first_claim is not None
+    first_running = first_claim[0]
     first_job = window._job_queue.for_source(first)  # noqa: SLF001
     assert first_job is not None
     window._job_execution.fail(  # noqa: SLF001
@@ -950,7 +960,9 @@ def test_main_window_launch_order_comes_from_application_run_plan(
         error_code="failed",
         error_message="Error",
     )
-    second_running = window._next_pending_job()  # noqa: SLF001
+    window._queue_session.release_current()  # noqa: SLF001
+    second_claim = window._queue_session.claim_next()  # noqa: SLF001
+    second_running = second_claim[0] if second_claim is not None else None
 
     assert first_running.source.path == first
     assert second_running is not None
@@ -1020,7 +1032,7 @@ def test_main_window_invalidates_review_when_original_changed(
     )
     entry = _entries(window)[0]
     entry.status = ProjectedStatus.PROCESSING
-    window._current_job_id = entry.job_id
+    window._queue_session._current_job_id = entry.job_id  # noqa: SLF001
     window._processing_succeeded(
         ProcessResult(
             final_path=final_path,
@@ -1070,7 +1082,7 @@ def test_main_window_blocks_stale_review_before_opening_it(
     window.set_source_paths((source,))
     entry = _entries(window)[0]
     entry.status = ProjectedStatus.PROCESSING
-    window._current_job_id = entry.job_id
+    window._queue_session._current_job_id = entry.job_id  # noqa: SLF001
     window._processing_succeeded(
         ProcessResult(
             final_path=final_path,
@@ -1115,7 +1127,7 @@ def test_main_window_keeps_review_pending_when_finalization_cannot_be_recorded(
     window.set_source_paths((source,))
     entry = _entries(window)[0]  # noqa: SLF001
     entry.status = ProjectedStatus.PROCESSING
-    window._current_job_id = entry.job_id  # noqa: SLF001
+    window._queue_session._current_job_id = entry.job_id  # noqa: SLF001
     result = ProcessResult(
         final_path,
         review_original_path=source,
@@ -1397,17 +1409,19 @@ def test_main_window_routes_configuration_review_and_primary_actions(
 
     def prepare() -> None:
         actions.append("prepare")
-        window._prepared_run = PreparedQueueRun(  # noqa: SLF001
-            QueueRunPlan(RunMode.NEW, (job.id,)),
-            (),
-            (),
+        window._queue_session.set_prepared_run(  # noqa: SLF001
+            PreparedQueueRun(
+                QueueRunPlan(RunMode.NEW, (job.id,)),
+                (),
+                (),
+            )
         )
 
     monkeypatch.setattr(window, "_prepare_independent_requests", prepare)
 
     def start() -> None:
         actions.append("start")
-        window._batch_running = True
+        window._queue_session._running = True  # noqa: SLF001
 
     monkeypatch.setattr(window, "_start_processing", start)
 
@@ -1416,7 +1430,7 @@ def test_main_window_routes_configuration_review_and_primary_actions(
     entry.status = ProjectedStatus.COMPLETED
     window._run_primary_action("open_folder")
     window._run_primary_action("process")
-    window._batch_running = False
+    window._queue_session._running = False  # noqa: SLF001
 
     assert actions == ["pause", "review", "select", "folder", "prepare", "start"]
 
@@ -1691,7 +1705,7 @@ def test_contextual_retry_targets_only_the_failed_document(
     monkeypatch.setattr(
         window,
         "_start_prepared_run",
-        lambda: started.append(window._prepared_run.plan),  # noqa: SLF001
+        lambda: started.append(window._queue_session.prepared_run.plan),  # type: ignore[union-attr]  # noqa: SLF001
     )
 
     window._retry_failed_job(failed_job.id)  # noqa: SLF001
@@ -2760,7 +2774,10 @@ def test_processing_controller_projects_progress_success_failure_and_pause(
         ),
     )
     window._prepare_independent_requests()  # noqa: SLF001
-    qtbot.waitUntil(lambda: window._prepared_run is not None, timeout=3_000)  # noqa: SLF001
+    qtbot.waitUntil(
+        lambda: window._queue_session.prepared_run is not None,  # noqa: SLF001
+        timeout=3_000,
+    )
     starts: list[object] = []
     monkeypatch.setattr(
         window._processing_runner,  # noqa: SLF001
@@ -2786,7 +2803,7 @@ def test_processing_controller_projects_progress_success_failure_and_pause(
     window._processing_worker_finished()  # noqa: SLF001
     assert not window.is_processing
 
-    assert window._prepared_run is None  # noqa: SLF001
+    assert window._queue_session.prepared_run is None  # noqa: SLF001
 
     failed_source = tmp_path / "failure.txt"
     failed_source.write_text("Original", encoding="utf-8")
@@ -2804,7 +2821,10 @@ def test_processing_controller_projects_progress_success_failure_and_pause(
         ),
     )
     window._prepare_independent_requests()  # noqa: SLF001
-    qtbot.waitUntil(lambda: window._prepared_run is not None, timeout=3_000)  # noqa: SLF001
+    qtbot.waitUntil(
+        lambda: window._queue_session.prepared_run is not None,  # noqa: SLF001
+        timeout=3_000,
+    )
     window._start_processing()  # noqa: SLF001
     failed_entry = _entries(window)[0]  # noqa: SLF001
     window._show_stage(ProcessStage.READING)  # noqa: SLF001
@@ -2829,10 +2849,13 @@ def test_processing_controller_projects_progress_success_failure_and_pause(
         ),
     )
     window._prepare_independent_requests()  # noqa: SLF001
-    qtbot.waitUntil(lambda: window._prepared_run is not None, timeout=3_000)  # noqa: SLF001
+    qtbot.waitUntil(
+        lambda: window._queue_session.prepared_run is not None,  # noqa: SLF001
+        timeout=3_000,
+    )
     window._start_processing()  # noqa: SLF001
     paused_entry = _entries(window)[0]  # noqa: SLF001
-    window._pause_requested = True  # noqa: SLF001
+    assert window._queue_session.request_pause()  # noqa: SLF001
     window._processing_cancelled()  # noqa: SLF001
     assert paused_entry.status is ProjectedStatus.PAUSED
     window._processing_worker_finished()  # noqa: SLF001
@@ -2896,7 +2919,10 @@ def test_pause_keeps_runner_domain_checkpoints_activity_and_scheduler_consistent
         lambda request, *_args, **_kwargs: cleaned.append(request.source_path),
     )
     window._prepare_independent_requests()  # noqa: SLF001
-    qtbot.waitUntil(lambda: window._prepared_run is not None, timeout=3_000)  # noqa: SLF001
+    qtbot.waitUntil(
+        lambda: window._queue_session.prepared_run is not None,  # noqa: SLF001
+        timeout=3_000,
+    )
     window._start_processing()  # noqa: SLF001
     qtbot.waitUntil(started.is_set, timeout=2_000)
 
@@ -2948,7 +2974,7 @@ def test_recent_failure_captures_the_runner_attempt_before_history_is_written(
     )
     entry = _entries(window)[0]  # noqa: SLF001
     entry.status = ProjectedStatus.PROCESSING
-    window._current_job_id = entry.job_id  # noqa: SLF001
+    window._queue_session._current_job_id = entry.job_id  # noqa: SLF001
     window._job_execution.start_next(job.id)  # noqa: SLF001
     window._show_stage(ProcessStage.TRANSLATING)  # noqa: SLF001
 
@@ -3363,9 +3389,9 @@ def test_main_window_boundary_actions_fail_safely_without_hidden_state(
     assert window._processing_run_flags() == (False, False)  # noqa: SLF001
     assert not window._local_ai_required()  # noqa: SLF001
 
-    window._prepared_run = None  # noqa: SLF001
+    window._queue_session.set_prepared_run(None)  # noqa: SLF001
     window._start_processing()  # noqa: SLF001
-    window._current_job_id = None  # noqa: SLF001
+    window._queue_session._current_job_id = None  # noqa: SLF001
     window._show_stage(ProcessStage.READING)  # noqa: SLF001
     window._show_improvement_progress(2, 1)  # noqa: SLF001
     window._processing_succeeded(ProcessResult(tmp_path / "orphan.md"))  # noqa: SLF001
@@ -3373,10 +3399,10 @@ def test_main_window_boundary_actions_fail_safely_without_hidden_state(
     window._processing_cancelled()  # noqa: SLF001
 
     processing_close = QCloseEvent()
-    window._is_processing = True  # noqa: SLF001
+    window._queue_session._running = True  # noqa: SLF001
     window.closeEvent(processing_close)
     assert not processing_close.isAccepted()
-    window._is_processing = False  # noqa: SLF001
+    window._queue_session._running = False  # noqa: SLF001
     ai_close = QCloseEvent()
     window._local_ai._discovery_worker = Mock()  # noqa: SLF001
     window.closeEvent(ai_close)
@@ -3467,11 +3493,11 @@ def test_main_window_boundary_actions_fail_safely_without_hidden_state(
         lambda: next(pauses),
     )
     window._pause_processing()  # noqa: SLF001
-    window._is_processing = True  # noqa: SLF001
+    window._queue_session._running = True  # noqa: SLF001
     window._pause_processing()  # noqa: SLF001
-    assert not window._pause_requested  # noqa: SLF001
+    assert not window._queue_session.pause_requested  # noqa: SLF001
     window._pause_processing()  # noqa: SLF001
-    assert window._pause_requested  # noqa: SLF001
+    assert window._queue_session.pause_requested  # noqa: SLF001
 
 
 def test_primary_action_reports_each_non_runnable_queue_state(
@@ -3513,7 +3539,7 @@ def test_primary_action_reports_each_non_runnable_queue_state(
     monkeypatch.setattr(
         window,
         "_prepare_independent_requests",
-        lambda: setattr(window, "_prepared_run", empty),
+        lambda: window._queue_session.set_prepared_run(empty),  # noqa: SLF001
     )
     window._run_primary_action("run")  # noqa: SLF001
     assert notices[-1][0] == "Nada pendiente"
@@ -3526,7 +3552,7 @@ def test_primary_action_reports_each_non_runnable_queue_state(
     monkeypatch.setattr(
         window,
         "_prepare_independent_requests",
-        lambda: setattr(window, "_prepared_run", invalid),
+        lambda: window._queue_session.set_prepared_run(invalid),  # noqa: SLF001
     )
     window._run_primary_action("run")  # noqa: SLF001
     assert notices[-1][0] == "Revisa la configuración"
@@ -3535,7 +3561,7 @@ def test_primary_action_reports_each_non_runnable_queue_state(
     monkeypatch.setattr(
         window,
         "_prepare_independent_requests",
-        lambda: setattr(window, "_prepared_run", runnable),
+        lambda: window._queue_session.set_prepared_run(runnable),  # noqa: SLF001
     )
     monkeypatch.setattr(window, "_start_processing", lambda: None)
     window._run_primary_action("run")  # noqa: SLF001

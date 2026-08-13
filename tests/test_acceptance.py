@@ -277,7 +277,8 @@ def test_acceptance_window_processes_a_document_in_the_background(
     window._sync_workspace()
 
     window.parsezen_workspace.primary_button.click()
-    runtime = window._runtime_by_job[job.id]
+    runtime = window._queue_session.runtime_for(job.id)
+    assert runtime is not None
     qtbot.waitUntil(
         lambda: (
             runtime.result is not None or window._job_queue.get(job.id).status is JobStatus.FAILED

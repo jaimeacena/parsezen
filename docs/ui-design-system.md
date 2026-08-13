@@ -293,9 +293,9 @@ cancelación y los estados terminales mantienen explicación y siguiente paso.
   Es contenido interoperable del documento, no interfaz de Parsezen, y no puede depender del tema
   de la aplicación.
 - `presentation/main_window.py` sigue siendo un coordinador amplio porque reúne navegación,
-  proyección de cola y apertura de revisiones. El trabajo físico y la IA local ya están aislados en
-  controladores propios; nuevas capacidades deben entrar en servicios equivalentes y no volver a
-  crecer como estado oculto de widgets.
+  proyección de cola y apertura de revisiones. La sesión secuencial, el trabajo físico y la IA local
+  ya tienen propietarios explícitos; queda extraer de la ventana la orquestación visual de revisión
+  sin volver a crear estado oculto de widgets.
 - PySide6 no ofrece un equivalente web de `forced-colors`; el modo de alto contraste se delega a la
   paleta estándar de Windows.
 

@@ -315,11 +315,17 @@ configuración, selección del siguiente documento, progreso y estado de ejecuci
 un documento una sola vez: si falla, la ejecución continúa con el siguiente y sólo una acción
 posterior de reintento vuelve a elegirlo.
 
+`application.queue_session.QueueSession` posee el estado efímero de esa ejecución secuencial: plan
+preparado, runtimes por trabajo, documento activo, conjunto iniciado, revisión dirigida, petición de
+pausa y motivo terminal. Sus transiciones de inicio, selección, continuación y cierre no dependen de
+Qt. `ParsezenMainWindow` conserva la composición y la presentación de avisos, pero ya no mantiene
+copias de `_is_processing`, `_batch_running`, `_pause_requested` o `_current_job_id`.
+
 `ProcessingRunner`, en la capa de presentación, es el único adaptador Qt que posee el trabajador
 físico y su token de cancelación. Recibe una solicitud ya preparada, ejecuta el procesador estable en
 el `QThreadPool` y publica eventos de fase, progreso, resultado, error, cancelación y finalización. La
-ventana se limita a conectar esos eventos con `JobExecutionController`; ya no construye ni conserva
-trabajadores, y ninguna regla del planificador depende de Qt.
+ventana conecta esos eventos con `QueueSession` y los coordinadores de resultados; ya no construye
+ni conserva trabajadores, y ninguna regla del planificador depende de Qt.
 
 El procesador registra telemetría física con eventos `processing_*`; el runner registra el ciclo del
 intento como `processing_attempt_*`. El dominio no escribe logs y Diagnóstico se limita a representar
