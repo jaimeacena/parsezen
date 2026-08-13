@@ -2,17 +2,14 @@
 
 from __future__ import annotations
 
-import base64
 import logging
 import os
-import queue
 import re
 import secrets
 import shutil
 import subprocess
 import sys
 import tempfile
-import threading
 import time
 import uuid
 from collections.abc import Callable, Iterator
@@ -30,6 +27,16 @@ from parsezen.ocr_protocol import (
     OcrProtocolError,
     receive_message,
     send_message,
+)
+from parsezen.workers.private_channel import (
+    PrivateChannelAcceptError,
+    PrivateChannelProcessExited,
+    PrivateChannelTimeout,
+    accept_private_connection,
+    private_listener,
+    receive_initial_message,
+    start_private_process,
+    stop_private_process,
 )
 
 _AUTH_ENVIRONMENT_VARIABLE = "PARSEZEN_OCR_AUTH"
@@ -188,21 +195,8 @@ def _validated_pages(page_numbers: set[int]) -> set[int]:
 
 @contextmanager
 def _private_listener(auth_key: bytes) -> Iterator[tuple[Listener, str, str]]:
-    temporary_directory: tempfile.TemporaryDirectory[str] | None = None
-    if os.name == "nt":
-        family = "AF_PIPE"
-        address = rf"\\.\pipe\parsezen-ocr-{uuid.uuid4().hex}"
-    else:
-        family = "AF_UNIX"
-        temporary_directory = tempfile.TemporaryDirectory(prefix="parsezen-ocr-")
-        address = str(Path(temporary_directory.name) / "worker.sock")
-    listener = Listener(address=address, family=family, authkey=auth_key)
-    try:
-        yield listener, address, family
-    finally:
-        listener.close()
-        if temporary_directory is not None:
-            temporary_directory.cleanup()
+    with private_listener(auth_key, channel_name="ocr") as opened_listener:
+        yield opened_listener
 
 
 def _start_worker_process(
@@ -210,40 +204,15 @@ def _start_worker_process(
     family: str,
     auth_key: bytes,
 ) -> subprocess.Popen[bytes]:
-    environment = os.environ.copy()
-    environment[_AUTH_ENVIRONMENT_VARIABLE] = base64.urlsafe_b64encode(auth_key).decode("ascii")
-    if getattr(sys, "frozen", False):
-        command = [
-            sys.executable,
-            "--ocr-worker",
-            "--address",
-            address,
-            "--family",
-            family,
-        ]
-    else:
-        source_root = str(Path(__file__).resolve().parents[1])
-        inherited_path = environment.get("PYTHONPATH")
-        environment["PYTHONPATH"] = (
-            os.pathsep.join((source_root, inherited_path)) if inherited_path else source_root
-        )
-        command = [
-            sys.executable,
-            "-m",
-            "parsezen.ocr_worker",
-            "--address",
-            address,
-            "--family",
-            family,
-        ]
-    return subprocess.Popen(
-        command,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        env=environment,
-        close_fds=True,
-        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    return start_private_process(
+        address,
+        family,
+        auth_key,
+        auth_environment_variable=_AUTH_ENVIRONMENT_VARIABLE,
+        module="parsezen.ocr_worker",
+        frozen_switch="--ocr-worker",
+        executable=sys.executable,
+        frozen=getattr(sys, "frozen", False),
     )
 
 
@@ -252,33 +221,25 @@ def _accept_worker(
     process: subprocess.Popen[bytes],
     cancellation: CancellationToken | None,
 ) -> Connection:
-    accepted: queue.Queue[Connection | BaseException] = queue.Queue(maxsize=1)
-
-    def accept() -> None:
-        try:
-            accepted.put(listener.accept())
-        except BaseException as exc:  # pragma: no cover - platform listener details
-            accepted.put(exc)
-
-    threading.Thread(target=accept, name="ocr-worker-accept", daemon=True).start()
-    deadline = time.monotonic() + _STARTUP_TIMEOUT_SECONDS
-    while True:
-        check_cancelled(cancellation)
-        if process.poll() is not None:
-            raise ConversionError(
-                "El proceso OCR local no pudo iniciarse. Comprueba la instalación."
-            )
-        try:
-            result = accepted.get(timeout=_POLL_SECONDS)
-        except queue.Empty:
-            if time.monotonic() >= deadline:
-                raise ConversionError(
-                    "El proceso OCR local tardó demasiado en iniciarse. Vuelve a intentarlo."
-                ) from None
-            continue
-        if isinstance(result, BaseException):
-            raise ConversionError("No se pudo abrir el canal privado del OCR local.") from result
-        return result
+    try:
+        return accept_private_connection(
+            listener,
+            process,
+            cancellation,
+            timeout_seconds=_STARTUP_TIMEOUT_SECONDS,
+            poll_seconds=_POLL_SECONDS,
+            thread_name="ocr-worker-accept",
+        )
+    except PrivateChannelProcessExited as exc:
+        raise ConversionError(
+            "El proceso OCR local no pudo iniciarse. Comprueba la instalación."
+        ) from exc
+    except PrivateChannelTimeout as exc:
+        raise ConversionError(
+            "El proceso OCR local tardó demasiado en iniciarse. Vuelve a intentarlo."
+        ) from exc
+    except PrivateChannelAcceptError as exc:
+        raise ConversionError("No se pudo abrir el canal privado del OCR local.") from exc
 
 
 def _expect_hello(
@@ -296,17 +257,19 @@ def _receive_until_deadline(
     process: subprocess.Popen[bytes],
     cancellation: CancellationToken | None,
 ) -> dict[str, Any]:
-    deadline = time.monotonic() + _STARTUP_TIMEOUT_SECONDS
-    while True:
-        check_cancelled(cancellation)
-        if connection.poll(_POLL_SECONDS):
-            return receive_message(connection)
-        if process.poll() is not None:
-            raise EOFError
-        if time.monotonic() >= deadline:
-            raise ConversionError(
-                "El proceso OCR local tardó demasiado en responder. Vuelve a intentarlo."
-            )
+    try:
+        return receive_initial_message(
+            connection,
+            process,
+            cancellation,
+            receive_message=receive_message,
+            timeout_seconds=_STARTUP_TIMEOUT_SECONDS,
+            poll_seconds=_POLL_SECONDS,
+        )
+    except PrivateChannelTimeout as exc:
+        raise ConversionError(
+            "El proceso OCR local tardó demasiado en responder. Vuelve a intentarlo."
+        ) from exc
 
 
 def _receive_worker_result(
@@ -454,14 +417,7 @@ def _wait_for_clean_exit(process: subprocess.Popen[bytes]) -> None:
 
 
 def _stop_worker(process: subprocess.Popen[bytes]) -> None:
-    if process.poll() is not None:
-        return
-    process.terminate()
-    try:
-        process.wait(timeout=_PROCESS_EXIT_TIMEOUT_SECONDS)
-    except subprocess.TimeoutExpired:
-        process.kill()
-        process.wait(timeout=_PROCESS_EXIT_TIMEOUT_SECONDS)
+    stop_private_process(process, exit_timeout_seconds=_PROCESS_EXIT_TIMEOUT_SECONDS)
 
 
 def _elapsed_milliseconds(started_at: float) -> int:

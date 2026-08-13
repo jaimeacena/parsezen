@@ -142,6 +142,18 @@ def test_pipeline_publication_does_not_depend_on_transform_implementations() -> 
     assert "parsezen.offline_translation" not in imported
 
 
+def test_private_worker_channel_remains_protocol_agnostic() -> None:
+    imported = _imports(_PACKAGE_ROOT / "workers" / "private_channel.py")
+
+    assert not any(
+        name.startswith(("parsezen.ocr", "parsezen.offline_translation")) for name in imported
+    )
+    assert "parsezen.workers.private_channel" in _imports(_PACKAGE_ROOT / "ocr_executor.py")
+    assert "parsezen.workers.private_channel" in _imports(
+        _PACKAGE_ROOT / "offline_translation_executor.py"
+    )
+
+
 def test_main_window_delegates_the_local_ai_workflow() -> None:
     delegated = _class_methods(
         _PACKAGE_ROOT / "presentation" / "local_ai_workflow.py",

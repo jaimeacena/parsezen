@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-import json
 from typing import Any
+
+from parsezen.workers.private_channel import receive_bounded_json, send_bounded_json
 
 PROTOCOL_VERSION = 2
 MAX_MESSAGE_BYTES = 16 * 1024 * 1024
@@ -17,31 +18,25 @@ class OcrProtocolError(Exception):
 
 def send_message(connection: Any, message: dict[str, Any]) -> None:
     """Serialize one bounded JSON object without using pickle."""
-    if not isinstance(message.get("type"), str):
-        raise OcrProtocolError("El mensaje OCR no declara un tipo válido.")
-    try:
-        payload = json.dumps(
-            message,
-            ensure_ascii=False,
-            separators=(",", ":"),
-        ).encode("utf-8")
-    except (TypeError, ValueError) as exc:
-        raise OcrProtocolError("El mensaje OCR no se puede serializar.") from exc
-    if len(payload) > MAX_MESSAGE_BYTES:
-        raise OcrProtocolError("El mensaje OCR supera el límite permitido.")
-    connection.send_bytes(payload)
+    send_bounded_json(
+        connection,
+        message,
+        max_bytes=MAX_MESSAGE_BYTES,
+        error_type=OcrProtocolError,
+        invalid_type_message="El mensaje OCR no declara un tipo válido.",
+        serialization_message="El mensaje OCR no se puede serializar.",
+        size_message="El mensaje OCR supera el límite permitido.",
+    )
 
 
 def receive_message(connection: Any) -> dict[str, Any]:
     """Read and validate one bounded JSON object without deserializing objects."""
-    try:
-        payload = connection.recv_bytes(MAX_MESSAGE_BYTES)
-        message = json.loads(payload.decode("utf-8"))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise OcrProtocolError("El canal OCR recibió un mensaje no válido.") from exc
-    if not isinstance(message, dict) or not isinstance(message.get("type"), str):
-        raise OcrProtocolError("El canal OCR recibió un mensaje no válido.")
-    return message
+    return receive_bounded_json(
+        connection,
+        max_bytes=MAX_MESSAGE_BYTES,
+        error_type=OcrProtocolError,
+        invalid_message="El canal OCR recibió un mensaje no válido.",
+    )
 
 
 def normalized_page_numbers(value: Any, *, field_name: str) -> set[int]:

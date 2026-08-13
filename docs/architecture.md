@@ -69,6 +69,11 @@ propias ya no están mezclados:
   inmutable de página y `pdf_checkpoints.py` serializa y valida su reanudación sin abrir PDFs ni
   invocar OCR.
 
+OCR y Argos conservan protocolos, límites y máquinas de estado independientes. Comparten únicamente
+las primitivas mecánicas de `workers/private_channel.py`: JSON acotado sin pickle, listener local
+autenticado, arranque oculto, espera cancelable y cierre terminate/kill. Esta pieza no conoce páginas,
+Markdown, diagnósticos ni resultados, y por tanto no constituye un framework común de workers.
+
 En presentación, `local_ai_workflow.py` posee tanto el estado visible como el flujo de descubrir,
 recomendar, instalar, seleccionar y borrar modelos. Recibe dependencias y callbacks tipados, conecta
 explícitamente las señales del controlador y proyecta sus cambios al workspace. `main_window.py`

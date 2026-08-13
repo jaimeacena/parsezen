@@ -2,6 +2,9 @@
 
 ## Próxima versión
 
+- OCR y Argos comparten ahora las primitivas mecánicas de su canal privado autenticado, proceso
+  oculto, espera cancelable y mensajes JSON acotados. Sus protocolos, límites y máquinas de estado
+  siguen separados.
 - `process_document()` conserva su fachada, mientras sus contratos inmutables pasan a
   `pipeline/contracts.py` y la preparación a `pipeline/prepare.py`; los consumidores internos dejan
   de importar el orquestador solo por tipos. `pipeline/publish.py` concentra build, integridad y
