@@ -41,7 +41,9 @@ solicitud, preparación, transformación, resultado y telemetría viven en `pipe
 modo que aplicación, infraestructura y presentación ya no necesitan importar el orquestador para
 intercambiar datos. `pipeline/prepare.py` convierte el origen, resuelve el rango PDF, preserva
 recursos, recopila calidad inicial y construye el documento semántico sin transformar texto ni
-publicar archivos. La ruta EPUB→EPUB separa además traducción del paquete, preparación
+publicar archivos. `pipeline/publish.py` recibe únicamente los contratos preparados, construye la
+salida elegida, aplica integridad y usa las primitivas atómicas existentes; no traduce ni invoca IA.
+La ruta EPUB→EPUB separa además traducción del paquete, preparación
 editable/revisión y publicación. Estos límites usan contratos concretos y evitan una jerarquía
 genérica de procesadores que no aportaría comportamiento actual.
 

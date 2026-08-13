@@ -134,6 +134,14 @@ def test_pipeline_preparation_does_not_depend_on_transform_or_publish() -> None:
     assert "parsezen.output" not in imported
 
 
+def test_pipeline_publication_does_not_depend_on_transform_implementations() -> None:
+    imported = _imports(_PACKAGE_ROOT / "pipeline" / "publish.py")
+
+    assert "parsezen.processing" not in imported
+    assert "parsezen.local_ai_transport" not in imported
+    assert "parsezen.offline_translation" not in imported
+
+
 def test_main_window_delegates_the_local_ai_workflow() -> None:
     delegated = _class_methods(
         _PACKAGE_ROOT / "presentation" / "local_ai_workflow.py",
