@@ -479,6 +479,24 @@ La presentación expone ese coordinador como una única superficie `Revisión de
 progreso global y fase actual; no obliga a elegir qué editor abrir. Un documento bloqueado queda
 fuera de la selección automática, pero la cola continúa con el siguiente trabajo elegible.
 
+### Decisión sobre separar el review gate
+
+Tras extraer el pipeline, la sesión de cola y las instantáneas v2 se reevaluó separar por completo
+ejecución y gate. El modelo actual tiene nueve estados de etapa y veinte transiciones permitidas; solo
+`BLOCKED_FOR_REVIEW` representa el gate. `ReviewSession` tiene cuatro estados y el coordinador que
+reconcilia ambos ocupa 255 líneas con 15 ramas. Hay 24 referencias de producción a cada uno de
+`BLOCKED_FOR_REVIEW` y `ReviewStatus`, y ocho pruebas contractuales cubren avance, crash entre
+escrituras, pendiente, desfase, reapertura, invalidación dependiente y reinicio desde SQLite.
+
+La alternativa no elimina esas reglas: la ejecución todavía necesitaría `READY` e `INVALIDATED`, y
+un `ReviewGate` separado añadiría al menos `NONE/PENDING/APPLIED/DISMISSED`, su persistencia y una
+asociación con la etapa. Si el gate vive solo en el repositorio de revisiones, `DocumentJob` y el
+scheduler dejarían de poder decidir por sí mismos si un trabajo es ejecutable; si se copia al trabajo,
+se conserva la misma duplicación con una migración mayor. Con la suite actual en verde y sin una fuente
+de fallos demostrada, no se implementa el rediseño: reduciría un estado de etapa, pero no complejidad
+neta. Se reconsiderará solo ante incidencias repetidas de reconciliación o si las revisiones dejan de
+estar ligadas a una etapa concreta.
+
 Una fase revisada conserva los artefactos elegidos y el contador de intentos del trabajo automático:
 abrir una revisión sobre un resultado ya calculado no se registra como un reprocesamiento. Si la
 publicación final o el editor no pueden terminar, se vuelve a exponer la última fase revisada sin

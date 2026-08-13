@@ -2,6 +2,9 @@
 
 ## Próxima versión
 
+- La evaluación del review gate conserva el modelo actual: separar ejecución y revisión eliminaría
+  un estado de etapa, pero añadiría otra proyección durable y dependencia del scheduler sin reducir
+  las reglas de recuperación. La decisión y sus métricas quedan documentadas.
 - Se documenta el modelo de amenazas local: los payloads documentales recuperables usan DPAPI, los
   metadatos operativos de SQLite, configuración e historial dependen del perfil de Windows, y un
   atacante que ya opera como el mismo usuario queda fuera de alcance. También se inventariaron los
