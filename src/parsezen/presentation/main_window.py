@@ -80,7 +80,6 @@ from parsezen.application.run_preparation import PreparedQueueRun
 from parsezen.application.run_validation import BatchValidationIssue
 from parsezen.application.runtime_mapping import (
     request_and_settings_from_job,
-    stage_kind_from_process_stage,
 )
 from parsezen.application.scheduler import QueueRunPlan, RunMode
 from parsezen.application.workspace_recovery import (
@@ -109,6 +108,7 @@ from parsezen.domain.jobs import (
     TranslationConfiguration,
 )
 from parsezen.domain.outcomes import EarlyCheckReport, OutcomeSummary
+from parsezen.domain.process_lifecycle import stage_kind_from_process_stage
 from parsezen.domain.reviews import ReviewChoice, ReviewKind, ReviewSession, ReviewStatus
 from parsezen.domain.stages import StageKind, StageStatus
 from parsezen.errors import ParsezenError

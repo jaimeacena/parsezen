@@ -20,9 +20,9 @@ from parsezen.domain.attempt_activity import (
     extract_diagnostic_reference,
     is_safe_token,
     make_failure_snapshot,
-    phase_for_process_stage,
 )
 from parsezen.domain.outcomes import EarlyCheckReport
+from parsezen.domain.process_lifecycle import phase_for_process_stage
 from parsezen.errors import EarlyCheckError, ParsezenError, ProcessingCancelledError
 from parsezen.failure_recovery import ProcessingFailure
 from parsezen.processing import ProcessRequest, ProcessResult, ProcessStage, process_document
@@ -100,14 +100,14 @@ class ProcessingWorker(QRunnable):
 
     def run(self) -> None:
         LOGGER.info(
-            "processing_started attempt_id=%s phase=%s",
+            "processing_attempt_started attempt_id=%s phase=%s",
             self._attempt_id,
             AttemptPhase.PREPARATION.value,
         )
         try:
             if self._early_check is not None:
                 LOGGER.info(
-                    "processing_early_check_started attempt_id=%s phase=%s",
+                    "processing_attempt_early_check_started attempt_id=%s phase=%s",
                     self._attempt_id,
                     AttemptPhase.EARLY_CHECK.value,
                 )
@@ -128,7 +128,7 @@ class ProcessingWorker(QRunnable):
                 )
                 self.signals.early_check_completed.emit(report)
                 LOGGER.info(
-                    "processing_early_check_completed attempt_id=%s phase=%s "
+                    "processing_attempt_early_check_completed attempt_id=%s phase=%s "
                     "blocking=%s sampled_pages=%d warning_pages=%d",
                     self._attempt_id,
                     AttemptPhase.EARLY_CHECK.value,
@@ -159,14 +159,14 @@ class ProcessingWorker(QRunnable):
             self._log_incomplete_early_check("cancelled")
             if self._pause_requested:
                 LOGGER.info(
-                    "processing_paused attempt_id=%s phase=%s error_code=pause "
+                    "processing_attempt_paused attempt_id=%s phase=%s error_code=pause "
                     "error_type=ProcessingCancelledError",
                     self._attempt_id,
                     self.failure_phase.value,
                 )
             else:
                 LOGGER.info(
-                    "processing_cancelled attempt_id=%s phase=%s "
+                    "processing_attempt_cancelled attempt_id=%s phase=%s "
                     "error_code=cancellation error_type=ProcessingCancelledError",
                     self._attempt_id,
                     self.failure_phase.value,
@@ -177,7 +177,7 @@ class ProcessingWorker(QRunnable):
             failure = ProcessingFailure.from_exception(exc)
             self._log_failure(failure)
             LOGGER.warning(
-                "processing_task_failed error_type=%s attempt_id=%s",
+                "processing_attempt_task_failed error_type=%s attempt_id=%s",
                 type(exc).__name__,
                 self._attempt_id,
             )
@@ -187,14 +187,14 @@ class ProcessingWorker(QRunnable):
             failure = ProcessingFailure.from_exception(exc)
             self._log_failure(failure)
             LOGGER.error(
-                "unexpected_processing_task_failure error_type=%s attempt_id=%s",
+                "unexpected_processing_attempt_failure error_type=%s attempt_id=%s",
                 type(exc).__name__,
                 self._attempt_id,
             )
             self.signals.failed.emit(failure)
         else:
             LOGGER.info(
-                "processing_completed attempt_id=%s phase=%s",
+                "processing_attempt_completed attempt_id=%s phase=%s",
                 self._attempt_id,
                 AttemptPhase.COMPLETION.value,
             )
@@ -223,7 +223,7 @@ class ProcessingWorker(QRunnable):
             reference = secrets.token_hex(4)
         self._diagnostic_reference = reference
         LOGGER.warning(
-            "processing_failed attempt_id=%s phase=%s error_code=%s error_type=%s "
+            "processing_attempt_failed attempt_id=%s phase=%s error_code=%s error_type=%s "
             "incident=%s diagnostic_reference=%s",
             self._attempt_id,
             self.failure_phase.value,
@@ -237,7 +237,7 @@ class ProcessingWorker(QRunnable):
         if not self._early_check_active or self._early_check_completed:
             return
         LOGGER.info(
-            "processing_early_check_completed attempt_id=%s phase=%s outcome=%s "
+            "processing_attempt_early_check_completed attempt_id=%s phase=%s outcome=%s "
             "blocking=false sampled_pages=0 warning_pages=0",
             self._attempt_id,
             AttemptPhase.EARLY_CHECK.value,

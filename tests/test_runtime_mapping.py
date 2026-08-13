@@ -5,7 +5,6 @@ import pytest
 from parsezen.application.runtime_mapping import (
     configuration_from_request,
     request_and_settings_from_job,
-    stage_kind_from_process_stage,
 )
 from parsezen.domain.jobs import (
     CoverStrategy,
@@ -18,6 +17,7 @@ from parsezen.domain.jobs import (
     TranslationConfiguration,
     TranslationMethod,
 )
+from parsezen.domain.process_lifecycle import stage_kind_from_process_stage
 from parsezen.domain.stages import StageKind
 from parsezen.processing import OutputFormat, ProcessRequest, ProcessStage
 from parsezen.settings import AppSettings

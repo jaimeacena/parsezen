@@ -269,12 +269,12 @@ def test_runner_pause_terminates_the_active_phase_as_paused(qtbot, tmp_path: Pat
         (
             ConversionError("No se pudo convertir."),
             "No se pudo convertir.",
-            "processing_task_failed error_type=ConversionError",
+            "processing_attempt_task_failed error_type=ConversionError",
         ),
         (
             RuntimeError("C:/private/document.txt"),
             "Se produjo un error inesperado durante el procesamiento.",
-            "unexpected_processing_task_failure error_type=RuntimeError",
+            "unexpected_processing_attempt_failure error_type=RuntimeError",
         ),
     ),
 )
@@ -354,7 +354,7 @@ def test_blocking_early_check_prevents_the_full_processor(
     assert runner.timeline.events[-1].phase is AttemptPhase.EARLY_CHECK
     assert runner.timeline.events[-1].status is AttemptEventStatus.FAILED
     terminal = [
-        record.message for record in caplog.records if "processing_failed" in record.message
+        record.message for record in caplog.records if "processing_attempt_failed" in record.message
     ]
     assert terminal
     assert f"attempt_id={runner.attempt_id}" in terminal[-1]

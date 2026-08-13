@@ -13,7 +13,6 @@ from collections.abc import Callable, Iterator
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from contextvars import ContextVar
 from dataclasses import dataclass, replace
-from enum import StrEnum
 from pathlib import Path, PurePosixPath
 from tempfile import gettempdir, mkstemp
 from time import monotonic
@@ -31,9 +30,9 @@ from parsezen.document_model import ConvertedDocument, ConvertedResource
 from parsezen.domain.attempt_activity import (
     AttemptPhase,
     is_safe_token,
-    phase_for_process_stage,
 )
 from parsezen.domain.jobs import MarkdownOrganization, ReviewRecommendation
+from parsezen.domain.process_lifecycle import ProcessStage, phase_for_process_stage
 from parsezen.domain.source_identity import is_sha256_digest, sha256_file
 from parsezen.epub_builder import (
     EpubBookMetadata,
@@ -169,25 +168,6 @@ def _decode_pdf_ocr_checkpoint(payload: str | None) -> str | None:
     if payload.startswith(_PDF_OCR_CHECKPOINT_PREFIX):
         return None
     return payload
-
-
-class ProcessStage(StrEnum):
-    """Observable stages backed by real work whenever a total is available."""
-
-    VALIDATING = "validating"
-    READING = "reading"
-    CONVERTING = "converting"
-    OCR = "ocr"
-    PRESERVING_IMAGES = "preserving_images"
-    STRUCTURING = "structuring"
-    PREPARING_TRANSLATION = "preparing_translation"
-    IMPROVING = "improving"
-    REVIEWING_CONTENT = "reviewing_content"
-    ORGANIZING_STRUCTURE = "organizing_structure"
-    TRANSLATING = "translating"
-    BUILDING_EPUB = "building_epub"
-    WRITING = "writing"
-    COMPLETED = "completed"
 
 
 @dataclass(frozen=True, slots=True)

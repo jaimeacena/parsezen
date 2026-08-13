@@ -40,16 +40,11 @@ class AttemptPhase(StrEnum):
     """Stable user-visible phases in one processing attempt."""
 
     PREPARATION = "prepare"
-    PREPARE = "prepare"
     EARLY_CHECK = "early_check"
     TRANSLATION = "translate"
-    TRANSLATE = "translate"
     CORRECTION = "refine"
-    REFINE = "refine"
     PERSONALIZATION = "structure"
-    STRUCTURE = "structure"
     PUBLICATION = "publish"
-    PUBLISH = "publish"
     COMPLETION = "completion"
     FAILURE = "failure"
     CANCELLATION = "cancellation"
@@ -198,30 +193,6 @@ class FailureSnapshot:
 
 # ``AttemptTrace`` is a useful semantic alias for UI/application callers.
 AttemptTrace = AttemptTimeline
-
-
-def phase_for_process_stage(stage: object) -> AttemptPhase:
-    """Map a physical processor stage to its stable user-visible phase."""
-
-    value = stage.value if isinstance(stage, StrEnum) else stage
-    if not isinstance(value, str):
-        return AttemptPhase.PREPARATION
-    return {
-        "validating": AttemptPhase.PREPARATION,
-        "reading": AttemptPhase.PREPARATION,
-        "converting": AttemptPhase.PREPARATION,
-        "ocr": AttemptPhase.PREPARATION,
-        "preserving_images": AttemptPhase.PREPARATION,
-        "structuring": AttemptPhase.PREPARATION,
-        "preparing_translation": AttemptPhase.TRANSLATION,
-        "translating": AttemptPhase.TRANSLATION,
-        "improving": AttemptPhase.CORRECTION,
-        "reviewing_content": AttemptPhase.CORRECTION,
-        "organizing_structure": AttemptPhase.PERSONALIZATION,
-        "building_epub": AttemptPhase.PUBLICATION,
-        "writing": AttemptPhase.PUBLICATION,
-        "completed": AttemptPhase.COMPLETION,
-    }.get(value, AttemptPhase.PREPARATION)
 
 
 def reusable_work_for_phase(phase: AttemptPhase) -> ReusableWork:

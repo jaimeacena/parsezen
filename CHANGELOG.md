@@ -2,6 +2,9 @@
 
 ## Próxima versión
 
+- Una tabla exhaustiva proyecta cada etapa física a fase de dominio, fase de actividad y etiqueta de
+  diagnóstico. Los logs distinguen trabajo físico (`processing_*`) del intento Qt
+  (`processing_attempt_*`) para eliminar eventos terminales conceptualmente duplicados.
 - Checkpoints y artefactos comparten primitivas pequeñas para DPAPI y reemplazo atómico sin cambiar
   sus formatos ni políticas. El SHA-256 del original se captura una vez durante la preparación en
   segundo plano y se reutiliza en validación y caches, evitando bloquear la interfaz al añadirlo.

@@ -20,32 +20,9 @@ from parsezen.domain.stages import StageKind
 from parsezen.glossary import GlossaryEntry
 from parsezen.improvement import ImprovementMode
 from parsezen.pdf_conversion import PdfPageRange
-from parsezen.processing import ProcessRequest, ProcessResult, ProcessStage
+from parsezen.processing import ProcessRequest, ProcessResult
 from parsezen.settings import AppSettings
 from parsezen.workflow import OutputFormat, WorkflowOptions, plan_workflow
-
-_PROCESS_STAGE_MAP = {
-    ProcessStage.VALIDATING: StageKind.PREPARE,
-    ProcessStage.READING: StageKind.PREPARE,
-    ProcessStage.CONVERTING: StageKind.PREPARE,
-    ProcessStage.OCR: StageKind.PREPARE,
-    ProcessStage.PRESERVING_IMAGES: StageKind.PREPARE,
-    ProcessStage.STRUCTURING: StageKind.PREPARE,
-    ProcessStage.PREPARING_TRANSLATION: StageKind.TRANSLATE,
-    ProcessStage.TRANSLATING: StageKind.TRANSLATE,
-    ProcessStage.IMPROVING: StageKind.REFINE,
-    ProcessStage.REVIEWING_CONTENT: StageKind.REFINE,
-    ProcessStage.ORGANIZING_STRUCTURE: StageKind.STRUCTURE,
-    ProcessStage.BUILDING_EPUB: StageKind.PUBLISH,
-    ProcessStage.WRITING: StageKind.PUBLISH,
-    ProcessStage.COMPLETED: StageKind.PUBLISH,
-}
-
-
-def stage_kind_from_process_stage(stage: ProcessStage | None) -> StageKind:
-    """Translate one physical processor stage into the stable domain phase."""
-
-    return _PROCESS_STAGE_MAP.get(stage or ProcessStage.VALIDATING, StageKind.PREPARE)
 
 
 def review_stage_for_result(

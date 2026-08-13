@@ -17,6 +17,7 @@ from platformdirs import user_cache_path, user_log_path
 
 from parsezen import APP_DISPLAY_NAME, APP_STORAGE_NAME, __version__
 from parsezen.domain.attempt_activity import AttemptPhase
+from parsezen.domain.process_lifecycle import diagnostic_label_for_process_stage
 from parsezen.recent_activity import (
     RecentJobStatus,
     get_history_path,
@@ -36,23 +37,6 @@ _OLLAMA_STATUS_TEXT = {
     "missing_model": "Sin modelo",
     "local_only_required": "Requiere modo local",
     "unavailable": "No disponible",
-}
-_PROCESS_STAGE_TEXT = {
-    "validating": "validaci\u00f3n",
-    "reading": "lectura",
-    "converting": "conversi\u00f3n",
-    "ocr": "OCR",
-    "preserving_images": "im\u00e1genes",
-    "structuring": "estructura inicial",
-    "preparing_translation": "preparaci\u00f3n de traducci\u00f3n",
-    "improving": "traducci\u00f3n o mejora",
-    "reviewing_content": "revisi\u00f3n de contenido",
-    "organizing_structure": "personalizaci\u00f3n",
-    "translating": "traducci\u00f3n",
-    "building_epub": "creaci\u00f3n del EPUB",
-    "writing": "guardado",
-    "completed": "finalizaci\u00f3n",
-    "not_started": "inicio",
 }
 _PROCESS_PHASE_TEXT = {
     AttemptPhase.PREPARATION.value: "preparaci\u00f3n",
@@ -208,7 +192,7 @@ def _latest_safe_failure(log_path: Path | None) -> str | None:
     except OSError:
         return None
     for line in reversed(lines):
-        if "processing_failed" not in line:
+        if "processing_failed" not in line and "processing_attempt_failed" not in line:
             continue
         expected_type = _log_value(line, "error_type")
         stage = _safe_stage_text(_log_value(line, "stage"))
@@ -241,9 +225,7 @@ def _latest_safe_failure(log_path: Path | None) -> str | None:
 
 
 def _safe_stage_text(value: str | None) -> str | None:
-    if value is None:
-        return None
-    return _PROCESS_STAGE_TEXT.get(value)
+    return diagnostic_label_for_process_stage(value)
 
 
 def _safe_phase_text(value: str | None) -> str | None:

@@ -188,9 +188,10 @@ Las fases son:
 5. `PUBLISH`.
 
 Este orden es la fuente de verdad de dominio y también de la configuración, el resumen del flujo,
-las revisiones y la presentación de actividad. El adaptador `runtime_mapping` traduce cada evento
-físico al tramo correspondiente; una traducción con Ollama emite `TRANSLATING` y no reutiliza el
-estado visual de corrección.
+las revisiones y la presentación de actividad. `domain.process_lifecycle` declara en una sola tabla
+cada `ProcessStage` y su `StageKind`, `AttemptPhase` y etiqueta segura de diagnóstico; la suite exige
+que ningún valor físico quede sin las cuatro proyecciones. Una traducción con Ollama emite
+`TRANSLATING` y no reutiliza el estado visual de corrección.
 
 Antes de crear el trabajador, `prepare_queue_run` fija las solicitudes inmutables y valida el lote.
 `PreflightRunner` ejecuta esta lectura en el `QThreadPool`, de modo que abrir y contar páginas de PDF
@@ -317,6 +318,11 @@ físico y su token de cancelación. Recibe una solicitud ya preparada, ejecuta e
 el `QThreadPool` y publica eventos de fase, progreso, resultado, error, cancelación y finalización. La
 ventana se limita a conectar esos eventos con `JobExecutionController`; ya no construye ni conserva
 trabajadores, y ninguna regla del planificador depende de Qt.
+
+El procesador registra telemetría física con eventos `processing_*`; el runner registra el ciclo del
+intento como `processing_attempt_*`. El dominio no escribe logs y Diagnóstico se limita a representar
+tokens seguros. Los nombres distintos evitan que inicio, cierre o fallo parezcan el mismo evento
+emitido dos veces por capas diferentes.
 
 La pausa entra siempre por `ProcessingRunner.pause()`: marca al trabajador antes de activar su token
 de cancelación cooperativa y cierra la fase activa como `paused` en la traza del intento. La ventana
