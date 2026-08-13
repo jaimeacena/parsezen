@@ -937,6 +937,12 @@ carpetas desconocidas y cualquier archivo ajeno al formato interno se conservan.
 
 ## Seguridad de datos
 
+El modelo de amenazas detallado y el inventario de metadatos en claro se mantienen en
+[`SECURITY.md`](../SECURITY.md). La frontera actual es la cuenta de Windows: el contenido intermedio
+se protege con DPAPI, mientras SQLite, configuración e historial conservan metadatos recuperables bajo
+los permisos del perfil. Un atacante que ya actúa como ese mismo usuario queda fuera de alcance; no se
+añade cifrado de SQLite sin diseñar primero índices, migración y recuperación.
+
 - El origen es inmutable: al añadirlo se conservan rápidamente tamaño y fecha. La preparación fuera
   del event loop captura un `SourceIdentity` con tamaño, fecha y SHA-256, rechaza cambios durante la
   lectura y persiste el digest en el trabajo. Ese mismo digest verificado identifica los checkpoints

@@ -2,6 +2,10 @@
 
 ## Próxima versión
 
+- Se documenta el modelo de amenazas local: los payloads documentales recuperables usan DPAPI, los
+  metadatos operativos de SQLite, configuración e historial dependen del perfil de Windows, y un
+  atacante que ya opera como el mismo usuario queda fuera de alcance. También se inventariaron los
+  datos en claro y sus vías de limpieza antes de plantear cualquier migración criptográfica.
 - El streaming de Ollama deja de reutilizar el timeout de lectura como duración total accidental.
   Las generaciones activas respetan el timeout de inactividad de `httpx` y solo tienen un deadline
   total cuando el consumidor lo solicita explícitamente.
