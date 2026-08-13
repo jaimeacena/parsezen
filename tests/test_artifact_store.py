@@ -81,3 +81,34 @@ def test_artifact_store_rejects_corrupted_content(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="integrity"):
         store.read("job", "one")
+
+
+def test_snapshot_generations_are_isolated_and_pruned_conservatively(tmp_path: Path) -> None:
+    root = tmp_path / "artifacts"
+    store = ArtifactStore(root, protect=reversible, unprotect=reversible)
+    store.put_text(job_id="job", generation="old", artifact_id="text", text="Anterior")
+    store.put_text(job_id="job", generation="active", artifact_id="text", text="Actual")
+    foreign = root / "job" / "foreign.generation"
+    foreign.mkdir()
+    (foreign / "keep.txt").write_text("keep", encoding="utf-8")
+
+    removed = store.prune_orphaned_generations("job", ("active",))
+
+    assert removed == ("old",)
+    assert store.read_text("job", "text", generation="active") == "Actual"
+    assert not (root / "job" / "old").exists()
+    assert (foreign / "keep.txt").read_text(encoding="utf-8") == "keep"
+
+
+def test_remove_job_cleans_known_generations_but_preserves_unknown_data(tmp_path: Path) -> None:
+    root = tmp_path / "artifacts"
+    store = ArtifactStore(root, protect=reversible, unprotect=reversible)
+    store.put_text(job_id="safe", generation="generation", text="private")
+    store.remove_job("safe")
+    assert not (root / "safe").exists()
+
+    store.put_text(job_id="mixed", generation="generation", text="private")
+    (root / "mixed" / "generation" / "foreign.txt").write_text("keep", encoding="utf-8")
+    with pytest.raises(OSError):
+        store.remove_job("mixed")
+    assert (root / "mixed" / "generation" / "foreign.txt").exists()
