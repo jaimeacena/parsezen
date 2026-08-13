@@ -22,8 +22,9 @@ def request_local_ai(
     cancellation: CancellationToken | None,
     *,
     prediction_characters: int | None = None,
+    max_generation_seconds: float | None = None,
 ) -> str:
-    """Return one deterministic local transformation with strict output bounds."""
+    """Return one deterministic local transformation with independent stream bounds."""
 
     request_payload = {
         "model": model,
@@ -46,10 +47,9 @@ def request_local_ai(
         },
     }
     check_cancelled(cancellation)
-    read_timeout = client.timeout.read
     deadline = (
-        monotonic() + float(read_timeout)
-        if isinstance(read_timeout, int | float) and read_timeout > 0
+        monotonic() + max_generation_seconds
+        if max_generation_seconds is not None and max_generation_seconds > 0
         else None
     )
     with client.stream(
@@ -72,7 +72,9 @@ def request_local_ai(
         for line in response.iter_lines():
             check_cancelled(cancellation)
             if deadline is not None and monotonic() > deadline:
-                raise ImprovementError("El modelo local superó el tiempo máximo de respuesta.")
+                raise ImprovementError(
+                    "El modelo local superó el tiempo máximo total de generación."
+                )
             if not line.strip():
                 continue
             try:

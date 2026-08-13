@@ -2,6 +2,9 @@
 
 ## Próxima versión
 
+- El streaming de Ollama deja de reutilizar el timeout de lectura como duración total accidental.
+  Las generaciones activas respetan el timeout de inactividad de `httpx` y solo tienen un deadline
+  total cuando el consumidor lo solicita explícitamente.
 - OCR y Argos comparten ahora las primitivas mecánicas de su canal privado autenticado, proceso
   oculto, espera cancelable y mensajes JSON acotados. Sus protocolos, límites y máquinas de estado
   siguen separados.

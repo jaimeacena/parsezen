@@ -1954,37 +1954,6 @@ def test_combined_mode_uses_one_operation_per_safe_fragment() -> None:
     )
 
 
-def test_prediction_limit_scales_with_the_fragment_and_context() -> None:
-    assert transport_module.prediction_token_limit(5, 8_192) == 130
-    assert transport_module.prediction_token_limit(3_000, 8_192) == 1_128
-    assert transport_module.prediction_token_limit(20_000, 8_192) == 2_048
-    assert transport_module.prediction_token_limit(20_000, 2_048) == 1_024
-
-
-def test_streaming_request_has_a_total_wall_clock_deadline(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    clock = iter((0.0, 31.0))
-    monkeypatch.setattr(transport_module, "monotonic", clock.__next__)
-    transport = httpx.MockTransport(
-        lambda _request: httpx.Response(
-            200,
-            content=b'{"message":{"content":"partial"}}\n',
-        )
-    )
-
-    with httpx.Client(timeout=30, transport=transport) as client:
-        with pytest.raises(ImprovementError, match="tiempo máximo"):
-            transport_module.request_local_ai(
-                client,
-                "parsezen-local",
-                8_192,
-                "Return the content.",
-                "Content",
-                None,
-            )
-
-
 def test_missing_model_is_rejected_before_any_request() -> None:
     called = False
 

@@ -955,6 +955,12 @@ carpetas desconocidas y cualquier archivo ajeno al formato interno se conservan.
 - La selección, la caché de recomendaciones y la validación previa bloquean variantes conocidas de
   razonamiento; la ejecución vuelve a rechazarlas como última barrera antes de leer el documento.
 
+En el streaming de Ollama, el timeout de lectura de `httpx` limita la inactividad entre datos; no es
+un reloj total de la respuesta. El transporte admite además un límite total explícito e independiente
+para consumidores que lo necesiten. Al no configurarlo, una generación activa puede durar más que el
+timeout de lectura sin ser tratada como bloqueada; `num_predict` y el límite de salida siguen acotando
+su tamaño.
+
 Los errores inesperados del ejecutor físico se registran únicamente por tipo técnico. No se incluyen
 mensajes de excepción, rutas ni contenido documental; el usuario recibe un mensaje estable y seguro.
 
