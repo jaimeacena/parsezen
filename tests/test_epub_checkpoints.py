@@ -66,7 +66,7 @@ def test_epub_checkpoint_reports_invalid_or_failed_writes(
 
     assert checkpoints.save("invalid", "translated text") is False
     monkeypatch.setattr(
-        "parsezen.epub_checkpoints.os.replace",
+        "parsezen.infrastructure.protected_file.os.replace",
         lambda *_args: (_ for _ in ()).throw(OSError("disk full")),
     )
 

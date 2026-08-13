@@ -5,12 +5,10 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-import os
 import re
 from base64 import b64decode, b64encode
 from dataclasses import dataclass
 from pathlib import Path
-from tempfile import mkstemp
 
 from platformdirs import user_cache_path
 
@@ -22,9 +20,12 @@ from parsezen.checkpoint_cache import (
     prune_checkpoint_cache,
 )
 from parsezen.domain.source_identity import sha256_file
-from parsezen.epub_checkpoints import (
-    _protect_for_current_user,
-    _unprotect_for_current_user,
+from parsezen.infrastructure.protected_file import atomic_write_bytes
+from parsezen.infrastructure.user_data_protection import (
+    protect_for_current_user as _protect_for_current_user,
+)
+from parsezen.infrastructure.user_data_protection import (
+    unprotect_for_current_user as _unprotect_for_current_user,
 )
 
 LOGGER = logging.getLogger(__name__)
@@ -86,7 +87,6 @@ class WorkCheckpoints:
             or len(encoded) > _MAX_PAYLOAD_BYTES
         ):
             return False
-        temporary_path: Path | None = None
         new_cache_directory = not self.directory.exists()
         try:
             record = {
@@ -94,32 +94,17 @@ class WorkCheckpoints:
                 "key": key,
                 "protected_payload": b64encode(_protect_for_current_user(encoded)).decode("ascii"),
             }
-            self.directory.mkdir(parents=True, exist_ok=True)
-            descriptor, temporary_name = mkstemp(
-                dir=self.directory,
-                prefix=".work-",
-                suffix=".tmp",
-                text=True,
+            atomic_write_bytes(
+                self.directory / f"{key}.json",
+                json.dumps(record, ensure_ascii=False, separators=(",", ":")).encode("utf-8"),
+                temporary_prefix=".work-",
             )
-            temporary_path = Path(temporary_name)
-            with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as stream:
-                json.dump(record, stream, ensure_ascii=False, separators=(",", ":"))
-                stream.flush()
-                os.fsync(stream.fileno())
-            os.replace(temporary_path, self.directory / f"{key}.json")
-            temporary_path = None
             if new_cache_directory:
                 prune_work_checkpoint_cache(root=self.directory.parent)
             return True
         except (OSError, TypeError, UnicodeError):
             LOGGER.warning("work_checkpoint_save_failed")
             return False
-        finally:
-            if temporary_path is not None:
-                try:
-                    temporary_path.unlink(missing_ok=True)
-                except OSError:
-                    pass
 
     def clear(self) -> None:
         """Remove only files owned by this exact checkpoint directory."""

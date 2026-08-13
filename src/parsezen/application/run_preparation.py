@@ -22,7 +22,8 @@ from parsezen.application.scheduler import (
 )
 from parsezen.cancellation import CancellationToken, check_cancelled
 from parsezen.domain.estimates import ProcessingMetric, WorkloadProfile
-from parsezen.domain.jobs import DocumentJob
+from parsezen.domain.jobs import DocumentJob, DocumentSource
+from parsezen.domain.source_identity import SourceIdentity
 from parsezen.processing import ProcessRequest
 from parsezen.settings import AppSettings
 
@@ -32,6 +33,7 @@ class PreparedRunItem:
     job_id: str
     request: ProcessRequest
     settings: AppSettings
+    source_identity: SourceIdentity
     preflight: DocumentPreflight | None = None
     workload_profile: WorkloadProfile | None = None
 
@@ -66,14 +68,39 @@ def prepare_queue_run(
     mapped_items: list[PreparedRunItem] = []
     for job_id in selected_plan.job_ids:
         check_cancelled(cancellation)
+        job = jobs_by_id[job_id]
+        source = job.source
+        identity_captured_now = source.content_sha256 is None
+        if source.content_sha256 is None:
+            identity = SourceIdentity.inspect(source.path)
+            source = DocumentSource(
+                source.path,
+                source.format,
+                identity.size_bytes,
+                identity.modified_ns,
+                identity.sha256,
+            )
+            job = replace(job, source=source)
+            jobs_by_id[job_id] = job
+        else:
+            identity = SourceIdentity(
+                source.size_bytes,
+                source.modified_ns,
+                source.content_sha256,
+            )
+        request, settings = request_and_settings_from_job(
+            job,
+            timeout_seconds=timeout_seconds,
+            checkpoint_retention_days=checkpoint_retention_days,
+        )
+        if identity_captured_now:
+            request = replace(request, source_identity_verified=True)
         mapped_items.append(
             PreparedRunItem(
                 job_id,
-                *request_and_settings_from_job(
-                    jobs_by_id[job_id],
-                    timeout_seconds=timeout_seconds,
-                    checkpoint_retention_days=checkpoint_retention_days,
-                ),
+                request,
+                settings,
+                identity,
             )
         )
     issues = validate_independent_batch_requests(
@@ -115,6 +142,7 @@ def prepare_queue_run(
                 item.job_id,
                 item.request,
                 item.settings,
+                item.source_identity,
                 analysis,
                 profile,
             )

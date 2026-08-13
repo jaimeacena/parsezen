@@ -3,6 +3,7 @@ from pathlib import Path
 
 import pytest
 
+import parsezen.domain.source_identity as source_identity_module
 from parsezen.application.job_execution import JobExecutionController
 from parsezen.application.job_queue import JobQueue
 from parsezen.application.run_preparation import prepare_queue_run
@@ -77,6 +78,38 @@ def test_preparation_rejects_a_same_size_source_replacement(tmp_path: Path) -> N
     assert len(prepared.issues) == 1
     assert "original cambió" in prepared.issues[0].message
     assert not prepared.items[0].request.source_identity_verified
+
+
+def test_preparation_captures_a_missing_content_identity_once(tmp_path: Path, monkeypatch) -> None:
+    path = tmp_path / "source.txt"
+    path.write_text("content", encoding="utf-8")
+    statistics = path.stat()
+    queue = JobQueue()
+    queue.add(
+        DocumentSource(
+            path,
+            DocumentFormat.TEXT,
+            statistics.st_size,
+            statistics.st_mtime_ns,
+        ),
+        JobConfiguration(),
+        job_id="unhashed",
+    )
+    calls: list[Path] = []
+    original_sha256_file = source_identity_module.sha256_file
+
+    def counted_sha256_file(source: Path) -> str:
+        calls.append(source)
+        return original_sha256_file(source)
+
+    monkeypatch.setattr(source_identity_module, "sha256_file", counted_sha256_file)
+
+    prepared = prepare_queue_run(queue.jobs, timeout_seconds=45)
+
+    item = prepared.items[0]
+    assert calls == [path]
+    assert item.request.source_identity_verified
+    assert item.request.source_content_sha256 == item.source_identity.sha256
 
 
 def test_explicit_retry_prepares_only_the_failed_document(tmp_path: Path) -> None:

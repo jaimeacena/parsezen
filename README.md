@@ -31,7 +31,7 @@ de Ollama y nunca envía el documento fuera del equipo. Es open source, privado 
   El plan revisado es una decisión aparte y puede comprobar después cualquiera de las dos salidas.
 
 - **Local, privado y gratuito.** Tus documentos permanecen en tu equipo y los originales nunca se
-  modifican. Parsezen verifica su identidad local antes de procesarlos y solo habilita la IA cuando
+  modifican. Parsezen verifica su identidad local en la preparación en segundo plano antes de procesarlos y solo habilita la IA cuando
   la configuración persistente de Ollama desactiva su nube. No necesitas suscripciones, cuotas ni
   pagos por uso.
 

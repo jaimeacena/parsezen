@@ -2,6 +2,9 @@
 
 ## Próxima versión
 
+- Checkpoints y artefactos comparten primitivas pequeñas para DPAPI y reemplazo atómico sin cambiar
+  sus formatos ni políticas. El SHA-256 del original se captura una vez durante la preparación en
+  segundo plano y se reutiliza en validación y caches, evitando bloquear la interfaz al añadirlo.
 - Pausar usa ahora el motivo terminal explícito del ejecutor físico: worker, cronología y dominio
   terminan en `PAUSED`, se conservan checkpoints y no aparece una cancelación falsa en Actividad.
 - Traducción y revisión dejan una cobertura lingüística explícita: distingue corrección integrada,

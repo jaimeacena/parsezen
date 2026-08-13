@@ -2562,6 +2562,19 @@ class ParsezenMainWindow(QMainWindow):
             return
         self._prepared_run = value
         for item in value.items:
+            job = self._job_queue.get(item.job_id)
+            if job is not None:
+                identity = item.source_identity
+                self._job_queue.refresh_source(
+                    job.id,
+                    DocumentSource(
+                        job.source.path,
+                        job.source.format,
+                        identity.size_bytes,
+                        identity.modified_ns,
+                        identity.sha256,
+                    ),
+                )
             if item.preflight is not None:
                 self._latest_forecasts[item.job_id] = item.preflight
                 job = self._job_queue.get(item.job_id)
@@ -2905,7 +2918,7 @@ class ParsezenMainWindow(QMainWindow):
 
 def _source_from_path(path: Path) -> DocumentSource:
     try:
-        return DocumentSource.inspect(path)
+        return DocumentSource.inspect(path, include_content_hash=False)
     except OSError:
         return DocumentSource(path, DocumentFormat.from_path(path), 0, 0)
 

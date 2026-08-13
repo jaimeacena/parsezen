@@ -7,7 +7,7 @@ from enum import StrEnum
 from pathlib import Path
 from uuid import uuid4
 
-from parsezen.domain.source_identity import is_sha256_digest, sha256_file
+from parsezen.domain.source_identity import SourceIdentity, is_sha256_digest
 from parsezen.domain.stages import (
     STAGE_ORDER,
     StageAvailability,
@@ -133,23 +133,25 @@ class DocumentSource:
             raise ValueError("The document content identity must be a SHA-256 digest.")
 
     @classmethod
-    def inspect(cls, path: Path) -> DocumentSource:
+    def inspect(cls, path: Path, *, include_content_hash: bool = True) -> DocumentSource:
         resolved = path.expanduser().resolve(strict=True)
         if not resolved.is_file():
             raise ValueError("The document source must be a file.")
-        statistics = resolved.stat()
-        content_sha256 = sha256_file(resolved)
-        final_statistics = resolved.stat()
-        if (
-            final_statistics.st_size != statistics.st_size
-            or final_statistics.st_mtime_ns != statistics.st_mtime_ns
-        ):
-            raise OSError("The document changed while its identity was being captured.")
+        if include_content_hash:
+            identity = SourceIdentity.inspect(resolved)
+            size_bytes = identity.size_bytes
+            modified_ns = identity.modified_ns
+            content_sha256 = identity.sha256
+        else:
+            statistics = resolved.stat()
+            size_bytes = statistics.st_size
+            modified_ns = statistics.st_mtime_ns
+            content_sha256 = None
         return cls(
             path=resolved,
             format=DocumentFormat.from_path(resolved),
-            size_bytes=statistics.st_size,
-            modified_ns=statistics.st_mtime_ns,
+            size_bytes=size_bytes,
+            modified_ns=modified_ns,
             content_sha256=content_sha256,
         )
 

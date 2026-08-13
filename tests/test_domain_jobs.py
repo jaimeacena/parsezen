@@ -21,6 +21,7 @@ from parsezen.domain.jobs import (
     ProcessingPlan,
     TranslationConfiguration,
 )
+from parsezen.domain.source_identity import SourceIdentity
 from parsezen.domain.stages import StageAvailability, StageKind, StageStatus
 
 
@@ -36,6 +37,20 @@ def test_document_source_inspection_captures_content_identity(tmp_path: Path) ->
     inspected = DocumentSource.inspect(path)
 
     assert inspected.content_sha256 == hashlib.sha256(content).hexdigest()
+
+
+def test_source_identity_rejects_invalid_values_and_hash_can_be_deferred(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "book.pdf"
+    path.write_bytes(b"%PDF-local")
+
+    inspected = DocumentSource.inspect(path, include_content_hash=False)
+
+    assert inspected.content_sha256 is None
+    assert inspected.size_bytes == path.stat().st_size
+    with pytest.raises(ValueError, match="identity is invalid"):
+        SourceIdentity(-1, 0, "invalid")
 
 
 def complete(job: DocumentJob, kind: StageKind) -> DocumentJob:

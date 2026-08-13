@@ -3,17 +3,16 @@
 from __future__ import annotations
 
 import hashlib
-import os
 import re
 import secrets
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from pathlib import Path
-from tempfile import mkstemp
 
-from parsezen.epub_checkpoints import (
-    _protect_for_current_user,
-    _unprotect_for_current_user,
+from parsezen.infrastructure.protected_file import atomic_write_bytes
+from parsezen.infrastructure.user_data_protection import (
+    protect_for_current_user,
+    unprotect_for_current_user,
 )
 
 _SAFE_IDENTIFIER = re.compile(r"[a-zA-Z0-9_-]{1,128}\Z")
@@ -38,8 +37,8 @@ class ArtifactStore:
         self,
         root: Path,
         *,
-        protect: Protect = _protect_for_current_user,
-        unprotect: Protect = _unprotect_for_current_user,
+        protect: Protect = protect_for_current_user,
+        unprotect: Protect = unprotect_for_current_user,
     ) -> None:
         self.root = root
         self._protect = protect
@@ -64,24 +63,11 @@ class ArtifactStore:
             raise FileExistsError("Artifact ids are immutable.")
         digest = hashlib.sha256(payload).digest()
         protected = self._protect(_ARTIFACT_MAGIC + digest + payload)
-        temporary: Path | None = None
-        try:
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            descriptor, temporary_name = mkstemp(
-                dir=destination.parent,
-                prefix=".artifact-",
-                suffix=".tmp",
-            )
-            temporary = Path(temporary_name)
-            with os.fdopen(descriptor, "wb") as output:
-                output.write(protected)
-                output.flush()
-                os.fsync(output.fileno())
-            os.replace(temporary, destination)
-            temporary = None
-        finally:
-            if temporary is not None:
-                temporary.unlink(missing_ok=True)
+        atomic_write_bytes(
+            destination,
+            protected,
+            temporary_prefix=".artifact-",
+        )
         return ArtifactRecord(
             id=identifier,
             job_id=job_id,

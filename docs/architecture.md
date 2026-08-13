@@ -837,7 +837,10 @@ SQLite usa WAL, `synchronous=FULL`, claves foráneas y transacciones:
 
 El contenido documental no se guarda en SQLite. `ArtifactStore` escribe artefactos inmutables,
 protegidos con DPAPI para la cuenta actual de Windows y acompañados de SHA-256 dentro del sobre
-cifrado.
+cifrado. Checkpoints EPUB, checkpoints generales y artefactos usan la misma primitiva
+`infrastructure.user_data_protection`; la escritura temporal, `flush`, `fsync` y reemplazo atómico
+comparten únicamente el mecanismo pequeño de `infrastructure.protected_file`. Los esquemas,
+límites, nombres y políticas de retención siguen perteneciendo a cada almacén.
 
 Antes de que una cola avance desde un documento que necesita revisión, `ResultSnapshotStore`
 persiste:
@@ -893,9 +896,10 @@ carpetas desconocidas y cualquier archivo ajeno al formato interno se conservan.
 
 ## Seguridad de datos
 
-- El origen es inmutable: al añadirlo se conservan tamaño, fecha y SHA-256. La preparación vuelve a
-  comprobar su contenido y detiene el trabajo si ha cambiado; el mismo digest verificado identifica
-  los checkpoints PDF, EPUB y de transformación sin releer el archivo para cada caché.
+- El origen es inmutable: al añadirlo se conservan rápidamente tamaño y fecha. La preparación fuera
+  del event loop captura un `SourceIdentity` con tamaño, fecha y SHA-256, rechaza cambios durante la
+  lectura y persiste el digest en el trabajo. Ese mismo digest verificado identifica los checkpoints
+  PDF, EPUB y de transformación sin releer el archivo para cada caché.
 - Una salida se construye fuera de su destino y se reemplaza solo al estar completa.
 - Las colisiones producen un nombre nuevo.
 - Una cancelación no publica un parcial.

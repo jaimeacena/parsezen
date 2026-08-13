@@ -2,28 +2,13 @@
 
 from __future__ import annotations
 
-import ctypes
 import hashlib
 import json
 import logging
-import os
 import re
 from base64 import b64decode, b64encode
-from ctypes import (
-    POINTER,
-    Structure,
-    byref,
-    c_byte,
-    c_void_p,
-    cast,
-    create_string_buffer,
-    string_at,
-)
-from ctypes.wintypes import BOOL, DWORD, LPCWSTR
 from dataclasses import dataclass
 from pathlib import Path
-from tempfile import mkstemp
-from typing import Any
 
 from platformdirs import user_cache_path
 
@@ -35,6 +20,13 @@ from parsezen.checkpoint_cache import (
     prune_checkpoint_cache,
 )
 from parsezen.domain.source_identity import sha256_file
+from parsezen.infrastructure.protected_file import atomic_write_bytes
+from parsezen.infrastructure.user_data_protection import (
+    protect_for_current_user as _protect_for_current_user,
+)
+from parsezen.infrastructure.user_data_protection import (
+    unprotect_for_current_user as _unprotect_for_current_user,
+)
 
 LOGGER = logging.getLogger(__name__)
 
@@ -43,11 +35,6 @@ _IMPLEMENTATION_REVISION = "epub-semantic-parts-v2-encrypted"
 _PART_KEY_PATTERN = re.compile(r"[0-9a-f]{64}")
 _MAX_TRANSLATED_PAYLOAD_BYTES = 2 * 1024 * 1024
 _MAX_CHECKPOINT_BYTES = 3 * 1024 * 1024
-_CRYPTPROTECT_UI_FORBIDDEN = 0x1
-
-
-class _DataBlob(Structure):
-    _fields_ = [("cbData", DWORD), ("pbData", POINTER(c_byte))]
 
 
 @dataclass(frozen=True, slots=True)
@@ -104,17 +91,8 @@ class EpubTranslationCheckpoints:
             or len(encoded_payload) > _MAX_TRANSLATED_PAYLOAD_BYTES
         ):
             return False
-        temporary_path: Path | None = None
         new_cache_directory = not self.directory.exists()
         try:
-            self.directory.mkdir(parents=True, exist_ok=True)
-            descriptor, temporary_name = mkstemp(
-                dir=self.directory,
-                prefix=".part-",
-                suffix=".tmp",
-                text=True,
-            )
-            temporary_path = Path(temporary_name)
             payload = {
                 "schema_version": _SCHEMA_VERSION,
                 "part_key": part_key,
@@ -122,24 +100,17 @@ class EpubTranslationCheckpoints:
                     "ascii"
                 ),
             }
-            with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as stream:
-                json.dump(payload, stream, ensure_ascii=False, separators=(",", ":"))
-                stream.flush()
-                os.fsync(stream.fileno())
-            os.replace(temporary_path, self.directory / f"{part_key}.json")
-            temporary_path = None
+            atomic_write_bytes(
+                self.directory / f"{part_key}.json",
+                json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8"),
+                temporary_prefix=".part-",
+            )
             if new_cache_directory:
                 prune_epub_translation_cache(root=self.directory.parent)
             return True
         except (OSError, TypeError, UnicodeError):
             LOGGER.warning("epub_checkpoint_save_failed")
             return False
-        finally:
-            if temporary_path is not None:
-                try:
-                    temporary_path.unlink(missing_ok=True)
-                except OSError:
-                    pass
 
     def clear(self) -> None:
         """Remove this completed job's owned files, leaving unexpected data alone."""
@@ -251,84 +222,3 @@ def _cache_root(root: Path | None) -> Path:
 
 def _sha256_text(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
-
-
-def _protect_for_current_user(payload: bytes) -> bytes:
-    if os.name != "nt":
-        raise OSError("El sistema no ofrece protección de caché compatible.")
-    input_buffer = create_string_buffer(payload)
-    input_blob = _DataBlob(
-        len(payload),
-        cast(input_buffer, POINTER(c_byte)),
-    )
-    output_blob = _DataBlob()
-    protect = ctypes.windll.crypt32.CryptProtectData
-    protect.argtypes = [
-        POINTER(_DataBlob),
-        LPCWSTR,
-        POINTER(_DataBlob),
-        c_void_p,
-        c_void_p,
-        DWORD,
-        POINTER(_DataBlob),
-    ]
-    protect.restype = BOOL
-    success = protect(
-        byref(input_blob),
-        "Parsezen EPUB checkpoint",
-        None,
-        None,
-        None,
-        _CRYPTPROTECT_UI_FORBIDDEN,
-        byref(output_blob),
-    )
-    if not success:
-        raise OSError("No se pudo proteger la caché de traducción.")
-    try:
-        return string_at(output_blob.pbData, output_blob.cbData)
-    finally:
-        _local_free(output_blob.pbData)
-
-
-def _unprotect_for_current_user(payload: bytes) -> bytes:
-    if os.name != "nt":
-        raise OSError("El sistema no ofrece protección de caché compatible.")
-    input_buffer = create_string_buffer(payload)
-    input_blob = _DataBlob(
-        len(payload),
-        cast(input_buffer, POINTER(c_byte)),
-    )
-    output_blob = _DataBlob()
-    unprotect = ctypes.windll.crypt32.CryptUnprotectData
-    unprotect.argtypes = [
-        POINTER(_DataBlob),
-        POINTER(LPCWSTR),
-        POINTER(_DataBlob),
-        c_void_p,
-        c_void_p,
-        DWORD,
-        POINTER(_DataBlob),
-    ]
-    unprotect.restype = BOOL
-    success = unprotect(
-        byref(input_blob),
-        None,
-        None,
-        None,
-        None,
-        _CRYPTPROTECT_UI_FORBIDDEN,
-        byref(output_blob),
-    )
-    if not success:
-        raise OSError("No se pudo abrir la caché de traducción.")
-    try:
-        return string_at(output_blob.pbData, output_blob.cbData)
-    finally:
-        _local_free(output_blob.pbData)
-
-
-def _local_free(pointer: Any) -> None:
-    local_free = ctypes.windll.kernel32.LocalFree
-    local_free.argtypes = [c_void_p]
-    local_free.restype = c_void_p
-    local_free(cast(pointer, c_void_p))
