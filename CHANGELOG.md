@@ -2,6 +2,8 @@
 
 ## Próxima versión
 
+- La cola y sus informes se proyectan por eventos. El polling general de 200 ms se sustituye por un
+  refresco de un segundo limitado a tiempo restante y reintento de persistencia diferida.
 - La nueva `QueueSession` Qt-free posee el plan preparado, runtimes, documento activo, pausa y cierre
   del lote. La ventana principal deja de duplicar las banderas de su máquina de estados.
 - El flujo de IA local posee ahora su estado de presentación y expone operaciones explícitas. La

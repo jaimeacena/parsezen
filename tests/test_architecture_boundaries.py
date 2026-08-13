@@ -143,3 +143,11 @@ def test_main_window_does_not_own_queue_session_flags() -> None:
     assert "self._pause_requested" not in source
     assert "self._current_job_id" not in source
     assert "self._runtime_by_job" not in source
+
+
+def test_main_window_timer_only_targets_temporal_projection() -> None:
+    source = (_PACKAGE_ROOT / "presentation" / "main_window.py").read_text(encoding="utf-8")
+
+    assert "setInterval(1_000)" in source
+    assert "timeout.connect(self._refresh_temporal_projection)" in source
+    assert "timeout.connect(self._sync_workspace)" not in source

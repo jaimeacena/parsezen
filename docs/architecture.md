@@ -321,6 +321,11 @@ pausa y motivo terminal. Sus transiciones de inicio, selección, continuación y
 Qt. `ParsezenMainWindow` conserva la composición y la presentación de avisos, pero ya no mantiene
 copias de `_is_processing`, `_batch_running`, `_pause_requested` o `_current_job_id`.
 
+La proyección estructural del workspace es dirigida por eventos: cambios de cola, configuración,
+resultado, revisión, IA o integridad la actualizan de forma explícita. Un timer de un segundo queda
+limitado al tiempo restante y al reintento de la persistencia diferida; no vuelve a proyectar la cola,
+pronósticos ni informes de integridad. `QueuePersistenceCoordinator` conserva su throttling durable.
+
 `ProcessingRunner`, en la capa de presentación, es el único adaptador Qt que posee el trabajador
 físico y su token de cancelación. Recibe una solicitud ya preparada, ejecuta el procesador estable en
 el `QThreadPool` y publica eventos de fase, progreso, resultado, error, cancelación y finalización. La

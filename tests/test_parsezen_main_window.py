@@ -620,7 +620,7 @@ def test_main_window_inspects_each_source_only_when_its_snapshot_is_created(
         state_path=tmp_path / "workspace.sqlite3",
     )
     qtbot.addWidget(window)
-    window._projection_timer.stop()
+    window._temporal_timer.stop()
     inspected: list[Path] = []
     original_inspect = main_window_module._source_from_path
 
@@ -1043,7 +1043,7 @@ def test_main_window_invalidates_review_when_original_changed(
     )
     job_id = window._project_jobs()[0].id
     original_source = window._project_jobs()[0].source
-    window._projection_timer.stop()
+    window._temporal_timer.stop()
     source.write_text("El original ahora contiene otro texto.", encoding="utf-8")
     window._sync_workspace(force_persist=True)
 
@@ -1185,8 +1185,42 @@ def test_main_window_warns_and_retries_when_state_write_fails(
 
     assert window._sync_workspace()
     assert window.parsezen_workspace.recovery_warning.isHidden()
-    window._projection_timer.stop()
+    window._temporal_timer.stop()
     _entries(window).clear()
+
+
+def test_temporal_timer_does_not_reproject_structural_workspace_state(
+    qtbot,
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    window = ParsezenMainWindow(
+        settings=AppSettings(),
+        auto_discover_ai=False,
+        state_path=tmp_path / "workspace.sqlite3",
+    )
+    qtbot.addWidget(window)
+    window._temporal_timer.stop()  # noqa: SLF001
+    workspace = window.parsezen_workspace
+    runtime_update = Mock()
+    jobs_update = Mock()
+    integrity_update = Mock()
+    preflight_update = Mock()
+    persistence = Mock(return_value=True)
+    monkeypatch.setattr(workspace, "set_runtime_estimates", runtime_update)
+    monkeypatch.setattr(workspace, "set_jobs", jobs_update)
+    monkeypatch.setattr(workspace, "set_integrity_reports", integrity_update)
+    monkeypatch.setattr(window, "_refresh_preflight_forecasts", preflight_update)
+    monkeypatch.setattr(window, "_persist_workspace", persistence)
+
+    window._refresh_temporal_projection()  # noqa: SLF001
+
+    assert window._temporal_timer.interval() == 1_000  # noqa: SLF001
+    runtime_update.assert_called_once()
+    persistence.assert_called_once_with(window._job_queue.jobs)  # noqa: SLF001
+    jobs_update.assert_not_called()
+    integrity_update.assert_not_called()
+    preflight_update.assert_not_called()
 
 
 def test_main_window_preserves_unreadable_queue_before_starting_clean(
@@ -1225,7 +1259,7 @@ def test_main_window_preserves_unreadable_queue_before_starting_clean(
         assert "Se conservó una copia local segura" in (
             window.parsezen_workspace.recovery_warning.text()
         )
-        window._projection_timer.stop()
+        window._temporal_timer.stop()
         _entries(window).clear()
 
     backups = tuple(tmp_path.glob("workspace.unreadable-*.sqlite3"))
@@ -1273,7 +1307,7 @@ def test_main_window_never_overwrites_unreadable_queue_if_backup_fails(
         qtbot.addWidget(window)
         assert window._queue_persistence.unavailable
         assert not window.parsezen_workspace.recovery_warning.isHidden()
-        window._projection_timer.stop()
+        window._temporal_timer.stop()
         _entries(window).clear()
 
     assert StateStore(state_path).load_jobs() == (saved_job,)
@@ -1306,7 +1340,7 @@ def test_main_window_quarantines_structurally_corrupted_state(
     assert StateStore(state_path).load_jobs() == ()
     assert not window.parsezen_workspace.recovery_warning.isHidden()
     assert "estado anterior estaba dañado" in window.parsezen_workspace.recovery_warning.text()
-    window._projection_timer.stop()
+    window._temporal_timer.stop()
     _entries(window).clear()
 
 

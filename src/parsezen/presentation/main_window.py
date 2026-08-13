@@ -207,7 +207,7 @@ class ParsezenMainWindow(QMainWindow):
         self._outcome_summaries: dict[str, OutcomeSummary] = {}
         self._latest_forecasts: dict[str, DocumentPreflight] = {}
         # One terminal snapshot per job keeps delayed review tied to its attempt.
-        # It is pruned against the live queue in ``_sync_workspace``.
+        # It is pruned whenever a domain event projects the live queue.
         self._terminal_attempt_activity: dict[str, _AttemptActivity] = {}
         self._processing_runner = ProcessingRunner(self)
         self._processing_runner.stage_changed.connect(self._show_stage)
@@ -329,10 +329,10 @@ class ParsezenMainWindow(QMainWindow):
         retained_artifact_jobs = self._restore_workspace()
         if retained_artifact_jobs is not None:
             self._prune_orphaned_review_artifacts(retained_artifact_jobs)
-        self._projection_timer = QTimer(self)
-        self._projection_timer.setInterval(200)
-        self._projection_timer.timeout.connect(self._sync_workspace)
-        self._projection_timer.start()
+        self._temporal_timer = QTimer(self)
+        self._temporal_timer.setInterval(1_000)
+        self._temporal_timer.timeout.connect(self._refresh_temporal_projection)
+        self._temporal_timer.start()
         self._sync_workspace(force_persist=True)
 
     @Slot(bool)
@@ -665,7 +665,7 @@ class ParsezenMainWindow(QMainWindow):
         ):
             event.ignore()
             return
-        self._projection_timer.stop()
+        self._temporal_timer.stop()
         self._sleep_blocker.stop()
         if self._notification_tray is not None:
             self._notification_tray.hide()
@@ -2680,6 +2680,8 @@ class ParsezenMainWindow(QMainWindow):
         return self._job_queue.jobs
 
     def _sync_workspace(self, *, force_persist: bool = False) -> bool:
+        """Project one explicit state change; this method is never timer-polled."""
+
         jobs = self._project_jobs()
         self._prune_terminal_attempt_activity(jobs)
         self.parsezen_workspace.set_output_directory(self._settings.output_directory)
@@ -2700,7 +2702,23 @@ class ParsezenMainWindow(QMainWindow):
             self.parsezen_workspace.set_jobs(jobs)
             self._refresh_preflight_forecasts(jobs)
             self._last_projection = jobs
-        persistence = self._queue_persistence.persist(jobs, force=force_persist)
+        return self._persist_workspace(jobs, force=force_persist)
+
+    @Slot()
+    def _refresh_temporal_projection(self) -> None:
+        """Refresh only time-derived UI and retry throttled persistence."""
+
+        jobs = self._job_queue.jobs
+        self.parsezen_workspace.set_runtime_estimates(self._runtime_estimates())
+        self._persist_workspace(jobs)
+
+    def _persist_workspace(
+        self,
+        jobs: tuple[DocumentJob, ...],
+        *,
+        force: bool = False,
+    ) -> bool:
+        persistence = self._queue_persistence.persist(jobs, force=force)
         if persistence.status is QueuePersistenceStatus.UNAVAILABLE:
             self.parsezen_workspace.set_recovery_warning(_RECOVERY_READ_WARNING)
             return False
