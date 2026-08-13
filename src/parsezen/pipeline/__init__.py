@@ -10,6 +10,7 @@ from parsezen.pipeline.contracts import (
     StageTelemetry,
     TransformedDocument,
 )
+from parsezen.pipeline.prepare import combined_translation_glossary, prepare_document_input
 
 __all__ = [
     "PreparedDocument",
@@ -20,4 +21,6 @@ __all__ = [
     "StageCallback",
     "StageTelemetry",
     "TransformedDocument",
+    "combined_translation_glossary",
+    "prepare_document_input",
 ]

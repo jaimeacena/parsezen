@@ -8,6 +8,7 @@ from zipfile import ZipFile
 import pytest
 
 import parsezen.output as output_module
+import parsezen.pipeline.prepare as prepare_module
 import parsezen.processing as processing_module
 from parsezen.cancellation import CancellationToken
 from parsezen.document_model import ConvertedDocument, ConvertedResource
@@ -42,6 +43,7 @@ from parsezen.processing import (
     validate_process_request,
 )
 from parsezen.revision import RevisionDecision
+from parsezen.semantic_blocks import DocumentTerm
 from parsezen.settings import AppSettings
 from parsezen.translation_quality import (
     LinguisticReviewMode,
@@ -893,11 +895,11 @@ def test_repeated_document_terms_are_protected_without_a_manual_glossary(
 
 def test_inferred_terminology_has_a_bounded_occurrence_budget() -> None:
     terminology = (
-        processing_module.DocumentTerm("Overused Proper Name", 65),
-        processing_module.DocumentTerm("Austin Coppock", 2),
+        DocumentTerm("Overused Proper Name", 65),
+        DocumentTerm("Austin Coppock", 2),
     )
 
-    assert processing_module._combined_translation_glossary((), terminology) == (
+    assert prepare_module.combined_translation_glossary((), terminology) == (
         GlossaryEntry("Austin Coppock", "Austin Coppock"),
     )
 
@@ -2620,20 +2622,20 @@ def test_pdf_reports_ocr_only_when_selective_ocr_starts(
 
 
 def test_pdf_ocr_checkpoint_encoding_preserves_empty_results() -> None:
-    encoded_empty = processing_module._encode_pdf_ocr_checkpoint("")
-    encoded_text = processing_module._encode_pdf_ocr_checkpoint("Recognized")
+    encoded_empty = prepare_module.encode_pdf_ocr_checkpoint("")
+    encoded_text = prepare_module.encode_pdf_ocr_checkpoint("Recognized")
 
     assert encoded_empty
-    assert processing_module._decode_pdf_ocr_checkpoint(encoded_empty) == ""
-    assert processing_module._decode_pdf_ocr_checkpoint(encoded_text) == "Recognized"
-    assert processing_module._decode_pdf_ocr_checkpoint("Legacy") == "Legacy"
-    assert processing_module._decode_pdf_ocr_checkpoint(None) is None
+    assert prepare_module.decode_pdf_ocr_checkpoint(encoded_empty) == ""
+    assert prepare_module.decode_pdf_ocr_checkpoint(encoded_text) == "Recognized"
+    assert prepare_module.decode_pdf_ocr_checkpoint("Legacy") == "Legacy"
+    assert prepare_module.decode_pdf_ocr_checkpoint(None) is None
 
 
 def test_pdf_ocr_checkpoint_rejects_a_stale_tagged_version() -> None:
     stale = "\x1eParsezen PDF OCR v2\x1fRecognized"
 
-    assert processing_module._decode_pdf_ocr_checkpoint(stale) is None
+    assert prepare_module.decode_pdf_ocr_checkpoint(stale) is None
 
 
 def test_pdf_result_reports_pages_marked_for_review(

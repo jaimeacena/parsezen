@@ -39,7 +39,9 @@ Las flechas representan dependencias de código, no una cadena de llamadas. Las 
 `processing.py` mantiene la fachada Qt-free `process_document()`. Los contratos inmutables de
 solicitud, preparación, transformación, resultado y telemetría viven en `pipeline/contracts.py`, de
 modo que aplicación, infraestructura y presentación ya no necesitan importar el orquestador para
-intercambiar datos. La ruta EPUB→EPUB separa además traducción del paquete, preparación
+intercambiar datos. `pipeline/prepare.py` convierte el origen, resuelve el rango PDF, preserva
+recursos, recopila calidad inicial y construye el documento semántico sin transformar texto ni
+publicar archivos. La ruta EPUB→EPUB separa además traducción del paquete, preparación
 editable/revisión y publicación. Estos límites usan contratos concretos y evitan una jerarquía
 genérica de procesadores que no aportaría comportamiento actual.
 

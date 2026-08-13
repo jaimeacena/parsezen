@@ -3,7 +3,8 @@
 ## Próxima versión
 
 - `process_document()` conserva su fachada, mientras sus contratos inmutables pasan a
-  `pipeline/contracts.py`; los consumidores internos dejan de importar el orquestador solo por tipos.
+  `pipeline/contracts.py` y la preparación a `pipeline/prepare.py`; los consumidores internos dejan
+  de importar el orquestador solo por tipos y la preparación no conoce transformación ni publicación.
 - La cola y sus informes se proyectan por eventos. El polling general de 200 ms se sustituye por un
   refresco de un segundo limitado a tiempo restante y reintento de persistencia diferida.
 - La nueva `QueueSession` Qt-free posee el plan preparado, runtimes, documento activo, pausa y cierre
