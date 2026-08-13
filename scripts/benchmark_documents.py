@@ -17,9 +17,12 @@ from time import monotonic
 
 from parsezen.errors import ParsezenError
 from parsezen.pdf_conversion import (
+    PdfEmbeddedResource,
     PdfPageRange,
+    PdfProgressPhase,
     PdfQualityReport,
     convert_pdf,
+    convert_pdf_document,
     extract_pdf_warning_pages,
 )
 
@@ -43,6 +46,15 @@ class PdfMetrics:
     ocr_pages: int
     elapsed_seconds: float
     peak_incremental_mib: float | None
+    resources: int = 0
+    resource_bytes: int = 0
+    ocr_elapsed_seconds: float = 0.0
+
+    @property
+    def elapsed_per_page_seconds(self) -> float | None:
+        if not self.processed_pages:
+            return None
+        return self.elapsed_seconds / self.processed_pages
 
 
 @dataclass(frozen=True, slots=True)
@@ -84,6 +96,7 @@ def measure_pdf(
     *,
     page_range: PdfPageRange | None = None,
     force_ocr: bool = False,
+    include_images: bool = False,
 ) -> PdfMetrics:
     """Convert one PDF in memory and return content-free structural and resource metrics."""
     source = source_path.resolve(strict=True)
@@ -103,20 +116,48 @@ def measure_pdf(
     sampler = threading.Thread(target=sample_memory, daemon=True)
     sampler.start()
     quality_report: PdfQualityReport | None = None
+    ocr_started_at: float | None = None
+    ocr_elapsed_seconds = 0.0
 
     def capture_quality(report: PdfQualityReport) -> None:
         nonlocal quality_report
         quality_report = report
 
+    def capture_progress(phase: PdfProgressPhase, _current: int, _total: int) -> None:
+        nonlocal ocr_elapsed_seconds, ocr_started_at
+        current_time = monotonic()
+        if phase is PdfProgressPhase.OCR:
+            if ocr_started_at is None:
+                ocr_started_at = current_time
+        elif ocr_started_at is not None:
+            ocr_elapsed_seconds += current_time - ocr_started_at
+            ocr_started_at = None
+
     started = monotonic()
+    resources: tuple[PdfEmbeddedResource, ...] = ()
     try:
-        markdown = convert_pdf(
-            source,
-            on_quality_report=capture_quality,
-            page_range=page_range,
-            force_ocr=force_ocr,
-        )
+        if include_images:
+            converted = convert_pdf_document(
+                source,
+                on_quality_report=capture_quality,
+                page_range=page_range,
+                force_ocr=force_ocr,
+                on_progress=capture_progress,
+                include_images=True,
+            )
+            markdown = converted.markdown
+            resources = converted.resources
+        else:
+            markdown = convert_pdf(
+                source,
+                on_quality_report=capture_quality,
+                page_range=page_range,
+                force_ocr=force_ocr,
+                on_progress=capture_progress,
+            )
     finally:
+        if ocr_started_at is not None:
+            ocr_elapsed_seconds += monotonic() - ocr_started_at
         stop_sampling.set()
         sampler.join()
     elapsed = monotonic() - started
@@ -138,6 +179,9 @@ def measure_pdf(
         ocr_pages=(len(quality_report.ocr_pages) if quality_report is not None else 0),
         elapsed_seconds=elapsed,
         peak_incremental_mib=incremental_mib,
+        resources=len(resources),
+        resource_bytes=sum(len(resource.content) for resource in resources),
+        ocr_elapsed_seconds=ocr_elapsed_seconds,
     )
 
 
@@ -205,6 +249,9 @@ def _aggregate_recording_samples(samples: tuple[PdfMetrics, ...]) -> PdfMetrics:
         ocr_pages=reference.ocr_pages,
         elapsed_seconds=max(sample.elapsed_seconds for sample in samples),
         peak_incremental_mib=max(memory_samples) if memory_samples else None,
+        resources=reference.resources,
+        resource_bytes=reference.resource_bytes,
+        ocr_elapsed_seconds=max(sample.ocr_elapsed_seconds for sample in samples),
     )
 
 
@@ -524,6 +571,11 @@ def _parser() -> argparse.ArgumentParser:
     )
     check = subparsers.add_parser("check", help="Comprobar una referencia local")
     check.add_argument("manifest", type=Path)
+    profile = subparsers.add_parser("profile", help="Medir un PDF sin crear una referencia")
+    profile.add_argument("source", type=Path)
+    profile.add_argument("--pages", nargs=2, type=int, metavar=("INICIO", "FIN"))
+    profile.add_argument("--force-ocr", action="store_true")
+    profile.add_argument("--include-images", action="store_true")
     return parser
 
 
@@ -545,6 +597,31 @@ def main(argv: list[str] | None = None) -> int:
                     f"{baseline.expected.elapsed_seconds:.2f} s, "
                     f"{baseline.expected.peak_incremental_mib or 0:.1f} MiB."
                 )
+            return 0
+        if arguments.command == "profile":
+            page_range = PdfPageRange(*arguments.pages) if arguments.pages is not None else None
+            metrics = measure_pdf(
+                arguments.source,
+                page_range=page_range,
+                force_ocr=arguments.force_ocr,
+                include_images=arguments.include_images,
+            )
+            print(
+                json.dumps(
+                    {
+                        "elapsed_seconds": metrics.elapsed_seconds,
+                        "elapsed_per_page_seconds": metrics.elapsed_per_page_seconds,
+                        "peak_incremental_mib": metrics.peak_incremental_mib,
+                        "processed_pages": metrics.processed_pages,
+                        "ocr_pages": metrics.ocr_pages,
+                        "ocr_elapsed_seconds": metrics.ocr_elapsed_seconds,
+                        "resources": metrics.resources,
+                        "resource_bytes": metrics.resource_bytes,
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                )
+            )
             return 0
         checks = check_manifest(arguments.manifest)
         for check in checks:

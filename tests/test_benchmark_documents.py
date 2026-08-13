@@ -7,7 +7,7 @@ from types import SimpleNamespace
 import pytest
 import scripts.benchmark_documents as benchmark_module
 
-from parsezen.pdf_conversion import PdfQualityReport
+from parsezen.pdf_conversion import PdfProgressPhase, PdfQualityReport
 
 
 def test_private_pdf_benchmark_records_no_document_text_and_detects_regressions(
@@ -162,3 +162,34 @@ def test_private_pdf_benchmark_counts_descendant_working_sets(
     monkeypatch.setitem(sys.modules, "psutil", fake_psutil)
 
     assert benchmark_module._working_set_bytes() == 600
+
+
+def test_pdf_profile_measures_page_rate_ocr_time_and_resources(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "book.pdf"
+    source.write_bytes(b"%PDF")
+    clock = iter((0.0, 1.0, 2.0, 5.0, 10.0))
+    monkeypatch.setattr(benchmark_module, "monotonic", clock.__next__)
+    monkeypatch.setattr(benchmark_module, "_working_set_bytes", lambda: 100 * 1024 * 1024)
+
+    def convert(_source: Path, *, on_quality_report, on_progress, **_kwargs):
+        on_quality_report(PdfQualityReport((1, 2), (2,), ()))
+        on_progress(PdfProgressPhase.EXTRACTING, 1, 2)
+        on_progress(PdfProgressPhase.OCR, 1, 1)
+        on_progress(PdfProgressPhase.STRUCTURING, 2, 2)
+        return SimpleNamespace(
+            markdown="# Result\n",
+            resources=(SimpleNamespace(content=b"image"),),
+        )
+
+    monkeypatch.setattr(benchmark_module, "convert_pdf_document", convert)
+
+    metrics = benchmark_module.measure_pdf(source, include_images=True)
+
+    assert metrics.elapsed_seconds == 10.0
+    assert metrics.elapsed_per_page_seconds == 5.0
+    assert metrics.ocr_elapsed_seconds == 3.0
+    assert metrics.resources == 1
+    assert metrics.resource_bytes == 5

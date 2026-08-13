@@ -1039,6 +1039,18 @@ el peor tiempo y pico de memoria observados antes de añadir el margen de regres
 no determinista impide crear la referencia y la variación normal de OCR no se confunde con un cambio
 funcional. Los manifiestos y resultados viven en `local-benchmarks/`, fuera de Git.
 
+El subcomando `profile` añade observación sin crear una referencia: tiempo total y por página, pico
+RSS incremental del árbol de procesos, páginas y tiempo OCR, y cantidad/tamaño de recursos cuando se
+activa `--include-images`. `scripts/benchmark_runtime.py PERFIL INSTALACIÓN` completa la matriz con un
+payload sintético: tiempos DPAPI, escritura y recuperación de snapshot v2, disco privado/temporal,
+arranque en frío de una ventana offscreen y tamaño de la instalación; `--installer` añade el tamaño
+del instalador construido. El perfil resultante contiene solo números, no rutas ni payloads. Para que
+el tamaño instalado sea representativo se debe pasar la carpeta del paquete construido, no `src/`.
+
+Estas métricas son instrumentación, no una autorización automática para optimizar. Streaming global,
+paralelismo de documentos, `mmap`, persistencia delta y pooling SQLite solo se considerarán contra una
+referencia repetible que muestre un cuello de botella material.
+
 El instalador se construye únicamente bajo demanda o para una etiqueta de versión.
 
 La distribución pública usa un instalador Inno Setup sin Authenticode. El workflow de Windows parte

@@ -96,6 +96,11 @@ Los límites de importación se validan automáticamente para que cada módulo p
 probarse sin arrastrar la interfaz o SQLite. Las decisiones y comandos de verificación están en la
 [documentación de arquitectura](docs/architecture.md).
 
+Los benchmarks privados no se versionan. `scripts/benchmark_documents.py profile` mide tiempo total
+y por página, RSS, OCR y recursos de un PDF; `scripts/benchmark_runtime.py` usa solo un payload
+sintético para medir DPAPI, snapshots, recuperación, arranque en frío, disco temporal y tamaños de la
+instalación/instalador indicados.
+
 ## Licencia
 
 Parsezen es gratuito y se distribuye bajo licencia [MIT](LICENSE).

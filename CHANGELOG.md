@@ -2,6 +2,9 @@
 
 ## Próxima versión
 
+- Los benchmarks locales miden ahora tiempo por página, OCR y recursos PDF, y añaden un perfil
+  sintético para DPAPI, snapshots, recuperación, arranque en frío, disco temporal y tamaños de
+  instalación/instalador. No se aplica ninguna optimización sin una referencia medida.
 - La evaluación del review gate conserva el modelo actual: separar ejecución y revisión eliminaría
   un estado de etapa, pero añadiría otra proyección durable y dependencia del scheduler sin reducir
   las reglas de recuperación. La decisión y sus métricas quedan documentadas.
