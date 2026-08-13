@@ -2,6 +2,8 @@
 
 ## Próxima versión
 
+- Pausar usa ahora el motivo terminal explícito del ejecutor físico: worker, cronología y dominio
+  terminan en `PAUSED`, se conservan checkpoints y no aparece una cancelación falsa en Actividad.
 - Traducción y revisión dejan una cobertura lingüística explícita: distingue corrección integrada,
   verificación bilingüe independiente y revisión dirigida, y muestra bloques comprobados, revisados,
   no revisados e incidencias pendientes sin persistir contenido documental.

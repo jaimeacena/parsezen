@@ -21,7 +21,7 @@ de Ollama y nunca envía el documento fuera del equipo. Es open source, privado 
   glosarios y memoria terminológica. El resultado distingue una corrección integrada de una
   verificación bilingüe independiente y cuenta bloques comprobados, revisados y pendientes.
 
-- **Escalable y preparado para trabajos largos**. Trabaja con varios documentos, consulta el tiempo estimado, pausa el proceso y reanúdalo cuando quieras o repite solo la fase que haya fallado.
+- **Escalable y preparado para trabajos largos**. Trabaja con varios documentos, consulta el tiempo estimado, pausa el proceso y reanúdalo cuando quieras o repite solo la fase que haya fallado. Una pausa conserva los checkpoints reutilizables y no se registra como cancelación.
 
 - **Gratis, con IA local fácil de configurar**. Todo se procesa gratis en tu equipo, sin modificar los archivos originales. Instala Ollama, comprueba si tu equipo es compatible y elige un modelo adecuado mediante una configuración guiada y sin comandos.
 

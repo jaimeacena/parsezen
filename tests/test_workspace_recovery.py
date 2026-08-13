@@ -1,12 +1,14 @@
 from __future__ import annotations
 
+import json
 import os
 from dataclasses import dataclass, field
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 from parsezen.application.job_execution import JobExecutionController
 from parsezen.application.job_queue import JobQueue
 from parsezen.application.workspace_recovery import recover_workspace, source_is_unchanged
+from parsezen.document_model import ConvertedResource
 from parsezen.domain.jobs import (
     DocumentFormat,
     DocumentJob,
@@ -16,6 +18,9 @@ from parsezen.domain.jobs import (
     OutputConfiguration,
 )
 from parsezen.domain.stages import StageKind
+from parsezen.infrastructure.artifact_store import ArtifactStore
+from parsezen.infrastructure.result_snapshots import ResultSnapshotStore
+from parsezen.infrastructure.state_store import StateStore
 from parsezen.processing import ProcessResult
 from parsezen.settings import AppSettings
 
@@ -103,6 +108,52 @@ def test_workspace_recovery_rejects_a_review_after_the_source_changes(tmp_path: 
     assert dict(recovered.runtime)["review"].result is None
     assert recovered.reset_paused_job_ids == frozenset({"review"})
     assert recovered.source_changed_job_ids == frozenset({"review"})
+    assert recovered.retained_artifact_job_ids == frozenset()
+
+
+def test_workspace_recovery_rejects_an_incomplete_review_snapshot(tmp_path: Path) -> None:
+    source = tmp_path / "source.txt"
+    source.write_text("Original", encoding="utf-8")
+    destination = tmp_path / "review.md"
+    destination.write_text("Proposal", encoding="utf-8")
+    queue = JobQueue((_job(source, "review"),))
+    execution = JobExecutionController(queue)
+    execution.block_completed_result_for_review(
+        "review",
+        StageKind.PREPARE,
+        review_id="review-gate",
+    )
+    state = StateStore(tmp_path / "state.sqlite3")
+    state.replace_jobs(queue.jobs)
+    artifacts = ArtifactStore(
+        tmp_path / "artifacts",
+        protect=lambda payload: payload,
+        unprotect=lambda payload: payload,
+    )
+    snapshots = ResultSnapshotStore(state, artifacts)
+    manifest_id = snapshots.save(
+        "review",
+        ProcessResult(
+            destination,
+            review_markdown="Proposal",
+            review_required=True,
+            revision_resources=(
+                ConvertedResource(
+                    PurePosixPath("image.jpg"),
+                    b"image",
+                    "image/jpeg",
+                ),
+            ),
+        ),
+    )
+    manifest = json.loads(artifacts.read_text("review", manifest_id))
+    resource_id = manifest["revision_resources"][0]["artifact_id"]
+    artifacts.remove_artifact("review", resource_id)
+
+    recovered = recover_workspace(queue.jobs, snapshots, AppSettings())
+
+    assert dict(recovered.runtime)["review"].result is None
+    assert recovered.reset_paused_job_ids == frozenset({"review"})
     assert recovered.retained_artifact_job_ids == frozenset()
 
 

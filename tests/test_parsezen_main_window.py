@@ -1,6 +1,7 @@
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
+from threading import Event
 from unittest.mock import Mock
 
 from PySide6.QtCore import QTimer
@@ -2836,6 +2837,86 @@ def test_processing_controller_projects_progress_success_failure_and_pause(
     assert not window.is_processing
 
 
+def test_pause_keeps_runner_domain_checkpoints_activity_and_scheduler_consistent(
+    qtbot,
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    source = tmp_path / "pause.txt"
+    source.write_text("Original", encoding="utf-8")
+    history = tmp_path / "recent.json"
+    checkpoint = tmp_path / "checkpoints" / "pause.checkpoint"
+    started = Event()
+    cleaned: list[Path] = []
+    window = ParsezenMainWindow(
+        settings=AppSettings(),
+        auto_discover_ai=False,
+        state_path=tmp_path / "workspace.sqlite3",
+        history_path=history,
+        work_checkpoint_root=checkpoint.parent,
+    )
+    qtbot.addWidget(window)
+    window.set_source_paths((source,))
+    job = window._job_queue.jobs[0]  # noqa: SLF001
+    window._job_queue.configure(  # noqa: SLF001
+        job.id,
+        replace(
+            job.configuration,
+            output=replace(
+                job.configuration.output,
+                format=DocumentFormat.MARKDOWN,
+                configured=True,
+            ),
+        ),
+    )
+
+    def processor(
+        _request,
+        *,
+        on_stage,
+        on_progress,
+        settings,
+        cancellation,
+    ) -> ProcessResult:
+        del on_progress, settings
+        on_stage(ProcessStage.TRANSLATING)
+        checkpoint.parent.mkdir(parents=True, exist_ok=True)
+        checkpoint.write_text("reusable work", encoding="utf-8")
+        started.set()
+        assert cancellation._event.wait(timeout=2)  # noqa: SLF001
+        cancellation.check()
+        raise AssertionError("Pause must stop the physical processor.")
+
+    monkeypatch.setattr(main_window_module, "process_document", processor)
+    monkeypatch.setattr(
+        main_window_module,
+        "clear_document_work_checkpoints",
+        lambda request, *_args, **_kwargs: cleaned.append(request.source_path),
+    )
+    window._prepare_independent_requests()  # noqa: SLF001
+    qtbot.waitUntil(lambda: window._prepared_run is not None, timeout=3_000)  # noqa: SLF001
+    window._start_processing()  # noqa: SLF001
+    qtbot.waitUntil(started.is_set, timeout=2_000)
+
+    window._pause_processing()  # noqa: SLF001
+
+    qtbot.waitUntil(lambda: not window.is_processing, timeout=2_000)
+    paused = window._job_queue.get(job.id)  # noqa: SLF001
+    activity = window._activity_for_job(job.id)  # noqa: SLF001
+    assert paused is not None
+    assert paused.status is JobStatus.PAUSED
+    assert activity is not None
+    assert activity[1].events[-1].status is AttemptEventStatus.PAUSED
+    assert all(event.status is not AttemptEventStatus.CANCELLED for event in activity[1].events)
+    assert checkpoint.read_text(encoding="utf-8") == "reusable work"
+    assert cleaned == []
+    assert load_recent_jobs(path=history) == ()
+    assert window._job_execution.plan_run() == QueueRunPlan(  # noqa: SLF001
+        RunMode.RESUME,
+        (job.id,),
+    )
+
+
 def test_recent_failure_captures_the_runner_attempt_before_history_is_written(
     qtbot,
     tmp_path: Path,
@@ -3377,11 +3458,11 @@ def test_main_window_boundary_actions_fail_safely_without_hidden_state(
     window._move_job(first_entry.job_id, 1)  # noqa: SLF001
     assert first_entry in _entries(window)  # noqa: SLF001
 
-    cancellations = iter((False, True))
+    pauses = iter((False, True))
     monkeypatch.setattr(
         window._processing_runner,  # noqa: SLF001
-        "cancel",
-        lambda: next(cancellations),
+        "pause",
+        lambda: next(pauses),
     )
     window._pause_processing()  # noqa: SLF001
     window._is_processing = True  # noqa: SLF001

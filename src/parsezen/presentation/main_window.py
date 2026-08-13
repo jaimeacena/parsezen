@@ -2392,7 +2392,7 @@ class ParsezenMainWindow(QMainWindow):
         if not self._is_processing:
             return
         self._pause_requested = True
-        if not self._processing_runner.cancel():
+        if not self._processing_runner.pause():
             self._pause_requested = False
 
     @Slot(str)

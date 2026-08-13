@@ -318,6 +318,12 @@ el `QThreadPool` y publica eventos de fase, progreso, resultado, error, cancelac
 ventana se limita a conectar esos eventos con `JobExecutionController`; ya no construye ni conserva
 trabajadores, y ninguna regla del planificador depende de Qt.
 
+La pausa entra siempre por `ProcessingRunner.pause()`: marca al trabajador antes de activar su token
+de cancelación cooperativa y cierra la fase activa como `paused` en la traza del intento. La ventana
+proyecta ese mismo motivo en el dominio, conserva los checkpoints, no crea una fila de actividad
+`cancelled` y deja que el planificador elija después `RunMode.RESUME`. La cancelación real mantiene el
+recorrido separado y sí elimina el trabajo temporal exacto.
+
 ### Traza local de intentos y actividad reciente
 
 `domain.attempt_activity` define la traza inmutable y acotada de un intento: fases semánticas
