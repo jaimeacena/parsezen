@@ -9,7 +9,7 @@ from parsezen.application.job_runtime import JobRuntime
 from parsezen.application.runtime_mapping import request_and_settings_from_job
 from parsezen.domain.jobs import DocumentJob, DocumentSource, JobStatus
 from parsezen.domain.source_identity import sha256_file
-from parsezen.processing import ProcessResult
+from parsezen.pipeline.contracts import ProcessResult
 from parsezen.settings import AppSettings
 
 SOURCE_CHANGED_MESSAGE = (

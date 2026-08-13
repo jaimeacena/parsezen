@@ -119,6 +119,13 @@ def test_markdown_safety_does_not_own_network_or_model_selection() -> None:
     assert "parsezen.local_models" not in imported
 
 
+def test_pipeline_contracts_do_not_depend_on_the_orchestrator_or_output() -> None:
+    imported = _imports(_PACKAGE_ROOT / "pipeline" / "contracts.py")
+
+    assert "parsezen.processing" not in imported
+    assert "parsezen.output" not in imported
+
+
 def test_main_window_delegates_the_local_ai_workflow() -> None:
     delegated = _class_methods(
         _PACKAGE_ROOT / "presentation" / "local_ai_workflow.py",

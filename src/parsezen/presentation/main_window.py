@@ -107,7 +107,7 @@ from parsezen.domain.jobs import (
     TranslationConfiguration,
 )
 from parsezen.domain.outcomes import EarlyCheckReport, OutcomeSummary
-from parsezen.domain.process_lifecycle import stage_kind_from_process_stage
+from parsezen.domain.process_lifecycle import ProcessStage, stage_kind_from_process_stage
 from parsezen.domain.reviews import ReviewChoice, ReviewKind, ReviewSession, ReviewStatus
 from parsezen.domain.stages import StageKind, StageStatus
 from parsezen.errors import ParsezenError
@@ -116,6 +116,7 @@ from parsezen.infrastructure.artifact_store import ArtifactStore
 from parsezen.infrastructure.result_snapshots import ResultSnapshotStore
 from parsezen.infrastructure.state_store import StateStore, StateStoreError
 from parsezen.local_models import is_reasoning_model_id
+from parsezen.pipeline.contracts import ProcessRequest, ProcessResult
 from parsezen.presentation.activity_view import ActivityView
 from parsezen.presentation.book_editor_dialog import BookEditorDialog
 from parsezen.presentation.design_system import (
@@ -138,9 +139,6 @@ from parsezen.presentation.preflight_runner import (
 from parsezen.presentation.processing_runner import ProcessingRunner
 from parsezen.presentation.workspace import ParsezenWorkspace
 from parsezen.processing import (
-    ProcessRequest,
-    ProcessResult,
-    ProcessStage,
     clear_document_work_checkpoints,
     process_document,
     review_completed_result,

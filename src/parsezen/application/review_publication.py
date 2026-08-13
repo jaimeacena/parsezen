@@ -21,7 +21,8 @@ from parsezen.errors import RequestValidationError
 from parsezen.final_integrity import IntegrityLedger, binary_integrity_capture
 from parsezen.output import replace_binary_output
 from parsezen.pdf_conversion import strip_pdf_page_markers
-from parsezen.processing import ProcessResult, apply_reviewed_revision
+from parsezen.pipeline.contracts import ProcessResult
+from parsezen.processing import apply_reviewed_revision
 
 
 class BookDraftRepository(Protocol):

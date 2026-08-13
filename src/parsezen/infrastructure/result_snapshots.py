@@ -10,6 +10,7 @@ from typing import Any
 
 from parsezen.document_model import ConvertedResource
 from parsezen.domain.jobs import MarkdownOrganization
+from parsezen.domain.process_lifecycle import ProcessStage
 from parsezen.epub_builder import EpubBookMetadata
 from parsezen.final_integrity import (
     FinalIntegrityReport,
@@ -20,9 +21,8 @@ from parsezen.final_integrity import (
 from parsezen.infrastructure.artifact_store import ArtifactStore
 from parsezen.infrastructure.state_store import StateStore
 from parsezen.pdf_conversion import PdfQualityReport, PdfReviewIssue
-from parsezen.processing import (
+from parsezen.pipeline.contracts import (
     ProcessResult,
-    ProcessStage,
     ProcessTelemetry,
     StageTelemetry,
 )

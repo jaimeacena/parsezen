@@ -7,7 +7,8 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from parsezen.errors import ParsezenError
-from parsezen.processing import ProcessRequest, validate_process_request
+from parsezen.pipeline.contracts import ProcessRequest
+from parsezen.processing import validate_process_request
 from parsezen.settings import AppSettings
 
 

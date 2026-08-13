@@ -12,7 +12,7 @@ from parsezen.application.review_plan import ReviewStep, review_steps_for_result
 from parsezen.domain.jobs import DocumentJob
 from parsezen.domain.reviews import ReviewKind, ReviewSession, ReviewStatus
 from parsezen.domain.stages import StageStatus
-from parsezen.processing import ProcessResult
+from parsezen.pipeline.contracts import ProcessResult
 
 
 class PhaseReviewRepository(Protocol):

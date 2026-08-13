@@ -20,7 +20,7 @@ from parsezen.domain.stages import StageKind
 from parsezen.glossary import GlossaryEntry
 from parsezen.improvement import ImprovementMode
 from parsezen.pdf_conversion import PdfPageRange
-from parsezen.processing import ProcessRequest, ProcessResult
+from parsezen.pipeline.contracts import ProcessRequest, ProcessResult
 from parsezen.settings import AppSettings
 from parsezen.workflow import OutputFormat, WorkflowOptions, plan_workflow
 

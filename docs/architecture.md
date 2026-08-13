@@ -36,10 +36,12 @@ Las flechas representan dependencias de código, no una cadena de llamadas. Las 
   requisitos reales. En particular, EPUB permanece en `epub_conversion.py` y su reanudación en
   `epub_checkpoints.py`.
 
-`processing.py` es un orquestador Qt-free con fronteras explícitas de preparación, transformación y
-publicación. La ruta EPUB→EPUB separa además traducción del paquete, preparación editable/revisión y
-publicación. Estos límites comparten contratos concretos y evitan una jerarquía genérica de
-procesadores que no aportaría comportamiento actual.
+`processing.py` mantiene la fachada Qt-free `process_document()`. Los contratos inmutables de
+solicitud, preparación, transformación, resultado y telemetría viven en `pipeline/contracts.py`, de
+modo que aplicación, infraestructura y presentación ya no necesitan importar el orquestador para
+intercambiar datos. La ruta EPUB→EPUB separa además traducción del paquete, preparación
+editable/revisión y publicación. Estos límites usan contratos concretos y evitan una jerarquía
+genérica de procesadores que no aportaría comportamiento actual.
 
 Los dos procesadores más grandes conservan una fachada estable, pero sus subsistemas con invariantes
 propias ya no están mezclados:

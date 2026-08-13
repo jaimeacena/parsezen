@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from parsezen.domain.jobs import DocumentFormat, JobConfiguration, ProcessingPlan
 from parsezen.domain.reviews import ReviewKind
 from parsezen.domain.stages import StageKind
-from parsezen.processing import ProcessResult
+from parsezen.pipeline.contracts import ProcessResult
 from parsezen.revision import RevisionKind
 
 

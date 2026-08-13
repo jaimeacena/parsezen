@@ -24,7 +24,7 @@ from parsezen.cancellation import CancellationToken, check_cancelled
 from parsezen.domain.estimates import ProcessingMetric, WorkloadProfile
 from parsezen.domain.jobs import DocumentJob, DocumentSource
 from parsezen.domain.source_identity import SourceIdentity
-from parsezen.processing import ProcessRequest
+from parsezen.pipeline.contracts import ProcessRequest
 from parsezen.settings import AppSettings
 
 

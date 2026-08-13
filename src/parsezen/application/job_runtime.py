@@ -4,8 +4,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from parsezen.domain.process_lifecycle import ProcessStage
 from parsezen.pdf_conversion import PdfPageRange
-from parsezen.processing import ProcessResult, ProcessStage
+from parsezen.pipeline.contracts import ProcessResult
 
 
 @dataclass(slots=True)

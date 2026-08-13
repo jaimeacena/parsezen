@@ -26,7 +26,7 @@ from parsezen.domain.jobs import (
     TranslationMethod,
 )
 from parsezen.pdf_conversion import PdfPageRange, resolve_pdf_page_range
-from parsezen.processing import ProcessRequest, ProcessTelemetry
+from parsezen.pipeline.contracts import ProcessRequest, ProcessTelemetry
 from parsezen.settings import AppSettings
 
 

@@ -22,10 +22,11 @@ from parsezen.domain.attempt_activity import (
     make_failure_snapshot,
 )
 from parsezen.domain.outcomes import EarlyCheckReport
-from parsezen.domain.process_lifecycle import phase_for_process_stage
+from parsezen.domain.process_lifecycle import ProcessStage, phase_for_process_stage
 from parsezen.errors import EarlyCheckError, ParsezenError, ProcessingCancelledError
 from parsezen.failure_recovery import ProcessingFailure
-from parsezen.processing import ProcessRequest, ProcessResult, ProcessStage, process_document
+from parsezen.pipeline.contracts import ProcessRequest, ProcessResult
+from parsezen.processing import process_document
 from parsezen.settings import AppSettings
 
 ProcessCallable = Callable[..., ProcessResult]

@@ -6,7 +6,7 @@ from parsezen.domain.estimates import DurationEstimate
 from parsezen.domain.jobs import DocumentFormat, DocumentJob, ProcessingPlan
 from parsezen.domain.outcomes import EarlyCheckReport, OutcomeSummary
 from parsezen.domain.reviews import ReviewChoice, ReviewSession
-from parsezen.processing import ProcessResult
+from parsezen.pipeline.contracts import ProcessResult
 
 
 def build_outcome_summary(

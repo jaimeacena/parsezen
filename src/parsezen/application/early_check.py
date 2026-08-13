@@ -13,14 +13,10 @@ import pdfplumber
 from parsezen.cancellation import CancellationToken, check_cancelled
 from parsezen.domain.outcomes import EarlyCheckReport
 from parsezen.pdf_conversion import PdfPageRange, resolve_pdf_page_range
-from parsezen.processing import (
-    OutputFormat,
-    ProcessRequest,
-    ProcessResult,
-    clear_general_work_checkpoints,
-    process_document,
-)
+from parsezen.pipeline.contracts import ProcessRequest, ProcessResult
+from parsezen.processing import clear_general_work_checkpoints, process_document
 from parsezen.settings import AppSettings
+from parsezen.workflow import OutputFormat
 
 EarlyCheckProgress = Callable[[int, int], None]
 DocumentProcessor = Callable[..., ProcessResult]

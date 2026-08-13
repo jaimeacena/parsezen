@@ -18,7 +18,7 @@ from parsezen.application.review_plan import review_workload_for_result
 from parsezen.application.revision_materializer import create_revision_review
 from parsezen.domain.jobs import DocumentJob, JobConfiguration
 from parsezen.domain.reviews import ReviewChoice, ReviewKind, ReviewSession, ReviewStatus
-from parsezen.processing import ProcessResult
+from parsezen.pipeline.contracts import ProcessResult
 from parsezen.revision import RevisionDraft, RevisionKind
 
 

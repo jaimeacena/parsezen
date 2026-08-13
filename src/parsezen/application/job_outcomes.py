@@ -11,7 +11,7 @@ from parsezen.application.job_queue import JobQueue
 from parsezen.application.runtime_mapping import review_stage_for_result
 from parsezen.domain.jobs import DocumentJob
 from parsezen.domain.stages import StageKind
-from parsezen.processing import ProcessResult
+from parsezen.pipeline.contracts import ProcessResult
 
 
 class ReviewSnapshotRepository(Protocol):
