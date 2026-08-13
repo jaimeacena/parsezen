@@ -65,6 +65,11 @@ def test_recent_activity_round_trips_content_free_summary(tmp_path: Path) -> Non
             ai_review_recommended=True,
             ai_review_blocks=2,
             ai_review_signals=3,
+            linguistic_review_mode="independent_bilingual",
+            translation_checked_blocks=14,
+            translation_reviewed_blocks=12,
+            translation_independent_blocks=12,
+            translation_unreviewed_blocks=2,
         ),
     )
 

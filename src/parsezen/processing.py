@@ -34,6 +34,7 @@ from parsezen.domain.attempt_activity import (
     phase_for_process_stage,
 )
 from parsezen.domain.jobs import MarkdownOrganization, ReviewRecommendation
+from parsezen.domain.source_identity import is_sha256_digest, sha256_file
 from parsezen.epub_builder import (
     EpubBookMetadata,
     build_epub,
@@ -116,6 +117,8 @@ from parsezen.semantic_blocks import (
 )
 from parsezen.settings import AppSettings, validate_settings
 from parsezen.translation_quality import (
+    LinguisticReviewCoverage,
+    LinguisticReviewMode,
     TranslationQualityReport,
     build_translation_quality_report,
     detect_language_code,
@@ -275,6 +278,10 @@ class ProcessRequest:
     epub_remove_cover: bool = False
     review_content: bool = False
     review_structure: bool = False
+    source_size_bytes: int | None = None
+    source_modified_ns: int | None = None
+    source_content_sha256: str | None = None
+    source_identity_verified: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -291,6 +298,7 @@ class ProcessResult:
     epub_resumed_parts: int = 0
     epub_checkpoint_degraded: bool = False
     translation_quality_report: TranslationQualityReport | None = None
+    linguistic_review_coverage: LinguisticReviewCoverage | None = None
     preserved_translation_chunks: tuple[int, ...] = ()
     preserved_images: int = 0
     epub_chapters: int = 0
@@ -329,6 +337,7 @@ class _PreparedDocument:
 class _TransformedDocument:
     transformed_markdown: str
     translation_quality_report: TranslationQualityReport | None
+    linguistic_review_coverage: LinguisticReviewCoverage | None
     preserved_translation_chunks: tuple[int, ...]
     revision_draft: RevisionDraft | None
     published_markdown: str
@@ -344,6 +353,8 @@ class _PreparedEpubReview:
     resource_count: int
     integrity_report: FinalIntegrityReport | None
     revision_draft: RevisionDraft | None
+    linguistic_review_mode: LinguisticReviewMode
+    translation_quality_report: TranslationQualityReport
 
 
 StageCallback = Callable[[ProcessStage], None]
@@ -624,10 +635,12 @@ def review_completed_result(
         review_structure=False,
     )
     _validate_request(scoped_request, settings)
+    source_digest = _checkpoint_source_digest(scoped_request)
     checkpoints = _open_general_work_checkpoints(
         scoped_request,
         settings,
         root=work_checkpoint_root,
+        source_digest=source_digest,
     )
     selected = frozenset(resolved_positions)
 
@@ -688,6 +701,30 @@ def review_completed_result(
         protected_translation_terms=tuple(entry.target for entry in request.glossary),
     )
     draft = candidate if candidate.changes else None
+    translation_quality_report = base_result.translation_quality_report
+    linguistic_review_coverage = base_result.linguistic_review_coverage
+    if bilingual and source_markdown is not None:
+        translation_quality_report = _translation_quality_report(
+            request,
+            source_markdown,
+            proposed_markdown,
+        )
+        previous_reviewed = (
+            linguistic_review_coverage.semantically_reviewed_blocks
+            if linguistic_review_coverage is not None
+            else 0
+        )
+        previous_independent = (
+            linguistic_review_coverage.independently_verified_blocks
+            if linguistic_review_coverage is not None
+            else 0
+        )
+        linguistic_review_coverage = _linguistic_review_coverage(
+            translation_quality_report,
+            mode=LinguisticReviewMode.TARGETED_BILINGUAL,
+            reviewed_blocks=previous_reviewed + len(selected),
+            independently_verified_blocks=previous_independent + len(selected),
+        )
     _finish_work_checkpoints(
         checkpoints,
         settings=settings,
@@ -696,6 +733,8 @@ def review_completed_result(
     )
     return replace(
         base_result,
+        translation_quality_report=translation_quality_report,
+        linguistic_review_coverage=linguistic_review_coverage,
         revision_draft=draft,
         review_markdown=proposed_markdown if draft is not None else current,
         review_required=draft is not None,
@@ -1008,11 +1047,13 @@ def _transform_prepared_document(
     revision_source = transformed_markdown
     revision_kinds: set[RevisionKind] = set()
     translation_review_source: str | None = None
+    linguistic_review_mode = LinguisticReviewMode.NOT_REVIEWED
     if request.review_content:
         if settings is None:
             raise AssertionError("Validated review requests always have settings.")
         _notify(on_stage, ProcessStage.REVIEWING_CONTENT)
         if _content_review_was_fused(request, effective_ai_mode, translation_source):
+            linguistic_review_mode = LinguisticReviewMode.CORRECTED_DURING_TRANSLATION
             transformed_markdown = _improve_selected_content(
                 transformed_markdown,
                 settings,
@@ -1024,6 +1065,7 @@ def _transform_prepared_document(
                 pdf_quality_report=pdf_quality_report,
             )
         elif translation_source is not None:
+            linguistic_review_mode = LinguisticReviewMode.INDEPENDENT_BILINGUAL
             translation_review_source = translation_source
             transformed_markdown = _review_translation_with_checkpoints(
                 translation_source,
@@ -1090,6 +1132,10 @@ def _transform_prepared_document(
         if revision_candidate is not None and revision_candidate.changes
         else None
     )
+    linguistic_review_coverage = _linguistic_review_coverage(
+        translation_quality_report,
+        mode=linguistic_review_mode,
+    )
 
     published_markdown = revision_source if revision_draft is not None else transformed_markdown
     review_required = (
@@ -1115,6 +1161,7 @@ def _transform_prepared_document(
     return _TransformedDocument(
         transformed_markdown,
         translation_quality_report,
+        linguistic_review_coverage,
         tuple(preserved_translation_chunks),
         revision_draft,
         published_markdown,
@@ -1145,6 +1192,7 @@ def _publish_transformed_document(
     semantic_document = prepared.semantic_document
     transformed_markdown = transformed.transformed_markdown
     translation_quality_report = transformed.translation_quality_report
+    linguistic_review_coverage = transformed.linguistic_review_coverage
     preserved_translation_chunks = transformed.preserved_translation_chunks
     revision_draft = transformed.revision_draft
     published_markdown = transformed.published_markdown
@@ -1239,6 +1287,7 @@ def _publish_transformed_document(
             pdf_quality_report=pdf_quality_report,
             exhaustive_pdf_ocr_used=request.force_pdf_ocr,
             translation_quality_report=translation_quality_report,
+            linguistic_review_coverage=linguistic_review_coverage,
             preserved_translation_chunks=tuple(preserved_translation_chunks),
             preserved_images=built_epub.resource_count,
             epub_chapters=built_epub.chapter_count,
@@ -1314,6 +1363,7 @@ def _publish_transformed_document(
             pdf_quality_report=pdf_quality_report,
             exhaustive_pdf_ocr_used=request.force_pdf_ocr,
             translation_quality_report=translation_quality_report,
+            linguistic_review_coverage=linguistic_review_coverage,
             preserved_translation_chunks=tuple(preserved_translation_chunks),
             preserved_images=len(converted_resources),
             revision_draft=materialized_revision,
@@ -1398,6 +1448,7 @@ def _process_document(
     check_cancelled(cancellation)
 
     if _is_epub_translation(request):
+        epub_source_digest = _checkpoint_source_digest(request)
         return _process_epub_translation(
             request,
             on_stage,
@@ -1406,6 +1457,7 @@ def _process_document(
             cancellation=cancellation,
             epub_checkpoint_root=epub_checkpoint_root,
             work_checkpoint_root=work_checkpoint_root,
+            source_digest=epub_source_digest,
         )
 
     if _is_epub_personalization(request):
@@ -1415,14 +1467,21 @@ def _process_document(
             cancellation=cancellation,
         )
 
+    source_digest = (
+        _checkpoint_source_digest(request)
+        if _uses_general_work_checkpoints(request) or _uses_pdf_conversion_checkpoints(request)
+        else None
+    )
     work_checkpoints = _open_general_work_checkpoints(
         request,
         settings,
         root=work_checkpoint_root,
+        source_digest=source_digest,
     )
     pdf_checkpoints = _open_pdf_conversion_checkpoints(
         request,
         root=work_checkpoint_root,
+        source_digest=source_digest,
     )
 
     prepared = _prepare_document_input(
@@ -1463,6 +1522,7 @@ def _prepare_translated_epub_review(
     final_path: Path,
     translated_language_code: str,
     converted_source: ConvertedDocument,
+    initial_translation_quality_report: TranslationQualityReport,
     translation_glossary: tuple[GlossaryEntry, ...],
     target_language: str | None,
     effective_ai_mode: ImprovementMode | None,
@@ -1552,10 +1612,16 @@ def _prepare_translated_epub_review(
         and request.offline_translation_language is None
         and effective_ai_mode is ImprovementMode.CLEAN_AND_TRANSLATE
     )
+    linguistic_review_mode = (
+        LinguisticReviewMode.CORRECTED_DURING_TRANSLATION
+        if content_review_fused
+        else LinguisticReviewMode.NOT_REVIEWED
+    )
     if request.review_content and not content_review_fused:
         if settings is None:
             raise AssertionError("Validated review requests always have settings.")
         _notify(on_stage, ProcessStage.REVIEWING_CONTENT)
+        linguistic_review_mode = LinguisticReviewMode.INDEPENDENT_BILINGUAL
         translation_review_source = converted_source.markdown
         reviewed_markdown = _review_translation_with_checkpoints(
             translation_review_source,
@@ -1599,6 +1665,16 @@ def _prepare_translated_epub_review(
         if revision_candidate is not None and revision_candidate.changes
         else None
     )
+    translation_quality_report = initial_translation_quality_report
+    if reviewed_markdown != revision_source:
+        updated_report = _translation_quality_report(
+            request,
+            converted_source.markdown,
+            reviewed_markdown,
+        )
+        if updated_report is None:
+            raise AssertionError("A translated EPUB always has a translation quality report.")
+        translation_quality_report = updated_report
     normalized_document = replace(
         normalized_document,
         markdown=(revision_source if revision_draft is not None else reviewed_markdown),
@@ -1641,6 +1717,8 @@ def _prepare_translated_epub_review(
         resource_count=resource_count,
         integrity_report=integrity_report,
         revision_draft=revision_draft,
+        linguistic_review_mode=linguistic_review_mode,
+        translation_quality_report=translation_quality_report,
     )
 
 
@@ -1653,6 +1731,7 @@ def _process_epub_translation(
     cancellation: CancellationToken | None,
     epub_checkpoint_root: Path | None,
     work_checkpoint_root: Path | None,
+    source_digest: str,
 ) -> ProcessResult:
     target_language = request.offline_translation_language or request.target_language
     language_code = resolve_language_code(target_language)
@@ -1685,6 +1764,7 @@ def _process_epub_translation(
         request,
         settings,
         root=work_checkpoint_root,
+        source_digest=source_digest,
     )
     translation_glossary = _combined_translation_glossary(
         request.glossary,
@@ -1704,6 +1784,7 @@ def _process_epub_translation(
             source_semantic.terms,
         ),
         root=epub_checkpoint_root,
+        source_digest=source_digest,
     )
     translation_stage_announced = request.offline_translation_language is None
 
@@ -1812,6 +1893,7 @@ def _process_epub_translation(
         final_path,
         translated_epub.language_code,
         converted_source,
+        translated_epub.quality_report,
         translation_glossary,
         target_language,
         effective_ai_mode,
@@ -1839,7 +1921,11 @@ def _process_epub_translation(
         epub_translation_parts=translated_epub.translation_parts,
         epub_resumed_parts=translated_epub.resumed_parts,
         epub_checkpoint_degraded=translated_epub.checkpoint_degraded,
-        translation_quality_report=translated_epub.quality_report,
+        translation_quality_report=prepared_review.translation_quality_report,
+        linguistic_review_coverage=_linguistic_review_coverage(
+            prepared_review.translation_quality_report,
+            mode=prepared_review.linguistic_review_mode,
+        ),
         preserved_images=prepared_review.resource_count,
         epub_chapters=prepared_review.chapter_count,
         revision_resources=prepared_review.document.resources,
@@ -2200,6 +2286,37 @@ def _translation_quality_report(
     )
 
 
+def _linguistic_review_coverage(
+    report: TranslationQualityReport | None,
+    *,
+    mode: LinguisticReviewMode,
+    reviewed_blocks: int | None = None,
+    independently_verified_blocks: int | None = None,
+) -> LinguisticReviewCoverage | None:
+    """Describe semantic coverage without treating heuristic checks as verification."""
+
+    if report is None:
+        return None
+    translated_blocks = max(0, report.checked_segments, report.translated_blocks)
+    if reviewed_blocks is None:
+        reviewed_blocks = translated_blocks if mode is not LinguisticReviewMode.NOT_REVIEWED else 0
+    if independently_verified_blocks is None:
+        independently_verified_blocks = (
+            translated_blocks if mode is LinguisticReviewMode.INDEPENDENT_BILINGUAL else 0
+        )
+    return LinguisticReviewCoverage(
+        mode=mode,
+        translated_blocks=translated_blocks,
+        automatically_checked_blocks=min(translated_blocks, max(0, report.checked_segments)),
+        semantically_reviewed_blocks=min(translated_blocks, max(0, reviewed_blocks)),
+        independently_verified_blocks=min(
+            translated_blocks,
+            max(0, independently_verified_blocks),
+        ),
+        remaining_issues=max(0, report.total_issues),
+    )
+
+
 def _translation_is_redundant(markdown: str, target_language: str | None) -> bool:
     """Return true only when both source and target languages are confidently known."""
 
@@ -2366,19 +2483,32 @@ def _combined_translation_glossary(
     return tuple(normalized)
 
 
+def _uses_general_work_checkpoints(request: ProcessRequest) -> bool:
+    return bool(
+        request.improvement_mode is not None
+        or request.offline_translation_language is not None
+        or request.review_content
+        or request.review_structure
+    )
+
+
+def _uses_pdf_conversion_checkpoints(request: ProcessRequest) -> bool:
+    return request.source_path.suffix.lower() == ".pdf" and request.convert_to_markdown
+
+
+def _checkpoint_source_digest(request: ProcessRequest) -> str:
+    return request.source_content_sha256 or sha256_file(request.source_path)
+
+
 def _open_general_work_checkpoints(
     request: ProcessRequest,
     settings: AppSettings | None,
     *,
     root: Path | None,
+    source_digest: str | None = None,
 ) -> WorkCheckpoints | None:
     """Open checkpoints only when a workflow contains expensive resumable work."""
-    if (
-        request.source_path.suffix.lower() != ".pdf"
-        and request.improvement_mode is None
-        and not request.review_content
-        and not request.review_structure
-    ):
+    if not _uses_general_work_checkpoints(request):
         return None
     model = settings.model if settings is not None else None
     context_window = settings.context_window if settings is not None else None
@@ -2403,23 +2533,34 @@ def _open_general_work_checkpoints(
             context_window,
         )
     )
-    return open_work_checkpoints(request.source_path, resume_key, root=root)
+    return open_work_checkpoints(
+        request.source_path,
+        resume_key,
+        root=root,
+        source_digest=source_digest,
+    )
 
 
 def _open_pdf_conversion_checkpoints(
     request: ProcessRequest,
     *,
     root: Path | None,
+    source_digest: str | None = None,
 ) -> WorkCheckpoints | None:
     """Share costly page/OCR work across Markdown, EPUB and later text transformations."""
-    if request.source_path.suffix.lower() != ".pdf" or not request.convert_to_markdown:
+    if not _uses_pdf_conversion_checkpoints(request):
         return None
     # Native extraction and OCR payloads are keyed again by their absolute page
     # number. Keeping the directory independent from the selected interval lets
     # the representative early check feed the later full run without ever
     # sharing data between different source bytes or OCR strategies.
     resume_key = repr(("pdf-conversion-v2", request.force_pdf_ocr))
-    return open_work_checkpoints(request.source_path, resume_key, root=root)
+    return open_work_checkpoints(
+        request.source_path,
+        resume_key,
+        root=root,
+        source_digest=source_digest,
+    )
 
 
 def _finish_work_checkpoints(
@@ -2469,10 +2610,24 @@ def clear_document_work_checkpoints(
     root: Path | None = None,
 ) -> None:
     """Discard resumable work for one exact request after an explicit cancellation."""
-    checkpoints = _open_general_work_checkpoints(request, settings, root=root)
+    source_digest = (
+        _checkpoint_source_digest(request)
+        if _uses_general_work_checkpoints(request) or _uses_pdf_conversion_checkpoints(request)
+        else None
+    )
+    checkpoints = _open_general_work_checkpoints(
+        request,
+        settings,
+        root=root,
+        source_digest=source_digest,
+    )
     if checkpoints is not None:
         checkpoints.clear()
-    pdf_checkpoints = _open_pdf_conversion_checkpoints(request, root=root)
+    pdf_checkpoints = _open_pdf_conversion_checkpoints(
+        request,
+        root=root,
+        source_digest=source_digest,
+    )
     if pdf_checkpoints is not None:
         pdf_checkpoints.clear()
 
@@ -2485,7 +2640,15 @@ def clear_general_work_checkpoints(
 ) -> None:
     """Discard transformed sample text while retaining reusable PDF page work."""
 
-    checkpoints = _open_general_work_checkpoints(request, settings, root=root)
+    source_digest = (
+        _checkpoint_source_digest(request) if _uses_general_work_checkpoints(request) else None
+    )
+    checkpoints = _open_general_work_checkpoints(
+        request,
+        settings,
+        root=root,
+        source_digest=source_digest,
+    )
     if checkpoints is not None:
         checkpoints.clear()
 
@@ -2503,6 +2666,7 @@ def validate_process_request(request: ProcessRequest, settings: AppSettings | No
 
 def _validate_request(request: ProcessRequest, settings: AppSettings | None) -> None:
     _validate_source(request.source_path)
+    _validate_source_identity(request)
     _validate_pdf_options(request)
     _validate_translation_options(request)
     _validate_requested_action(request)
@@ -2523,6 +2687,44 @@ def _validate_request(request: ProcessRequest, settings: AppSettings | None) -> 
                 "La carpeta de imágenes debe estar en la misma unidad que la salida Markdown."
             ) from exc
     _validate_temporary_working_space(request)
+
+
+def _validate_source_identity(request: ProcessRequest) -> None:
+    """Reject a source that no longer matches the immutable queued document."""
+
+    expected_size = request.source_size_bytes
+    expected_modified = request.source_modified_ns
+    expected_digest = request.source_content_sha256
+    if expected_digest is not None and not is_sha256_digest(expected_digest):
+        raise RequestValidationError("La identidad del documento original no es válida.")
+    if request.source_identity_verified and (
+        expected_size is None or expected_modified is None or expected_digest is None
+    ):
+        raise RequestValidationError("La identidad verificada del documento está incompleta.")
+    if expected_size is None and expected_modified is None and expected_digest is None:
+        return
+    if expected_size is None or expected_modified is None:
+        raise RequestValidationError("La identidad del documento original está incompleta.")
+    try:
+        statistics = request.source_path.stat()
+    except OSError as exc:
+        raise RequestValidationError("No se pudo comprobar el documento original.") from exc
+    if statistics.st_size != expected_size or statistics.st_mtime_ns != expected_modified:
+        raise RequestValidationError(
+            "El original cambió desde que se añadió a la cola. "
+            "Quítalo y vuelve a añadirlo antes de procesarlo."
+        )
+    if expected_digest is None or request.source_identity_verified:
+        return
+    try:
+        current_digest = sha256_file(request.source_path)
+    except OSError as exc:
+        raise RequestValidationError("No se pudo comprobar el documento original.") from exc
+    if current_digest != expected_digest:
+        raise RequestValidationError(
+            "El original cambió desde que se añadió a la cola. "
+            "Quítalo y vuelve a añadirlo antes de procesarlo."
+        )
 
 
 def _validate_source(source_path: Path) -> None:

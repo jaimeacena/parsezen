@@ -1,6 +1,7 @@
 from datetime import UTC, datetime
 from pathlib import Path
 
+import pytest
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QApplication, QLabel
 
@@ -76,6 +77,7 @@ def test_activity_view_exposes_result_actions_and_reflows(qtbot, tmp_path: Path)
             ocr_pages=8,
             preserved_images=12,
             chapters=14,
+            translation_issues=2,
             integrity_verified=True,
             integrity_checks=3,
             review_units=5,
@@ -87,6 +89,10 @@ def test_activity_view_exposes_result_actions_and_reflows(qtbot, tmp_path: Path)
             ai_review_recommended=True,
             ai_review_blocks=2,
             ai_review_signals=3,
+            linguistic_review_mode="corrected_during_translation",
+            translation_checked_blocks=20,
+            translation_reviewed_blocks=16,
+            translation_unreviewed_blocks=4,
         ),
     )
     view = ActivityView((recent,))
@@ -99,6 +105,11 @@ def test_activity_view_exposes_result_actions_and_reflows(qtbot, tmp_path: Path)
     assert "Revisión manual" in view.details_summary.text()
     assert "Revisión con IA sugerida" in view.details_summary.text()
     assert "No se ejecutó automáticamente" in view.details_summary.text()
+    assert "corrección integrada durante la traducción" in view.details_summary.text()
+    assert "20 bloques comprobados automáticamente" in view.details_summary.text()
+    assert "4 sin revisión semántica" in view.details_summary.text()
+    assert "sin segunda verificación bilingüe independiente" in view.details_summary.text()
+    assert "2 incidencias pendientes" in view.details_summary.text()
 
     qtbot.mouseClick(view.open_button, Qt.MouseButton.LeftButton)
     assert opened == [result]
@@ -121,6 +132,27 @@ def test_summary_never_presents_technical_integrity_as_semantic_quality() -> Non
     assert any("Integridad técnica: comprobada" in line for line in lines)
     assert any("3 de traducción" in line for line in lines)
     assert any("no estaba activada" in line for line in lines)
+
+
+@pytest.mark.parametrize(
+    ("summary", "expected"),
+    (
+        (OutcomeSummary("EPUB", editor_completed=True), "editor EPUB final completado"),
+        (
+            OutcomeSummary("MD", manual_review_expected=True),
+            "no hubo incidencias que exigieran una decisión",
+        ),
+        (
+            OutcomeSummary("MD", manual_review_expected=True, translation_issues=1),
+            "no consta una decisión manual",
+        ),
+    ),
+)
+def test_summary_distinguishes_pending_manual_review_states(
+    summary: OutcomeSummary,
+    expected: str,
+) -> None:
+    assert any(expected in line for line in outcome_summary_lines(summary))
 
 
 def test_failed_activity_explains_phase_work_timeline_and_safe_actions(

@@ -2215,8 +2215,98 @@ def test_structure_review_preserves_an_oversized_table_without_sending_it_to_mod
     )
 
     assert len(table) > MAX_INPUT_CHARACTERS
-    assert requests == ["PZL1 CANDIDATA: Chapter One", "PZL1 CANDIDATA: Chapter Two"]
-    assert result == f"# Chapter One\n\n{table}\n\n# Chapter Two"
+    assert len(requests) == 1
+    assert "PZL1 CANDIDATA" in requests[0]
+    assert "PZL186 CANDIDATA" in requests[0]
+    assert "rol=front_matter" in requests[0]
+    assert result == f"# Chapter One\n\n{table}\n\nChapter Two"
+
+
+def test_structure_review_plans_from_toc_page_and_semantic_role_globally() -> None:
+    source = (
+        "<!-- PZDOC PDF PAGE 1 -->\n\n"
+        "# Contents\n\n"
+        "Chapter One .... 3\n\n"
+        "<!-- PZDOC PDF PAGE 3 -->\n\n"
+        "Chapter One\n\n"
+        "This paragraph explains the chapter without changing its words.\n"
+    )
+    requests: list[str] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        inventory = payload["messages"][1]["content"]
+        requests.append(inventory)
+        body_record = next(
+            line
+            for line in inventory.splitlines()
+            if "página=3" in line and line.endswith(": Chapter One")
+        )
+        assert "índice=sí" in body_record
+        assert "rol=" in body_record
+        line_number = re.match(r"PZL(\d+)", body_record)
+        assert line_number is not None
+        return httpx.Response(
+            200,
+            json={"message": {"content": f"PZL{line_number.group(1)}=1"}},
+        )
+
+    result = improve_markdown(
+        source,
+        ImprovementMode.REVIEW_STRUCTURE,
+        LOCAL_SETTINGS,
+        transport=httpx.MockTransport(respond),
+    )
+
+    assert len(requests) == 1
+    assert "# Contents" in requests[0]
+    assert "Chapter One .... 3" in requests[0]
+    assert result == source.replace("\nChapter One\n\nThis", "\n# Chapter One\n\nThis")
+
+
+def test_global_structure_inventory_prioritizes_and_bounds_large_outlines() -> None:
+    source = "\n\n".join(f"# Heading {index}" for index in range(180))
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        inventory = payload["messages"][1]["content"]
+        records = inventory.splitlines()
+        assert len(records) == improvement_module.MAX_GLOBAL_STRUCTURE_CANDIDATES
+        assert records[0].startswith("PZL1 CANDIDATA")
+        assert records[-1].endswith(": # Heading 179")
+        return httpx.Response(200, json={"message": {"content": "\n"}})
+
+    result = improve_markdown(
+        source,
+        ImprovementMode.REVIEW_STRUCTURE,
+        LOCAL_SETTINGS,
+        transport=httpx.MockTransport(respond),
+    )
+
+    assert result == source
+
+
+def test_global_structure_ignores_short_body_lines_without_outline_evidence() -> None:
+    assert improvement_module._global_structure_candidates("Alpha\nBeta\nGamma") == ()
+
+
+@pytest.mark.parametrize("response", ("respuesta libre", "PZL999=1", "PZL1=3"))
+def test_global_structure_preserves_document_on_invalid_or_unsafe_directives(
+    response: str,
+) -> None:
+    source = "# Existing title\n\nBody paragraph."
+
+    def respond(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"message": {"content": response}})
+
+    result = improve_markdown(
+        source,
+        ImprovementMode.REVIEW_STRUCTURE,
+        LOCAL_SETTINGS,
+        transport=httpx.MockTransport(respond),
+    )
+
+    assert result == source
 
 
 def test_translation_recovers_table_rows_when_a_full_response_breaks_the_table() -> None:
@@ -2663,7 +2753,8 @@ def test_structure_review_recovers_exact_source_words_from_heading_directives() 
         calls += 1
         payload = json.loads(request.content)
         numbered = payload["messages"][1]["content"]
-        assert "PZL3 CANDIDATA: Chapter One" in numbered
+        assert "PZL3 CANDIDATA" in numbered
+        assert "Chapter One" in numbered
         return httpx.Response(200, json={"message": {"content": "PZL3=1"}})
 
     result = improve_markdown(

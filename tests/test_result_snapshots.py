@@ -4,6 +4,7 @@ from pathlib import Path, PurePosixPath
 
 import pytest
 
+import parsezen.infrastructure.result_snapshots as result_snapshots_module
 from parsezen.document_model import ConvertedResource
 from parsezen.domain.jobs import DocumentJob, DocumentSource, JobConfiguration
 from parsezen.epub_builder import EpubBookMetadata
@@ -20,10 +21,19 @@ from parsezen.processing import (
 )
 from parsezen.revision import RevisionKind, build_revision_draft
 from parsezen.translation_quality import (
+    LinguisticReviewCoverage,
+    LinguisticReviewMode,
     TranslationIssueKind,
     TranslationQualityIssue,
     TranslationQualityReport,
 )
+
+
+def test_rejects_translation_report_with_null_block_coverage() -> None:
+    with pytest.raises(ValueError, match="cobertura de traducción"):
+        result_snapshots_module._translation_report_from_json(  # noqa: SLF001
+            {"checked_segments": 1, "source_blocks": None}
+        )
 
 
 def test_round_trips_a_sensitive_pending_result_encrypted(tmp_path: Path) -> None:
@@ -76,6 +86,16 @@ def test_round_trips_a_sensitive_pending_result_encrypted(tmp_path: Path) -> Non
                 ),
             ),
             ((TranslationIssueKind.SOURCE_TEXT, 1),),
+            source_blocks=5,
+            translated_blocks=5,
+        ),
+        linguistic_review_coverage=LinguisticReviewCoverage(
+            LinguisticReviewMode.INDEPENDENT_BILINGUAL,
+            translated_blocks=5,
+            automatically_checked_blocks=5,
+            semantically_reviewed_blocks=5,
+            independently_verified_blocks=5,
+            remaining_issues=1,
         ),
         revision_draft=draft,
         revision_resources=(ConvertedResource(PurePosixPath("image.jpg"), b"image", "image/jpeg"),),

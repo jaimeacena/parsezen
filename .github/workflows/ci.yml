@@ -43,7 +43,7 @@ jobs:
         run: |
           $PSNativeCommandUseErrorActionPreference = $true
           python -m pip check
-          python -m pip_audit -r requirements.lock --no-deps --disable-pip --ignore-vuln CVE-2026-54499
+          python scripts/audit_dependencies.py requirements.lock --ignore-vuln CVE-2026-54499
 
   epubcheck:
     name: EPUBCheck 5.3.0

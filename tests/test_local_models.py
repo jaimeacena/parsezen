@@ -210,19 +210,18 @@ def test_discovery_refuses_models_until_ollama_cloud_is_disabled() -> None:
     assert "solo local" in (result.message or "")
 
 
-def test_detects_ollama_local_only_environment_or_server_configuration(
+def test_detects_ollama_local_only_server_configuration_only(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     config = tmp_path / "server.json"
     config.write_text(json.dumps({"disable_ollama_cloud": True}), encoding="utf-8")
 
-    assert is_ollama_local_only_configured(environment={}, config_path=config)
-    assert is_ollama_local_only_configured(
-        environment={"OLLAMA_NO_CLOUD": "1"},
-        config_path=tmp_path / "missing.json",
-    )
+    assert is_ollama_local_only_configured(config_path=config)
+    monkeypatch.setenv("OLLAMA_NO_CLOUD", "1")
+    assert not is_ollama_local_only_configured(config_path=tmp_path / "missing.json")
     config.write_text(json.dumps({"disable_ollama_cloud": False}), encoding="utf-8")
-    assert not is_ollama_local_only_configured(environment={}, config_path=config)
+    assert not is_ollama_local_only_configured(config_path=config)
 
 
 def test_guided_local_only_configuration_preserves_existing_values(tmp_path: Path) -> None:
@@ -466,6 +465,31 @@ def test_guided_start_explains_when_ollama_is_missing(monkeypatch) -> None:
 
     with pytest.raises(LocalModelUnavailableError, match="no está instalado"):
         start_ollama()
+
+
+def test_guided_start_rejects_an_active_server_without_persistent_privacy(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(local_models_module, "_ollama_api_is_ready", lambda: True)
+    monkeypatch.setattr(
+        local_models_module,
+        "is_ollama_local_only_configured",
+        lambda: False,
+    )
+
+    with pytest.raises(LocalModelUnavailableError, match="Protégelo y reinícialo"):
+        start_ollama()
+
+
+def test_guided_start_accepts_an_active_server_with_persistent_privacy(monkeypatch) -> None:
+    monkeypatch.setattr(local_models_module, "_ollama_api_is_ready", lambda: True)
+    monkeypatch.setattr(
+        local_models_module,
+        "is_ollama_local_only_configured",
+        lambda: True,
+    )
+
+    start_ollama()
 
 
 def test_guided_restart_applies_privacy_and_restarts_known_processes(monkeypatch) -> None:

@@ -47,6 +47,24 @@ def test_work_checkpoints_are_atomic_private_and_bound_to_exact_source(
     assert changed_source.load(key) is None
 
 
+def test_work_checkpoints_reuse_a_verified_source_digest(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "book.pdf"
+    source.write_bytes(b"%PDF-local")
+    monkeypatch.setattr(
+        checkpoints_module,
+        "sha256_file",
+        lambda _path: (_ for _ in ()).throw(AssertionError("unexpected source read")),
+    )
+
+    first = open_work_checkpoints(source, "first", root=tmp_path, source_digest="0" * 64)
+    second = open_work_checkpoints(source, "second", root=tmp_path, source_digest="0" * 64)
+
+    assert first.directory != second.directory
+
+
 def test_work_checkpoints_ignore_damage_and_clear_only_owned_files(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

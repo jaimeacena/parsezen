@@ -23,6 +23,7 @@ def build_outcome_summary(
     review_units = tuple(unit for review in reviews for unit in review.units)
     pdf_report = result.pdf_quality_report
     translation_report = result.translation_quality_report
+    linguistic_coverage = result.linguistic_review_coverage
     integrity = result.final_integrity_report
     recommendation = job.review_recommendation
     operations: list[str] = ["Conversión"]
@@ -46,6 +47,29 @@ def build_outcome_summary(
         conversion_issues=len(pdf_report.issues) if pdf_report is not None else 0,
         translation_issues=(
             translation_report.total_issues if translation_report is not None else 0
+        ),
+        linguistic_review_mode=(
+            linguistic_coverage.mode.value if linguistic_coverage is not None else None
+        ),
+        translation_checked_blocks=(
+            linguistic_coverage.automatically_checked_blocks
+            if linguistic_coverage is not None
+            else 0
+        ),
+        translation_reviewed_blocks=(
+            linguistic_coverage.semantically_reviewed_blocks
+            if linguistic_coverage is not None
+            else 0
+        ),
+        translation_independent_blocks=(
+            linguistic_coverage.independently_verified_blocks
+            if linguistic_coverage is not None
+            else 0
+        ),
+        translation_unreviewed_blocks=(
+            linguistic_coverage.semantically_unreviewed_blocks
+            if linguistic_coverage is not None
+            else 0
         ),
         preserved_segments=len(result.preserved_translation_chunks),
         review_units=len(review_units),

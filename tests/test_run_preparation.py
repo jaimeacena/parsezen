@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 
 import pytest
@@ -54,9 +55,28 @@ def test_preparation_maps_and_validates_only_the_planned_jobs(tmp_path: Path) ->
     assert tuple(item.job_id for item in prepared.items) == (second_job.id,)
     assert prepared.items[0].request.source_path == second
     assert prepared.items[0].settings.timeout_seconds == 45
+    assert prepared.items[0].request.source_identity_verified
+    assert prepared.items[0].request.source_content_sha256 == second_job.source.content_sha256
     assert prepared.issues == ()
     assert prepared.item(first_job.id) is None
     assert prepared.item(second_job.id) == prepared.items[0]
+
+
+def test_preparation_rejects_a_same_size_source_replacement(tmp_path: Path) -> None:
+    path = tmp_path / "source.txt"
+    path.write_text("first", encoding="utf-8")
+    source = DocumentSource.inspect(path)
+    original_stat = path.stat()
+    queue = JobQueue()
+    queue.add(source, JobConfiguration(), job_id="changed")
+    path.write_text("other", encoding="utf-8")
+    os.utime(path, ns=(original_stat.st_atime_ns, source.modified_ns))
+
+    prepared = prepare_queue_run(queue.jobs, timeout_seconds=45)
+
+    assert len(prepared.issues) == 1
+    assert "original cambió" in prepared.issues[0].message
+    assert not prepared.items[0].request.source_identity_verified
 
 
 def test_explicit_retry_prepares_only_the_failed_document(tmp_path: Path) -> None:

@@ -43,8 +43,105 @@ from parsezen.processing import (
 )
 from parsezen.revision import RevisionDecision
 from parsezen.settings import AppSettings
+from parsezen.translation_quality import (
+    LinguisticReviewMode,
+    TranslationQualityReport,
+)
 
 LOCAL_SETTINGS = AppSettings(model="local-model", context_window=4_096)
+
+
+def test_linguistic_coverage_keeps_unaligned_blocks_out_of_automatic_checks() -> None:
+    report = TranslationQualityReport(
+        None,
+        "es",
+        "es",
+        checked_segments=2,
+        source_characters=100,
+        translated_characters=120,
+        total_issues=1,
+        issues=(),
+        source_blocks=2,
+        translated_blocks=3,
+    )
+
+    coverage = processing_module._linguistic_review_coverage(  # noqa: SLF001
+        report,
+        mode=LinguisticReviewMode.NOT_REVIEWED,
+    )
+
+    assert coverage is not None
+    assert coverage.translated_blocks == 3
+    assert coverage.automatically_checked_blocks == 2
+    assert coverage.semantically_unreviewed_blocks == 3
+    assert coverage.remaining_issues == 1
+
+
+def test_direct_pdf_checkpoint_cleanup_hashes_the_source_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "book.pdf"
+    source.write_bytes(b"%PDF-local")
+    hash_calls: list[Path] = []
+
+    def digest(path: Path) -> str:
+        hash_calls.append(path)
+        return "0" * 64
+
+    monkeypatch.setattr(processing_module, "sha256_file", digest)
+
+    processing_module.clear_document_work_checkpoints(
+        ProcessRequest(source, convert_to_markdown=True),
+        None,
+        root=tmp_path / "cache",
+    )
+
+    assert hash_calls == [source]
+
+
+@pytest.mark.parametrize(
+    ("identity", "message"),
+    (
+        ({"source_content_sha256": "invalid"}, "identidad del documento original no es válida"),
+        ({"source_size_bytes": 1}, "identidad del documento original está incompleta"),
+        ({"source_identity_verified": True}, "identidad verificada.*incompleta"),
+    ),
+)
+def test_source_identity_validation_fails_closed_for_incomplete_metadata(
+    tmp_path: Path,
+    identity: dict[str, object],
+    message: str,
+) -> None:
+    source = tmp_path / "book.txt"
+    source.write_text("local", encoding="utf-8")
+
+    with pytest.raises(RequestValidationError, match=message):
+        validate_process_request(ProcessRequest(source, True, **identity), None)
+
+
+def test_source_identity_validation_reports_an_unreadable_digest(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "book.txt"
+    source.write_text("local", encoding="utf-8")
+    statistics = source.stat()
+    monkeypatch.setattr(
+        processing_module,
+        "sha256_file",
+        lambda _path: (_ for _ in ()).throw(OSError("blocked")),
+    )
+    request = ProcessRequest(
+        source,
+        True,
+        source_size_bytes=statistics.st_size,
+        source_modified_ns=statistics.st_mtime_ns,
+        source_content_sha256="0" * 64,
+    )
+
+    with pytest.raises(RequestValidationError, match="No se pudo comprobar"):
+        validate_process_request(request, None)
 
 
 def test_targeted_review_sends_only_signalled_blocks_to_local_ai(
@@ -612,10 +709,11 @@ def test_fused_translation_corrects_only_pdf_pages_with_quality_signals(
         "_repair_translation_warnings",
         lambda _request, _source, value, **_kwargs: value,
     )
+    quality_report = TranslationQualityReport(None, "es", "es", 2, 100, 100, 1, ())
     monkeypatch.setattr(
         processing_module,
         "_translation_quality_report",
-        lambda *_args: None,
+        lambda *_args: quality_report,
     )
 
     result = process_document(
@@ -635,6 +733,13 @@ def test_fused_translation_corrects_only_pdf_pages_with_quality_signals(
     assert any("Segunda página dañada" in payload for payload in reviewed_payloads)
     assert result.revision_draft is not None
     assert "Segunda página corregida" in result.revision_draft.proposed_markdown
+    assert result.linguistic_review_coverage is not None
+    assert (
+        result.linguistic_review_coverage.mode is LinguisticReviewMode.CORRECTED_DURING_TRANSLATION
+    )
+    assert result.linguistic_review_coverage.semantically_reviewed_blocks == 2
+    assert result.linguistic_review_coverage.independently_verified_blocks == 0
+    assert result.linguistic_review_coverage.remaining_issues == 1
 
 
 def test_offline_translation_applies_and_restores_the_glossary(
@@ -681,6 +786,7 @@ def test_offline_translation_content_review_compares_source_and_target(
     source.write_text(source_markdown, encoding="utf-8")
     review_calls: list[tuple[str, str, str]] = []
     quality_calls: list[tuple[str | None, str]] = []
+    quality_report = TranslationQualityReport(None, "es", "es", 2, 100, 95, 1, ())
 
     monkeypatch.setattr(
         processing_module,
@@ -692,11 +798,16 @@ def test_offline_translation_content_review_compares_source_and_target(
         "_repair_translation_warnings",
         lambda _request, _source, value, **_kwargs: value,
     )
-    monkeypatch.setattr(
-        processing_module,
-        "_translation_quality_report",
-        lambda _request, original, current: quality_calls.append((original, current)),
-    )
+
+    def report_quality(
+        _request: ProcessRequest,
+        original: str | None,
+        current: str,
+    ) -> TranslationQualityReport:
+        quality_calls.append((original, current))
+        return quality_report
+
+    monkeypatch.setattr(processing_module, "_translation_quality_report", report_quality)
 
     def review(
         original: str,
@@ -731,6 +842,11 @@ def test_offline_translation_content_review_compares_source_and_target(
         change.recommended_decision is RevisionDecision.ACCEPTED
         for change in result.revision_draft.changes
     )
+    assert result.linguistic_review_coverage is not None
+    assert result.linguistic_review_coverage.mode is LinguisticReviewMode.INDEPENDENT_BILINGUAL
+    assert result.linguistic_review_coverage.automatically_checked_blocks == 2
+    assert result.linguistic_review_coverage.semantically_unreviewed_blocks == 0
+    assert result.linguistic_review_coverage.independently_verified_blocks == 2
 
 
 def test_repeated_document_terms_are_protected_without_a_manual_glossary(
@@ -1360,7 +1476,7 @@ def test_pdf_translation_is_applied_before_building_the_epub(
     assert "Contenido en español" in chapter
 
 
-def test_completed_pdf_retains_encrypted_work_for_the_configured_period(
+def test_completed_direct_pdf_opens_only_reusable_pdf_work(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1391,13 +1507,12 @@ def test_completed_pdf_retains_encrypted_work_for_the_configured_period(
 
     process_document(ProcessRequest(source, True))
 
-    general = next(item for key, item in opened if "general-work" in key)
     pdf = next(item for key, item in opened if "pdf-conversion" in key)
-    assert general.clear_calls == 0
+    assert all("general-work" not in key for key, _item in opened)
     assert pdf.clear_calls == 0
 
 
-def test_zero_checkpoint_retention_clears_completed_general_work(
+def test_zero_checkpoint_retention_clears_completed_pdf_work(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1431,9 +1546,8 @@ def test_zero_checkpoint_retention_clears_completed_general_work(
         settings=AppSettings(checkpoint_retention_days=0),
     )
 
-    general = next(item for key, item in opened if "general-work" in key)
     pdf = next(item for key, item in opened if "pdf-conversion" in key)
-    assert general.clear_calls == 1
+    assert all("general-work" not in key for key, _item in opened)
     assert pdf.clear_calls == 1
 
 
@@ -1801,6 +1915,12 @@ def test_translates_markdown_offline_without_requiring_a_local_model(
     assert result.final_path.read_text(encoding="utf-8") == "# Traducido 10"
     assert result.translation_quality_report is not None
     assert result.translation_quality_report.target_language == "es"
+    assert result.linguistic_review_coverage is not None
+    assert result.linguistic_review_coverage.mode is LinguisticReviewMode.NOT_REVIEWED
+    assert (
+        result.linguistic_review_coverage.semantically_unreviewed_blocks
+        == result.translation_quality_report.checked_segments
+    )
 
 
 def test_ai_translation_is_skipped_when_the_text_is_already_in_the_target_language(

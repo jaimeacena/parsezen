@@ -43,6 +43,7 @@ from parsezen.application.preflight import (
     estimate_remaining_time,
     processing_metric,
 )
+from parsezen.application.processing_explanation import linguistic_review_summary
 from parsezen.application.quality_review_adapter import (
     apply_pdf_review,
     apply_translation_review,
@@ -679,8 +680,11 @@ class ParsezenMainWindow(QMainWindow):
 
     @staticmethod
     def _early_check_marker(job: DocumentJob) -> str:
+        source_identity = job.source.content_sha256 or (
+            f"legacy-{job.source.size_bytes}-{job.source.modified_ns}"
+        )
         return (
-            f"early_check_passed:{job.configuration_revision}:"
+            f"early_check_passed:{job.configuration_revision}:{source_identity}:"
             f"{job.source.size_bytes}:{job.source.modified_ns}"
         )
 
@@ -1271,33 +1275,22 @@ class ParsezenMainWindow(QMainWindow):
         ):
             models = ((configured_model, configured_model), *models)
         stage = requested_stage if isinstance(requested_stage, StageKind) else None
-        compatible_count = sum(
-            candidate.id != job.id
-            and candidate.source.format is job.source.format
-            and candidate.status in {JobStatus.QUEUED, JobStatus.FAILED, JobStatus.CANCELLED}
-            for candidate in self._job_queue.jobs
-        )
         active_dialog = self._active_configuration_dialog
         if active_dialog is not None:
-            if active_dialog.isVisible():
-                active_dialog.raise_()
-                active_dialog.activateWindow()
-                return
-            active_dialog.reject()
+            return
         dialog = JobConfigurationDialog(
             job,
             models=models,
             stage=stage,
-            embedded=False,
+            embedded=True,
             default_output_directory=self._settings.output_directory,
             default_ai_model=self._settings.model,
             default_ai_context=self._settings.context_window,
             ollama_status=self._ollama_status,
-            compatible_job_count=compatible_count,
-            parent=self,
+            parent=self.parsezen_workspace,
         )
         self._active_configuration_dialog = dialog
-        dialog.save_requested.connect(
+        dialog.configuration_changed.connect(
             lambda job_id=job.id, editor=dialog: self._save_job_configuration(job_id, editor)
         )
         dialog.finished.connect(
@@ -1307,10 +1300,14 @@ class ParsezenMainWindow(QMainWindow):
             lambda editor=dialog: self._open_models_from_configuration(editor)
         )
         self.parsezen_workspace.set_configuring(job.id, None)
-        dialog.open()
+        self.parsezen_workspace.show_internal_view(
+            dialog,
+            f"Configurar · {job.source.path.name}",
+        )
+        dialog.persist_if_valid()
         if (
             self._auto_discover_ai
-            and requires_ai(job.configuration)
+            and (dialog.review_enabled or requires_ai(job.configuration))
             and not self._ollama_models
             and not self._is_discovering_models
             and not self._is_recommending_models
@@ -1321,17 +1318,16 @@ class ParsezenMainWindow(QMainWindow):
     def _configuration_dialog_finished(self, dialog: JobConfigurationDialog) -> None:
         if self._active_configuration_dialog is not dialog:
             return
+        self.parsezen_workspace.close_internal_view(dialog)
         self._active_configuration_dialog = None
         self.parsezen_workspace.set_configuring(None, None)
 
     def _open_models_from_configuration(self, dialog: JobConfigurationDialog) -> None:
         if self._active_configuration_dialog is not dialog:
             return
-        dialog.hide()
         self._show_model_manager()
         manager = self._model_manager
         if manager is None:
-            dialog.open()
             return
         manager.finished.connect(
             lambda _result, editor=dialog: self._resume_configuration_dialog(editor)
@@ -1352,13 +1348,15 @@ class ParsezenMainWindow(QMainWindow):
             self._settings.context_window,
         )
         dialog.set_ai_status(self._ollama_status)
-        dialog.open()
+        dialog.persist_if_valid()
 
     @Slot(object)
     def _close_internal_workflow(self, widget: object) -> None:
         """Route the shared back action through each workflow's safe exit."""
 
-        if isinstance(widget, QDialog):
+        if isinstance(widget, JobConfigurationDialog):
+            widget.reject()
+        elif isinstance(widget, QDialog):
             widget.reject()
         elif isinstance(widget, QWidget):
             self.parsezen_workspace.close_internal_view(widget)
@@ -1465,13 +1463,8 @@ class ParsezenMainWindow(QMainWindow):
         self._job_queue.replace(configured_job)
         entry.pdf_page_range = request.pdf_page_range if request is not None else None
         entry.result = None
-        if dialog.apply_compatible.isChecked():
-            self._apply_configuration_to_compatible_jobs(
-                configured_job,
-                configuration,
-            )
         self._sync_workspace(force_persist=True)
-        dialog.accept()
+        dialog.mark_persisted(configured_job)
 
     def _apply_configuration_to_compatible_jobs(
         self,
@@ -1760,6 +1753,11 @@ class ParsezenMainWindow(QMainWindow):
                 self._artifact_store,
                 phase_plan=phase_plan,
                 translation_follows_ocr=job.configuration.translation.enabled,
+                linguistic_review_context=(
+                    linguistic_review_summary(result.linguistic_review_coverage)
+                    if review.kind is ReviewKind.TRANSLATION
+                    else None
+                ),
                 previous_phase_callback=reopen_previous if previous_kind is not None else None,
                 parent=self,
             )
@@ -1888,6 +1886,11 @@ class ParsezenMainWindow(QMainWindow):
                     self._artifact_store,
                     phase_plan=phase_plan,
                     translation_follows_ocr=job.configuration.translation.enabled,
+                    structure_outline=(
+                        (draft.original_markdown, draft.proposed_markdown)
+                        if review.kind is ReviewKind.STRUCTURE
+                        else None
+                    ),
                     previous_phase_callback=(
                         reopen_previous if previous_kind is not None else None
                     ),

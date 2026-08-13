@@ -6,6 +6,8 @@ import parsezen.translation_quality as translation_quality_module
 from parsezen.translation_quality import (
     MAX_REPORT_EXCERPT_CHARACTERS,
     NUMBER_PATTERN,
+    LinguisticReviewCoverage,
+    LinguisticReviewMode,
     TranslationIssueKind,
     TranslationQualityError,
     build_aligned_translation_quality_report,
@@ -46,6 +48,32 @@ cada cláusula y rechazó la propuesta porque cambiaba el alcance original.
 print("This code remains in English")
 ```
 """
+
+
+@pytest.mark.parametrize(
+    "coverage",
+    (
+        LinguisticReviewCoverage(LinguisticReviewMode.NOT_REVIEWED, 1, 0, 0, 0, 0),
+        LinguisticReviewCoverage(LinguisticReviewMode.NOT_REVIEWED, 1, 1, 0, 0, 0),
+    ),
+)
+def test_accepts_consistent_linguistic_coverage(coverage: LinguisticReviewCoverage) -> None:
+    assert coverage.semantically_unreviewed_blocks == 1
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    (
+        (-1, 0, 0, 0, 0),
+        (1, 2, 0, 0, 0),
+        (1, 1, 0, 1, 0),
+    ),
+)
+def test_rejects_inconsistent_linguistic_coverage(
+    arguments: tuple[int, int, int, int, int],
+) -> None:
+    with pytest.raises(ValueError, match="Linguistic review counts"):
+        LinguisticReviewCoverage(LinguisticReviewMode.NOT_REVIEWED, *arguments)
 
 
 def test_accepts_a_complete_translation_with_preserved_markdown() -> None:
@@ -137,6 +165,20 @@ def test_reports_a_short_title_left_in_the_source_language() -> None:
     )
 
     assert report.total_issues > 0
+
+
+def test_report_counts_checked_and_unaligned_output_blocks_separately() -> None:
+    report = build_translation_quality_report(
+        "First source paragraph.\n\nSecond source paragraph.",
+        "Primer párrafo traducido.\n\nSegundo párrafo traducido.\n\nBloque adicional.",
+        source_language="en",
+        target_language="es",
+    )
+
+    assert report.source_blocks == 2
+    assert report.translated_blocks == 3
+    assert report.checked_segments == 2
+    assert report.issues_by_kind[TranslationIssueKind.ALIGNMENT] == 1
 
 
 def test_reports_an_untranslated_title_below_the_general_language_threshold() -> None:

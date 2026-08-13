@@ -361,6 +361,11 @@ def start_ollama(
 ) -> None:
     """Start Ollama's Windows background application and wait for its loopback API."""
     if _ollama_api_is_ready():
+        if not is_ollama_local_only_configured():
+            raise LocalModelUnavailableError(
+                "Ollama ya está activo sin una configuración local verificable. "
+                "Protégelo y reinícialo antes de procesar documentos."
+            )
         return
     executable = find_ollama_executable()
     if executable is None:
@@ -758,19 +763,10 @@ def _report_progress(
 
 def is_ollama_local_only_configured(
     *,
-    environment: dict[str, str] | None = None,
     config_path: Path | None = None,
 ) -> bool:
-    """Return whether Ollama is explicitly configured to disable cloud features."""
+    """Return whether Ollama's persistent server configuration disables cloud features."""
 
-    current_environment = os.environ if environment is None else environment
-    if current_environment.get("OLLAMA_NO_CLOUD", "").strip().casefold() in {
-        "1",
-        "true",
-        "yes",
-        "on",
-    }:
-        return True
     path = config_path if config_path is not None else Path.home() / ".ollama" / "server.json"
     try:
         if path.is_symlink() or path.stat().st_size > 64 * 1024:

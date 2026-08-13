@@ -26,7 +26,7 @@ La presentación activa se organiza así:
 ParsezenMainWindow
 └── ParsezenWorkspace
     ├── cola de documentos + destino + acción contextual
-    ├── hoja modal de configuración: Resultado / Traducción / Más opciones
+    ├── página de configuración: Resultado / Traducción / Revisión / PDF
     ├── IA local y modelos
     ├── glosario
     ├── revisión por fase
@@ -110,8 +110,10 @@ Las capturas iniciales se conservaron fuera del repositorio en
 4. Los formularios mantienen etiquetas visibles y validación junto al contenido que debe corregirse.
 5. Las revisiones conservan siempre la comparación y la elección; en compacto pasan de dos columnas
    a una secuencia vertical.
-6. La configuración sigue siendo una transacción compacta sobre la cola: resultado y traducción son
-   las únicas decisiones principales; las excepciones se revelan de forma progresiva.
+6. La configuración es una página compacta de la pila principal. Markdown/EPUB son las únicas tarjetas
+   de elección, por ser una decisión primaria fácil de reconocer; Revisión con IA usa un interruptor.
+   Las demás decisiones usan `Etiqueta — Valor — ›` y solo el espaciado vertical separa grupos.
+   Traductor y glosario dependen del idioma, mientras páginas y OCR aparecen solo para PDF.
 
 ## Densidad y elevación
 
@@ -237,7 +239,9 @@ Desde 320 px:
 - la cabecera pasa a tres filas y conserva IA, destino, apariencia y acción principal;
 - la cola combina Documento + Flujo y mantiene la acción contextual y eliminar;
 - la zona de añadir documentos apila icono, instrucción, enlace y formatos;
-- la configuración apila las dos tarjetas de resultado y mantiene un único selector de traducción;
+- las tarjetas de formato se apilan y el resto de la configuración conserva una única columna; sus
+  selectores viven en menús o diálogos puntuales, se anclan al valor de la fila y nunca dejan campos
+  permanentes en la página; el bloque completo permanece centrado en el espacio disponible;
 - los formularios envuelven etiqueta y campo;
 - las acciones de imágenes se apilan;
 - los comparadores y el editor EPUB cambian a orientación vertical;

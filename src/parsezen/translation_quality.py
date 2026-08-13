@@ -232,6 +232,15 @@ class TranslationIssueKind(StrEnum):
     FIDELITY = "fidelity"
 
 
+class LinguisticReviewMode(StrEnum):
+    """How semantic language review related to the translation pass."""
+
+    NOT_REVIEWED = "not_reviewed"
+    CORRECTED_DURING_TRANSLATION = "corrected_during_translation"
+    INDEPENDENT_BILINGUAL = "independent_bilingual"
+    TARGETED_BILINGUAL = "targeted_bilingual"
+
+
 @dataclass(frozen=True, slots=True)
 class TranslationQualityIssue:
     """One local signal that deserves human review, with bounded excerpts."""
@@ -257,6 +266,8 @@ class TranslationQualityReport:
     total_issues: int
     issues: tuple[TranslationQualityIssue, ...]
     issue_totals: tuple[tuple[TranslationIssueKind, int], ...] = ()
+    source_blocks: int = 0
+    translated_blocks: int = 0
 
     @property
     def issues_by_kind(self) -> dict[TranslationIssueKind, int]:
@@ -265,6 +276,39 @@ class TranslationQualityReport:
         if self.issue_totals:
             return dict(self.issue_totals)
         return dict(Counter(issue.kind for issue in self.issues))
+
+
+@dataclass(frozen=True, slots=True)
+class LinguisticReviewCoverage:
+    """Content-free account of automatic checks and semantic review coverage."""
+
+    mode: LinguisticReviewMode
+    translated_blocks: int
+    automatically_checked_blocks: int
+    semantically_reviewed_blocks: int
+    independently_verified_blocks: int
+    remaining_issues: int
+
+    def __post_init__(self) -> None:
+        counts = (
+            self.translated_blocks,
+            self.automatically_checked_blocks,
+            self.semantically_reviewed_blocks,
+            self.independently_verified_blocks,
+            self.remaining_issues,
+        )
+        if any(count < 0 for count in counts):
+            raise ValueError("Linguistic review counts cannot be negative.")
+        if (
+            self.automatically_checked_blocks > self.translated_blocks
+            or self.semantically_reviewed_blocks > self.translated_blocks
+            or self.independently_verified_blocks > self.semantically_reviewed_blocks
+        ):
+            raise ValueError("Linguistic review counts are inconsistent.")
+
+    @property
+    def semantically_unreviewed_blocks(self) -> int:
+        return max(0, self.translated_blocks - self.semantically_reviewed_blocks)
 
 
 @dataclass(frozen=True, slots=True)
@@ -487,6 +531,8 @@ def _build_translation_quality_report(
         issue_totals=tuple(
             (kind, issue_totals[kind]) for kind in TranslationIssueKind if issue_totals[kind]
         ),
+        source_blocks=len(source_blocks),
+        translated_blocks=len(translated_blocks),
     )
 
 

@@ -28,6 +28,8 @@ from parsezen.processing import (
 )
 from parsezen.revision import RevisionKind, build_revision_draft
 from parsezen.translation_quality import (
+    LinguisticReviewCoverage,
+    LinguisticReviewMode,
     TranslationIssueKind,
     TranslationQualityIssue,
     TranslationQualityReport,
@@ -190,6 +192,9 @@ def _result_to_json(result: ProcessResult) -> dict[str, Any]:
         "translation_quality_report": _translation_report_to_json(
             result.translation_quality_report
         ),
+        "linguistic_review_coverage": _linguistic_review_coverage_to_json(
+            result.linguistic_review_coverage
+        ),
         "preserved_translation_chunks": list(result.preserved_translation_chunks),
         "preserved_images": result.preserved_images,
         "epub_chapters": result.epub_chapters,
@@ -295,6 +300,9 @@ def _result_from_json(
         epub_checkpoint_degraded=bool(raw.get("epub_checkpoint_degraded", False)),
         translation_quality_report=_translation_report_from_json(
             raw.get("translation_quality_report")
+        ),
+        linguistic_review_coverage=_linguistic_review_coverage_from_json(
+            raw.get("linguistic_review_coverage")
         ),
         preserved_translation_chunks=tuple(
             int(value) for value in raw.get("preserved_translation_chunks", ())
@@ -471,6 +479,8 @@ def _translation_report_to_json(
         "checked_segments": report.checked_segments,
         "source_characters": report.source_characters,
         "translated_characters": report.translated_characters,
+        "source_blocks": report.source_blocks,
+        "translated_blocks": report.translated_blocks,
         "total_issues": report.total_issues,
         "issue_totals": {kind.value: count for kind, count in report.issue_totals},
         "issues": [
@@ -487,9 +497,43 @@ def _translation_report_to_json(
     }
 
 
+def _linguistic_review_coverage_to_json(
+    coverage: LinguisticReviewCoverage | None,
+) -> dict[str, Any] | None:
+    if coverage is None:
+        return None
+    return {
+        "mode": coverage.mode.value,
+        "translated_blocks": coverage.translated_blocks,
+        "automatically_checked_blocks": coverage.automatically_checked_blocks,
+        "semantically_reviewed_blocks": coverage.semantically_reviewed_blocks,
+        "independently_verified_blocks": coverage.independently_verified_blocks,
+        "remaining_issues": coverage.remaining_issues,
+    }
+
+
+def _linguistic_review_coverage_from_json(
+    raw: object,
+) -> LinguisticReviewCoverage | None:
+    if not isinstance(raw, dict):
+        return None
+    return LinguisticReviewCoverage(
+        mode=LinguisticReviewMode(str(raw["mode"])),
+        translated_blocks=max(0, int(raw["translated_blocks"])),
+        automatically_checked_blocks=max(0, int(raw["automatically_checked_blocks"])),
+        semantically_reviewed_blocks=max(0, int(raw["semantically_reviewed_blocks"])),
+        independently_verified_blocks=max(0, int(raw["independently_verified_blocks"])),
+        remaining_issues=max(0, int(raw["remaining_issues"])),
+    )
+
+
 def _translation_report_from_json(raw: object) -> TranslationQualityReport | None:
     if not isinstance(raw, dict):
         return None
+    source_blocks = raw.get("source_blocks", raw["checked_segments"])
+    translated_blocks = raw.get("translated_blocks", raw["checked_segments"])
+    if source_blocks is None or translated_blocks is None:
+        raise ValueError("La cobertura de traducción de la instantánea no es válida.")
     return TranslationQualityReport(
         source_language=raw.get("source_language"),
         target_language=str(raw["target_language"]),
@@ -513,4 +557,6 @@ def _translation_report_from_json(raw: object) -> TranslationQualityReport | Non
             (TranslationIssueKind(kind), int(count))
             for kind, count in raw.get("issue_totals", {}).items()
         ),
+        source_blocks=max(0, int(source_blocks)),
+        translated_blocks=max(0, int(translated_blocks)),
     )

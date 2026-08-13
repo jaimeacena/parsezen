@@ -21,6 +21,7 @@ from parsezen.checkpoint_cache import (
     checkpoint_cache_stats,
     prune_checkpoint_cache,
 )
+from parsezen.domain.source_identity import sha256_file
 from parsezen.epub_checkpoints import (
     _protect_for_current_user,
     _unprotect_for_current_user,
@@ -149,14 +150,15 @@ def open_work_checkpoints(
     resume_key: str,
     *,
     root: Path | None = None,
+    source_digest: str | None = None,
 ) -> WorkCheckpoints:
     """Open the cache bound to the source bytes and all processing choices."""
-    source_digest = _sha256_file(source_path)
+    effective_source_digest = source_digest or sha256_file(source_path)
     identity = "\n".join(
         (
             str(_SCHEMA_VERSION),
             _IMPLEMENTATION_REVISION,
-            source_digest,
+            effective_source_digest,
             resume_key,
         )
     )
@@ -228,11 +230,3 @@ def _cache_root(root: Path | None) -> Path:
         if root is not None
         else user_cache_path(APP_STORAGE_NAME, appauthor=False) / "work-checkpoints"
     )
-
-
-def _sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as stream:
-        while block := stream.read(1024 * 1024):
-            digest.update(block)
-    return digest.hexdigest()

@@ -17,7 +17,9 @@ de Ollama y nunca envía el documento fuera del equipo. Es open source, privado 
 
 - **Procesamiento avanzado de documentos**. Extrae texto, imágenes y tablas, aplica OCR a páginas escaneadas, selecciona únicamente las páginas que te interesen y mejora el resultado con IA local.
 
-- **Traducción y revisión precisas**. Combina el procesamiento con traducción (algorítmica o mediante IA), usando glosarios y memoria terminológica para mantener nombres y términos consistentes. Revisa los cambios dudosos y valida el resultado antes de finalizar.
+- **Traducción y revisión trazables**. Combina traducción algorítmica o mediante IA con
+  glosarios y memoria terminológica. El resultado distingue una corrección integrada de una
+  verificación bilingüe independiente y cuenta bloques comprobados, revisados y pendientes.
 
 - **Escalable y preparado para trabajos largos**. Trabaja con varios documentos, consulta el tiempo estimado, pausa el proceso y reanúdalo cuando quieras o repite solo la fase que haya fallado.
 
@@ -29,7 +31,9 @@ de Ollama y nunca envía el documento fuera del equipo. Es open source, privado 
   El plan revisado es una decisión aparte y puede comprobar después cualquiera de las dos salidas.
 
 - **Local, privado y gratuito.** Tus documentos permanecen en tu equipo y los originales nunca se
-  modifican. No necesitas suscripciones, cuotas ni pagos por uso.
+  modifican. Parsezen verifica su identidad local antes de procesarlos y solo habilita la IA cuando
+  la configuración persistente de Ollama desactiva su nube. No necesitas suscripciones, cuotas ni
+  pagos por uso.
 
 - **Tú conservas el control.** Parsezen te muestra los cambios dudosos, te permite comparar el
   original con la propuesta y comprueba el resultado antes de publicarlo. Una recomendación nunca
@@ -46,6 +50,10 @@ de Ollama y nunca envía el documento fuera del equipo. Es open source, privado 
 - **Jerarquía conservadora.** Solo anida un contenedor explícito cuando encuentra al menos dos
   capítulos inequívocos contiguos; los casos ambiguos permanecen planos y conservan su orden.
 
+- **Esquema global verificable.** La revisión estructural combina índice, páginas, geometría,
+  encabezados y roles semánticos, pero solo aplica directivas de nivel sobre palabras ya existentes.
+  Antes de decidir, muestra los árboles actual y propuesto.
+
 - **IA local sin complicaciones.** Parsezen te ayuda a instalar Ollama, comprobar tu equipo y elegir
   un modelo adecuado sin que tengas que utilizar comandos.
 
@@ -54,10 +62,12 @@ de Ollama y nunca envía el documento fuera del equipo. Es open source, privado 
 1. **[Descarga la última versión](https://github.com/jaimeacena/parsezen/releases/latest).** Necesitas Windows de 64 bits, pero no tienes que instalar Python.
 
 2. **Añade tu documento.** Puedes trabajar con PDF, Word, EPUB, Markdown y archivos de texto.
-3. **Configura el resultado.** En la ventana breve sobre la cola solo eliges Markdown o EPUB y, si
-   quieres, el idioma de traducción. Parsezen usa el recorrido directo, Argos y OCR automático por
-   defecto. Revisión completa, IA para traducir, páginas, OCR forzado y glosario permanecen en
-   `Más opciones` para los casos que realmente los necesitan.
+3. **Configura el resultado.** Dentro de Parsezen, dos tarjetas claras permiten elegir Markdown o
+   EPUB; traducción, páginas y OCR usan filas breves `Etiqueta — Valor — ›`, y la revisión con IA un
+   único interruptor. Al elegir un idioma aparecen traductor y glosario; un intervalo se resume como
+   `25–140`. Bajo el traductor se explica el recorrido efectivo, el número de pasadas y un coste
+   cualitativo que cambia con el formato y la revisión elegidos. Cada elección válida se guarda al
+   instante, sin pie de acciones ni scroll en el tamaño normal.
 4. **Procesa y revisa.** Parsezen extrae y organiza el contenido, conserva las imágenes y tablas
    compatibles y te muestra cualquier decisión pendiente antes de publicar.
 

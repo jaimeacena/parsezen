@@ -2,7 +2,13 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from scripts.sync_version import VERSIONED_FILES, project_version, synchronize
+import pytest
+from scripts.sync_version import (
+    VERSIONED_FILES,
+    project_version,
+    synchronize,
+    validate_release_tag,
+)
 
 
 def _write_version_fixture(root: Path, version: str = "1.2.3") -> None:
@@ -48,3 +54,10 @@ def test_repository_version_metadata_is_synchronized() -> None:
     root = Path(__file__).parents[1]
 
     assert synchronize(root, check=True) == ()
+
+
+def test_release_tag_must_match_the_exact_project_version() -> None:
+    validate_release_tag("v1.2.3", "1.2.3")
+
+    with pytest.raises(ValueError, match="debe ser v1.2.3"):
+        validate_release_tag("v9.9.9", "1.2.3")

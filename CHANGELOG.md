@@ -1,5 +1,32 @@
 # Historial de cambios
 
+## Próxima versión
+
+- Traducción y revisión dejan una cobertura lingüística explícita: distingue corrección integrada,
+  verificación bilingüe independiente y revisión dirigida, y muestra bloques comprobados, revisados,
+  no revisados e incidencias pendientes sin persistir contenido documental.
+- La revisión estructural planifica el esquema con un inventario global de índice, páginas,
+  geometría, encabezados y roles semánticos. Ollama solo devuelve directivas de nivel; la revisión
+  muestra los árboles actual y propuesto y Parsezen conserva literalmente el texto.
+- La configuración del traductor explica dinámicamente el recorrido real, las pasadas, la
+  independencia de la verificación y el coste cualitativo según motor, plan y formato.
+- Los documentos nuevos quedan ligados a un SHA-256 local. La preparación rechaza cualquier cambio
+  del original, incluso si conserva tamaño y fecha, y PDF/EPUB reutilizan ese digest entre checkpoints
+  para evitar lecturas completas redundantes.
+- La IA exige la configuración persistente de Ollama sin nube; el entorno del proceso cliente ya no
+  acredita un servidor previamente iniciado. Las releases validan etiqueta y versión, usan permisos
+  mínimos por job y la auditoría falla ante dependencias omitidas sin justificación canónica.
+- La configuración pasa a ser una página compacta dentro de la ventana principal. El formato recupera
+  dos tarjetas visuales para Markdown y EPUB; la revisión con IA usa un único interruptor. Traducir,
+  Traductor, Glosario, Páginas y OCR conservan el patrón plano `Etiqueta — Valor — ›`, sin controles
+  segmentados, encabezados ni scroll en el tamaño normal. Traductor y Glosario solo aparecen al
+  traducir; el rango PDF se pide en un diálogo y después se muestra como `25–140`.
+- La página de configuración queda centrada en el espacio disponible y cada menú se abre alineado con
+  el valor y el chevron de la fila que lo activa, también tras redimensionar la ventana.
+- Cada elección válida se guarda inmediatamente. Desaparecen Cancelar y Crear/Guardar del pie;
+  Volver y Escape solo cierran la página. La IA ausente abre su gestor desde la elección que la
+  necesita y el glosario conserva su editor compacto independiente.
+
 ## 1.2.0 - 2026-08-12
 
 - Configurar deja de sustituir la cola por un formulario largo: una ventana compacta pide únicamente

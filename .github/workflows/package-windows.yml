@@ -3,12 +3,10 @@ name: Paquete de Windows
 on:
   workflow_dispatch:
   push:
-    tags: ["v*"]
+    tags: ["v[0-9]*.[0-9]*.[0-9]*"]
 
 permissions:
-  contents: write
-  id-token: write
-  attestations: write
+  contents: read
 
 jobs:
   package:
@@ -33,6 +31,9 @@ jobs:
           python-version: "3.12"
           cache: pip
           cache-dependency-path: requirements-windows-cpu.lock
+      - name: Verificar que etiqueta y versión coinciden
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+        run: python scripts/sync_version.py --check --release-tag $env:GITHUB_REF_NAME
       - name: Instalar dependencias bloqueadas
         run: |
           $PSNativeCommandUseErrorActionPreference = $true
@@ -44,7 +45,7 @@ jobs:
           $PSNativeCommandUseErrorActionPreference = $true
           python -c "import torch, torchvision; assert torch.version.cuda is None; print(torch.__version__, torchvision.__version__)"
           python -m pip check
-          python -m pip_audit -r requirements-windows-cpu.lock --no-deps --disable-pip --ignore-vuln CVE-2026-54499
+          python scripts/audit_dependencies.py requirements-windows-cpu.lock --canonical-lock requirements.lock --allow-variant-skip torch --allow-variant-skip torchvision --ignore-vuln CVE-2026-54499
       - name: Validar el código antes de empaquetar
         run: |
           $PSNativeCommandUseErrorActionPreference = $true
@@ -74,11 +75,6 @@ jobs:
           $digest = (Get-FileHash -LiteralPath $installer.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
           "$digest  $($installer.Name)" |
             Out-File -Encoding ascii -NoNewline "$($installer.FullName).sha256"
-      - name: Atestar la procedencia del instalador
-        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
-        uses: actions/attest-build-provenance@v4
-        with:
-          subject-path: outputs/Parsezen-Setup-*.exe
       - uses: actions/upload-artifact@v7
         with:
           name: Parsezen-Windows
@@ -87,8 +83,26 @@ jobs:
             outputs/Parsezen-Setup-*.exe.sha256
             outputs/python-environment.json
           if-no-files-found: error
+
+  publish:
+    name: Publicar release verificada
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+    needs: package
+    runs-on: windows-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: Parsezen-Windows
+          path: outputs
+      - name: Atestar la procedencia del instalador
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: outputs/Parsezen-Setup-*.exe
       - name: Crear o actualizar la Release en borrador
-        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}

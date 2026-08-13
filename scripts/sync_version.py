@@ -26,6 +26,14 @@ def project_version(root: Path = ROOT) -> str:
     return version
 
 
+def validate_release_tag(tag: str, version: str) -> None:
+    """Require a release tag to identify the exact project version."""
+
+    expected = f"v{version}"
+    if tag != expected:
+        raise ValueError(f"La etiqueta de release debe ser {expected}; se recibió {tag!r}.")
+
+
 def synchronized_text(path: Path, text: str, version: str) -> str:
     """Render one known generated file without touching the filesystem."""
     relative = path.as_posix()
@@ -85,7 +93,17 @@ def main() -> int:
         action="store_true",
         help="No escribe; falla si algún metadato no coincide con pyproject.toml.",
     )
+    parser.add_argument(
+        "--release-tag",
+        help="Falla si la etiqueta no coincide exactamente con v<versión del proyecto>.",
+    )
     args = parser.parse_args()
+    if args.release_tag is not None:
+        try:
+            validate_release_tag(args.release_tag, project_version())
+        except ValueError as exc:
+            print(exc)
+            return 1
     stale = synchronize(check=args.check)
     if args.check and stale:
         print("Metadatos de versión desactualizados:")

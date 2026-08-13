@@ -104,22 +104,27 @@ en `docs/ui-design-system.md`.
 
 `OutputConfiguration.configured` separa un documento recién añadido de un trabajo ejecutable.
 Mientras sea falso, el planificador no lo incluye y `PUBLISH` no participa. La presentación abre
-una única transacción modal no bloqueante sobre la cola. Su nivel principal proyecta solo dos
-decisiones: resultado Markdown/EPUB y traducción desactivada/idioma. `STANDARD`, Argos y OCR
-automático son valores de producto, no preguntas. Un único disclosure contiene las excepciones:
-`LOCAL_AI_REVIEWED`, traducción con IA, glosario, intervalo PDF y OCR forzado; una configuración que
-ya use alguna se abre expandida. Solo Markdown y EPUB son resultados de producto.
+una página de ajustes dentro de la pila de la ventana principal. El formato se proyecta como dos
+tarjetas visuales exclusivas, la revisión con IA como interruptor y el resto de decisiones como una
+fila de etiqueta, valor y chevron. Los documentos nuevos presentan
+`LOCAL_AI_REVIEWED` activado; una configuración guardada conserva su plan. Argos y OCR automático
+son valores iniciales. Traductor y glosario dependen del idioma; Páginas y OCR aparecen solo para
+PDF. El intervalo se edita en un diálogo efímero y la fila conserva únicamente su valor resumido.
+Solo Markdown y EPUB son resultados de producto. La página no incorpora scroll ni vuelve a
+proyectar destino. Al activar traducción, `translation_route_summary` deriva del motor, el plan y el
+formato una explicación breve del recorrido efectivo, sus pasadas y su coste cualitativo; la
+presentación no duplica reglas del procesador.
 
 `STANDARD` se resume como procesamiento directo; `LOCAL_AI_REVIEWED`, como revisión completa con IA
-local, activa la revisión de texto y, únicamente para EPUB, la revisión de estructura. El detalle
-avanzado proyecta el recorrido y el número de pasadas reales antes de guardar. No existen
-combinaciones independientes de corrección y estructura. La configuración sigue siendo atómica: una
-validación fallida conserva la ventana, los valores y el contexto de la cola.
+local, activa la revisión de texto y, únicamente para EPUB, la revisión de estructura. No existen
+combinaciones independientes de corrección y estructura. Cada elección válida reemplaza de forma
+atómica la configuración del documento y se persiste inmediatamente; una elección incompleta por
+falta de IA conserva su valor visible y dirige al gestor sin publicar una configuración inválida.
 
-El plan directo es el valor recomendado por producto. Una evaluación local sobre muestras privadas
-confirmó que la revisión puede producir correcciones conservadoras, pero no una mejora universal, y
-que su coste varía mucho según conversión y motor de traducción. Por eso no se ejecuta IA de manera
-implícita ni se oculta como una fase obligatoria. El informe de validación registra por separado las
+La revisión completa es el valor inicial visible para trabajos nuevos, pero sigue siendo una decisión
+reversible y nunca se aplica a configuraciones ya guardadas. Una evaluación local confirmó que puede
+producir correcciones conservadoras, no una mejora universal, por lo que la interfaz explica su coste
+y conserva `STANDARD` como alternativa inmediata. El informe de validación registra por separado las
 propuestas de contenido y estructura, sus decisiones recomendadas, las incidencias objetivas y el
 tiempo; una propuesta aceptable no se interpreta por sí sola como evidencia de mejor calidad.
 
@@ -154,11 +159,21 @@ contextual y dependiente del modelo. La elección del motor es independiente de 
 plan revisado puede actuar después de cualquiera de los dos. `AIProfileConfiguration` es una
 instantánea de la única pareja modelo/contexto global. No hay excepciones por documento y los cambios
 generales se propagan a todos los trabajos editables. La eliminación de un modelo se bloquea mientras
-algún trabajo sin terminar dependa de él.
+algún trabajo sin terminar dependa de él. Si el valor inicial necesita IA y falta un modelo local
+válido, la configuración conserva la intención, muestra la causa junto al control y dirige al gestor
+de modelos antes de guardar.
 
-El destino funciona del mismo modo: cada documento muestra la ruta general efectiva, pero no puede
-sustituirla localmente. Cambiarla actualiza todos los trabajos editables. El intervalo de páginas y
-el OCR forzado son las únicas excepciones propias de un PDF y permanecen bajo Opciones adicionales.
+`LinguisticReviewCoverage` registra sin texto documental cómo se obtuvo la confianza lingüística:
+sin revisión semántica, corrección integrada en la traducción, verificación bilingüe independiente o
+verificación dirigida. Separa el total de bloques traducidos, los comprobados por las heurísticas,
+los revisados semánticamente, los verificados de forma independiente y las incidencias restantes.
+`TranslationQualityReport` conserva además los totales de bloques de origen y salida para no ocultar
+la parte no alineada. La cobertura viaja en `ProcessResult`, las instantáneas cifradas y el resumen
+sin contenido de actividad; nunca convierte una comprobación automática en verificación semántica.
+
+El destino funciona del mismo modo: cada documento hereda la ruta general efectiva, pero no puede
+sustituirla localmente. Cambiarla actualiza todos los trabajos editables. Páginas muestra `Todas` o
+el rango ya elegido; OCR muestra `Automático` o `Todas las páginas`.
 
 La configuración persistida v6 es un corte limpio. Al abrir una base con un esquema anterior se
 descarta solo el estado reconstruible de Parsezen (cola, revisiones, libros, instantáneas, eventos y
@@ -242,9 +257,10 @@ modificación anterior invalida únicamente sus fases dependientes.
 
 La ventana principal contiene una pila de páginas. La cola usa una tabla compacta de ancho completo
 y deriva con `job_view_model` el siguiente paso, el contador y la única acción contextual de la
-cabecera. Configuración, IA local, glosario, revisiones y editor EPUB
-se presentan dentro de la pila. La flecha de vuelta guarda las configuraciones válidas sin añadir
-un segundo pie de confirmación. Si hay una inconsistencia muestra su causa y conserva la página para
+cabecera. Configuración, IA local, revisiones y editor EPUB se presentan dentro de la pila; solo el
+editor compacto de glosario y el selector de intervalo son diálogos modales acotados sobre su
+contexto. Como no existen cambios pendientes, la flecha de vuelta y Escape cierran configuración sin
+confirmación. Si hay una inconsistencia muestra su causa y conserva la página para
 corregirla. Las opciones de una fase apagada quedan inhabilitadas y no participan en su validación
 ni en el `ProcessRequest`. Los controladores de revisión conservan sus contratos y
 checkpoints: la navegación interna sustituye al contenedor de ventana, no a la lógica de
@@ -536,8 +552,8 @@ La ruta de producto conserva Argos y añade IA local como alternativas explícit
 presupone que una sea semánticamente mejor: presenta a Argos como ligera y a IA local como contextual
 y dependiente del modelo. Ambas protegen el
 glosario y pasan por las mismas guardas compartidas de cobertura, cifras, enlaces, estructura e
-idioma. El informe de calidad se calcula sobre la salida del motor antes de que el plan Revisado
-cambie la división en bloques. La evidencia admite una cita intacta en otro idioma cuando la prosa
+idioma. El informe de calidad inicial se calcula sobre la salida del motor y vuelve a calcularse
+sobre la propuesta completa después del plan Revisado. La evidencia admite una cita intacta en otro idioma cuando la prosa
 que la contiene sí se ha traducido; las variantes incompatibles de un mismo término se señalan para
 revisión y no se sustituyen por semejanza.
 
@@ -588,13 +604,21 @@ extracción, OCR, fragmentos y EPUB sobreviven a una publicación correcta y se 
 tamaño; con cero se limpian al terminar, salvo que todavía exista una revisión pendiente. Descartar
 o cancelar explícitamente un trabajo sigue eliminando sus checkpoints exactos.
 
-La propuesta estructural es una operación de encabezados por directivas. El código identifica
-localmente las líneas candidatas, las numera y solo permite que el modelo devuelva pares línea-nivel;
-nunca le acepta un bloque documental reescrito. Parsezen reconstruye cada cambio con las palabras
-exactas de la línea de entrada y conserva el fragmento si la respuesta no es utilizable. Las
-respuestas opcionales sin cambios se consolidan cuando superan todas las guardas; una conservación
-causada por una respuesta inválida nunca se guarda como trabajo correcto. Además, el texto completo
-de cada encabezado nuevo debe proceder de una única línea candidata del original.
+La propuesta estructural es una planificación documental de encabezados por directivas. Antes de
+invocar Ollama, `semantic_blocks` recorre el documento completo y construye un inventario de
+candidatas con su nivel actual, página, rol semántico y coincidencia con el índice. Se priorizan hasta
+160 candidatas fuertes para mantener el inventario dentro del contexto local; tienen preferencia los
+encabezados existentes, las coincidencias del índice y los bloques ya clasificados como título. El
+modelo recibe ese inventario conjunto una sola vez y solo puede devolver pares línea-nivel; nunca se
+acepta un bloque documental reescrito. Parsezen reconstruye cada cambio con las palabras exactas de
+la línea original, limita a un nivel los movimientos de encabezados existentes y solo permite niveles
+1–3 para candidatos nuevos. La propuesta completa vuelve a superar las guardas estructurales; una
+respuesta inválida conserva el documento completo y no se guarda como trabajo correcto. Una respuesta
+vacía es una decisión válida de no proponer cambios.
+
+`markdown_outline_tree` proyecta, sin IA ni persistencia adicional, los árboles anterior y propuesto
+en la revisión de estructura. Los árboles se presentan en paralelo o apilados en anchura compacta;
+las decisiones siguen materializándose por cambio y el texto permanece inmutable.
 
 Los checkpoints de fragmentos usan una clave ligada al modo y al contenido, independiente de su
 posición ordinal. Al cargar una clave posicional de la versión anterior, se vuelve a validar el
@@ -813,7 +837,7 @@ Antes de que una cola avance desde un documento que necesita revisión, `ResultS
 persiste:
 
 - resultado y rutas;
-- informes OCR y de traducción;
+- informes OCR y de traducción, incluida la cobertura lingüística sin contenido;
 - propuesta de corrección;
 - recursos;
 - metadatos EPUB;
@@ -824,8 +848,9 @@ rutas, prompts, términos ni texto. La validación real usa el mismo resultado p
 páginas OCR sustituidas o dudosas y conteos de preliminares, índice y memoria terminológica.
 
 `OutcomeSummary` es el contrato de cierre para interfaz y actividad. Mantiene separados el control
-de integridad final, las incidencias detectadas por las etapas y las decisiones de revisión manual;
-ninguna ausencia de avisos se presenta como una certificación semántica. El historial
+de integridad final, las incidencias detectadas por las etapas, la cobertura lingüística y las
+decisiones de revisión manual; ninguna ausencia de avisos se presenta como una certificación
+semántica. El historial
 `recent-jobs.json` conserva de forma atómica un máximo de 20 intentos, deduplicados por origen,
 estado y resultado, con rutas y conteos pero sin contenido. El usuario puede borrarlo sin tocar
 documentos ni resultados. No es una biblioteca durable.
@@ -862,7 +887,9 @@ carpetas desconocidas y cualquier archivo ajeno al formato interno se conservan.
 
 ## Seguridad de datos
 
-- El origen es inmutable.
+- El origen es inmutable: al añadirlo se conservan tamaño, fecha y SHA-256. La preparación vuelve a
+  comprobar su contenido y detiene el trabajo si ha cambiado; el mismo digest verificado identifica
+  los checkpoints PDF, EPUB y de transformación sin releer el archivo para cada caché.
 - Una salida se construye fuera de su destino y se reemplaza solo al estar completa.
 - Las colisiones producen un nombre nuevo.
 - Una cancelación no publica un parcial.
@@ -871,7 +898,9 @@ carpetas desconocidas y cualquier archivo ajeno al formato interno se conservan.
 - XML usa analizadores sin entidades ni red.
 - HTML editable elimina scripts, formularios, eventos y URL ejecutables.
 - Los logs están sanitizados y rotan.
-- Ollama solo acepta loopback y modelos locales; Argos y OCR son locales.
+- Ollama solo acepta loopback y modelos locales; Argos y OCR son locales. La autorización para
+  enviar texto exige `server.json` con la nube desactivada: el entorno del cliente no acredita el
+  estado de un servidor Ollama que ya estuviera activo.
 - La selección, la caché de recomendaciones y la validación previa bloquean variantes conocidas de
   razonamiento; la ejecución vuelve a rechazarlas como última barrera antes de leer el documento.
 
@@ -941,5 +970,8 @@ por Windows ni evita por sí sola los avisos de editor desconocido.
 Las compilaciones manuales solo producen candidatos temporales. Una versión para usuarios se
 publica como GitHub Release en borrador desde una etiqueta inmutable perteneciente a `main` y adjunta
 automáticamente el instalador, su checksum y el inventario generados en la misma ejecución. El
+nombre de esa etiqueta debe coincidir exactamente con `v` y la versión de `pyproject.toml`. El job de
+compilación conserva permisos de solo lectura; escritura de contenido, OIDC y atestaciones se
+habilitan únicamente en el job posterior que publica una etiqueta validada. El
 instalador conserva el `AppId` entre versiones, limpia el runtime `_internal` anterior
 antes de actualizar y no toca `%LOCALAPPDATA%\Parsezen`, los originales ni los resultados.

@@ -120,6 +120,17 @@ def test_saved_recommendation_without_scope_fingerprint_remains_readable() -> No
     assert restored.review_recommendation == job.review_recommendation
 
 
+def test_source_digest_round_trips_and_legacy_payloads_remain_readable() -> None:
+    job = make_job("digest", 0)
+    job = replace(job, source=replace(job.source, content_sha256="a" * 64))
+    payload = state_store_module._job_to_json(job)
+
+    assert state_store_module._job_from_json(payload).source.content_sha256 == "a" * 64
+
+    payload["source"].pop("content_sha256")
+    assert state_store_module._job_from_json(payload).source.content_sha256 is None
+
+
 def test_legacy_job_payload_without_shared_ai_profile_is_rejected() -> None:
     original = make_job("legacy", 0)
     payload = state_store_module._job_to_json(original)

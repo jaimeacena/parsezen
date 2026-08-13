@@ -194,6 +194,9 @@ def request_and_settings_from_job(
         epub_remove_cover=(configuration.output.cover_strategy is CoverStrategy.REMOVE),
         review_content=reviewed,
         review_structure=review_structure,
+        source_size_bytes=job.source.size_bytes,
+        source_modified_ns=job.source.modified_ns,
+        source_content_sha256=job.source.content_sha256,
     )
     settings = AppSettings(
         model=configuration.ai.model,

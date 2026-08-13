@@ -1369,7 +1369,7 @@ def test_main_window_routes_configuration_review_and_primary_actions(
     editor = window._active_configuration_dialog  # noqa: SLF001
     assert isinstance(editor, JobConfigurationDialog)
     monkeypatch.setattr(editor, "configuration", lambda: configured)
-    editor.save_requested.emit()
+    editor.configuration_changed.emit()
     updated_job = window._job_queue.get(job.id)  # noqa: SLF001
     assert updated_job is not None
     assert updated_job.configuration.plan is ProcessingPlan.LOCAL_AI_REVIEWED
@@ -1457,19 +1457,24 @@ def test_table_click_opens_the_compact_configuration_sheet(
 
     editor = window._active_configuration_dialog  # noqa: SLF001
     assert isinstance(editor, JobConfigurationDialog)
-    assert editor.isVisible()
-    assert not editor.advanced_panel.isVisible()
-    assert editor.translation_target.isVisible()
-    assert editor.summary_card.isVisible()
-    assert window.parsezen_workspace.current_internal_widget is None
+    assert window.parsezen_workspace.current_internal_widget is editor
+    assert editor.window() is window
+    assert not editor.review_row.isHidden()
+    assert not editor.translate_row.isHidden()
+    assert editor.translator_row.isHidden()
+    assert editor.glossary_row.isHidden()
+    assert not hasattr(editor, "scroll_area")
+    assert not hasattr(editor, "save_button")
+    assert not hasattr(editor, "cancel_button")
     assert index.data(CONFIGURING_ROLE) is True
     assert discovery == []
 
     window._ollama_models = (OllamaModel("qwen3:4b-instruct", "Qwen3 4B Instruct"),)
-    editor.plan_reviewed.setChecked(True)
     window._select_model_from_manager("qwen3:4b-instruct")
+    editor._set_review_enabled(True)  # noqa: SLF001
 
-    assert "Qwen3 4B Instruct" in editor.ai_summary.text()
+    assert editor.configuration().ai.model == "qwen3:4b-instruct"
+    assert editor.plan_reviewed.isChecked()
 
     editor.reject()
 
@@ -1502,15 +1507,43 @@ def test_configuration_sheet_resumes_after_local_ai_settings(
 
     manager = window._model_manager  # noqa: SLF001
     assert manager is not None
-    assert not editor.isVisible()
     assert window.parsezen_workspace.current_internal_widget is manager
 
     manager.reject()
-    qtbot.waitUntil(editor.isVisible)
+    qtbot.waitUntil(lambda: window.parsezen_workspace.current_internal_widget is editor)
 
     assert window._active_configuration_dialog is editor  # noqa: SLF001
-    assert window.parsezen_workspace.current_internal_widget is None
+    assert window.parsezen_workspace.current_internal_widget is editor
     editor.reject()
+    assert window.parsezen_workspace.current_internal_widget is None
+
+
+def test_internal_back_closes_the_immediately_saved_configuration(
+    qtbot,
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "notes.txt"
+    source.write_text("Original", encoding="utf-8")
+    window = ParsezenMainWindow(
+        settings=AppSettings(),
+        auto_discover_ai=False,
+        state_path=tmp_path / "workspace.sqlite3",
+    )
+    qtbot.addWidget(window)
+    window.set_source_paths((source,))
+    job = window._project_jobs()[0]
+    window._configure_job(job.id, None)
+    editor = window._active_configuration_dialog  # noqa: SLF001
+    assert isinstance(editor, JobConfigurationDialog)
+    editor._set_review_enabled(False)  # noqa: SLF001
+    editor._set_output_format(DocumentFormat.EPUB)  # noqa: SLF001
+
+    window._close_internal_workflow(editor)  # noqa: SLF001
+
+    configured = window._job_queue.get(job.id).configuration  # noqa: SLF001
+    assert configured.output.format is DocumentFormat.EPUB
+    assert window._active_configuration_dialog is None  # noqa: SLF001
+    assert window.parsezen_workspace.current_internal_widget is None
 
 
 def test_model_manager_opens_before_discovery_and_starts_it(
@@ -1693,7 +1726,7 @@ def test_main_window_keeps_previous_configuration_when_runtime_mapping_fails(
     editor = window._active_configuration_dialog  # noqa: SLF001
     assert isinstance(editor, JobConfigurationDialog)
     monkeypatch.setattr(editor, "configuration", lambda: changed)
-    editor.save_requested.emit()
+    editor.configuration_changed.emit()
 
     assert window._job_queue.get(job.id).configuration == job.configuration
 
@@ -2431,7 +2464,7 @@ def test_global_destination_updates_every_editable_job(
     assert two.configuration.output.directory == new_destination
 
 
-def test_complete_configuration_can_be_applied_to_same_format_documents(
+def test_flat_configuration_updates_only_the_selected_document(
     qtbot,
     tmp_path: Path,
 ) -> None:
@@ -2454,15 +2487,13 @@ def test_complete_configuration_can_be_applied_to_same_format_documents(
     window._configure_job(first.id, None)
     editor = window._active_configuration_dialog  # noqa: SLF001
     assert isinstance(editor, JobConfigurationDialog)
-    editor.output_markdown.setChecked(True)
-    editor.apply_compatible.setChecked(True)
-    editor._submit()
+    editor._set_review_enabled(False)  # noqa: SLF001
+    editor._set_output_format(DocumentFormat.MARKDOWN)  # noqa: SLF001
 
     one, two, markdown = window._job_queue.jobs
     assert one.configuration.output.configured
-    assert two.configuration.output.configured
+    assert not two.configuration.output.configured
     assert one.configuration.output.format is DocumentFormat.MARKDOWN
-    assert two.configuration.output.format is DocumentFormat.MARKDOWN
     assert not markdown.configuration.output.configured
 
 
@@ -3660,8 +3691,9 @@ def test_workspace_commands_route_through_the_active_surface(
         OllamaConnection(OllamaStatus.READY, (model,))
     )
     window._select_model_from_manager(model.model_id)  # noqa: SLF001
-    editor.plan_reviewed.setChecked(True)
-    assert model.display_name in editor.ai_summary.text()
+    editor._set_review_enabled(True)  # noqa: SLF001
+    assert editor.configuration().ai.model == model.model_id
+    assert editor.plan_reviewed.isChecked()
     editor.reject()
 
     entry = _entries(window)[0]  # noqa: SLF001

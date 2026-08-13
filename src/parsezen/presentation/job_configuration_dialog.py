@@ -1,25 +1,26 @@
-"""Compact, progressive document configuration sheet."""
+"""Compact, immediately persisted document configuration page."""
 
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
-from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QCloseEvent, QKeyEvent, QMouseEvent, QResizeEvent
+from PySide6.QtCore import QPoint, Qt, Signal, Slot
+from PySide6.QtGui import QKeyEvent, QMouseEvent, QResizeEvent
 from PySide6.QtWidgets import (
     QBoxLayout,
     QButtonGroup,
     QDialog,
+    QDialogButtonBox,
     QFrame,
     QGridLayout,
     QHBoxLayout,
     QHeaderView,
     QLabel,
     QLayout,
-    QMessageBox,
+    QMenu,
     QPushButton,
     QRadioButton,
-    QScrollArea,
     QSizePolicy,
     QSpinBox,
     QTableWidget,
@@ -29,10 +30,7 @@ from PySide6.QtWidgets import (
 )
 
 from parsezen.application.configuration_rules import configuration_issues
-from parsezen.application.processing_explanation import (
-    processing_flow_steps,
-    processing_pass_summary,
-)
+from parsezen.application.processing_explanation import translation_route_summary
 from parsezen.domain.jobs import (
     AIProfileConfiguration,
     DocumentFormat,
@@ -49,15 +47,15 @@ from parsezen.domain.stages import StageKind
 from parsezen.errors import RequestValidationError
 from parsezen.glossary import MAX_GLOSSARY_ENTRIES, GlossaryEntry, validate_glossary
 from parsezen.local_models import OllamaStatus
-from parsezen.presentation.components import ChevronComboBox, Switch
-from parsezen.presentation.design_system import COLORS, SPACING
+from parsezen.presentation.components import Switch
+from parsezen.presentation.design_system import BREAKPOINTS, SPACING
 from parsezen.translation_quality import TARGET_LANGUAGE_CODES
 
 _AI_DEFAULT_UNSET = object()
 
 
 class _ChoiceCard(QFrame):
-    """A whole-card radio target with concise, purpose-led copy."""
+    """A whole-card format choice retained as the page's one visual selector."""
 
     def __init__(
         self,
@@ -84,8 +82,6 @@ class _ChoiceCard(QFrame):
         self.title.setObjectName("choiceTitle")
         self.description = QLabel(description, self)
         self.description.setObjectName("choiceDescription")
-        self.description.setWordWrap(True)
-        self.description.setMinimumWidth(0)
         copy.addWidget(self.title)
         copy.addWidget(self.description)
         layout.addLayout(copy, 1)
@@ -107,11 +103,216 @@ class _ChoiceCard(QFrame):
         self.style().polish(self)
 
 
-class JobConfigurationDialog(QDialog):
-    """Ask only for the desired result; keep exceptional controls behind one disclosure."""
+class _OptionRow(QWidget):
+    """One keyboard-operable setting rendered as label, current value and chevron."""
 
-    save_requested = Signal()
-    cancel_requested = Signal()
+    activated = Signal()
+
+    def __init__(self, label: str, value: str, *, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setObjectName("configurationOptionRow")
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.setAccessibleName(label)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(SPACING.sm, SPACING.sm, SPACING.sm, SPACING.sm)
+        layout.setSpacing(SPACING.sm)
+        self.label = QLabel(label, self)
+        self.label.setObjectName("configurationOptionLabel")
+        layout.addWidget(self.label)
+        layout.addStretch(1)
+        self.value = QLabel(value, self)
+        self.value.setObjectName("configurationOptionValue")
+        self.value.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        layout.addWidget(self.value)
+        self.chevron = QLabel("›", self)
+        self.chevron.setObjectName("configurationOptionChevron")
+        self.chevron.setAccessibleName("Abrir")
+        layout.addWidget(self.chevron)
+        self._sync_accessible_description()
+
+    def set_value(self, value: str) -> None:
+        self.value.setText(value)
+        self._sync_accessible_description()
+
+    def mouseReleaseEvent(self, event: QMouseEvent) -> None:  # noqa: N802
+        if event.button() is Qt.MouseButton.LeftButton and self.rect().contains(
+            event.position().toPoint()
+        ):
+            self.setFocus(Qt.FocusReason.MouseFocusReason)
+            self.activated.emit()
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+    def keyPressEvent(self, event: QKeyEvent) -> None:  # noqa: N802
+        if event.key() in {Qt.Key.Key_Return, Qt.Key.Key_Enter, Qt.Key.Key_Space}:
+            self.activated.emit()
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+    def _sync_accessible_description(self) -> None:
+        self.setAccessibleDescription(f"Valor actual: {self.value.text()}")
+
+
+class _PageRangeDialog(QDialog):
+    """Ask for an inclusive PDF interval away from the flat settings page."""
+
+    def __init__(
+        self,
+        page_range: PageRangeConfiguration | None,
+        *,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Intervalo de páginas")
+        self.setModal(True)
+        self.setObjectName("configurationRangeDialog")
+        self.setMinimumWidth(340)
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(SPACING.lg, SPACING.lg, SPACING.lg, SPACING.lg)
+        root.setSpacing(SPACING.md)
+        prompt = QLabel("Indica la primera y la última página.", self)
+        root.addWidget(prompt)
+
+        range_layout = QGridLayout()
+        range_layout.setHorizontalSpacing(SPACING.md)
+        self.first_page = QSpinBox(self)
+        self.last_page = QSpinBox(self)
+        for spin in (self.first_page, self.last_page):
+            spin.setRange(1, 2_147_483_647)
+        first = page_range.first_page if page_range is not None else 1
+        last = page_range.last_page if page_range is not None else first
+        self.first_page.setValue(first)
+        self.last_page.setMinimum(first)
+        self.last_page.setValue(last)
+        self.first_page.valueChanged.connect(self.last_page.setMinimum)
+        range_layout.addWidget(QLabel("Primera", self), 0, 0)
+        range_layout.addWidget(QLabel("Última", self), 0, 1)
+        range_layout.addWidget(self.first_page, 1, 0)
+        range_layout.addWidget(self.last_page, 1, 1)
+        root.addLayout(range_layout)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Cancel | QDialogButtonBox.StandardButton.Ok,
+            parent=self,
+        )
+        buttons.button(QDialogButtonBox.StandardButton.Ok).setText("Aplicar")
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        root.addWidget(buttons)
+
+    def page_range(self) -> PageRangeConfiguration:
+        return PageRangeConfiguration(self.first_page.value(), self.last_page.value())
+
+
+class _GlossaryEditorDialog(QDialog):
+    """Edit optional translation terms without expanding the settings page."""
+
+    def __init__(
+        self,
+        entries: tuple[GlossaryEntry, ...],
+        *,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Glosario de traducción")
+        self.setModal(True)
+        self.resize(620, 420)
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(SPACING.lg, SPACING.lg, SPACING.lg, SPACING.lg)
+        root.setSpacing(SPACING.md)
+
+        help_label = QLabel(
+            "Añade solo términos cuya traducción quieras mantener constante.",
+            self,
+        )
+        help_label.setObjectName("sectionHelp")
+        help_label.setWordWrap(True)
+        root.addWidget(help_label)
+
+        self.table = QTableWidget(0, 3, self)
+        self.table.setHorizontalHeaderLabels(("Original", "Traducción", ""))
+        self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        self.table.horizontalHeader().setSectionResizeMode(
+            2, QHeaderView.ResizeMode.ResizeToContents
+        )
+        root.addWidget(self.table, 1)
+
+        self.validation_label = QLabel(self)
+        self.validation_label.setObjectName("configurationValidation")
+        self.validation_label.setWordWrap(True)
+        self.validation_label.hide()
+        root.addWidget(self.validation_label)
+
+        footer = QHBoxLayout()
+        self.add_button = QPushButton("Añadir término", self)
+        self.add_button.clicked.connect(self._add_empty_row)
+        footer.addWidget(self.add_button)
+        footer.addStretch(1)
+        cancel_button = QPushButton("Cancelar", self)
+        save_button = QPushButton("Guardar glosario", self)
+        save_button.setObjectName("primaryAction")
+        cancel_button.clicked.connect(self.reject)
+        save_button.clicked.connect(self._submit)
+        footer.addWidget(cancel_button)
+        footer.addWidget(save_button)
+        root.addLayout(footer)
+
+        for entry in entries:
+            self._append_entry(entry)
+
+    def entries(self) -> tuple[GlossaryEntry, ...]:
+        entries: list[GlossaryEntry] = []
+        for row in range(self.table.rowCount()):
+            source_item = self.table.item(row, 0)
+            target_item = self.table.item(row, 1)
+            source = source_item.text().strip() if source_item is not None else ""
+            target = target_item.text().strip() if target_item is not None else ""
+            if source or target:
+                entries.append(GlossaryEntry(source, target))
+        return tuple(entries)
+
+    def _append_entry(self, entry: GlossaryEntry) -> None:
+        row = self.table.rowCount()
+        self.table.insertRow(row)
+        self.table.setItem(row, 0, QTableWidgetItem(entry.source))
+        self.table.setItem(row, 1, QTableWidgetItem(entry.target))
+        remove = QPushButton("×", self.table)
+        remove.setAccessibleName(f"Eliminar término {row + 1}")
+        remove.clicked.connect(lambda _checked=False, button=remove: self._remove_row(button))
+        self.table.setCellWidget(row, 2, remove)
+
+    def _add_empty_row(self) -> None:
+        if self.table.rowCount() < MAX_GLOSSARY_ENTRIES:
+            self._append_entry(GlossaryEntry("", ""))
+
+    def _remove_row(self, button: QPushButton) -> None:
+        for row in range(self.table.rowCount()):
+            if self.table.cellWidget(row, 2) is button:
+                self.table.removeRow(row)
+                return
+
+    def _submit(self) -> None:
+        try:
+            validate_glossary(self.entries())
+        except RequestValidationError as exc:
+            self.validation_label.setText(str(exc))
+            self.validation_label.show()
+            return
+        self.accept()
+
+
+class JobConfigurationDialog(QDialog):
+    """Present a compact conversion configuration that is saved immediately."""
+
+    configuration_changed = Signal()
     models_requested = Signal()
 
     def __init__(
@@ -125,7 +326,6 @@ class JobConfigurationDialog(QDialog):
         default_ai_model: str | None | object = _AI_DEFAULT_UNSET,
         default_ai_context: int | None | object = _AI_DEFAULT_UNSET,
         ollama_status: OllamaStatus | None = None,
-        compatible_job_count: int = 0,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
@@ -148,60 +348,42 @@ class JobConfigurationDialog(QDialog):
         )
         self._models = dict(models)
         self._ollama_status = ollama_status
-        self._dirty = False
-        self._loading = True
-        self._compact = False
+        self._glossary_values: list[GlossaryEntry] = []
+        self._load(job.configuration)
 
         self.setWindowTitle(f"Configurar · {job.source.path.name}")
         self.setObjectName("jobConfigurationEditor")
         self.setModal(not embedded)
-        self.setWindowModality(
-            Qt.WindowModality.NonModal if embedded else Qt.WindowModality.WindowModal
-        )
         if embedded:
             self.setWindowFlags(Qt.WindowType.Widget)
-        self.resize(680, 520)
+        self.resize(720, 560)
         self.setMinimumWidth(0)
 
         root = QVBoxLayout(self)
+        self._root_layout = root
         root.setSizeConstraint(QLayout.SizeConstraint.SetNoConstraint)
-        root.setContentsMargins(*(0, 0, 0, 0) if embedded else (24, 20, 24, 20))
-        root.setSpacing(SPACING.md)
+        root.setContentsMargins(SPACING.xl, SPACING.lg, SPACING.xl, SPACING.lg)
+        root.setSpacing(0)
 
-        heading = QLabel("¿Qué quieres crear?", self)
-        heading.setObjectName("configurationHeading")
-        root.addWidget(heading)
-        intro = QLabel(
-            "Elige el resultado. Parsezen se ocupa de la extracción, las comprobaciones y del "
-            "OCR si hace falta, sin pedirte más decisiones.",
-            self,
-        )
-        intro.setObjectName("configurationIntro")
-        intro.setWordWrap(True)
-        root.addWidget(intro)
-
-        self.scroll_area = QScrollArea(self)
-        self.scroll_area.setObjectName("configurationScroll")
-        self.scroll_area.setWidgetResizable(True)
-        self.scroll_area.setFrameShape(QFrame.Shape.NoFrame)
-        self.scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self.content = QWidget(self.scroll_area)
+        self.content = QWidget(self)
+        self.content.setObjectName("configurationFlatList")
+        self.content.setMaximumWidth(760)
         self.content.setMinimumWidth(0)
-        self.content.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
-        content_layout = QVBoxLayout(self.content)
-        content_layout.setContentsMargins(0, 0, SPACING.xs, 0)
-        content_layout.setSpacing(SPACING.md)
+        self.content.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        self.options_layout = QVBoxLayout(self.content)
+        self.options_layout.setContentsMargins(0, 0, 0, 0)
+        self.options_layout.setSpacing(SPACING.xs)
 
         self.output_group = QButtonGroup(self)
         self.output_group.setExclusive(True)
         self.markdown_card = _ChoiceCard(
             "Markdown",
-            "Para editar, buscar o usar en tus notas.",
+            "Texto editable.",
             parent=self.content,
         )
         self.epub_card = _ChoiceCard(
             "EPUB",
-            "Para leer como un libro en cualquier dispositivo.",
+            "Libro electrónico.",
             parent=self.content,
         )
         self.output_markdown = self.markdown_card.radio
@@ -209,255 +391,177 @@ class JobConfigurationDialog(QDialog):
         self.output_group.addButton(self.output_markdown)
         self.output_group.addButton(self.output_epub)
         self.output_choices = QBoxLayout(QBoxLayout.Direction.LeftToRight)
+        self.output_choices.setContentsMargins(0, 0, 0, 0)
         self.output_choices.setSpacing(SPACING.sm)
         self.output_choices.addWidget(self.markdown_card, 1)
         self.output_choices.addWidget(self.epub_card, 1)
-        content_layout.addLayout(self.output_choices)
 
-        translation_row = QGridLayout()
-        translation_row.setHorizontalSpacing(SPACING.md)
-        translation_row.setVerticalSpacing(SPACING.xs)
-        translation_label = QLabel("Traducción", self.content)
-        translation_label.setObjectName("configurationFieldLabel")
-        translation_row.addWidget(translation_label, 0, 0)
-        self.translation_target = ChevronComboBox(self.content)
-        self.translation_target.setMinimumWidth(0)
-        self.translation_target.setSizePolicy(
-            QSizePolicy.Policy.Ignored,
-            QSizePolicy.Policy.Fixed,
-        )
-        self.translation_target.setAccessibleName("Traducción e idioma de destino")
-        self.translation_target.addItem("No traducir", None)
-        for display_name, code in TARGET_LANGUAGE_CODES.items():
-            self.translation_target.addItem(f"Traducir a {display_name}", code)
-        translation_row.addWidget(self.translation_target, 0, 1)
-        translation_row.setColumnStretch(1, 1)
-        content_layout.addLayout(translation_row)
-
-        self.summary_card = QFrame(self.content)
-        self.summary_card.setObjectName("configurationSummary")
-        summary_layout = QVBoxLayout(self.summary_card)
-        summary_layout.setContentsMargins(SPACING.md, SPACING.sm, SPACING.md, SPACING.sm)
-        summary_layout.setSpacing(3)
-        self.summary_title = QLabel(self.summary_card)
-        self.summary_title.setObjectName("configurationSummaryTitle")
-        self.summary_detail = QLabel(self.summary_card)
-        self.summary_detail.setObjectName("configurationSummaryDetail")
-        self.summary_detail.setWordWrap(True)
-        self.destination_summary = QLabel(self.summary_card)
-        self.destination_summary.setObjectName("inheritedSetting")
-        self.destination_summary.setWordWrap(True)
-        summary_layout.addWidget(self.summary_title)
-        summary_layout.addWidget(self.summary_detail)
-        summary_layout.addWidget(self.destination_summary)
-        content_layout.addWidget(self.summary_card)
-
-        self.advanced_toggle = QPushButton("Más opciones", self.content)
-        self.advanced_toggle.setObjectName("configurationDisclosure")
-        self.advanced_toggle.setCheckable(True)
-        self.advanced_toggle.setAccessibleName("Mostrar más opciones de procesamiento")
-        content_layout.addWidget(self.advanced_toggle, 0, Qt.AlignmentFlag.AlignLeft)
-
-        self.advanced_panel = QFrame(self.content)
-        self.advanced_panel.setObjectName("configurationAdvanced")
-        advanced_layout = QVBoxLayout(self.advanced_panel)
-        advanced_layout.setContentsMargins(SPACING.md, SPACING.md, SPACING.md, SPACING.md)
-        advanced_layout.setSpacing(SPACING.md)
-
-        self.review_row = QWidget(self.advanced_panel)
-        review_layout = QGridLayout(self.review_row)
-        review_layout.setContentsMargins(0, 0, 0, 0)
-        review_layout.setHorizontalSpacing(SPACING.md)
-        review_title = QLabel("Revisar todo con IA", self.review_row)
-        review_title.setObjectName("configurationFieldLabel")
-        review_layout.addWidget(review_title, 0, 0)
+        self.translate_row = _OptionRow("Traducir", "", parent=self.content)
+        self.translator_row = _OptionRow("Traductor", "", parent=self.content)
+        self.glossary_row = _OptionRow("Glosario", "", parent=self.content)
+        self.translation_route = QLabel("", self.content)
+        self.translation_route.setObjectName("sectionHelp")
+        self.translation_route.setWordWrap(True)
+        self.translation_route.setAccessibleName("Recorrido y coste aproximado de traducción")
+        self.review_row = QWidget(self.content)
+        self.review_row.setObjectName("configurationSwitchRow")
+        review_layout = QHBoxLayout(self.review_row)
+        review_layout.setContentsMargins(SPACING.sm, SPACING.sm, SPACING.sm, SPACING.sm)
+        review_layout.setSpacing(SPACING.sm)
+        self.review_label = QLabel("Revisión con IA", self.review_row)
+        self.review_label.setObjectName("configurationOptionLabel")
+        review_layout.addWidget(self.review_label)
+        review_layout.addStretch(1)
         self.plan_reviewed = Switch(self.review_row)
-        self.plan_reviewed.setAccessibleName("Revisar todo el documento con IA local")
-        review_layout.addWidget(self.plan_reviewed, 0, 1, Qt.AlignmentFlag.AlignRight)
-        review_help = QLabel(
-            "Más lento. El modo normal ya detecta zonas dudosas y te permite revisar solo esas.",
-            self.review_row,
+        self.plan_reviewed.setAccessibleName("Revisión con IA")
+        self.plan_reviewed.setAccessibleDescription(
+            "Revisa todo el documento con el modelo de IA local."
         )
-        review_help.setObjectName("sectionHelp")
-        review_help.setWordWrap(True)
-        review_layout.addWidget(review_help, 1, 0, 1, 2)
-        review_layout.setColumnStretch(0, 1)
-        advanced_layout.addWidget(self.review_row)
+        review_layout.addWidget(self.plan_reviewed)
+        self.pages_row = _OptionRow("Páginas", "", parent=self.content)
+        self.ocr_row = _OptionRow("OCR", "", parent=self.content)
 
-        self.translation_method_row = QWidget(self.advanced_panel)
-        method_layout = QGridLayout(self.translation_method_row)
-        method_layout.setContentsMargins(0, 0, 0, 0)
-        method_layout.setHorizontalSpacing(SPACING.md)
-        method_label = QLabel("Traductor", self.translation_method_row)
-        method_label.setObjectName("configurationFieldLabel")
-        method_layout.addWidget(method_label, 0, 0)
-        self.translation_method = ChevronComboBox(self.translation_method_row)
-        self.translation_method.setAccessibleName("Motor de traducción")
-        self.translation_method.addItem(
-            "Argos · Rápido y recomendado",
-            TranslationMethod.OFFLINE,
-        )
-        self.translation_method.addItem(
-            "IA local · Más contextual",
-            TranslationMethod.LOCAL_AI,
-        )
-        self.translation_method.setMinimumWidth(0)
-        self.translation_method.setSizePolicy(
-            QSizePolicy.Policy.Ignored,
-            QSizePolicy.Policy.Fixed,
-        )
-        method_layout.addWidget(self.translation_method, 0, 1)
-        method_layout.setColumnStretch(1, 1)
-        advanced_layout.addWidget(self.translation_method_row)
+        self.options_layout.addLayout(self.output_choices)
+        self.options_layout.addSpacing(SPACING.sm)
+        self.options_layout.addWidget(self.translate_row)
+        self.options_layout.addWidget(self.translator_row)
+        self.options_layout.addWidget(self.glossary_row)
+        self.options_layout.addWidget(self.translation_route)
+        self.options_layout.addSpacing(SPACING.sm)
+        self.options_layout.addWidget(self.review_row)
+        self.options_layout.addWidget(self.pages_row)
+        self.options_layout.addWidget(self.ocr_row)
 
-        self.ai_summary = QLabel(self.advanced_panel)
-        self.ai_summary.setObjectName("inheritedSetting")
-        self.ai_summary.setWordWrap(True)
-        advanced_layout.addWidget(self.ai_summary)
-        self.manage_models_button = QPushButton("Configurar IA local…", self.advanced_panel)
-        self.manage_models_button.clicked.connect(self.models_requested.emit)
-        advanced_layout.addWidget(
-            self.manage_models_button,
-            0,
-            Qt.AlignmentFlag.AlignLeft,
-        )
-
-        self.glossary_toggle = QPushButton("Glosario", self.advanced_panel)
-        self.glossary_toggle.setCheckable(True)
-        self.glossary_toggle.toggled.connect(self._toggle_glossary)
-        advanced_layout.addWidget(self.glossary_toggle, 0, Qt.AlignmentFlag.AlignLeft)
-        self.glossary_panel = QWidget(self.advanced_panel)
-        glossary_layout = QVBoxLayout(self.glossary_panel)
-        glossary_layout.setContentsMargins(0, 0, 0, 0)
-        self.glossary_table = QTableWidget(0, 3, self.glossary_panel)
-        self.glossary_table.setHorizontalHeaderLabels(("Original", "Traducción", ""))
-        self.glossary_table.horizontalHeader().setSectionResizeMode(
-            0, QHeaderView.ResizeMode.Stretch
-        )
-        self.glossary_table.horizontalHeader().setSectionResizeMode(
-            1, QHeaderView.ResizeMode.Stretch
-        )
-        self.glossary_table.horizontalHeader().setSectionResizeMode(
-            2, QHeaderView.ResizeMode.ResizeToContents
-        )
-        self.glossary_table.setMinimumHeight(150)
-        glossary_layout.addWidget(self.glossary_table)
-        self.add_glossary_button = QPushButton("Añadir término", self.glossary_panel)
-        self.add_glossary_button.clicked.connect(self._add_glossary_row)
-        glossary_layout.addWidget(self.add_glossary_button, 0, Qt.AlignmentFlag.AlignLeft)
-        self.glossary_panel.hide()
-        advanced_layout.addWidget(self.glossary_panel)
-
-        self.pdf_options = QWidget(self.advanced_panel)
-        pdf_layout = QGridLayout(self.pdf_options)
-        pdf_layout.setContentsMargins(0, 0, 0, 0)
-        pdf_layout.setHorizontalSpacing(SPACING.md)
-        pdf_layout.setVerticalSpacing(SPACING.xs)
-        range_label = QLabel("Procesar solo algunas páginas", self.pdf_options)
-        range_label.setObjectName("configurationFieldLabel")
-        pdf_layout.addWidget(range_label, 0, 0)
-        self.page_range_enabled = Switch(self.pdf_options)
-        self.page_range_enabled.setAccessibleName("Procesar solo un intervalo de páginas")
-        pdf_layout.addWidget(self.page_range_enabled, 0, 1, Qt.AlignmentFlag.AlignRight)
-        self.page_first = QSpinBox(self.pdf_options)
-        self.page_last = QSpinBox(self.pdf_options)
-        for spin in (self.page_first, self.page_last):
-            spin.setRange(1, 2_147_483_647)
-        range_row = QHBoxLayout()
-        range_row.addWidget(QLabel("De", self.pdf_options))
-        range_row.addWidget(self.page_first)
-        range_row.addWidget(QLabel("a", self.pdf_options))
-        range_row.addWidget(self.page_last)
-        range_row.addStretch(1)
-        pdf_layout.addLayout(range_row, 1, 0, 1, 2)
-        ocr_label = QLabel("Forzar OCR en todas las páginas", self.pdf_options)
-        ocr_label.setObjectName("configurationFieldLabel")
-        pdf_layout.addWidget(ocr_label, 2, 0)
-        self.force_pdf_ocr = Switch(self.pdf_options)
-        self.force_pdf_ocr.setAccessibleName("Forzar OCR en todas las páginas")
-        pdf_layout.addWidget(self.force_pdf_ocr, 2, 1, Qt.AlignmentFlag.AlignRight)
-        ocr_help = QLabel(
-            "Déjalo desactivado salvo que el PDF sea una imagen y la detección automática falle.",
-            self.pdf_options,
-        )
-        ocr_help.setObjectName("sectionHelp")
-        ocr_help.setWordWrap(True)
-        pdf_layout.addWidget(ocr_help, 3, 0, 1, 2)
-        pdf_layout.setColumnStretch(0, 1)
-        advanced_layout.addWidget(self.pdf_options)
-
-        self.epub_note = QLabel(
-            "Antes de publicar podrás confirmar título, autor, idioma y portada.",
-            self.advanced_panel,
-        )
-        self.epub_note.setObjectName("sectionHelp")
-        self.epub_note.setWordWrap(True)
-        advanced_layout.addWidget(self.epub_note)
-
-        self.route_summary = QLabel(self.advanced_panel)
-        self.route_summary.setObjectName("routeDetail")
-        self.route_summary.setWordWrap(True)
-        advanced_layout.addWidget(self.route_summary)
-        content_layout.addWidget(self.advanced_panel)
-        content_layout.addStretch(1)
-
-        self.scroll_area.setWidget(self.content)
-        root.addWidget(self.scroll_area, 1)
-
-        self.validation_label = QLabel(self)
+        self.validation_label = QLabel(self.content)
         self.validation_label.setObjectName("configurationValidation")
         self.validation_label.setWordWrap(True)
         self.validation_label.hide()
-        root.addWidget(self.validation_label)
+        self.options_layout.addWidget(self.validation_label)
 
-        self.apply_compatible_row = QWidget(self)
-        apply_layout = QHBoxLayout(self.apply_compatible_row)
-        apply_layout.setContentsMargins(0, 0, 0, 0)
-        self.apply_compatible = Switch(self.apply_compatible_row)
-        self.apply_compatible.setAccessibleName("Aplicar a documentos compatibles")
-        self.apply_compatible_label = QLabel(
-            f"Usar también en {compatible_job_count} documento"
-            f"{'s' if compatible_job_count != 1 else ''} del mismo tipo",
-            self.apply_compatible_row,
+        root.addWidget(
+            self.content,
+            0,
+            Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignHCenter,
         )
-        self.apply_compatible_label.setWordWrap(True)
-        apply_layout.addWidget(self.apply_compatible)
-        apply_layout.addWidget(self.apply_compatible_label, 1)
-        self.apply_compatible_row.setVisible(compatible_job_count > 0)
-        root.addWidget(self.apply_compatible_row)
+        root.addStretch(1)
 
-        footer = QHBoxLayout()
-        footer.addStretch(1)
-        self.cancel_button = QPushButton("Cancelar", self)
-        self.save_button = QPushButton("Guardar", self)
-        self.save_button.setObjectName("primaryAction")
-        self.save_button.setDefault(True)
-        footer.addWidget(self.cancel_button)
-        footer.addWidget(self.save_button)
-        root.addLayout(footer)
-
-        self._load(job.configuration)
-        self._connect_changes()
-        self._loading = False
-        self._dirty = False
+        self.output_markdown.toggled.connect(self._set_markdown_output_when_checked)
+        self.output_epub.toggled.connect(self._set_epub_output_when_checked)
+        self.translate_row.activated.connect(self._open_translation_menu)
+        self.translator_row.activated.connect(self._open_translator_menu)
+        self.glossary_row.activated.connect(self._open_glossary)
+        self.plan_reviewed.toggled.connect(self._set_review_enabled)
+        self.pages_row.activated.connect(self._open_pages_menu)
+        self.ocr_row.activated.connect(self._open_ocr_menu)
         self._refresh()
         self._focus_stage(stage)
-        self._apply_styles()
 
-    def _connect_changes(self) -> None:
-        self.output_markdown.toggled.connect(self._changed)
-        self.output_epub.toggled.connect(self._changed)
-        self.translation_target.currentIndexChanged.connect(self._changed)
-        self.advanced_toggle.toggled.connect(lambda _checked: self._refresh())
-        self.plan_reviewed.toggled.connect(self._changed)
-        self.translation_method.currentIndexChanged.connect(self._changed)
-        self.page_range_enabled.toggled.connect(self._changed)
-        self.page_first.valueChanged.connect(self._changed)
-        self.page_last.valueChanged.connect(self._changed)
-        self.force_pdf_ocr.toggled.connect(self._changed)
-        self.glossary_table.itemChanged.connect(self._changed)
-        self.save_button.clicked.connect(self._submit)
-        self.cancel_button.clicked.connect(self._cancel)
+    def configuration(self) -> JobConfiguration:
+        translating = self._translation_language is not None
+        glossary = validate_glossary(self._glossary_entries()) if translating else ()
+        previous = self._job.configuration.output
+        configuration = JobConfiguration(
+            output=OutputConfiguration(
+                configured=True,
+                format=self._output_format,
+                directory=self._default_output_directory,
+                include_images=True,
+                image_directory=None,
+                preserve_styles=self._output_format is DocumentFormat.EPUB,
+                markdown_organization=MarkdownOrganization.SINGLE_FILE,
+                markdown_include_metadata=False,
+                markdown_include_page_references=False,
+                title=(previous.title or self._job.source.path.stem)
+                if self._output_format is DocumentFormat.EPUB
+                else None,
+                author=previous.author if self._output_format is DocumentFormat.EPUB else None,
+                cover_strategy=previous.cover_strategy,
+                cover_path=previous.cover_path,
+            ),
+            ai=AIProfileConfiguration(
+                model=self._default_ai_model,
+                context_window=self._default_ai_context,
+            ),
+            translation=TranslationConfiguration(
+                enabled=translating,
+                method=(self._translation_method if translating else TranslationMethod.OFFLINE),
+                target_language=self._translation_language,
+                glossary=(
+                    tuple((entry.source, entry.target) for entry in glossary) if translating else ()
+                ),
+            ),
+            plan=(
+                ProcessingPlan.LOCAL_AI_REVIEWED
+                if self._review_enabled
+                else ProcessingPlan.STANDARD
+            ),
+            page_range=(
+                self._page_range if self._job.source.format is DocumentFormat.PDF else None
+            ),
+            force_pdf_ocr=(
+                self._force_pdf_ocr if self._job.source.format is DocumentFormat.PDF else False
+            ),
+        )
+        issues = configuration_issues(self._job.source, configuration)
+        if issues:
+            raise ValueError(issues[0].message)
+        return configuration
+
+    def persist_if_valid(self, *, open_models: bool = False) -> bool:
+        """Persist the visible choices when valid, leaving incomplete AI intent visible."""
+
+        try:
+            self.configuration()
+        except (RequestValidationError, ValueError) as exc:
+            self.validation_label.setText(str(exc))
+            self.validation_label.show()
+            if open_models and self._ai_needed() and self._ai_setup_required():
+                self.models_requested.emit()
+            return False
+        self.validation_label.hide()
+        self.configuration_changed.emit()
+        return True
+
+    def mark_persisted(self, job: DocumentJob) -> None:
+        """Keep later immediate updates based on the last committed configuration."""
+
+        self._job = job
+
+    @property
+    def review_enabled(self) -> bool:
+        return self._review_enabled
+
+    def set_models(self, models: tuple[tuple[str, str], ...]) -> None:
+        self._models = dict(models)
+
+    def set_default_ai_profile(self, model: str | None, context_window: int | None) -> None:
+        self._default_ai_model = model
+        self._default_ai_context = context_window
+
+    def set_ai_status(self, status: OllamaStatus | None) -> None:
+        self._ollama_status = status
+
+    def set_compact_mode(self, compact: bool) -> None:
+        """Stack only the visual format choices when horizontal space is limited."""
+
+        direction = (
+            QBoxLayout.Direction.TopToBottom if compact else QBoxLayout.Direction.LeftToRight
+        )
+        self.output_choices.setDirection(direction)
+
+    def keyPressEvent(self, event: QKeyEvent) -> None:  # noqa: N802
+        if event.key() == Qt.Key.Key_Escape:
+            self.reject()
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+    def resizeEvent(self, event: QResizeEvent) -> None:  # noqa: N802
+        margins = self._root_layout.contentsMargins()
+        available_width = max(0, event.size().width() - margins.left() - margins.right())
+        self.content.setFixedWidth(min(760, available_width))
+        self.set_compact_mode(event.size().width() <= BREAKPOINTS.compact)
+        super().resizeEvent(event)
 
     def _load(self, configuration: JobConfiguration) -> None:
         output = configuration.output.format
@@ -469,408 +573,248 @@ class JobConfigurationDialog(QDialog):
             and output is DocumentFormat.MARKDOWN
         ):
             output = DocumentFormat.EPUB
-        self.output_epub.setChecked(output is DocumentFormat.EPUB)
-        self.output_markdown.setChecked(output is DocumentFormat.MARKDOWN)
-        self._set_combo_data(
-            self.translation_target,
-            configuration.translation.target_language
-            if configuration.translation.enabled
-            else None,
+        self._output_format = output
+        self._translation_language = (
+            configuration.translation.target_language if configuration.translation.enabled else None
         )
-        self._set_combo_data(self.translation_method, configuration.translation.method)
-        self.plan_reviewed.setChecked(configuration.plan is ProcessingPlan.LOCAL_AI_REVIEWED)
-        for source, target in configuration.translation.glossary:
-            self._append_glossary_entry(GlossaryEntry(source, target))
-        page_range = configuration.page_range
-        self.page_range_enabled.setChecked(page_range is not None)
-        self.page_first.setValue(page_range.first_page if page_range is not None else 1)
-        self.page_last.setValue(page_range.last_page if page_range is not None else 1)
-        self.force_pdf_ocr.setChecked(configuration.force_pdf_ocr)
-        has_advanced = bool(
+        self._translation_method = configuration.translation.method
+        self._review_enabled = (
             configuration.plan is ProcessingPlan.LOCAL_AI_REVIEWED
-            or (
-                configuration.translation.enabled
-                and configuration.translation.method is TranslationMethod.LOCAL_AI
-            )
-            or configuration.translation.glossary
-            or page_range is not None
-            or configuration.force_pdf_ocr
+            or not configuration.output.configured
         )
-        self.advanced_toggle.setChecked(has_advanced)
-        self.glossary_toggle.setChecked(bool(configuration.translation.glossary))
-
-    def configuration(self) -> JobConfiguration:
-        output_format = self._selected_output()
-        target_data = self.translation_target.currentData()
-        translating = isinstance(target_data, str) and bool(target_data)
-        glossary = validate_glossary(self._glossary_entries()) if translating else ()
-        page_range = None
-        if self._job.source.format is DocumentFormat.PDF and self.page_range_enabled.isChecked():
-            page_range = PageRangeConfiguration(self.page_first.value(), self.page_last.value())
-        previous = self._job.configuration.output
-        method = self._selected_translation_method()
-        configuration = JobConfiguration(
-            output=OutputConfiguration(
-                configured=True,
-                format=output_format,
-                directory=self._default_output_directory,
-                include_images=True,
-                image_directory=None,
-                preserve_styles=output_format is DocumentFormat.EPUB,
-                markdown_organization=MarkdownOrganization.SINGLE_FILE,
-                markdown_include_metadata=False,
-                markdown_include_page_references=False,
-                title=(previous.title or self._job.source.path.stem)
-                if output_format is DocumentFormat.EPUB
-                else None,
-                author=previous.author if output_format is DocumentFormat.EPUB else None,
-                cover_strategy=previous.cover_strategy,
-                cover_path=previous.cover_path,
-            ),
-            ai=AIProfileConfiguration(
-                model=self._default_ai_model,
-                context_window=self._default_ai_context,
-            ),
-            translation=TranslationConfiguration(
-                enabled=translating,
-                method=method if translating else TranslationMethod.OFFLINE,
-                target_language=str(target_data) if translating else None,
-                glossary=(
-                    tuple((entry.source, entry.target) for entry in glossary) if translating else ()
-                ),
-            ),
-            plan=(
-                ProcessingPlan.LOCAL_AI_REVIEWED
-                if self.plan_reviewed.isChecked()
-                else ProcessingPlan.STANDARD
-            ),
-            page_range=page_range,
-            force_pdf_ocr=(
-                self.force_pdf_ocr.isChecked()
-                if self._job.source.format is DocumentFormat.PDF
-                else False
-            ),
-        )
-        issues = configuration_issues(self._job.source, configuration)
-        if issues:
-            raise ValueError(issues[0].message)
-        return configuration
-
-    def set_models(self, models: tuple[tuple[str, str], ...]) -> None:
-        self._models = dict(models)
-        self._refresh_ai_summary()
-
-    def set_default_ai_profile(self, model: str | None, context_window: int | None) -> None:
-        self._default_ai_model = model
-        self._default_ai_context = context_window
-        self._refresh_ai_summary()
-
-    def set_ai_status(self, status: OllamaStatus | None) -> None:
-        self._ollama_status = status
-        self._refresh_ai_summary()
-
-    def request_close(self) -> bool:
-        if not self._dirty:
-            return True
-        answer = QMessageBox.question(
-            self,
-            "Descartar cambios",
-            "¿Cerrar sin guardar los cambios de este documento?",
-            QMessageBox.StandardButton.Discard | QMessageBox.StandardButton.Cancel,
-            QMessageBox.StandardButton.Cancel,
-        )
-        return answer is QMessageBox.StandardButton.Discard
-
-    def set_compact_mode(self, compact: bool) -> None:
-        if compact == self._compact:
-            return
-        self._compact = compact
-        self.output_choices.setDirection(
-            QBoxLayout.Direction.TopToBottom if compact else QBoxLayout.Direction.LeftToRight
-        )
-
-    def resizeEvent(self, event: QResizeEvent) -> None:  # noqa: N802
-        super().resizeEvent(event)
-        self.set_compact_mode(event.size().width() < 520)
-
-    def keyPressEvent(self, event: QKeyEvent) -> None:  # noqa: N802
-        if event.key() == Qt.Key.Key_Escape:
-            self._cancel()
-            event.accept()
-            return
-        super().keyPressEvent(event)
-
-    def _changed(self, *_args: object) -> None:
-        if not self._loading:
-            self._dirty = True
-        self.validation_label.hide()
-        self._refresh()
+        self._page_range = configuration.page_range
+        self._force_pdf_ocr = configuration.force_pdf_ocr
+        self._glossary_values = [
+            GlossaryEntry(source, target) for source, target in configuration.translation.glossary
+        ]
 
     def _refresh(self) -> None:
-        advanced = self.advanced_toggle.isChecked()
-        translating = isinstance(self.translation_target.currentData(), str)
-        output_format = self._selected_output()
-        self.advanced_panel.setVisible(advanced)
-        self.translation_method_row.setVisible(translating)
-        self.glossary_toggle.setVisible(translating)
-        self.glossary_panel.setVisible(translating and self.glossary_toggle.isChecked())
-        self.pdf_options.setVisible(self._job.source.format is DocumentFormat.PDF)
-        self.page_first.setEnabled(self.page_range_enabled.isChecked())
-        self.page_last.setEnabled(self.page_range_enabled.isChecked())
-        self.epub_note.setVisible(output_format is DocumentFormat.EPUB)
-        self._refresh_advanced_label()
-        self._refresh_summary()
-        self._refresh_ai_summary()
-        self._refresh_route_summary()
+        self._set_checked_without_signal(
+            self.output_markdown,
+            self._output_format is DocumentFormat.MARKDOWN,
+        )
+        self._set_checked_without_signal(
+            self.output_epub,
+            self._output_format is DocumentFormat.EPUB,
+        )
+        self.markdown_card._refresh_state(  # noqa: SLF001
+            self._output_format is DocumentFormat.MARKDOWN
+        )
+        self.epub_card._refresh_state(  # noqa: SLF001
+            self._output_format is DocumentFormat.EPUB
+        )
+        language_name = self._language_name(self._translation_language)
+        self.translate_row.set_value(language_name or "No traducir")
+        translating = self._translation_language is not None
+        self.translator_row.setVisible(translating)
+        self.glossary_row.setVisible(translating)
+        self.translator_row.set_value(
+            "IA local · contextual"
+            if self._translation_method is TranslationMethod.LOCAL_AI
+            else "Argos · ligero"
+        )
+        glossary_count = len(self._glossary_values)
+        self.glossary_row.set_value(
+            "Ninguno"
+            if glossary_count == 0
+            else f"{glossary_count} término{'s' if glossary_count != 1 else ''}"
+        )
+        self.translation_route.setVisible(translating)
+        if translating:
+            self.translation_route.setText(
+                translation_route_summary(
+                    self._translation_method,
+                    reviewed=self._review_enabled,
+                    epub=self._output_format is DocumentFormat.EPUB,
+                )
+            )
+        self._set_checked_without_signal(self.plan_reviewed, self._review_enabled)
+        is_pdf = self._job.source.format is DocumentFormat.PDF
+        self.pages_row.setVisible(is_pdf)
+        self.ocr_row.setVisible(is_pdf)
+        self.pages_row.set_value(
+            "Todas"
+            if self._page_range is None
+            else f"{self._page_range.first_page}–{self._page_range.last_page}"
+        )
+        self.ocr_row.set_value("Todas las páginas" if self._force_pdf_ocr else "Automático")
 
-    def _refresh_advanced_label(self) -> None:
-        active = sum(
+    def _open_translation_menu(self) -> None:
+        self._open_menu(
+            self.translate_row,
+            self._translation_choices(),
+            self._translation_language,
+            self._set_translation_language,
+        )
+
+    @staticmethod
+    def _translation_choices() -> tuple[tuple[str, str | None], ...]:
+        return (
+            ("No traducir", None),
+            *((name, code) for name, code in TARGET_LANGUAGE_CODES.items()),
+        )
+
+    def _open_translator_menu(self) -> None:
+        self._open_menu(
+            self.translator_row,
             (
-                self.plan_reviewed.isChecked(),
-                isinstance(self.translation_target.currentData(), str)
-                and self._selected_translation_method() is TranslationMethod.LOCAL_AI,
-                bool(self._glossary_entries()),
-                self._job.source.format is DocumentFormat.PDF
-                and self.page_range_enabled.isChecked(),
-                self._job.source.format is DocumentFormat.PDF and self.force_pdf_ocr.isChecked(),
-            )
-        )
-        suffix = f" · {active} activada{'s' if active != 1 else ''}" if active else ""
-        prefix = "Menos opciones" if self.advanced_toggle.isChecked() else "Más opciones"
-        self.advanced_toggle.setText(prefix + suffix)
-
-    def _refresh_summary(self) -> None:
-        output = self._selected_output()
-        target_data = self.translation_target.currentData()
-        translating = isinstance(target_data, str)
-        output_label = (
-            "Markdown para editar" if output is DocumentFormat.MARKDOWN else "EPUB para leer"
-        )
-        translation_label = (
-            self.translation_target.currentText().removeprefix("Traducir a ")
-            if translating
-            else "Sin traducción"
-        )
-        self.summary_title.setText(f"{output_label} · {translation_label}")
-        if self.plan_reviewed.isChecked():
-            detail = "Revisión completa con IA local antes de publicar."
-        else:
-            automatic_work = (
-                "OCR cuando haga falta y comprobaciones automáticas."
-                if self._job.source.format is DocumentFormat.PDF
-                else "Conversión y comprobaciones automáticas."
-            )
-            detail = (
-                f"{automatic_work} Si hay señales concretas, podrás revisar después solo los "
-                "bloques afectados."
-            )
-        self.summary_detail.setText(detail)
-        if self._default_output_directory is None:
-            destination_text = "Se guardará junto al original."
-        else:
-            destination = self._default_output_directory.name or str(self._default_output_directory)
-            destination_text = f"Se guardará en {destination}."
-        self.destination_summary.setText(destination_text)
-        self.destination_summary.setToolTip(
-            str(self._default_output_directory)
-            if self._default_output_directory is not None
-            else "El resultado se guardará junto al documento original."
-        )
-
-    def _refresh_ai_summary(self) -> None:
-        ai_needed = self.plan_reviewed.isChecked() or (
-            isinstance(self.translation_target.currentData(), str)
-            and self._selected_translation_method() is TranslationMethod.LOCAL_AI
-        )
-        self.ai_summary.setVisible(ai_needed)
-        self.manage_models_button.setVisible(ai_needed)
-        if not ai_needed:
-            return
-        model = self._default_ai_model
-        model_name = self._models.get(model or "", model or "Sin modelo configurado")
-        status = {
-            OllamaStatus.READY: "disponible",
-            OllamaStatus.MISSING_MODEL: "sin modelo instalado",
-            OllamaStatus.NOT_INSTALLED: "Ollama no instalado",
-            OllamaStatus.STOPPED: "Ollama detenido",
-            OllamaStatus.LOCAL_ONLY_REQUIRED: "requiere configuración local",
-            OllamaStatus.UNAVAILABLE: "Ollama no disponible",
-            None: "sin comprobar",
-        }.get(self._ollama_status, "sin comprobar")
-        self.ai_summary.setText(f"IA local: {model_name} · {status}.")
-
-    def _refresh_route_summary(self) -> None:
-        target_data = self.translation_target.currentData()
-        translating = isinstance(target_data, str)
-        configuration = JobConfiguration(
-            output=OutputConfiguration(format=self._selected_output()),
-            translation=TranslationConfiguration(
-                enabled=translating,
-                method=self._selected_translation_method(),
-                target_language=str(target_data) if translating else None,
+                ("IA local · contextual y más lenta", TranslationMethod.LOCAL_AI),
+                ("Argos · ligero y predecible", TranslationMethod.OFFLINE),
             ),
-            plan=(
-                ProcessingPlan.LOCAL_AI_REVIEWED
-                if self.plan_reviewed.isChecked()
-                else ProcessingPlan.STANDARD
-            ),
-        )
-        steps = processing_flow_steps(self._job.source.format, configuration)
-        self.route_summary.setText(
-            "Detalle: " + " → ".join(steps) + ". " + processing_pass_summary(configuration)
+            self._translation_method,
+            self._set_translation_method,
         )
 
-    def _submit(self) -> None:
-        try:
-            self.configuration()
-        except (RequestValidationError, ValueError) as exc:
-            self.validation_label.setText(str(exc))
-            self.validation_label.show()
-            self.validation_label.setFocus(Qt.FocusReason.OtherFocusReason)
+    def _open_pages_menu(self) -> None:
+        menu = QMenu(self)
+        all_pages = menu.addAction("Todas")
+        all_pages.setCheckable(True)
+        all_pages.setChecked(self._page_range is None)
+        interval = menu.addAction("Intervalo…")
+        interval.setCheckable(True)
+        interval.setChecked(self._page_range is not None)
+        all_pages.triggered.connect(lambda: self._set_page_range(None))
+        interval.triggered.connect(self._choose_page_interval)
+        self._show_menu(menu, self.pages_row)
+
+    def _open_ocr_menu(self) -> None:
+        self._open_menu(
+            self.ocr_row,
+            (("Automático", False), ("Todas las páginas", True)),
+            self._force_pdf_ocr,
+            self._set_force_pdf_ocr,
+        )
+
+    def _open_menu(
+        self,
+        row: _OptionRow,
+        choices: tuple[tuple[str, Any], ...],
+        current: Any,
+        callback: Any,
+    ) -> None:
+        menu = QMenu(self)
+        for label, value in choices:
+            action = menu.addAction(label)
+            action.setCheckable(True)
+            action.setChecked(value == current)
+            action.triggered.connect(lambda _checked=False, selected=value: callback(selected))
+        self._show_menu(menu, row)
+
+    @staticmethod
+    def _show_menu(menu: QMenu, row: _OptionRow) -> None:
+        menu.exec(JobConfigurationDialog._menu_anchor(menu, row))
+
+    @staticmethod
+    def _menu_anchor(menu: QMenu, row: _OptionRow) -> QPoint:
+        """Right-align a choice menu with the value that opened it."""
+
+        menu.ensurePolished()
+        menu_width = menu.sizeHint().width()
+        return row.mapToGlobal(QPoint(max(0, row.width() - menu_width), row.height()))
+
+    def _set_output_format(self, output: DocumentFormat) -> None:
+        self._output_format = output
+        self._changed()
+
+    def _set_translation_language(self, language: str | None) -> None:
+        self._translation_language = language
+        self._changed()
+
+    def _set_translation_method(self, method: TranslationMethod) -> None:
+        self._translation_method = method
+        self._changed(open_models=method is TranslationMethod.LOCAL_AI)
+
+    def _set_review_enabled(self, enabled: bool) -> None:
+        self._review_enabled = enabled
+        self._changed(open_models=enabled)
+
+    def _set_page_range(self, page_range: PageRangeConfiguration | None) -> None:
+        self._page_range = page_range
+        self._changed()
+
+    def _choose_page_interval(self) -> None:
+        dialog = _PageRangeDialog(self._page_range, parent=self)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            self._set_page_range(dialog.page_range())
+
+    def _set_force_pdf_ocr(self, force: bool) -> None:
+        self._force_pdf_ocr = force
+        self._changed()
+
+    def _open_glossary(self) -> None:
+        editor = _GlossaryEditorDialog(self._glossary_entries(), parent=self)
+        if editor.exec() != QDialog.DialogCode.Accepted:
             return
-        self.save_requested.emit()
-
-    def _cancel(self) -> None:
-        if not self.request_close():
-            return
-        if self._embedded:
-            self.cancel_requested.emit()
-        else:
-            self.reject()
-
-    def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802
-        if self._embedded or self.request_close():
-            event.accept()
-        else:
-            event.ignore()
-
-    def _toggle_glossary(self, visible: bool) -> None:
-        self.glossary_panel.setVisible(
-            visible and isinstance(self.translation_target.currentData(), str)
-        )
-        self.glossary_toggle.setText("Ocultar glosario" if visible else "Glosario")
+        updated = list(editor.entries())
+        if updated != self._glossary_values:
+            self._glossary_values = updated
+            self._changed()
 
     def _append_glossary_entry(self, entry: GlossaryEntry) -> None:
-        row = self.glossary_table.rowCount()
-        self.glossary_table.insertRow(row)
-        self.glossary_table.setItem(row, 0, QTableWidgetItem(entry.source))
-        self.glossary_table.setItem(row, 1, QTableWidgetItem(entry.target))
-        remove = QPushButton("×", self.glossary_table)
-        remove.setAccessibleName(f"Eliminar término {row + 1}")
-        remove.clicked.connect(lambda _checked=False, button=remove: self._remove_glossary(button))
-        self.glossary_table.setCellWidget(row, 2, remove)
-
-    def _add_glossary_row(self) -> None:
-        if self.glossary_table.rowCount() >= MAX_GLOSSARY_ENTRIES:
-            return
-        self._append_glossary_entry(GlossaryEntry("", ""))
-        self._dirty = True
-
-    def _remove_glossary(self, button: QPushButton) -> None:
-        for row in range(self.glossary_table.rowCount()):
-            if self.glossary_table.cellWidget(row, 2) is button:
-                self.glossary_table.removeRow(row)
-                self._changed()
-                return
+        self._glossary_values.append(entry)
+        self._refresh()
 
     def _glossary_entries(self) -> tuple[GlossaryEntry, ...]:
-        entries: list[GlossaryEntry] = []
-        for row in range(self.glossary_table.rowCount()):
-            source_item = self.glossary_table.item(row, 0)
-            target_item = self.glossary_table.item(row, 1)
-            source = source_item.text().strip() if source_item is not None else ""
-            target = target_item.text().strip() if target_item is not None else ""
-            if source or target:
-                entries.append(GlossaryEntry(source, target))
-        return tuple(entries)
+        return tuple(self._glossary_values)
+
+    def _changed(self, *, open_models: bool = False) -> None:
+        self._refresh()
+        self.persist_if_valid(open_models=open_models)
 
     def _focus_stage(self, stage: StageKind | None) -> None:
         if stage is None:
             return
-        if stage in {
-            StageKind.TRANSLATE,
-            StageKind.REFINE,
-            StageKind.STRUCTURE,
-            StageKind.PREPARE,
-        }:
-            self.advanced_toggle.setChecked(True)
         target = {
-            StageKind.TRANSLATE: self.translation_method_row,
-            StageKind.REFINE: self.review_row,
-            StageKind.STRUCTURE: self.review_row,
-            StageKind.PREPARE: self.pdf_options,
-            StageKind.PUBLISH: self.markdown_card,
+            StageKind.TRANSLATE: self.translate_row,
+            StageKind.REFINE: self.plan_reviewed,
+            StageKind.STRUCTURE: self.plan_reviewed,
+            StageKind.PREPARE: self.pages_row,
+            StageKind.PUBLISH: (
+                self.output_epub
+                if self._output_format is DocumentFormat.EPUB
+                else self.output_markdown
+            ),
         }.get(stage)
-        if target is not None:
-            self.scroll_area.ensureWidgetVisible(target)
+        if target is not None and target.isVisible():
+            target.setFocus(Qt.FocusReason.OtherFocusReason)
 
-    def _selected_output(self) -> DocumentFormat:
-        return DocumentFormat.EPUB if self.output_epub.isChecked() else DocumentFormat.MARKDOWN
+    @Slot(bool)
+    def _set_markdown_output_when_checked(self, checked: bool) -> None:
+        if checked:
+            self._set_output_format(DocumentFormat.MARKDOWN)
 
-    def _selected_translation_method(self) -> TranslationMethod:
-        try:
-            return TranslationMethod(self.translation_method.currentData())
-        except (TypeError, ValueError):
-            return TranslationMethod.OFFLINE
+    @Slot(bool)
+    def _set_epub_output_when_checked(self, checked: bool) -> None:
+        if checked:
+            self._set_output_format(DocumentFormat.EPUB)
 
     @staticmethod
-    def _set_combo_data(combo: ChevronComboBox, value: object) -> None:
-        index = combo.findData(value)
-        if index >= 0:
-            combo.setCurrentIndex(index)
+    def _set_checked_without_signal(widget: QRadioButton | Switch, checked: bool) -> None:
+        previous = widget.blockSignals(True)
+        widget.setChecked(checked)
+        widget.blockSignals(previous)
 
-    def _apply_styles(self) -> None:
-        self.setStyleSheet(
-            f"""
-            QDialog#jobConfigurationEditor {{ background: {COLORS.canvas}; }}
-            QScrollArea#configurationScroll {{ border: none; background: transparent; }}
-            QScrollArea#configurationScroll > QWidget > QWidget {{ background: transparent; }}
-            QLabel#configurationHeading {{
-                color: {COLORS.text_primary};
-                font-size: 16pt;
-                font-weight: 700;
-            }}
-            QLabel#configurationIntro,
-            QLabel#choiceDescription,
-            QLabel#sectionHelp,
-            QLabel#inheritedSetting,
-            QLabel#configurationSummaryDetail,
-            QLabel#routeDetail {{ color: {COLORS.text_secondary}; }}
-            QLabel#configurationFieldLabel,
-            QLabel#choiceTitle,
-            QLabel#configurationSummaryTitle {{
-                color: {COLORS.text_primary};
-                font-weight: 650;
-            }}
-            QFrame#configurationChoice,
-            QFrame#configurationAdvanced,
-            QFrame#configurationSummary {{
-                background: {COLORS.surface};
-                border: 1px solid {COLORS.divider};
-                border-radius: 9px;
-            }}
-            QFrame#configurationChoice[selected="true"] {{
-                border: 2px solid {COLORS.action_primary};
-                background: {COLORS.action_primary_soft};
-            }}
-            QFrame#configurationSummary {{ background: {COLORS.surface_subtle}; }}
-            QPushButton#configurationDisclosure {{
-                color: {COLORS.action_primary};
-                background: transparent;
-                border: none;
-                padding: 6px 2px;
-                text-align: left;
-                font-weight: 650;
-            }}
-            QPushButton#configurationDisclosure:hover {{
-                color: {COLORS.action_primary_hover};
-                text-decoration: underline;
-            }}
-            QLabel#configurationValidation {{
-                color: {COLORS.error};
-                background: {COLORS.error_soft};
-                border-radius: 6px;
-                padding: 8px;
-            }}
-            """
+    def _ai_needed(self) -> bool:
+        return self._review_enabled or (
+            self._translation_language is not None
+            and self._translation_method is TranslationMethod.LOCAL_AI
+        )
+
+    def _ai_setup_required(self) -> bool:
+        if self._default_ai_model is None:
+            return True
+        return self._ollama_status in {
+            OllamaStatus.MISSING_MODEL,
+            OllamaStatus.NOT_INSTALLED,
+            OllamaStatus.LOCAL_ONLY_REQUIRED,
+            OllamaStatus.UNAVAILABLE,
+        }
+
+    @staticmethod
+    def _language_name(code: str | None) -> str | None:
+        if code is None:
+            return None
+        return next(
+            (name for name, candidate in TARGET_LANGUAGE_CODES.items() if candidate == code),
+            code,
         )

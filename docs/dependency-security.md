@@ -1,10 +1,12 @@
 # Política de seguridad de dependencias
 
-Estado verificado: 26 de julio de 2026.
+Estado verificado: 12 de agosto de 2026.
 
 Los dos lockfiles se generan con Python 3.12, fijan el grafo completo y contienen hashes. CI instala
 con `--require-hashes`, ejecuta `pip check` y bloquea cualquier vulnerabilidad conocida mediante
-`pip-audit` salvo la excepción explícita que sigue.
+`pip-audit` salvo la excepción explícita que sigue. La auditoría también falla si `pip-audit` omite
+una dependencia inesperada. Las variantes Windows `torch` y `torchvision` con sufijo `+cpu` se
+vinculan obligatoriamente con la misma versión canónica, auditada desde `requirements.lock`.
 
 ## Excepción temporal: CVE-2026-54499 en Stanza
 

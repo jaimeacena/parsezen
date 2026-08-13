@@ -36,6 +36,11 @@ class OutcomeSummary:
     chapters: int = 0
     conversion_issues: int = 0
     translation_issues: int = 0
+    linguistic_review_mode: str | None = None
+    translation_checked_blocks: int = 0
+    translation_reviewed_blocks: int = 0
+    translation_independent_blocks: int = 0
+    translation_unreviewed_blocks: int = 0
     preserved_segments: int = 0
     review_units: int = 0
     review_changes: int = 0

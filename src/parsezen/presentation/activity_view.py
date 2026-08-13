@@ -519,6 +519,28 @@ def outcome_summary_lines(summary: OutcomeSummary | None) -> tuple[str, ...]:
     else:
         lines.append("Incidencias detectadas: ninguna señal registrada.")
 
+    if summary.linguistic_review_mode is not None:
+        mode_text = {
+            "not_reviewed": "sin revisión semántica",
+            "corrected_during_translation": "corrección integrada durante la traducción",
+            "independent_bilingual": "verificación bilingüe independiente",
+            "targeted_bilingual": "verificación bilingüe dirigida",
+        }.get(summary.linguistic_review_mode, "revisión lingüística registrada")
+        coverage = (
+            f"{summary.translation_checked_blocks} bloques comprobados automáticamente · "
+            f"{summary.translation_reviewed_blocks} revisados semánticamente · "
+            f"{summary.translation_unreviewed_blocks} sin revisión semántica"
+        )
+        independence = (
+            f" · {summary.translation_independent_blocks} con verificación independiente"
+            if summary.translation_independent_blocks
+            else " · sin segunda verificación bilingüe independiente"
+        )
+        remaining = f" · {summary.translation_issues} " + (
+            "incidencia pendiente" if summary.translation_issues == 1 else "incidencias pendientes"
+        )
+        lines.append(f"Confianza lingüística: {mode_text} · {coverage}{independence}{remaining}.")
+
     if summary.review_units:
         lines.append(
             f"Revisión manual: {summary.review_units} decisiones · "

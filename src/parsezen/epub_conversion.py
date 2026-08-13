@@ -1529,6 +1529,7 @@ def _rebuild_epub(
     cancellation: CancellationToken | None,
 ) -> tuple[bytes, int]:
     binary_resources = 0
+    preserved_source_digests: dict[str, bytes] = {}
     infos = archive.infolist()
     ordered_infos = sorted(infos, key=lambda info: 0 if info.filename == "mimetype" else 1)
     with SpooledTemporaryFile(max_size=16 * 1024 * 1024) as output:
@@ -1562,6 +1563,7 @@ def _rebuild_epub(
                         ) from exc
                     continue
                 try:
+                    source_digest = hashlib.sha256()
                     with (
                         archive.open(info) as source,
                         rebuilt.open(
@@ -1572,7 +1574,9 @@ def _rebuild_epub(
                     ):
                         while block := source.read(1024 * 1024):
                             check_cancelled(cancellation)
+                            source_digest.update(block)
                             target.write(block)
+                    preserved_source_digests[normalized] = source_digest.digest()
                 except (KeyError, OSError, RuntimeError) as exc:
                     raise ConversionError(
                         "No se pudo copiar un recurso del EPUB original."
@@ -1588,9 +1592,8 @@ def _rebuild_epub(
             for normalized, info in members.items():
                 if normalized in replacements or normalized == "mimetype":
                     continue
-                if _zip_member_digest(verification, info.filename) != _zip_member_digest(
-                    archive,
-                    info.filename,
+                if _zip_member_digest(verification, info.filename) != preserved_source_digests.get(
+                    normalized
                 ):
                     raise ConversionError("El EPUB reconstruido cambió un recurso binario.")
         output.seek(0)

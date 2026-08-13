@@ -55,6 +55,9 @@ def test_process_request_and_settings_round_trip_independent_configuration() -> 
     assert configuration.translation.method is TranslationMethod.LOCAL_AI
     assert restored_request.target_language == "Español"
     assert restored_request.offline_translation_language is None
+    assert restored_request.source_size_bytes == job.source.size_bytes
+    assert restored_request.source_modified_ns == job.source.modified_ns
+    assert restored_request.source_content_sha256 == job.source.content_sha256
     assert restored_settings.model == "qwen3:4b"
     assert restored_settings.context_window == 8192
 

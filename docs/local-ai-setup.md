@@ -75,7 +75,9 @@ Configuración de Windows:
 ```
 
 Se guarda en `%USERPROFILE%\.ollama\server.json`. Parsezen conserva otras claves y reemplaza el
-archivo de forma atómica. También acepta `OLLAMA_NO_CLOUD=1` en el proceso servidor.
+archivo de forma atómica. La variable `OLLAMA_NO_CLOUD=1` se aplica además cuando Parsezen inicia
+Ollama, pero no se acepta el entorno del cliente como prueba del estado de un servidor que ya estaba
+activo. Si falta la configuración persistente, Parsezen exige proteger y reiniciar Ollama.
 
 ## Ventana de contexto
 

@@ -8,7 +8,11 @@ from parsezen.domain.jobs import (
     ProcessingPlan,
     TranslationMethod,
 )
-from parsezen.translation_quality import TARGET_LANGUAGE_CODES
+from parsezen.translation_quality import (
+    TARGET_LANGUAGE_CODES,
+    LinguisticReviewCoverage,
+    LinguisticReviewMode,
+)
 
 _FORMAT_LABELS = {
     DocumentFormat.TEXT: "TXT",
@@ -108,6 +112,70 @@ def processing_pass_summary(configuration: JobConfiguration) -> str:
     return (
         "1 pasada principal de IA que combina traducción y corrección. "
         "La corrección queda integrada en la traducción."
+    )
+
+
+def translation_route_summary(
+    method: TranslationMethod,
+    *,
+    reviewed: bool,
+    epub: bool,
+) -> str:
+    """Give configuration UI a short, truthful route and qualitative cost preview."""
+
+    if method is TranslationMethod.OFFLINE:
+        if reviewed and epub:
+            return (
+                "Coste aproximado alto · Argos traduce; la IA hace una verificación bilingüe "
+                "independiente y después planifica la estructura (3 pasadas)."
+            )
+        if reviewed:
+            return (
+                "Coste aproximado alto · Argos traduce y la IA realiza después una verificación "
+                "bilingüe independiente (2 pasadas)."
+            )
+        return (
+            "Coste aproximado bajo · Argos traduce sin Ollama (1 pasada); hay comprobaciones "
+            "automáticas, pero no revisión semántica."
+        )
+    if reviewed and epub:
+        return (
+            "Coste aproximado alto · la IA traduce y corrige en la misma pasada; después planifica "
+            "la estructura. No hay una segunda verificación bilingüe (2 pasadas)."
+        )
+    if reviewed:
+        return (
+            "Coste aproximado alto · la IA traduce y corrige en una sola pasada. La corrección "
+            "no es una verificación bilingüe independiente."
+        )
+    return (
+        "Coste aproximado medio · la IA traduce en una pasada; hay comprobaciones automáticas, "
+        "pero no una revisión semántica posterior."
+    )
+
+
+def linguistic_review_summary(coverage: LinguisticReviewCoverage | None) -> str | None:
+    """Explain completed language coverage without overstating automatic diagnostics."""
+
+    if coverage is None:
+        return None
+    mode = {
+        LinguisticReviewMode.NOT_REVIEWED: "Sin revisión semántica posterior.",
+        LinguisticReviewMode.CORRECTED_DURING_TRANSLATION: (
+            "La corrección se hizo durante la traducción; no fue una segunda verificación."
+        ),
+        LinguisticReviewMode.INDEPENDENT_BILINGUAL: (
+            "La traducción recibió una verificación bilingüe independiente."
+        ),
+        LinguisticReviewMode.TARGETED_BILINGUAL: (
+            "La verificación bilingüe independiente se limitó a bloques con señales concretas."
+        ),
+    }[coverage.mode]
+    return (
+        f"{mode} {coverage.automatically_checked_blocks} bloques comprobados, "
+        f"{coverage.semantically_reviewed_blocks} revisados semánticamente, "
+        f"{coverage.semantically_unreviewed_blocks} sin revisión semántica y "
+        f"{coverage.remaining_issues} incidencias pendientes."
     )
 
 

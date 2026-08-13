@@ -40,21 +40,24 @@ python scripts/sync_version.py --check
   tracks sin encabezado para reordenar y retirar.
 - Un documento nuevo muestra `Sin salida` y ofrece `Configurar` en Siguiente paso; todavía no es
   ejecutable ni cuenta como revisión.
-- `Configurar` abre una ventana compacta sobre la cola. Su nivel principal solo permite decidir el
-  resultado Markdown/EPUB y elegir `No traducir` o un idioma de destino.
-- Procesamiento directo, Argos y OCR automático son valores iniciales sin selector visible. `Más
-  opciones` reúne revisión completa, traductor con IA, glosario, intervalo PDF y OCR forzado; se abre
-  automáticamente si la configuración guardada usa alguna excepción.
+- `Configurar` abre una página compacta dentro de la ventana principal. Markdown y EPUB usan dos
+  tarjetas visuales exclusivas, Revisión con IA un interruptor, y Traducir, Traductor, Glosario,
+  Páginas y OCR una fila `Etiqueta — Valor — ›`. No hay segmentos, encabezados ni pie, y se ve entera
+  sin scroll al tamaño normal.
+- El bloque de configuración está centrado horizontalmente; los menús de cada fila aparecen bajo su
+  valor, alineados a la derecha, y no saltan al margen izquierdo de la ventana.
+- Los documentos nuevos parten con revisión completa activada. Una configuración ya guardada conserva
+  su plan. Argos y OCR automático siguen siendo valores iniciales sin preguntas técnicas.
 - Revisión completa con IA local activa una pasada proactiva de texto y, solo en EPUB, también de
-  estructura; no existen interruptores independientes. El recorrido y las pasadas reales se muestran
-  dentro de `Más opciones`.
-- La IA local muestra el modelo y contexto generales heredados, sin excepciones por documento.
-- `Guardar` aplica de forma atómica una configuración válida; si existe un error de validación,
-  permanece en la ventana y lo muestra sin descartar cambios. Cancelar, cerrar o pulsar Escape pide
-  confirmación cuando hay decisiones sin guardar.
-- `No traducir` oculta motor y glosario. Al elegir un idioma, Argos queda seleccionado sin pedir otra
-  decisión; `Más opciones` permite sustituirlo por IA local. No aparecen proveedores ni direcciones
-  configurables.
+  estructura; no existen interruptores independientes ni un resumen técnico del recorrido en esta
+  página.
+- La IA local muestra un estado breve y deja el modelo general heredado en la ayuda contextual, sin
+  excepciones por documento. Si falta, la acción principal abre su configuración.
+- Cada elección válida se aplica y persiste inmediatamente. No hay botones Cancelar o Crear/Guardar;
+  Volver y Escape cierran sin confirmación porque no existen cambios pendientes.
+- `Traducir — No traducir` oculta Traductor y Glosario. Al elegir cualquier idioma aparecen ambas
+  filas; Argos es el motor inicial y puede sustituirse por IA local. No aparecen proveedores ni
+  direcciones configurables.
 - Elegir traducción con IA o revisión semántica exige un modelo instalado anunciado por Ollama
   `/api/tags`; Argos directo no exige modelo. Argos con revisión usa Ollama después de traducir.
 - Un resultado directo solo muestra `Revisión sugerida` cuando comprobaciones objetivas permiten
@@ -67,7 +70,7 @@ python scripts/sync_version.py --check
   archivos locales, valida de nuevo las huellas, reubica objetivos únicos tras empaquetar EPUB y
   conserva la alineación bilingüe cuando existe. Un bloque modificado o ambiguo se rechaza antes de
   invocar el modelo.
-- El glosario integrado permite añadir o retirar filas sin abrir otra ventana.
+- El glosario se edita en una ventana compacta y su fila muestra `Ninguno` o el número de términos.
 - Si el contenido ya está en el idioma de destino con suficiente confianza, no se invoca ningún
   traductor ni aparece una fase de traducción ficticia.
 - Los flujos de mismo formato exigen una transformación útil, salvo EPUB→EPUB: la personalización
@@ -76,10 +79,8 @@ python scripts/sync_version.py --check
   editor completo solo se abre a petición o ante un bloqueo.
 - Desde la preparación inmutable de la ejecución hasta que terminan validación, lectura, conversión,
   OCR y recursos, la fila muestra `Preparando` sin estados visuales intermedios.
-- El destino general heredado permanece visible y no puede sustituirse por documento. Cambiarlo
-  actualiza todos los trabajos editables.
-- Aplicar a documentos del mismo formato sólo afecta a trabajos compatibles y conserva sus rangos
-  de páginas.
+- El destino general heredado permanece en la cabecera, no se repite en la configuración y no puede
+  sustituirse por documento. Cambiarlo actualiza todos los trabajos editables.
 - Los elementos accionables muestran respuesta de hover y cursor de enlace; el asa de ordenación
   muestra cursor de arrastre.
 - Cada fila conserva opciones independientes.
@@ -87,18 +88,17 @@ python scripts/sync_version.py --check
 - Cada fila muestra una papelera vectorial que solo la retira de la cola.
 - Un documento pausado o pendiente de revisión se puede retirar tras confirmar; se descarta el
   checkpoint o la revisión sin tocar el original.
-- La configuración permanece sobre la cola; modelos, revisiones y editor EPUB permanecen dentro de
-  la aplicación y vuelven al contexto que los abrió. El glosario se despliega dentro de la propia
-  configuración.
+- Configuración, modelos, revisiones y editor EPUB permanecen dentro de la aplicación y vuelven al
+  contexto que los abrió. El glosario usa una ventana modal compacta sobre la configuración.
 - Los controles son compactos y los desplegables tienen un chevrón visible; la rueda desplaza la
   página sin cambiar accidentalmente una selección.
 - Los botones y secciones indican foco o selección mediante fondo, sin contornos añadidos ni estados
   de ratón que permanezcan marcados después de cerrar su menú.
-- `Procesar solo un intervalo` usa el mismo interruptor que el resto de ajustes y conserva visibles
-  los campos de páginas solo cuando está activado.
-- `Aplicar misma configuración al resto de documentos` muestra el texto completo, queda separado
-  de las secciones del flujo mediante un divisor sutil y mantiene las excepciones de rango y OCR.
+- `Páginas` ofrece Todas o abre un diálogo para el intervalo; después muestra directamente un valor
+  como `25–140`, sin campos Desde/Hasta permanentes. `OCR` ofrece Automático o Todas las páginas.
 - Al empezar, las opciones del trabajo quedan bloqueadas.
+- Si el original cambia después de añadirlo —también con el mismo tamaño y fecha restaurada— la
+  preparación lo rechaza y pide retirarlo y volverlo a añadir; ningún resultado mezcla versiones.
 - Solo una tarea pesada figura como activa.
 - Un error o una revisión pendiente permite avanzar al siguiente documento. La fase fallida ofrece
   `Ver error`: durante la sesión muestra el detalle concreto y, tras reabrir, una explicación estable
@@ -314,6 +314,8 @@ cifrado debe eliminarse.
 - Sin Ollama, aparece la instalación guiada.
 - Con Ollama detenido, `Iniciar` lo pone disponible.
 - Sin modo solo local, se exige proteger y reiniciar.
+- `OLLAMA_NO_CLOUD` en el proceso de Parsezen no acredita por sí solo un servidor activo; falta de
+  `server.json` protegido mantiene bloqueado el envío de contenido.
 - Sin modelos, el gestor mantiene recomendación y entrada manual.
 - `IA local` abre el gestor aunque la detección aún no haya terminado.
 - Estado de Ollama, lista única, contexto e instalación manual se reúnen en esa página.

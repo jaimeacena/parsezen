@@ -1032,6 +1032,67 @@ def apply_parsezen_theme(
         QFrame#statusMessage:focus {{
             border: 2px solid {COLORS.focus_ring};
         }}
+        QWidget#configurationOptionRow {{
+            min-height: 44px;
+            background-color: transparent;
+            border: none;
+            border-radius: {RADIUS_SMALL}px;
+        }}
+        QWidget#configurationOptionRow:hover {{
+            background-color: {COLORS.surface_hover};
+        }}
+        QWidget#configurationOptionRow:focus {{
+            background-color: {COLORS.action_primary_soft};
+        }}
+        QFrame#configurationChoice {{
+            min-height: 58px;
+            background-color: {COLORS.surface};
+            border: 1px solid {COLORS.border};
+            border-radius: {RADIUS_MEDIUM}px;
+        }}
+        QFrame#configurationChoice:hover {{
+            background-color: {COLORS.surface_hover};
+        }}
+        QFrame#configurationChoice[selected="true"] {{
+            background-color: {COLORS.action_primary_soft};
+            border: 2px solid {COLORS.action_primary};
+        }}
+        QLabel#choiceTitle {{
+            color: {COLORS.text_primary};
+            background-color: transparent;
+            font-weight: 650;
+        }}
+        QLabel#choiceDescription {{
+            color: {COLORS.text_secondary};
+            background-color: transparent;
+        }}
+        QWidget#configurationSwitchRow {{
+            min-height: 44px;
+            background-color: transparent;
+            border: none;
+        }}
+        QLabel#configurationOptionLabel {{
+            color: {COLORS.text_primary};
+            background-color: transparent;
+            font-weight: 600;
+        }}
+        QLabel#configurationOptionValue {{
+            color: {COLORS.text_secondary};
+            background-color: transparent;
+        }}
+        QLabel#configurationOptionChevron {{
+            min-width: 16px;
+            color: {COLORS.text_muted};
+            background-color: transparent;
+            font-size: 18px;
+        }}
+        QLabel#configurationValidation {{
+            color: {COLORS.error};
+            background-color: {COLORS.error_soft};
+            border: none;
+            border-radius: {RADIUS_SMALL}px;
+            padding: 8px;
+        }}
         QFrame#statusMessage QLabel#statusMessageIcon {{
             min-width: 24px;
             max-width: 24px;

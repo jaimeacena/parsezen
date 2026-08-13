@@ -623,6 +623,7 @@ def _job_to_json(job: DocumentJob) -> dict[str, Any]:
             "format": job.source.format.value,
             "size_bytes": job.source.size_bytes,
             "modified_ns": job.source.modified_ns,
+            "content_sha256": job.source.content_sha256,
         },
         "configuration_revision": job.configuration_revision,
         "configuration": {
@@ -743,6 +744,11 @@ def _job_from_json(raw: object) -> DocumentJob:
         format=DocumentFormat(source_raw["format"]),
         size_bytes=int(source_raw["size_bytes"]),
         modified_ns=int(source_raw["modified_ns"]),
+        content_sha256=(
+            str(source_raw["content_sha256"])
+            if source_raw.get("content_sha256") is not None
+            else None
+        ),
     )
     recommendation_raw = raw.get("review_recommendation")
     recommendation = (

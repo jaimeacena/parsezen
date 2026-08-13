@@ -8,12 +8,13 @@ from typing import Protocol
 from parsezen.application.job_runtime import JobRuntime
 from parsezen.application.runtime_mapping import request_and_settings_from_job
 from parsezen.domain.jobs import DocumentJob, DocumentSource, JobStatus
+from parsezen.domain.source_identity import sha256_file
 from parsezen.processing import ProcessResult
 from parsezen.settings import AppSettings
 
 SOURCE_CHANGED_MESSAGE = (
-    "El original cambió desde que se preparó esta revisión. Para evitar mezclar "
-    "versiones, el documento continuará de nuevo desde un punto seguro."
+    "El original cambió desde que se añadió a la cola. Para evitar mezclar versiones, "
+    "quítalo y vuelve a añadirlo antes de procesarlo."
 )
 
 
@@ -106,4 +107,11 @@ def source_is_unchanged(source: DocumentSource) -> bool:
         statistics = source.path.stat()
     except OSError:
         return False
-    return statistics.st_size == source.size_bytes and statistics.st_mtime_ns == source.modified_ns
+    if statistics.st_size != source.size_bytes or statistics.st_mtime_ns != source.modified_ns:
+        return False
+    if source.content_sha256 is None:
+        return True
+    try:
+        return sha256_file(source.path) == source.content_sha256
+    except OSError:
+        return False

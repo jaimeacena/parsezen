@@ -6,6 +6,7 @@ import hashlib
 import json
 import logging
 import re
+import unicodedata
 from collections import Counter
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -78,6 +79,7 @@ from parsezen.local_models import (
     is_ollama_local_only_configured,
 )
 from parsezen.revision import split_markdown_blocks
+from parsezen.semantic_blocks import SemanticRole, analyze_markdown
 from parsezen.settings import AppSettings, validate_settings
 from parsezen.translation_quality import (
     ATX_HEADING_PATTERN,
@@ -123,6 +125,7 @@ MAX_CONSERVED_VALUES_PER_CHUNK = 16
 MAX_TRANSLATION_PROTECTED_VALUES_PER_CHUNK = 8
 MAX_FOCUSED_TITLE_REPAIRS_PER_CHUNK = MAX_TRANSLATION_PROTECTED_VALUES_PER_CHUNK
 MAX_STRUCTURE_DIRECTIVES_PER_CHUNK = 16
+MAX_GLOBAL_STRUCTURE_CANDIDATES = 160
 MAX_DOCUMENT_CHARACTERS = 1_000_000
 MAX_DOCUMENT_OUTPUT_CHARACTERS = 2_000_000
 
@@ -262,7 +265,9 @@ Devuelve únicamente el título traducido en una sola línea, sin Markdown, comi
 """
 
 STRUCTURE_DIRECTIVE_INSTRUCTIONS = """
-Analiza la estructura del fragmento numerado. No devuelvas ni reescribas el texto.
+Analiza el esquema completo del documento numerado. Cada candidata incluye su nivel actual, página,
+rol semántico y si coincide con el índice. Usa todo el inventario para mantener una jerarquía global
+coherente entre preliminares, partes, capítulos y secciones. No devuelvas ni reescribas el texto.
 Responde únicamente con cero o más directivas, una por línea, en el formato exacto `PZL12=2`,
 donde el primer número es un identificador de línea marcado como CANDIDATA y el segundo es un nivel
 de encabezado entre 1 y 6. Elige solo títulos reales de capítulo o sección; ignora cuerpo de texto,
@@ -366,6 +371,16 @@ class _PriorityTranslationReviewLine:
     part: _TranslationReviewPart
 
 
+@dataclass(frozen=True, slots=True)
+class _GlobalStructureCandidate:
+    line_number: int
+    source_line: str
+    current_level: int | None
+    page_number: int | None
+    role: SemanticRole
+    toc_match: bool
+
+
 def build_instructions(
     mode: ImprovementMode,
     target_language: str | None = None,
@@ -456,6 +471,61 @@ def improve_markdown(
         raise SettingsError("Activa el modo solo local de Ollama antes de procesar documentos.")
     context_window = normalized_settings.context_window or DEFAULT_CONTEXT_WINDOW
 
+    if mode is ImprovementMode.REVIEW_STRUCTURE:
+        if not _global_structure_candidates(markdown):
+            LOGGER.info("improvement_completed chunks=0 global_structure=true")
+            return markdown
+        checkpoint = _chunk_checkpoint_key(mode, markdown)
+        cached = load_checkpoint(checkpoint) if load_checkpoint is not None else None
+        if cached is not None:
+            try:
+                _validate_mode_output(
+                    markdown,
+                    cached,
+                    mode,
+                    max_characters=MAX_DOCUMENT_OUTPUT_CHARACTERS,
+                )
+            except ImprovementError:
+                cached = None
+        if cached is not None:
+            if on_progress is not None:
+                on_progress(1, 1)
+            LOGGER.info("improvement_completed chunks=1 global_structure=true resumed=true")
+            return cached
+        LOGGER.info("improvement_started chunks=1 global_structure=true")
+        try:
+            with httpx.Client(
+                timeout=normalized_settings.timeout_seconds,
+                follow_redirects=False,
+                trust_env=False,
+                transport=transport,
+            ) as client:
+                if on_progress is not None:
+                    on_progress(1, 1)
+                try:
+                    improved = _improve_structure_globally(
+                        client,
+                        model,
+                        context_window,
+                        markdown,
+                        cancellation,
+                    )
+                except ImprovementError as exc:
+                    LOGGER.warning(
+                        "improvement_document_preserved "
+                        "global_structure_unavailable=true reason=%s",
+                        str(exc),
+                    )
+                    return markdown
+        except httpx.RequestError as exc:
+            raise LocalModelUnavailableError(
+                "No se pudo contactar con el modelo local. Comprueba que el servidor esté iniciado."
+            ) from exc
+        if save_checkpoint is not None:
+            save_checkpoint(checkpoint, improved)
+        LOGGER.info("improvement_completed chunks=1 global_structure=true")
+        return improved
+
     instructions = build_instructions(mode, target_language, plain_text=plain_text)
     translation_context: _TranslationContext | None = None
     if mode in {ImprovementMode.TRANSLATE, ImprovementMode.CLEAN_AND_TRANSLATE}:
@@ -482,20 +552,7 @@ def improve_markdown(
         markdown,
         max_characters=max_chunk_characters,
         protect_paragraphs=translation_context is not None,
-        required_line_predicate=(
-            _is_structure_heading_candidate if mode is ImprovementMode.REVIEW_STRUCTURE else None
-        ),
     )
-    if mode is ImprovementMode.REVIEW_STRUCTURE:
-        parts = [
-            _MarkdownPart(
-                part.text,
-                part.should_improve
-                and any(_is_structure_heading_candidate(line) for line in part.text.splitlines()),
-                part.separator_before,
-            )
-            for part in parts
-        ]
     request_count = sum(part.should_improve for part in parts)
     LOGGER.info("improvement_started chunks=%d", request_count)
 
@@ -3251,6 +3308,170 @@ def _improve_structure_with_directives(
         candidate,
         None,
         ImprovementMode.REVIEW_STRUCTURE,
+    )
+
+
+def _improve_structure_globally(
+    client: httpx.Client,
+    model: str,
+    context_window: int,
+    markdown: str,
+    cancellation: CancellationToken | None,
+) -> str:
+    """Plan one document-wide outline while keeping all wording local and immutable."""
+
+    candidates = _global_structure_candidates(markdown)
+    if not candidates:
+        raise ImprovementError("El documento no contiene candidatos de encabezado seguros.")
+    selected = _bounded_global_structure_candidates(candidates)
+    payload = "\n".join(_structure_candidate_record(candidate) for candidate in selected)
+    response = _request_improvement(
+        client,
+        model,
+        context_window,
+        STRUCTURE_DIRECTIVE_INSTRUCTIONS,
+        payload,
+        cancellation,
+        prediction_characters=max(256, len(selected) * 12),
+    )
+    by_line = {candidate.line_number: candidate for candidate in selected}
+    directives: dict[int, int] = {}
+    for response_line in response.splitlines():
+        stripped = response_line.strip()
+        if not stripped:
+            continue
+        match = re.fullmatch(r"PZL(\d+)=(\d)", stripped)
+        if match is None:
+            raise ImprovementError("El modelo devolvió directivas estructurales incompatibles.")
+        line_number = int(match.group(1))
+        level = int(match.group(2))
+        candidate = by_line.get(line_number)
+        if candidate is None or not 1 <= level <= 6 or line_number in directives:
+            raise ImprovementError("El modelo devolvió una directiva estructural no válida.")
+        if not _is_safe_structure_level(candidate.source_line, level):
+            raise ImprovementError("El modelo propuso un nivel de encabezado incoherente.")
+        directives[line_number] = level
+    if len(directives) > MAX_GLOBAL_STRUCTURE_CANDIDATES:
+        raise ImprovementError("El modelo no devolvió directivas estructurales utilizables.")
+    if not directives:
+        return markdown
+
+    lines = markdown.splitlines(keepends=True)
+    structured = list(lines)
+    for line_number, level in directives.items():
+        source_line = lines[line_number - 1]
+        ending_start = len(source_line.rstrip("\r\n"))
+        visible = source_line[:ending_start]
+        ending = source_line[ending_start:]
+        indent = visible[: len(visible) - len(visible.lstrip())]
+        exact_words = re.sub(r"^#{1,6}[ \t]+", "", visible.lstrip()).strip()
+        structured[line_number - 1] = f"{indent}{'#' * level} {exact_words}{ending}"
+    proposal = "".join(structured)
+    return _prepare_and_validate_response(
+        markdown,
+        proposal,
+        None,
+        ImprovementMode.REVIEW_STRUCTURE,
+    )
+
+
+def _global_structure_candidates(markdown: str) -> tuple[_GlobalStructureCandidate, ...]:
+    document = analyze_markdown(markdown)
+    toc_keys = {
+        key
+        for block in document.blocks
+        if block.role is SemanticRole.TOC
+        for line in block.markdown.splitlines()
+        for key in (_structure_outline_key(line),)
+        if key
+    }
+    candidates: list[_GlobalStructureCandidate] = []
+    line_number = 1
+    for block in document.blocks:
+        block_lines = block.markdown.splitlines(keepends=True)
+        for local_index, line in enumerate(block_lines):
+            if not _is_structure_heading_candidate(line):
+                continue
+            stripped = line.strip()
+            existing = ATX_HEADING_PATTERN.match(stripped)
+            key = _structure_outline_key(stripped)
+            toc_match = bool(
+                key
+                and any(
+                    key == toc_key or (len(key) >= 8 and key in toc_key) for toc_key in toc_keys
+                )
+            )
+            visible_words = natural_language_text(re.sub(r"^#{1,6}[ \t]+", "", stripped)).split()
+            isolated = len(block_lines) <= 2
+            chapter_label = bool(
+                re.match(
+                    r"(?i)^(?:chapter|cap[ií]tulo|part|parte|book|libro|"
+                    r"introduction|introducci[oó]n|prologue|pr[oó]logo|"
+                    r"epilogue|ep[ií]logo|appendix|ap[eé]ndice)\b",
+                    re.sub(r"^#{1,6}[ \t]+", "", stripped),
+                )
+            )
+            strong = bool(
+                existing
+                or block.role is SemanticRole.HEADING
+                or toc_match
+                or chapter_label
+                or (isolated and len(visible_words) <= 12)
+            )
+            if not strong:
+                continue
+            candidates.append(
+                _GlobalStructureCandidate(
+                    line_number=line_number + local_index,
+                    source_line=line,
+                    current_level=(len(existing.group(1)) if existing is not None else None),
+                    page_number=block.page_number,
+                    role=block.role,
+                    toc_match=toc_match,
+                )
+            )
+        line_number += len(block_lines)
+    return tuple(candidates)
+
+
+def _bounded_global_structure_candidates(
+    candidates: tuple[_GlobalStructureCandidate, ...],
+) -> tuple[_GlobalStructureCandidate, ...]:
+    if len(candidates) <= MAX_GLOBAL_STRUCTURE_CANDIDATES:
+        return candidates
+    priority = sorted(
+        candidates,
+        key=lambda item: (
+            item.current_level is None,
+            not item.toc_match,
+            item.role is not SemanticRole.HEADING,
+            item.line_number,
+        ),
+    )[:MAX_GLOBAL_STRUCTURE_CANDIDATES]
+    return tuple(sorted(priority, key=lambda item: item.line_number))
+
+
+def _structure_candidate_record(candidate: _GlobalStructureCandidate) -> str:
+    current = str(candidate.current_level) if candidate.current_level is not None else "ninguno"
+    page = str(candidate.page_number) if candidate.page_number is not None else "desconocida"
+    text = candidate.source_line.strip()
+    return (
+        f"PZL{candidate.line_number} CANDIDATA | nivel={current} | página={page} | "
+        f"rol={candidate.role.value} | índice={'sí' if candidate.toc_match else 'no'}: {text}"
+    )
+
+
+def _structure_outline_key(value: str) -> str:
+    visible = re.sub(r"<!--.*?-->|^#{1,6}[ \t]+", " ", value).strip()
+    visible = re.sub(r"(?:\.{2,}|[ \t]{2,})[ \t]*\d+[ \t]*$", "", visible)
+    visible = re.sub(r"^[\-*+>\d.) \t]+", "", visible)
+    normalized = unicodedata.normalize("NFKD", visible.casefold())
+    return " ".join(
+        re.findall(
+            r"[^\W\d_]+|\d+",
+            "".join(character for character in normalized if not unicodedata.combining(character)),
+            re.UNICODE,
+        )
     )
 
 

@@ -290,6 +290,19 @@ def markdown_headings(markdown: str) -> tuple[tuple[int, str], ...]:
     return tuple(headings)
 
 
+def markdown_outline_tree(markdown: str) -> str:
+    """Render a compact, content-local outline for before/after structure comparison."""
+
+    headings = markdown_headings(markdown)
+    if not headings:
+        return "Sin títulos detectados"
+    base_level = min(level for level, _title in headings)
+    return "\n".join(
+        f"{'  ' * max(0, level - base_level)}{'└─ ' if level > base_level else ''}{title}"
+        for level, title in headings
+    )
+
+
 def set_heading_level(markdown: str, line_number: int, level: int | None) -> str:
     """Promote, demote or clear the heading marker on one one-based line."""
     if level is not None and not 1 <= level <= 6:

@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from parsezen.application.job_execution import JobExecutionController
 from parsezen.application.job_queue import JobQueue
-from parsezen.application.workspace_recovery import recover_workspace
+from parsezen.application.workspace_recovery import recover_workspace, source_is_unchanged
 from parsezen.domain.jobs import (
     DocumentFormat,
     DocumentJob,
@@ -103,6 +104,19 @@ def test_workspace_recovery_rejects_a_review_after_the_source_changes(tmp_path: 
     assert recovered.reset_paused_job_ids == frozenset({"review"})
     assert recovered.source_changed_job_ids == frozenset({"review"})
     assert recovered.retained_artifact_job_ids == frozenset()
+
+
+def test_source_identity_detects_same_size_replacement_with_preserved_timestamp(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "source.txt"
+    path.write_text("first", encoding="utf-8")
+    source = DocumentSource.inspect(path)
+    original_stat = path.stat()
+    path.write_text("other", encoding="utf-8")
+    os.utime(path, ns=(original_stat.st_atime_ns, source.modified_ns))
+
+    assert not source_is_unchanged(source)
 
 
 def test_workspace_recovery_ignores_sources_that_no_longer_exist(tmp_path: Path) -> None:

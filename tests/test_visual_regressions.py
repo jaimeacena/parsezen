@@ -20,10 +20,12 @@ from parsezen.domain.attempt_activity import (
     ReusableWork,
 )
 from parsezen.domain.jobs import (
+    DocumentFormat,
     DocumentJob,
     DocumentSource,
     JobConfiguration,
     OutputConfiguration,
+    PageRangeConfiguration,
 )
 from parsezen.domain.reviews import ReviewKind, ReviewSession, ReviewUnit
 from parsezen.domain.stages import StageKind, StageStatus
@@ -35,10 +37,12 @@ from parsezen.presentation.activity_view import ActivityView
 from parsezen.presentation.book_editor_dialog import BookEditorDialog
 from parsezen.presentation.design_system import ThemeMode, apply_parsezen_theme
 from parsezen.presentation.job_configuration_dialog import JobConfigurationDialog
+from parsezen.presentation.main_window import ParsezenMainWindow
 from parsezen.presentation.model_manager import ModelManagerDialog
 from parsezen.presentation.phase_review_dialog import PhaseReviewDialog
 from parsezen.presentation.workspace import InternalBackButton, ParsezenWorkspace
 from parsezen.recent_activity import RecentJob, RecentJobStatus
+from parsezen.settings import AppSettings
 
 
 def _make_job(path: Path) -> DocumentJob:
@@ -374,7 +378,7 @@ def test_recovery_actions_remain_visible_without_overlap(
 
 
 @pytest.mark.parametrize("theme", [ThemeMode.LIGHT, ThemeMode.DARK])
-def test_configuration_result_cards_render_as_one_progressive_choice(
+def test_configuration_combines_visual_format_with_compact_settings(
     qtbot,
     tmp_path: Path,
     theme: ThemeMode,
@@ -392,23 +396,28 @@ def test_configuration_result_cards_render_as_one_progressive_choice(
     qtbot.waitExposed(editor)
     QApplication.processEvents()
 
-    for card in (editor.markdown_card, editor.epub_card):
-        snapshot = card.grab()
-        assert not snapshot.isNull()
-        assert snapshot.width() == card.width()
-        assert snapshot.height() == card.height()
-
+    assert editor.markdown_card.objectName() == "configurationChoice"
+    assert editor.epub_card.objectName() == "configurationChoice"
     assert editor.markdown_card.property("selected") is True
-    assert not editor.advanced_panel.isVisible()
-    editor.output_epub.setChecked(True)
+    assert editor.translate_row.objectName() == "configurationOptionRow"
+    assert editor.review_row.objectName() == "configurationSwitchRow"
+    assert editor.review_row.isVisible()
+    assert not editor.plan_reviewed.isChecked()
+    assert editor.translate_row.isVisible()
+    assert not editor.translator_row.isVisible()
+    assert not editor.glossary_row.isVisible()
+    assert not hasattr(editor, "scroll_area")
+    assert not hasattr(editor, "save_button")
+    assert not hasattr(editor, "cancel_button")
+    editor._set_output_format(DocumentFormat.EPUB)  # noqa: SLF001
+    assert editor.output_epub.isChecked()
     assert editor.epub_card.property("selected") is True
-    assert not editor.output_markdown.isChecked()
     assert editor.grab().save(str(tmp_path / f"configuration-sheet-{theme.value}.png"))
     editor.accept()
 
 
 @pytest.mark.parametrize("theme", [ThemeMode.LIGHT, ThemeMode.DARK])
-def test_configuration_advanced_exceptions_stay_in_one_vertical_disclosure(
+def test_configuration_contextual_controls_stay_in_one_vertical_flow(
     qtbot,
     tmp_path: Path,
     theme: ThemeMode,
@@ -425,22 +434,27 @@ def test_configuration_advanced_exceptions_stay_in_one_vertical_disclosure(
     )
     qtbot.addWidget(editor)
     editor.resize(680, 620)
-    editor.translation_target.setCurrentIndex(editor.translation_target.findData("es"))
-    editor.advanced_toggle.setChecked(True)
+    editor._set_translation_language("es")  # noqa: SLF001
+    editor._set_page_range(PageRangeConfiguration(25, 140))  # noqa: SLF001
     editor.show()
     qtbot.waitExposed(editor)
     QApplication.processEvents()
 
-    assert editor.advanced_panel.isVisible()
-    assert editor.translation_method_row.isVisible()
-    assert editor.pdf_options.isVisible()
-    assert editor.scroll_area.horizontalScrollBar().maximum() == 0
+    assert editor.review_row.isVisible()
+    assert editor.translator_row.isVisible()
+    assert editor.glossary_row.isVisible()
+    assert editor.pages_row.isVisible()
+    assert editor.pages_row.value.text() == "25–140"
+    assert editor.ocr_row.isVisible()
+    assert not hasattr(editor, "page_first")
+    assert not hasattr(editor, "scroll_area")
+    assert editor.content.sizeHint().height() <= editor.height()
     assert editor.grab().save(str(tmp_path / f"configuration-advanced-{theme.value}.png"))
     editor.accept()
 
 
 @pytest.mark.parametrize("theme", [ThemeMode.LIGHT, ThemeMode.DARK])
-def test_batch_configuration_label_wraps_without_clipping_below_its_separator(
+def test_configuration_is_a_fully_visible_internal_page(
     qtbot,
     tmp_path: Path,
     theme: ThemeMode,
@@ -448,27 +462,43 @@ def test_batch_configuration_label_wraps_without_clipping_below_its_separator(
     application = QApplication.instance()
     assert isinstance(application, QApplication)
     apply_parsezen_theme(application, theme)
-    editor = JobConfigurationDialog(
-        _make_job(tmp_path / f"batch-{theme.value}.txt"),
-        embedded=True,
-        compatible_job_count=2,
+    source = tmp_path / f"internal-{theme.value}.pdf"
+    source.write_bytes(b"%PDF-1.4\n")
+    window = ParsezenMainWindow(
+        settings=AppSettings(),
+        auto_discover_ai=False,
+        state_path=tmp_path / "workspace.sqlite3",
     )
-    qtbot.addWidget(editor)
-    editor.resize(980, 680)
-    editor.show()
-    qtbot.waitExposed(editor)
+    qtbot.addWidget(window)
+    window.resize(1280, 760)
+    window.show()
+    qtbot.waitExposed(window)
+    window.set_source_paths((source,))
+    job = window._project_jobs()[0]  # noqa: SLF001
+    window._configure_job(job.id, None)  # noqa: SLF001
+    editor = window._active_configuration_dialog  # noqa: SLF001
+    assert isinstance(editor, JobConfigurationDialog)
+    editor._set_review_enabled(False)  # noqa: SLF001
+    editor._set_translation_language("es")  # noqa: SLF001
+    editor._set_page_range(PageRangeConfiguration(25, 140))  # noqa: SLF001
     QApplication.processEvents()
 
-    label = editor.apply_compatible_label
-    text_bounds = label.fontMetrics().boundingRect(
-        QRect(0, 0, label.width(), 1_000),
-        Qt.TextFlag.TextWordWrap | Qt.AlignmentFlag.AlignLeft,
-        label.text(),
-    )
+    assert editor.window() is window
+    assert window.parsezen_workspace.current_internal_widget is editor
+    assert not hasattr(editor, "scroll_area")
+    assert editor.content.width() >= 700
+    left_margin = editor.content.geometry().left()
+    right_margin = editor.width() - editor.content.geometry().right() - 1
+    assert abs(left_margin - right_margin) <= 1
+    _assert_fully_visible(editor.content, editor)
+    _assert_fully_visible(editor.markdown_card, editor)
+    _assert_fully_visible(editor.epub_card, editor)
+    _assert_fully_visible(editor.ocr_row, editor)
+    assert not hasattr(editor, "cancel_button")
+    assert not hasattr(editor, "save_button")
+    assert window.grab().save(str(tmp_path / f"configuration-internal-{theme.value}.png"))
 
-    assert label.height() >= text_bounds.height()
-    assert editor.apply_compatible.isVisible()
-    assert editor.grab().save(str(tmp_path / f"batch-configuration-{theme.value}.png"))
+    editor.reject()
 
 
 def test_internal_back_action_has_icon_only_hover_growth(qtbot) -> None:
@@ -487,7 +517,7 @@ def test_internal_back_action_has_icon_only_hover_growth(qtbot) -> None:
     assert button.iconSize() == QSize(20, 20)
 
 
-def test_switch_remains_keyboard_operable_without_clipping(qtbot, tmp_path: Path) -> None:
+def test_flat_option_row_remains_keyboard_operable_without_clipping(qtbot, tmp_path: Path) -> None:
     editor = JobConfigurationDialog(
         _make_job(tmp_path / "keyboard.txt"),
         embedded=True,
@@ -496,19 +526,17 @@ def test_switch_remains_keyboard_operable_without_clipping(qtbot, tmp_path: Path
     editor.resize(980, 680)
     editor.show()
     qtbot.waitExposed(editor)
-    editor.advanced_toggle.setChecked(True)
-    switch = editor.plan_reviewed
-    switch.setFocus()
+    row = editor.translate_row
+    row.activated.disconnect(editor._open_translation_menu)  # noqa: SLF001
+    row.setFocus()
     QApplication.processEvents()
-    assert switch.hasFocus()
-    before = switch.isChecked()
+    assert row.hasFocus()
 
-    qtbot.keyClick(switch, Qt.Key.Key_Space)
+    with qtbot.waitSignal(row.activated):
+        qtbot.keyClick(row, Qt.Key.Key_Space)
 
-    assert switch.isChecked() is not before
-    image = switch.grab().toImage()
-    assert image.size() == switch.size()
-    assert image.pixelColor(43, switch.height() // 2).alpha() >= 240
+    image = row.grab().toImage()
+    assert image.size() == row.size()
 
 
 @pytest.mark.parametrize("theme", [ThemeMode.LIGHT, ThemeMode.DARK])

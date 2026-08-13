@@ -592,10 +592,24 @@ def test_structure_review_never_offers_bulk_approval(qtbot, tmp_path: Path) -> N
         input_version=1,
         units=(ReviewUnit("structure", original.id, proposed.id),),
     )
-    dialog = PhaseReviewDialog(review, store)
+    dialog = PhaseReviewDialog(
+        review,
+        store,
+        structure_outline=(
+            "# Libro\n\n## Parte\n\n### Capítulo\n",
+            "# Libro\n\n## Parte\n\n## Capítulo\n",
+        ),
+    )
     qtbot.addWidget(dialog)
 
     assert dialog.approve_all_button.isHidden()
+    assert not dialog.outline_comparison.isHidden()
+    assert dialog.original_outline.toPlainText() == "Libro\n  └─ Parte\n    └─ Capítulo"
+    assert dialog.proposed_outline.toPlainText() == "Libro\n  └─ Parte\n  └─ Capítulo"
+
+    dialog.set_compact_mode(True)
+
+    assert dialog.outline_layout.itemAtPosition(2, 0).widget() is dialog.proposed_outline_label
 
 
 def test_review_pane_displays_binary_page_images(qtbot, tmp_path: Path) -> None:

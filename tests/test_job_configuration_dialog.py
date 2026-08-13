@@ -1,8 +1,8 @@
 from pathlib import Path
 
 import pytest
-from PySide6.QtCore import Qt
-from PySide6.QtWidgets import QMessageBox
+from PySide6.QtCore import QPoint, Qt
+from PySide6.QtWidgets import QBoxLayout, QDialog, QMenu
 
 from parsezen.application.runtime_mapping import request_and_settings_from_job
 from parsezen.domain.jobs import (
@@ -12,12 +12,19 @@ from parsezen.domain.jobs import (
     DocumentSource,
     JobConfiguration,
     OutputConfiguration,
+    PageRangeConfiguration,
     ProcessingPlan,
     TranslationConfiguration,
     TranslationMethod,
 )
+from parsezen.domain.stages import StageKind
 from parsezen.glossary import GlossaryEntry
-from parsezen.presentation.job_configuration_dialog import JobConfigurationDialog
+from parsezen.local_models import OllamaStatus
+from parsezen.presentation.job_configuration_dialog import (
+    JobConfigurationDialog,
+    _GlossaryEditorDialog,
+    _PageRangeDialog,
+)
 
 
 def _job(
@@ -35,31 +42,40 @@ def _job(
     )
 
 
-def test_editor_defaults_to_direct_processing_and_explains_the_route(
+def test_standard_configuration_uses_visual_format_and_compact_settings(
     qtbot,
     tmp_path: Path,
 ) -> None:
     dialog = JobConfigurationDialog(_job(tmp_path), embedded=True)
     qtbot.addWidget(dialog)
 
-    assert not dialog.plan_reviewed.isChecked()
     assert dialog.output_markdown.isChecked()
-    assert dialog.translation_target.currentData() is None
-    assert not dialog.advanced_panel.isVisible()
-    assert not dialog._dirty  # noqa: SLF001
-    assert not dialog.ai_summary.isVisible()
-    assert "Markdown" in dialog.markdown_card.radio.accessibleName()
-    assert "solo los bloques afectados" in dialog.summary_detail.text()
-    dialog.advanced_toggle.setChecked(True)
-    assert not dialog._dirty  # noqa: SLF001
-    assert "PDF → Markdown" in dialog.route_summary.text()
-    assert "Sin pasadas de IA" in dialog.route_summary.text()
+    assert not dialog.output_epub.isChecked()
+    assert dialog.markdown_card.property("selected") is True
+    assert dialog.epub_card.property("selected") is False
+    assert dialog.translate_row.value.text() == "No traducir"
+    assert dialog.translator_row.isHidden()
+    assert dialog.glossary_row.isHidden()
+    assert not dialog.plan_reviewed.isChecked()
+    assert dialog.pages_row.value.text() == "Todas"
+    assert dialog.ocr_row.value.text() == "Automático"
+    assert all(
+        row.objectName() == "configurationOptionRow"
+        for row in (
+            dialog.translate_row,
+            dialog.translator_row,
+            dialog.glossary_row,
+            dialog.pages_row,
+            dialog.ocr_row,
+        )
+    )
+    assert not hasattr(dialog, "save_button")
+    assert not hasattr(dialog, "cancel_button")
+    assert not hasattr(dialog, "scroll_area")
+    assert not hasattr(dialog, "translation_enabled")
 
 
-def test_unconfigured_markdown_source_defaults_to_a_useful_epub_result(
-    qtbot,
-    tmp_path: Path,
-) -> None:
+def test_unconfigured_markdown_defaults_to_epub_and_review(qtbot, tmp_path: Path) -> None:
     dialog = JobConfigurationDialog(
         _job(
             tmp_path,
@@ -71,24 +87,112 @@ def test_unconfigured_markdown_source_defaults_to_a_useful_epub_result(
     qtbot.addWidget(dialog)
 
     assert dialog.output_epub.isChecked()
+    assert dialog.plan_reviewed.isChecked()
 
 
-def test_editor_explains_argos_review_passes_without_calling_them_one_engine(
-    qtbot,
-    tmp_path: Path,
-) -> None:
+def test_missing_ai_is_opened_from_the_relevant_choice(qtbot, tmp_path: Path) -> None:
     dialog = JobConfigurationDialog(
         _job(tmp_path),
         embedded=True,
-        default_ai_model="qwen3:4b-instruct",
+        ollama_status=OllamaStatus.NOT_INSTALLED,
     )
     qtbot.addWidget(dialog)
-    dialog.translation_target.setCurrentIndex(dialog.translation_target.findData("es"))
-    dialog.plan_reviewed.setChecked(True)
 
-    assert "Argos" in dialog.route_summary.text()
-    assert "revisión bilingüe" in dialog.route_summary.text().casefold()
-    assert "2 pasadas" in dialog.route_summary.text()
+    with qtbot.waitSignal(dialog.models_requested):
+        dialog._set_review_enabled(True)  # noqa: SLF001
+
+    assert dialog.plan_reviewed.isChecked()
+    assert not dialog.validation_label.isHidden()
+
+
+def test_translation_choice_reveals_only_translator_and_glossary(
+    qtbot,
+    tmp_path: Path,
+) -> None:
+    dialog = JobConfigurationDialog(_job(tmp_path), embedded=True, ollama_status=OllamaStatus.READY)
+    qtbot.addWidget(dialog)
+
+    dialog._set_translation_language("es")  # noqa: SLF001
+
+    assert dialog.translate_row.value.text() == "Español"
+    assert not dialog.translator_row.isHidden()
+    assert dialog.translator_row.value.text() == "Argos · ligero"
+    assert not dialog.glossary_row.isHidden()
+    assert dialog.glossary_row.value.text() == "Ninguno"
+    assert "Coste aproximado bajo" in dialog.translation_route.text()
+    assert "no revisión semántica" in dialog.translation_route.text()
+    assert "1 pasada" in dialog.translation_route.text()
+
+    dialog._set_review_enabled(True)  # noqa: SLF001
+
+    assert "Coste aproximado alto" in dialog.translation_route.text()
+    assert "verificación bilingüe independiente" in dialog.translation_route.text()
+    assert "2 pasadas" in dialog.translation_route.text()
+
+
+def test_translation_menu_contains_no_translation_and_every_supported_language(
+    qtbot,
+    tmp_path: Path,
+) -> None:
+    dialog = JobConfigurationDialog(_job(tmp_path), embedded=True)
+    qtbot.addWidget(dialog)
+    labels = [label for label, _value in dialog._translation_choices()]  # noqa: SLF001
+
+    assert labels[0] == "No traducir"
+    assert "Español" in labels
+    assert "Inglés" in labels
+
+
+def test_page_interval_dialog_returns_one_inclusive_range(qtbot) -> None:
+    selector = _PageRangeDialog(PageRangeConfiguration(25, 140))
+    qtbot.addWidget(selector)
+
+    assert selector.first_page.value() == 25
+    assert selector.last_page.value() == 140
+    assert selector.page_range() == PageRangeConfiguration(25, 140)
+
+
+def test_glossary_editor_adds_validates_removes_and_accepts_terms(qtbot) -> None:
+    editor = _GlossaryEditorDialog((GlossaryEntry("one", "uno"), GlossaryEntry("two", "dos")))
+    qtbot.addWidget(editor)
+
+    remove = editor.table.cellWidget(0, 2)
+    assert remove is not None
+    qtbot.mouseClick(remove, Qt.MouseButton.LeftButton)
+    assert editor.entries() == (GlossaryEntry("two", "dos"),)
+
+    qtbot.mouseClick(editor.add_button, Qt.MouseButton.LeftButton)
+    row = editor.table.rowCount() - 1
+    editor.table.item(row, 0).setText("term")
+    editor._submit()  # noqa: SLF001
+    assert not editor.validation_label.isHidden()
+
+    editor.table.item(row, 1).setText("término")
+    editor._submit()  # noqa: SLF001
+    assert editor.result() == QDialog.DialogCode.Accepted
+
+
+def test_configuration_cards_rows_focus_and_output_slots_are_operable(
+    qtbot, tmp_path: Path
+) -> None:
+    dialog = JobConfigurationDialog(_job(tmp_path), embedded=False)
+    qtbot.addWidget(dialog)
+    dialog.show()
+    qtbot.waitExposed(dialog)
+    dialog.translate_row.activated.disconnect(dialog._open_translation_menu)  # noqa: SLF001
+
+    qtbot.mouseClick(dialog.epub_card, Qt.MouseButton.LeftButton)
+    assert dialog.output_epub.isChecked()
+    qtbot.mouseClick(dialog.translate_row, Qt.MouseButton.LeftButton, pos=QPoint(2, 2))
+    qtbot.waitUntil(dialog.translate_row.hasFocus)
+    qtbot.mouseClick(dialog.translate_row, Qt.MouseButton.RightButton, pos=QPoint(2, 2))
+    qtbot.mouseClick(dialog.markdown_card, Qt.MouseButton.RightButton, pos=QPoint(2, 2))
+
+    dialog._focus_stage(None)  # noqa: SLF001
+    dialog._focus_stage(StageKind.TRANSLATE)  # noqa: SLF001
+    assert dialog.translate_row.hasFocus()
+    dialog._set_markdown_output_when_checked(False)  # noqa: SLF001
+    dialog._set_epub_output_when_checked(False)  # noqa: SLF001
 
 
 @pytest.mark.parametrize(
@@ -106,12 +210,11 @@ def test_reviewed_plan_maps_to_the_fixed_runtime_phases(
         embedded=True,
         default_ai_model="qwen3:4b",
         default_ai_context=8192,
+        ollama_status=OllamaStatus.READY,
     )
     qtbot.addWidget(dialog)
-    (
-        dialog.output_markdown if output is DocumentFormat.MARKDOWN else dialog.output_epub
-    ).setChecked(True)
-    dialog.plan_reviewed.setChecked(True)
+    dialog._set_output_format(output)  # noqa: SLF001
+    dialog._set_review_enabled(True)  # noqa: SLF001
 
     configured = dialog.configuration()
     job = dialog._job.with_configuration(configured)  # noqa: SLF001
@@ -127,7 +230,7 @@ def test_reviewed_plan_maps_to_the_fixed_runtime_phases(
 def test_translation_defaults_to_argos_and_glossary_is_optional(qtbot, tmp_path: Path) -> None:
     dialog = JobConfigurationDialog(_job(tmp_path), embedded=True)
     qtbot.addWidget(dialog)
-    dialog.translation_target.setCurrentIndex(dialog.translation_target.findData("es"))
+    dialog._set_translation_language("es")  # noqa: SLF001
     dialog._append_glossary_entry(GlossaryEntry("term", "término"))  # noqa: SLF001
 
     configured = dialog.configuration()
@@ -137,16 +240,19 @@ def test_translation_defaults_to_argos_and_glossary_is_optional(qtbot, tmp_path:
     assert configured.translation.glossary == (("term", "término"),)
     assert configured.translation.method is TranslationMethod.OFFLINE
     assert tuple((item.source, item.target) for item in request.glossary) == (("term", "término"),)
+    assert dialog.glossary_row.value.text() == "1 término"
 
 
 def test_translation_can_use_the_global_local_ai_model(qtbot, tmp_path: Path) -> None:
-    dialog = JobConfigurationDialog(_job(tmp_path), embedded=True)
+    dialog = JobConfigurationDialog(
+        _job(tmp_path),
+        embedded=True,
+        ollama_status=OllamaStatus.READY,
+    )
     qtbot.addWidget(dialog)
     dialog.set_default_ai_profile("translategemma:4b", 8192)
-    dialog.translation_target.setCurrentIndex(dialog.translation_target.findData("es"))
-    dialog.translation_method.setCurrentIndex(
-        dialog.translation_method.findData(TranslationMethod.LOCAL_AI)
-    )
+    dialog._set_translation_language("es")  # noqa: SLF001
+    dialog._set_translation_method(TranslationMethod.LOCAL_AI)  # noqa: SLF001
 
     configured = dialog.configuration()
     job = dialog._job.with_configuration(configured)  # noqa: SLF001
@@ -157,19 +263,24 @@ def test_translation_can_use_the_global_local_ai_model(qtbot, tmp_path: Path) ->
         method=TranslationMethod.LOCAL_AI,
         target_language="es",
     )
+    assert dialog.translator_row.value.text() == "IA local · contextual"
+    assert "Coste aproximado medio" in dialog.translation_route.text()
+    assert "no una revisión semántica posterior" in dialog.translation_route.text()
     assert request.target_language == "es"
     assert request.offline_translation_language is None
     assert request.improvement_mode is not None
-    assert not hasattr(dialog, "ai_model")
+
+    dialog._set_review_enabled(True)  # noqa: SLF001
+
+    assert "corrige en una sola pasada" in dialog.translation_route.text()
+    assert "no es una verificación bilingüe independiente" in dialog.translation_route.text()
 
 
 def test_ai_translation_requires_the_global_model(qtbot, tmp_path: Path) -> None:
     dialog = JobConfigurationDialog(_job(tmp_path), embedded=True)
     qtbot.addWidget(dialog)
-    dialog.translation_target.setCurrentIndex(dialog.translation_target.findData("es"))
-    dialog.translation_method.setCurrentIndex(
-        dialog.translation_method.findData(TranslationMethod.LOCAL_AI)
-    )
+    dialog._set_translation_language("es")  # noqa: SLF001
+    dialog._set_translation_method(TranslationMethod.LOCAL_AI)  # noqa: SLF001
 
     with pytest.raises(ValueError, match="modelo de IA local general"):
         dialog.configuration()
@@ -178,19 +289,18 @@ def test_ai_translation_requires_the_global_model(qtbot, tmp_path: Path) -> None
 def test_turning_translation_off_discards_hidden_engine_and_glossary(qtbot, tmp_path: Path) -> None:
     dialog = JobConfigurationDialog(_job(tmp_path), embedded=True)
     qtbot.addWidget(dialog)
-    dialog.translation_target.setCurrentIndex(dialog.translation_target.findData("es"))
-    dialog.translation_method.setCurrentIndex(
-        dialog.translation_method.findData(TranslationMethod.LOCAL_AI)
-    )
+    dialog._set_translation_language("es")  # noqa: SLF001
+    dialog._set_translation_method(TranslationMethod.LOCAL_AI)  # noqa: SLF001
     dialog._append_glossary_entry(GlossaryEntry("term", "término"))  # noqa: SLF001
 
-    dialog.translation_target.setCurrentIndex(dialog.translation_target.findData(None))
-    configured = dialog.configuration()
+    dialog._set_translation_language(None)  # noqa: SLF001
 
-    assert configured.translation == TranslationConfiguration()
+    assert dialog.configuration().translation == TranslationConfiguration()
+    assert dialog.translator_row.isHidden()
+    assert dialog.glossary_row.isHidden()
 
 
-def test_global_destination_and_ai_are_visible_but_not_overridable(qtbot, tmp_path: Path) -> None:
+def test_global_destination_and_ai_are_inherited_but_not_overridable(qtbot, tmp_path: Path) -> None:
     destination = tmp_path / "results"
     dialog = JobConfigurationDialog(
         _job(tmp_path),
@@ -198,49 +308,46 @@ def test_global_destination_and_ai_are_visible_but_not_overridable(qtbot, tmp_pa
         default_output_directory=destination,
         default_ai_model="qwen3:4b",
         default_ai_context=4096,
-        models=(("qwen3:4b", "Qwen 4B"),),
+        ollama_status=OllamaStatus.READY,
     )
     qtbot.addWidget(dialog)
-    dialog.plan_reviewed.setChecked(True)
+    dialog._set_review_enabled(True)  # noqa: SLF001
 
     configured = dialog.configuration()
 
     assert configured.output.directory == destination
     assert configured.ai == AIProfileConfiguration(model="qwen3:4b", context_window=4096)
-    assert destination.name in dialog.destination_summary.text()
-    assert str(destination) in dialog.destination_summary.toolTip()
-    assert "Qwen 4B" in dialog.ai_summary.text()
-    assert not hasattr(dialog, "output_directory")
-    assert not hasattr(dialog, "ai_context")
+    assert not hasattr(dialog, "destination_summary")
+    assert not hasattr(dialog, "ai_model")
 
 
-def test_pdf_range_and_forced_ocr_live_under_additional_options(qtbot, tmp_path: Path) -> None:
+def test_pdf_interval_and_ocr_are_values_not_permanent_controls(qtbot, tmp_path: Path) -> None:
     dialog = JobConfigurationDialog(_job(tmp_path), embedded=True)
     qtbot.addWidget(dialog)
-    dialog.advanced_toggle.setChecked(True)
-    dialog.page_range_enabled.setChecked(True)
-    dialog.page_first.setValue(3)
-    dialog.page_last.setValue(8)
-    dialog.force_pdf_ocr.setChecked(True)
+    dialog._set_page_range(PageRangeConfiguration(25, 140))  # noqa: SLF001
+    dialog._set_force_pdf_ocr(True)  # noqa: SLF001
 
     configured = dialog.configuration()
 
-    assert configured.page_range is not None
-    assert (configured.page_range.first_page, configured.page_range.last_page) == (3, 8)
+    assert configured.page_range == PageRangeConfiguration(25, 140)
     assert configured.force_pdf_ocr
-    assert not dialog.pdf_options.isHidden()
+    assert dialog.pages_row.value.text() == "25–140"
+    assert dialog.ocr_row.value.text() == "Todas las páginas"
+    assert not hasattr(dialog, "page_first")
+    assert not hasattr(dialog, "page_last")
+    assert not hasattr(dialog, "page_interval")
 
 
-def test_non_pdf_ignores_pdf_specific_options(qtbot, tmp_path: Path) -> None:
+def test_non_pdf_hides_pdf_specific_rows_and_ignores_values(qtbot, tmp_path: Path) -> None:
     dialog = JobConfigurationDialog(_job(tmp_path, suffix=".txt"), embedded=True)
     qtbot.addWidget(dialog)
-    dialog.advanced_toggle.setChecked(True)
-    dialog.page_range_enabled.setChecked(True)
-    dialog.force_pdf_ocr.setChecked(True)
+    dialog._set_page_range(PageRangeConfiguration(3, 8))  # noqa: SLF001
+    dialog._set_force_pdf_ocr(True)  # noqa: SLF001
 
     configured = dialog.configuration()
 
-    assert not dialog.pdf_options.isVisible()
+    assert dialog.pages_row.isHidden()
+    assert dialog.ocr_row.isHidden()
     assert configured.page_range is None
     assert not configured.force_pdf_ocr
 
@@ -248,57 +355,68 @@ def test_non_pdf_ignores_pdf_specific_options(qtbot, tmp_path: Path) -> None:
 def test_reviewed_plan_surfaces_missing_global_ai(qtbot, tmp_path: Path) -> None:
     dialog = JobConfigurationDialog(_job(tmp_path), embedded=True)
     qtbot.addWidget(dialog)
-    dialog.plan_reviewed.setChecked(True)
+    dialog._set_review_enabled(True)  # noqa: SLF001
 
     with pytest.raises(ValueError, match="modelo de IA local general"):
         dialog.configuration()
 
 
-def test_editor_has_no_horizontal_scroll_at_compact_width(qtbot, tmp_path: Path) -> None:
+def test_editor_has_no_scroll_or_footer_at_compact_width(qtbot, tmp_path: Path) -> None:
     dialog = JobConfigurationDialog(_job(tmp_path), embedded=False)
     qtbot.addWidget(dialog)
-    dialog.resize(320, 700)
+    dialog.resize(320, 520)
     dialog.show()
     qtbot.wait(10)
 
     assert dialog.width() == 320
-    assert dialog.scroll_area.horizontalScrollBarPolicy() is Qt.ScrollBarPolicy.ScrollBarAlwaysOff
-    assert dialog.scroll_area.horizontalScrollBar().maximum() == 0
+    assert dialog.output_choices.direction() is QBoxLayout.Direction.TopToBottom
+    assert dialog.content.width() <= dialog.contentsRect().width()
+    assert dialog.content.sizeHint().height() <= dialog.height()
+    assert not hasattr(dialog, "save_button")
+    assert not hasattr(dialog, "cancel_button")
     assert dialog.grab().save(str(tmp_path / "configuration-compact.png"))
-    dialog.accept()
 
 
-def test_escape_preserves_unsaved_choices_until_discard_is_confirmed(
-    qtbot,
-    tmp_path: Path,
-    monkeypatch,
-) -> None:
+def test_escape_closes_without_discard_confirmation(qtbot, tmp_path: Path) -> None:
     dialog = JobConfigurationDialog(_job(tmp_path), embedded=False)
     qtbot.addWidget(dialog)
     dialog.show()
-    dialog.output_epub.setChecked(True)
-    answers = iter(
-        (
-            QMessageBox.StandardButton.Cancel,
-            QMessageBox.StandardButton.Discard,
-        )
-    )
-    monkeypatch.setattr(QMessageBox, "question", lambda *_args, **_kwargs: next(answers))
+    dialog._set_output_format(DocumentFormat.EPUB)  # noqa: SLF001
 
     qtbot.keyClick(dialog, Qt.Key.Key_Escape)
-    assert dialog.isVisible()
 
-    qtbot.keyClick(dialog, Qt.Key.Key_Escape)
     assert not dialog.isVisible()
 
 
-def test_model_management_is_global_and_emits_one_action(qtbot, tmp_path: Path) -> None:
-    dialog = JobConfigurationDialog(
-        _job(tmp_path),
-        embedded=True,
-        default_ai_model="qwen3:4b",
-    )
+def test_option_row_is_keyboard_operable(qtbot, tmp_path: Path) -> None:
+    dialog = JobConfigurationDialog(_job(tmp_path), embedded=False)
     qtbot.addWidget(dialog)
-    dialog.plan_reviewed.setChecked(True)
-    with qtbot.waitSignal(dialog.models_requested):
-        dialog.manage_models_button.click()
+    dialog.show()
+    qtbot.waitExposed(dialog)
+    dialog.translate_row.activated.disconnect(dialog._open_translation_menu)  # noqa: SLF001
+    dialog.translate_row.setFocus()
+    qtbot.waitUntil(dialog.translate_row.hasFocus)
+
+    with qtbot.waitSignal(dialog.translate_row.activated):
+        qtbot.keyClick(dialog.translate_row, Qt.Key.Key_Space)
+
+    assert dialog.translate_row.hasFocus()
+
+
+def test_choice_menu_is_anchored_to_the_value_side(qtbot, tmp_path: Path) -> None:
+    dialog = JobConfigurationDialog(_job(tmp_path), embedded=False)
+    qtbot.addWidget(dialog)
+    dialog.resize(720, 560)
+    dialog.show()
+    qtbot.waitExposed(dialog)
+    menu = QMenu(dialog)
+    for label, _value in dialog._translation_choices():  # noqa: SLF001
+        menu.addAction(label)
+
+    anchor = dialog._menu_anchor(menu, dialog.translate_row)  # noqa: SLF001
+    row_bottom_right = dialog.translate_row.mapToGlobal(
+        QPoint(dialog.translate_row.width(), dialog.translate_row.height())
+    )
+
+    assert anchor.x() + menu.sizeHint().width() == row_bottom_right.x()
+    assert anchor.y() == row_bottom_right.y()

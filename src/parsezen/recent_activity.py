@@ -289,6 +289,11 @@ def _outcome_summary_json(summary: OutcomeSummary | None) -> dict[str, Any] | No
         "chapters": summary.chapters,
         "conversion_issues": summary.conversion_issues,
         "translation_issues": summary.translation_issues,
+        "linguistic_review_mode": summary.linguistic_review_mode,
+        "translation_checked_blocks": summary.translation_checked_blocks,
+        "translation_reviewed_blocks": summary.translation_reviewed_blocks,
+        "translation_independent_blocks": summary.translation_independent_blocks,
+        "translation_unreviewed_blocks": summary.translation_unreviewed_blocks,
         "preserved_segments": summary.preserved_segments,
         "review_units": summary.review_units,
         "review_changes": summary.review_changes,
@@ -342,6 +347,11 @@ def _outcome_summary_from_json(raw: object) -> OutcomeSummary | None:
         "ai_review_recommended",
         "ai_review_blocks",
         "ai_review_signals",
+        "linguistic_review_mode",
+        "translation_checked_blocks",
+        "translation_reviewed_blocks",
+        "translation_independent_blocks",
+        "translation_unreviewed_blocks",
     }
     if (
         not isinstance(raw, dict)
@@ -375,6 +385,15 @@ def _outcome_summary_from_json(raw: object) -> OutcomeSummary | None:
         raise ValueError
     if "ai_review_recommended" in raw and not isinstance(raw["ai_review_recommended"], bool):
         raise ValueError
+    linguistic_review_mode = raw.get("linguistic_review_mode")
+    if linguistic_review_mode not in {
+        None,
+        "not_reviewed",
+        "corrected_during_translation",
+        "independent_bilingual",
+        "targeted_bilingual",
+    }:
+        raise ValueError
     numeric_fields = required_fields - {
         "output_format",
         "operations",
@@ -398,6 +417,26 @@ def _outcome_summary_from_json(raw: object) -> OutcomeSummary | None:
         editor_completed=raw["editor_completed"],
         manual_review_expected=raw["manual_review_expected"],
         integrity_verified=raw["integrity_verified"],
+        linguistic_review_mode=linguistic_review_mode,
+        translation_checked_blocks=cast(
+            int,
+            _summary_nonnegative_int(raw.get("translation_checked_blocks", 0), optional=False),
+        ),
+        translation_reviewed_blocks=cast(
+            int,
+            _summary_nonnegative_int(raw.get("translation_reviewed_blocks", 0), optional=False),
+        ),
+        translation_independent_blocks=cast(
+            int,
+            _summary_nonnegative_int(
+                raw.get("translation_independent_blocks", 0),
+                optional=False,
+            ),
+        ),
+        translation_unreviewed_blocks=cast(
+            int,
+            _summary_nonnegative_int(raw.get("translation_unreviewed_blocks", 0), optional=False),
+        ),
         ai_review_recommended=bool(raw.get("ai_review_recommended", False)),
         ai_review_blocks=cast(
             int,

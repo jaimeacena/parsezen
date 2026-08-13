@@ -43,6 +43,7 @@ from parsezen.domain.reviews import (
 )
 from parsezen.presentation.design_system import BREAKPOINTS, COLORS, SPACING, back_icon
 from parsezen.review_projection import ReviewProjection, project_review_text
+from parsezen.revision import markdown_outline_tree
 
 _PHASE_TITLES = {
     ReviewKind.OCR: "Revisar reconocimiento de página",
@@ -137,6 +138,8 @@ class PhaseReviewDialog(QDialog):
         *,
         phase_plan: tuple[ReviewKind | tuple[ReviewKind, int], ...] = (),
         translation_follows_ocr: bool = False,
+        linguistic_review_context: str | None = None,
+        structure_outline: tuple[str, str] | None = None,
         previous_phase_callback: Callable[[], bool] | None = None,
         parent: QWidget | None = None,
     ) -> None:
@@ -185,13 +188,13 @@ class PhaseReviewDialog(QDialog):
         self.case_summary.setMaximumHeight(48)
         self.case_summary.setAccessibleName("Síntesis del caso")
         layout.addWidget(self.case_summary)
-        self.instruction_label = QLabel(
-            _phase_instruction(
-                review.kind,
-                translation_follows_ocr=translation_follows_ocr,
-            ),
-            self,
+        instruction = _phase_instruction(
+            review.kind,
+            translation_follows_ocr=translation_follows_ocr,
         )
+        if review.kind is ReviewKind.TRANSLATION and linguistic_review_context:
+            instruction = f"{instruction} {linguistic_review_context}"
+        self.instruction_label = QLabel(instruction, self)
         self.instruction_label.setObjectName("reviewInstruction")
         self.instruction_label.setWordWrap(True)
         layout.addWidget(self.instruction_label)
@@ -208,6 +211,34 @@ class PhaseReviewDialog(QDialog):
         self.unit_warning.setWordWrap(True)
         self.unit_warning.hide()
         layout.addWidget(self.unit_warning)
+
+        self.outline_comparison = QFrame(self)
+        self.outline_comparison.setObjectName("reviewOutlineComparison")
+        outline_layout = QGridLayout(self.outline_comparison)
+        self.outline_layout = outline_layout
+        outline_layout.setContentsMargins(SPACING.sm, SPACING.sm, SPACING.sm, SPACING.sm)
+        outline_layout.setHorizontalSpacing(SPACING.md)
+        outline_layout.setVerticalSpacing(SPACING.xs)
+        self.original_outline_label = QLabel("Árbol actual", self.outline_comparison)
+        self.proposed_outline_label = QLabel("Árbol propuesto", self.outline_comparison)
+        outline_layout.addWidget(self.original_outline_label, 0, 0)
+        outline_layout.addWidget(self.proposed_outline_label, 0, 1)
+        self.original_outline = QPlainTextEdit(self.outline_comparison)
+        self.proposed_outline = QPlainTextEdit(self.outline_comparison)
+        for outline in (self.original_outline, self.proposed_outline):
+            outline.setReadOnly(True)
+            outline.setLineWrapMode(QPlainTextEdit.LineWrapMode.WidgetWidth)
+            outline.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+            outline.setMaximumHeight(150)
+            outline.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        if review.kind is ReviewKind.STRUCTURE and structure_outline is not None:
+            self.original_outline.setPlainText(markdown_outline_tree(structure_outline[0]))
+            self.proposed_outline.setPlainText(markdown_outline_tree(structure_outline[1]))
+        else:
+            self.outline_comparison.hide()
+        outline_layout.addWidget(self.original_outline, 1, 0)
+        outline_layout.addWidget(self.proposed_outline, 1, 1)
+        layout.addWidget(self.outline_comparison)
 
         splitter = QSplitter(Qt.Orientation.Horizontal, self)
         self.splitter = splitter
@@ -340,6 +371,7 @@ class PhaseReviewDialog(QDialog):
             self.footer_layout.addWidget(self.save_later_button, 2, 0, 1, 2)
             self.original_pane.set_compact_mode(True)
             self.proposed_pane.set_compact_mode(True)
+            self._layout_outline_comparison(compact=True)
         else:
             self.root_layout.setContentsMargins(24, 20, 24, 20)
             self.splitter.setOrientation(Qt.Orientation.Horizontal)
@@ -351,7 +383,33 @@ class PhaseReviewDialog(QDialog):
             self.footer_layout.addWidget(self.next_button, 0, 4)
             self.original_pane.set_compact_mode(False)
             self.proposed_pane.set_compact_mode(False)
+            self._layout_outline_comparison(compact=False)
         self._refresh_compact_labels()
+
+    def _layout_outline_comparison(self, *, compact: bool) -> None:
+        if self.outline_comparison.isHidden():
+            return
+        for widget in (
+            self.original_outline_label,
+            self.proposed_outline_label,
+            self.original_outline,
+            self.proposed_outline,
+        ):
+            self.outline_layout.removeWidget(widget)
+        if compact:
+            self.original_outline.setMaximumHeight(100)
+            self.proposed_outline.setMaximumHeight(100)
+            self.outline_layout.addWidget(self.original_outline_label, 0, 0)
+            self.outline_layout.addWidget(self.original_outline, 1, 0)
+            self.outline_layout.addWidget(self.proposed_outline_label, 2, 0)
+            self.outline_layout.addWidget(self.proposed_outline, 3, 0)
+        else:
+            self.original_outline.setMaximumHeight(150)
+            self.proposed_outline.setMaximumHeight(150)
+            self.outline_layout.addWidget(self.original_outline_label, 0, 0)
+            self.outline_layout.addWidget(self.proposed_outline_label, 0, 1)
+            self.outline_layout.addWidget(self.original_outline, 1, 0)
+            self.outline_layout.addWidget(self.proposed_outline, 1, 1)
 
     def _refresh_compact_labels(self) -> None:
         if not self._compact:

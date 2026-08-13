@@ -25,6 +25,7 @@ from parsezen.domain.stages import StageKind
 from parsezen.final_integrity import FinalIntegrityReport, IntegrityLedger
 from parsezen.pdf_conversion import PdfQualityReport, PdfReviewIssue
 from parsezen.processing import ProcessResult
+from parsezen.translation_quality import LinguisticReviewCoverage, LinguisticReviewMode
 
 
 def test_outcome_summary_keeps_integrity_incidents_and_review_separate() -> None:
@@ -79,6 +80,14 @@ def test_outcome_summary_keeps_integrity_incidents_and_review_separate() -> None
         ),
         preserved_images=4,
         epub_chapters=7,
+        linguistic_review_coverage=LinguisticReviewCoverage(
+            LinguisticReviewMode.CORRECTED_DURING_TRANSLATION,
+            translated_blocks=12,
+            automatically_checked_blocks=12,
+            semantically_reviewed_blocks=9,
+            independently_verified_blocks=0,
+            remaining_issues=2,
+        ),
         revision_approved=True,
         final_integrity_report=FinalIntegrityReport(
             "EPUB",
@@ -105,6 +114,11 @@ def test_outcome_summary_keeps_integrity_incidents_and_review_separate() -> None
     assert summary.review_originals == 1
     assert summary.early_check_pages == 3
     assert summary.early_check_warnings == 1
+    assert summary.linguistic_review_mode == "corrected_during_translation"
+    assert summary.translation_checked_blocks == 12
+    assert summary.translation_reviewed_blocks == 9
+    assert summary.translation_independent_blocks == 0
+    assert summary.translation_unreviewed_blocks == 3
 
 
 def test_outcome_summary_exposes_only_content_free_ai_recommendation_counts() -> None:

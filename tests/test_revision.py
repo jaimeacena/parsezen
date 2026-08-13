@@ -9,10 +9,15 @@ from parsezen.revision import (
     RevisionRisk,
     build_revision_draft,
     markdown_headings,
+    markdown_outline_tree,
     set_heading_level,
     split_markdown_blocks,
     validate_revision_selection,
 )
+
+
+def test_outline_tree_explains_when_no_headings_exist() -> None:
+    assert markdown_outline_tree("A plain paragraph.") == "Sin títulos detectados"
 
 
 def test_revision_draft_can_accept_and_reject_independent_changes() -> None:

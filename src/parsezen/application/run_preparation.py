@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from parsezen.application.preflight import (
     DocumentPreflight,
@@ -86,6 +86,17 @@ def prepare_queue_run(
             issues,
             explicit_plan=plan is not None,
         )
+
+    mapped_items = [
+        replace(
+            item,
+            request=replace(
+                item.request,
+                source_identity_verified=item.request.source_content_sha256 is not None,
+            ),
+        )
+        for item in mapped_items
+    ]
 
     items: list[PreparedRunItem] = []
     analyses: list[DocumentPreflight] = []

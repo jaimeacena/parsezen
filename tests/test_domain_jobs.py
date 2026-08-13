@@ -1,3 +1,4 @@
+import hashlib
 from dataclasses import replace
 from pathlib import Path
 
@@ -25,6 +26,16 @@ from parsezen.domain.stages import StageAvailability, StageKind, StageStatus
 
 def source(path: str = "book.pdf") -> DocumentSource:
     return DocumentSource(Path(path), DocumentFormat.PDF, 100, 1)
+
+
+def test_document_source_inspection_captures_content_identity(tmp_path: Path) -> None:
+    path = tmp_path / "book.pdf"
+    content = b"%PDF-local"
+    path.write_bytes(content)
+
+    inspected = DocumentSource.inspect(path)
+
+    assert inspected.content_sha256 == hashlib.sha256(content).hexdigest()
 
 
 def complete(job: DocumentJob, kind: StageKind) -> DocumentJob:
