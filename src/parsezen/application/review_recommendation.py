@@ -10,7 +10,7 @@ from parsezen.epub_builder import EpubBookMetadata
 from parsezen.epub_conversion import convert_epub, inspect_epub_package
 from parsezen.errors import ParsezenError
 from parsezen.pipeline.contracts import ProcessResult
-from parsezen.processing import (
+from parsezen.pipeline.transform import (
     resolve_targeted_review_positions,
     review_block_fingerprint,
     review_scope_fingerprint,

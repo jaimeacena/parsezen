@@ -6,6 +6,9 @@
   `pipeline/contracts.py` y la preparación a `pipeline/prepare.py`; los consumidores internos dejan
   de importar el orquestador solo por tipos. `pipeline/publish.py` concentra build, integridad y
   escritura atómica sin conocer los algoritmos de traducción o IA.
+- `pipeline/transform.py` concentra traducción, corrección, verificación bilingüe, calidad y
+  borradores de revisión sin publicar archivos. La fachada coordina ahora explícitamente validación,
+  preparación, transformación y publicación.
 - La cola y sus informes se proyectan por eventos. El polling general de 200 ms se sustituye por un
   refresco de un segundo limitado a tiempo restante y reintento de persistencia diferida.
 - La nueva `QueueSession` Qt-free posee el plan preparado, runtimes, documento activo, pausa y cierre

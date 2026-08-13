@@ -25,7 +25,7 @@ from parsezen.output import (
     write_epub_output,
     write_improvement_outputs,
 )
-from parsezen.pdf_conversion import PdfQualityReport, render_pdf_page_cover
+from parsezen.pdf_conversion import render_pdf_page_cover
 from parsezen.pipeline.contracts import (
     PreparedDocument,
     ProcessRequest,
@@ -33,10 +33,10 @@ from parsezen.pipeline.contracts import (
     StageCallback,
     TransformedDocument,
 )
+from parsezen.pipeline.transform import review_is_required
 from parsezen.revision import RevisionDecision, RevisionDraft, build_revision_draft
 from parsezen.settings import AppSettings
 from parsezen.translation_quality import (
-    TranslationQualityReport,
     detect_language_code,
     resolve_language_code,
 )
@@ -53,22 +53,6 @@ EPUB_COVER_MEDIA_TYPES = {
 }
 
 CoverRenderer = Callable[[Path, int], bytes]
-
-
-def review_is_required(
-    revision_draft: RevisionDraft | None,
-    pdf_report: PdfQualityReport | None,
-    translation_report: TranslationQualityReport | None,
-    unsafe_translation_preserved: bool = False,
-) -> bool:
-    """Distinguish optional advice from issues needing an explicit decision."""
-
-    del translation_report
-    return bool(
-        revision_draft is not None
-        or (pdf_report is not None and any(issue.blocking for issue in pdf_report.issues))
-        or unsafe_translation_preserved
-    )
 
 
 def finish_work_checkpoints(

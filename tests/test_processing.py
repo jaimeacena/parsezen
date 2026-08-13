@@ -9,6 +9,7 @@ import pytest
 
 import parsezen.output as output_module
 import parsezen.pipeline.prepare as prepare_module
+import parsezen.pipeline.transform as transform_module
 import parsezen.processing as processing_module
 from parsezen.cancellation import CancellationToken
 from parsezen.document_model import ConvertedDocument, ConvertedResource
@@ -31,6 +32,7 @@ from parsezen.pdf_conversion import (
     PdfQualityReport,
     PdfReviewIssue,
 )
+from parsezen.pipeline.transform import review_scope_fingerprint
 from parsezen.processing import (
     OutputFormat,
     ProcessRequest,
@@ -39,7 +41,6 @@ from parsezen.processing import (
     apply_reviewed_revision,
     process_document,
     review_completed_result,
-    review_scope_fingerprint,
     validate_process_request,
 )
 from parsezen.revision import RevisionDecision
@@ -51,6 +52,27 @@ from parsezen.translation_quality import (
 )
 
 LOCAL_SETTINGS = AppSettings(model="local-model", context_window=4_096)
+
+_TRANSFORM_DEPENDENCIES = {
+    "improve_markdown": "improve_markdown",
+    "translate_markdown_offline": "translate_markdown_offline",
+    "review_translation_markdown": "review_translation_markdown",
+    "_repair_translation_warnings": "repair_translation_warnings",
+    "_translation_quality_report": "translation_quality_report",
+    "_improve_with_checkpoints": "improve_with_checkpoints",
+    "_improve_selected_content": "improve_selected_content",
+    "_linguistic_review_coverage": "linguistic_review_coverage",
+}
+
+
+def _patch_transform_dependency(
+    monkeypatch: pytest.MonkeyPatch,
+    name: str,
+    value: object,
+) -> None:
+    if hasattr(processing_module, name):
+        monkeypatch.setattr(processing_module, name, value)
+    monkeypatch.setattr(transform_module, _TRANSFORM_DEPENDENCIES[name], value)
 
 
 def test_linguistic_coverage_keeps_unaligned_blocks_out_of_automatic_checks() -> None:
@@ -160,7 +182,7 @@ def test_targeted_review_sends_only_signalled_blocks_to_local_ai(
         reviewed.append(markdown)
         return markdown.replace("eror", "error")
 
-    monkeypatch.setattr(processing_module, "_improve_with_checkpoints", improve)
+    _patch_transform_dependency(monkeypatch, "_improve_with_checkpoints", improve)
     result = review_completed_result(
         ProcessRequest(source, convert_to_markdown=False),
         base_result=ProcessResult(
@@ -191,8 +213,8 @@ def test_targeted_review_rejects_a_result_changed_after_the_recommendation(
     changed = "Changed block.\n"
     final_path = tmp_path / "result.md"
     final_path.write_text(changed, encoding="utf-8")
-    monkeypatch.setattr(
-        processing_module,
+    _patch_transform_dependency(
+        monkeypatch,
         "_improve_with_checkpoints",
         lambda *_args, **_kwargs: pytest.fail("A stale scope must not reach the model."),
     )
@@ -584,13 +606,13 @@ def test_chained_ai_translation_and_correction_are_fused_in_the_target_language(
         assert text == "# Title\n\nOriginal text.\n"
         return "# Título\n\nTexto traducido y corregido.\n"
 
-    monkeypatch.setattr(processing_module, "improve_markdown", improve)
-    monkeypatch.setattr(
-        processing_module,
+    _patch_transform_dependency(monkeypatch, "improve_markdown", improve)
+    _patch_transform_dependency(
+        monkeypatch,
         "_repair_translation_warnings",
         lambda _request, _source, translated, **_kwargs: translated,
     )
-    monkeypatch.setattr(processing_module, "_translation_quality_report", lambda *_args: None)
+    _patch_transform_dependency(monkeypatch, "_translation_quality_report", lambda *_args: None)
 
     result = process_document(
         ProcessRequest(
@@ -632,13 +654,13 @@ def test_translation_quality_is_measured_before_review_changes_block_layout(
     ) -> None:
         quality_calls.append((translation_source, translated_markdown))
 
-    monkeypatch.setattr(processing_module, "improve_markdown", improve)
-    monkeypatch.setattr(
-        processing_module,
+    _patch_transform_dependency(monkeypatch, "improve_markdown", improve)
+    _patch_transform_dependency(
+        monkeypatch,
         "_repair_translation_warnings",
         lambda _request, _source, translated_markdown, **_kwargs: translated_markdown,
     )
-    monkeypatch.setattr(processing_module, "_translation_quality_report", quality_report)
+    _patch_transform_dependency(monkeypatch, "_translation_quality_report", quality_report)
 
     process_document(
         ProcessRequest(
@@ -705,15 +727,15 @@ def test_fused_translation_corrects_only_pdf_pages_with_quality_signals(
         return text.replace("dañada", "corregida")
 
     monkeypatch.setattr(processing_module, "convert_document", convert)
-    monkeypatch.setattr(processing_module, "improve_markdown", improve)
-    monkeypatch.setattr(
-        processing_module,
+    _patch_transform_dependency(monkeypatch, "improve_markdown", improve)
+    _patch_transform_dependency(
+        monkeypatch,
         "_repair_translation_warnings",
         lambda _request, _source, value, **_kwargs: value,
     )
     quality_report = TranslationQualityReport(None, "es", "es", 2, 100, 100, 1, ())
-    monkeypatch.setattr(
-        processing_module,
+    _patch_transform_dependency(
+        monkeypatch,
         "_translation_quality_report",
         lambda *_args: quality_report,
     )
@@ -756,11 +778,11 @@ def test_offline_translation_applies_and_restores_the_glossary(
         captured.append(text)
         return text
 
-    monkeypatch.setattr(processing_module, "translate_markdown_offline", translate)
-    monkeypatch.setattr(
-        processing_module, "_repair_translation_warnings", lambda *args, **kwargs: args[2]
+    _patch_transform_dependency(monkeypatch, "translate_markdown_offline", translate)
+    _patch_transform_dependency(
+        monkeypatch, "_repair_translation_warnings", lambda *args, **kwargs: args[2]
     )
-    monkeypatch.setattr(processing_module, "_translation_quality_report", lambda *_args: None)
+    _patch_transform_dependency(monkeypatch, "_translation_quality_report", lambda *_args: None)
 
     result = process_document(
         ProcessRequest(
@@ -790,13 +812,13 @@ def test_offline_translation_content_review_compares_source_and_target(
     quality_calls: list[tuple[str | None, str]] = []
     quality_report = TranslationQualityReport(None, "es", "es", 2, 100, 95, 1, ())
 
-    monkeypatch.setattr(
-        processing_module,
+    _patch_transform_dependency(
+        monkeypatch,
         "translate_markdown_offline",
         lambda *_args, **_kwargs: translated,
     )
-    monkeypatch.setattr(
-        processing_module,
+    _patch_transform_dependency(
+        monkeypatch,
         "_repair_translation_warnings",
         lambda _request, _source, value, **_kwargs: value,
     )
@@ -809,7 +831,7 @@ def test_offline_translation_content_review_compares_source_and_target(
         quality_calls.append((original, current))
         return quality_report
 
-    monkeypatch.setattr(processing_module, "_translation_quality_report", report_quality)
+    _patch_transform_dependency(monkeypatch, "_translation_quality_report", report_quality)
 
     def review(
         original: str,
@@ -821,7 +843,7 @@ def test_offline_translation_content_review_compares_source_and_target(
         review_calls.append((original, current, target_language))
         return corrected
 
-    monkeypatch.setattr(processing_module, "review_translation_markdown", review)
+    _patch_transform_dependency(monkeypatch, "review_translation_markdown", review)
 
     result = process_document(
         ProcessRequest(
@@ -866,14 +888,14 @@ def test_repeated_document_terms_are_protected_without_a_manual_glossary(
         captured.append(text)
         return text
 
-    monkeypatch.setattr(processing_module, "improve_markdown", improve)
-    monkeypatch.setattr(
-        processing_module,
+    _patch_transform_dependency(monkeypatch, "improve_markdown", improve)
+    _patch_transform_dependency(
+        monkeypatch,
         "_repair_translation_warnings",
         lambda _request, _source, translated, **_kwargs: translated,
     )
-    monkeypatch.setattr(
-        processing_module,
+    _patch_transform_dependency(
+        monkeypatch,
         "_translation_quality_report",
         lambda *_args: None,
     )
@@ -921,15 +943,15 @@ def test_ai_translation_repair_reuses_encrypted_work_checkpoints(
         translated = kwargs["translate_segment"]("Source text.", "Current text.")
         return SimpleNamespace(translated=translated, attempted_segments=1, repaired_segments=1)
 
-    monkeypatch.setattr(processing_module, "improve_markdown", improve)
-    monkeypatch.setattr(processing_module, "repair_untranslated_source_text", repair)
+    _patch_transform_dependency(monkeypatch, "improve_markdown", improve)
+    monkeypatch.setattr(transform_module, "repair_untranslated_source_text", repair)
     monkeypatch.setattr(
-        processing_module,
+        transform_module,
         "restore_changed_third_language_headings",
         lambda _source, translated, **_kwargs: translated,
     )
 
-    result = processing_module._repair_translation_warnings(
+    result = transform_module.repair_translation_warnings(
         ProcessRequest(
             Path("book.epub"),
             convert_to_markdown=False,
@@ -953,7 +975,7 @@ def test_translation_repair_rejects_numeric_damage_from_heading_restoration(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
-        processing_module,
+        transform_module,
         "repair_untranslated_source_text",
         lambda *_args, **_kwargs: SimpleNamespace(
             translated="Referencia 202.\n",
@@ -962,12 +984,12 @@ def test_translation_repair_rejects_numeric_damage_from_heading_restoration(
         ),
     )
     monkeypatch.setattr(
-        processing_module,
+        transform_module,
         "restore_changed_third_language_headings",
         lambda *_args, **_kwargs: "Referencia 260.\n",
     )
 
-    result = processing_module._repair_translation_warnings(
+    result = transform_module.repair_translation_warnings(
         ProcessRequest(
             Path("book.pdf"),
             convert_to_markdown=True,
@@ -1140,8 +1162,8 @@ def test_manual_epub_structure_review_is_kept_when_ai_changes_nothing(
 ) -> None:
     source = tmp_path / "notes.md"
     source.write_text("# Notes\n\nAlready well structured.", encoding="utf-8")
-    monkeypatch.setattr(
-        processing_module,
+    _patch_transform_dependency(
+        monkeypatch,
         "_improve_with_checkpoints",
         lambda markdown, *_args, **_kwargs: markdown,
     )
@@ -1450,17 +1472,17 @@ def test_pdf_translation_is_applied_before_building_the_epub(
         "convert_document",
         lambda *_args, **_kwargs: ConvertedDocument("# Original\n\nEnglish content."),
     )
-    monkeypatch.setattr(
-        processing_module,
+    _patch_transform_dependency(
+        monkeypatch,
         "translate_markdown_offline",
         lambda *_args, **_kwargs: "# Traducido\n\nContenido en español.",
     )
-    monkeypatch.setattr(
-        processing_module,
+    _patch_transform_dependency(
+        monkeypatch,
         "_repair_translation_warnings",
         lambda _request, _source, translated, **_kwargs: translated,
     )
-    monkeypatch.setattr(processing_module, "_translation_quality_report", lambda *_args: None)
+    _patch_transform_dependency(monkeypatch, "_translation_quality_report", lambda *_args: None)
 
     result = process_document(
         ProcessRequest(
@@ -1602,8 +1624,8 @@ def test_partial_pdf_improvement_uses_the_range_for_both_outputs(
         "convert_document",
         lambda _path, **_kwargs: ConvertedDocument("Raw 10"),
     )
-    monkeypatch.setattr(
-        processing_module,
+    _patch_transform_dependency(
+        monkeypatch,
         "improve_markdown",
         lambda *_args, **_kwargs: "Mended 10",
     )
@@ -1797,7 +1819,7 @@ def test_improves_markdown_without_creating_a_redundant_raw_copy(
         calls.append((mode, target_language))
         return markdown.replace("Original", "Clean")
 
-    monkeypatch.setattr(processing_module, "improve_markdown", improve)
+    _patch_transform_dependency(monkeypatch, "improve_markdown", improve)
 
     result = process_document(
         ProcessRequest(
@@ -1845,7 +1867,7 @@ def test_combined_converted_document_improvement_keeps_paired_raw_and_reports_st
         calls.append((markdown, mode, target_language))
         return "# Mejorado 10"
 
-    monkeypatch.setattr(processing_module, "improve_markdown", improve)
+    _patch_transform_dependency(monkeypatch, "improve_markdown", improve)
 
     request = ProcessRequest(
         source,
@@ -1892,7 +1914,7 @@ def test_translates_markdown_offline_without_requiring_a_local_model(
         calls.append((markdown, language))
         return "# Traducido 10"
 
-    monkeypatch.setattr(processing_module, "translate_markdown_offline", translate)
+    _patch_transform_dependency(monkeypatch, "translate_markdown_offline", translate)
 
     result = process_document(
         ProcessRequest(
@@ -1939,8 +1961,8 @@ def test_ai_translation_is_skipped_when_the_text_is_already_in_the_target_langua
     stages: list[ProcessStage] = []
 
     monkeypatch.setattr(processing_module, "detect_language_code", lambda *_args, **_kwargs: "es")
-    monkeypatch.setattr(
-        processing_module,
+    _patch_transform_dependency(
+        monkeypatch,
         "improve_markdown",
         lambda *_args, **_kwargs: pytest.fail("No debe invocarse la traducción redundante."),
     )
@@ -1976,8 +1998,8 @@ def test_offline_translation_is_skipped_when_the_text_is_already_in_target_langu
     stages: list[ProcessStage] = []
 
     monkeypatch.setattr(processing_module, "detect_language_code", lambda *_args, **_kwargs: "es")
-    monkeypatch.setattr(
-        processing_module,
+    _patch_transform_dependency(
+        monkeypatch,
         "translate_markdown_offline",
         lambda *_args, **_kwargs: pytest.fail("No debe invocarse la traducción redundante."),
     )
@@ -2407,7 +2429,7 @@ def test_offline_translation_repairs_one_residual_source_block_before_writing(
         assert kwargs["source_language_code"] == "en"
         return "El segundo párrafo completo necesitaba un único reintento específico."
 
-    monkeypatch.setattr(processing_module, "translate_markdown_offline", translate)
+    _patch_transform_dependency(monkeypatch, "translate_markdown_offline", translate)
 
     result = process_document(
         ProcessRequest(
@@ -2447,7 +2469,7 @@ def test_ai_translation_repairs_one_residual_source_block_before_writing(
             return first_translation
         return "El segundo párrafo completo necesitaba un único reintento específico."
 
-    monkeypatch.setattr(processing_module, "improve_markdown", improve)
+    _patch_transform_dependency(monkeypatch, "improve_markdown", improve)
 
     result = process_document(
         ProcessRequest(
@@ -2487,8 +2509,8 @@ def test_local_cleanup_runs_before_offline_translation(
         order.append(f"translate:{markdown}")
         return "Translated"
 
-    monkeypatch.setattr(processing_module, "improve_markdown", improve)
-    monkeypatch.setattr(processing_module, "translate_markdown_offline", translate)
+    _patch_transform_dependency(monkeypatch, "improve_markdown", improve)
+    _patch_transform_dependency(monkeypatch, "translate_markdown_offline", translate)
 
     result = process_document(
         ProcessRequest(
@@ -2544,7 +2566,7 @@ def test_reports_improvement_chunk_progress_to_the_caller(
         on_progress(2, 2)
         return markdown
 
-    monkeypatch.setattr(processing_module, "improve_markdown", improve)
+    _patch_transform_dependency(monkeypatch, "improve_markdown", improve)
 
     process_document(
         ProcessRequest(
@@ -2571,8 +2593,8 @@ def test_improvement_outputs_use_one_shared_collision_suffix(
         "convert_document",
         lambda _path, **_kwargs: ConvertedDocument("Raw"),
     )
-    monkeypatch.setattr(
-        processing_module,
+    _patch_transform_dependency(
+        monkeypatch,
         "improve_markdown",
         lambda *_args, **_kwargs: "Mended",
     )
@@ -2775,7 +2797,7 @@ def test_failed_improvement_does_not_publish_output(
     def fail(*_args, **_kwargs):
         raise ImprovementError("Unsafe response")
 
-    monkeypatch.setattr(processing_module, "improve_markdown", fail)
+    _patch_transform_dependency(monkeypatch, "improve_markdown", fail)
 
     with pytest.raises(ImprovementError, match="Unsafe"):
         process_document(

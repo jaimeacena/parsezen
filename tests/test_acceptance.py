@@ -8,7 +8,7 @@ from zipfile import ZIP_DEFLATED, ZipFile
 import pytest
 
 import parsezen.pdf_conversion as pdf_conversion_module
-import parsezen.processing as processing_module
+import parsezen.pipeline.transform as transform_module
 from parsezen.domain.jobs import (
     DocumentFormat,
     JobConfiguration,
@@ -185,7 +185,7 @@ def test_acceptance_keeps_paired_raw_and_mended_outputs_without_overwriting(
             "Un párrafo fiel y pulido con el valor 2026.",
         )
 
-    monkeypatch.setattr(processing_module, "improve_markdown", improve)
+    monkeypatch.setattr(transform_module, "improve_markdown", improve)
     request = ProcessRequest(
         source,
         True,
@@ -226,7 +226,7 @@ def test_acceptance_translates_offline_without_an_ai_model(
         assert "https://example.com/docs" in markdown
         return "# Notas\n\nValor 2026 en [sitio](https://example.com/docs)."
 
-    monkeypatch.setattr(processing_module, "translate_markdown_offline", translate)
+    monkeypatch.setattr(transform_module, "translate_markdown_offline", translate)
 
     result = process_document(
         ProcessRequest(

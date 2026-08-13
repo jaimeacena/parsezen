@@ -20,8 +20,8 @@ from parsezen.domain.jobs import (
 )
 from parsezen.epub_builder import EpubBookMetadata, build_epub
 from parsezen.pdf_conversion import PdfQualityReport, PdfReviewIssue
-from parsezen.processing import (
-    ProcessResult,
+from parsezen.pipeline.contracts import ProcessResult
+from parsezen.pipeline.transform import (
     review_block_fingerprint,
     review_scope_fingerprint,
 )

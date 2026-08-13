@@ -8,6 +8,7 @@ from zipfile import ZIP_STORED, ZipFile
 
 import pytest
 
+import parsezen.pipeline.transform as transform_module
 import parsezen.processing as processing_module
 from parsezen.document_model import ConvertedDocument
 from parsezen.improvement import ImprovementMode
@@ -87,13 +88,13 @@ def test_all_optional_improvement_combinations_complete_without_losing_the_sourc
             )
         raise AssertionError(f"Unexpected mode: {mode}")
 
-    monkeypatch.setattr(processing_module, "improve_markdown", improve)
+    monkeypatch.setattr(transform_module, "improve_markdown", improve)
     monkeypatch.setattr(
-        processing_module,
-        "_repair_translation_warnings",
+        transform_module,
+        "repair_translation_warnings",
         lambda _request, _source, translated, **_kwargs: translated,
     )
-    monkeypatch.setattr(processing_module, "_translation_quality_report", lambda *_args: None)
+    monkeypatch.setattr(transform_module, "translation_quality_report", lambda *_args: None)
 
     stages: list[ProcessStage] = []
     request = ProcessRequest(

@@ -8,6 +8,7 @@ from zipfile import ZIP_DEFLATED, ZIP_STORED, ZipFile
 import pytest
 
 import parsezen.epub_conversion as epub_conversion_module
+import parsezen.pipeline.transform as transform_module
 import parsezen.processing as processing_module
 from parsezen.conversion import RESOURCE_REFERENCE_PREFIX, convert_document, convert_file
 from parsezen.epub_builder import EpubBookMetadata, build_epub
@@ -21,6 +22,16 @@ from parsezen.improvement import ImprovementMode
 from parsezen.output import write_improvement_outputs
 from parsezen.processing import OutputFormat, ProcessRequest, ProcessStage, process_document
 from parsezen.settings import AppSettings
+
+
+def _patch_transformation_dependency(
+    monkeypatch: pytest.MonkeyPatch,
+    name: str,
+    value: object,
+) -> None:
+    if hasattr(processing_module, name):
+        monkeypatch.setattr(processing_module, name, value)
+    monkeypatch.setattr(transform_module, name, value)
 
 
 def test_epub_literal_work_title_requires_full_emphasis() -> None:
@@ -1008,7 +1019,7 @@ def test_processes_an_epub_translation_directly_and_avoids_collisions(
             .replace("Opening", "Apertura")
         )
 
-    monkeypatch.setattr(processing_module, "translate_markdown_offline", translate)
+    _patch_transformation_dependency(monkeypatch, "translate_markdown_offline", translate)
     request = ProcessRequest(
         source,
         convert_to_markdown=False,
@@ -1058,7 +1069,7 @@ def test_epub_translation_applies_selected_title_author_and_custom_cover(
             .replace("Cover image", "Imagen de portada")
         )
 
-    monkeypatch.setattr(processing_module, "translate_markdown_offline", translate)
+    _patch_transformation_dependency(monkeypatch, "translate_markdown_offline", translate)
     result = process_document(
         ProcessRequest(
             source,
@@ -1101,13 +1112,13 @@ def test_epub_review_route_can_remove_the_original_cover(
             .replace("Cover image", "Imagen de portada")
         )
 
-    monkeypatch.setattr(processing_module, "translate_markdown_offline", translate)
+    _patch_transformation_dependency(monkeypatch, "translate_markdown_offline", translate)
 
     def improve(markdown: str, mode: ImprovementMode, *_args, **_kwargs) -> str:
         review_modes.append(mode)
         return markdown
 
-    monkeypatch.setattr(processing_module, "improve_markdown", improve)
+    _patch_transformation_dependency(monkeypatch, "improve_markdown", improve)
 
     def review_translation(
         _source_markdown: str,
@@ -1118,8 +1129,8 @@ def test_epub_review_route_can_remove_the_original_cover(
         review_modes.append(ImprovementMode.REVIEW_CONTENT)
         return translated_markdown
 
-    monkeypatch.setattr(
-        processing_module,
+    _patch_transformation_dependency(
+        monkeypatch,
         "review_translation_markdown",
         review_translation,
     )
@@ -1178,7 +1189,7 @@ def test_processes_an_epub_translation_with_the_selected_ollama_model(
             .replace("Modern EPUB content.", "Contenido EPUB moderno.")
         )
 
-    monkeypatch.setattr(processing_module, "improve_markdown", improve)
+    _patch_transformation_dependency(monkeypatch, "improve_markdown", improve)
     result = process_document(
         ProcessRequest(
             source,
@@ -1221,7 +1232,7 @@ def test_epub_translation_repairs_residual_text_before_saving_the_part(
         assert kwargs["source_language_code"] == "en"
         return markdown.replace("Modern EPUB content.", "Contenido EPUB moderno.")
 
-    monkeypatch.setattr(processing_module, "translate_markdown_offline", translate)
+    _patch_transformation_dependency(monkeypatch, "translate_markdown_offline", translate)
     result = process_document(
         ProcessRequest(
             source,
@@ -1267,7 +1278,9 @@ def test_direct_epub_translation_resumes_after_an_interruption(
             raise ConversionError("Interrupción simulada")
         return _translate_chapterless_payload(markdown)
 
-    monkeypatch.setattr(processing_module, "translate_markdown_offline", interrupt_translation)
+    _patch_transformation_dependency(
+        monkeypatch, "translate_markdown_offline", interrupt_translation
+    )
     with pytest.raises(ConversionError, match="Interrupción simulada"):
         process_document(
             request,
@@ -1284,7 +1297,7 @@ def test_direct_epub_translation_resumes_after_an_interruption(
             resumed_main_calls += 1
         return _translate_chapterless_payload(markdown)
 
-    monkeypatch.setattr(processing_module, "translate_markdown_offline", finish_translation)
+    _patch_transformation_dependency(monkeypatch, "translate_markdown_offline", finish_translation)
     result = process_document(
         request,
         settings=AppSettings(checkpoint_retention_days=0),
@@ -1375,7 +1388,7 @@ def test_epub_cleaning_keeps_raw_markdown_images_and_anchors(
         assert "PZDOC EPUB ANCHOR" in markdown
         return markdown.replace("A faithful first paragraph.", "A polished first paragraph.")
 
-    monkeypatch.setattr(processing_module, "improve_markdown", clean)
+    _patch_transformation_dependency(monkeypatch, "improve_markdown", clean)
     result = process_document(
         ProcessRequest(
             source,
@@ -1405,7 +1418,7 @@ def test_epub_offline_translation_with_conversion_produces_translated_markdown(
         assert language == "Español"
         return markdown.replace("A faithful first paragraph.", "Un primer párrafo fiel.")
 
-    monkeypatch.setattr(processing_module, "translate_markdown_offline", translate)
+    _patch_transformation_dependency(monkeypatch, "translate_markdown_offline", translate)
     result = process_document(
         ProcessRequest(
             source,
