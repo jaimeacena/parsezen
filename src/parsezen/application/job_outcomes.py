@@ -10,6 +10,7 @@ from parsezen.application.job_execution import JobExecutionController
 from parsezen.application.job_queue import JobQueue
 from parsezen.application.runtime_mapping import review_stage_for_result
 from parsezen.domain.jobs import DocumentJob
+from parsezen.domain.source_identity import SourceIdentity
 from parsezen.domain.stages import StageKind
 from parsezen.pipeline.contracts import ProcessResult
 
@@ -17,7 +18,13 @@ from parsezen.pipeline.contracts import ProcessResult
 class ReviewSnapshotRepository(Protocol):
     """Persistence boundary for sensitive results awaiting human review."""
 
-    def save(self, job_id: str, result: ProcessResult) -> str: ...
+    def save(
+        self,
+        job_id: str,
+        result: ProcessResult,
+        *,
+        source_identity: SourceIdentity | None = None,
+    ) -> str: ...
 
     def discard(self, job_id: str) -> None: ...
 
@@ -103,8 +110,19 @@ class JobOutcomeCoordinator:
         return self._execution.cancel(job_id)
 
     def _save_review_snapshot(self, job_id: str, result: ProcessResult) -> bool:
+        job = self._require(job_id)
+        source = job.source
+        source_identity = (
+            SourceIdentity(source.size_bytes, source.modified_ns, source.content_sha256)
+            if source.content_sha256 is not None
+            else None
+        )
         try:
-            self._snapshots.save(job_id, result)
+            self._snapshots.save(
+                job_id,
+                result,
+                source_identity=source_identity,
+            )
         except (OSError, RuntimeError, ValueError):
             return False
         return True

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import logging
+import secrets
+from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from threading import RLock
 from typing import Any
@@ -11,6 +13,7 @@ from typing import Any
 from parsezen.document_model import ConvertedResource
 from parsezen.domain.jobs import MarkdownOrganization
 from parsezen.domain.process_lifecycle import ProcessStage
+from parsezen.domain.source_identity import SourceIdentity
 from parsezen.epub_builder import EpubBookMetadata
 from parsezen.final_integrity import (
     FinalIntegrityReport,
@@ -26,7 +29,7 @@ from parsezen.pipeline.contracts import (
     ProcessTelemetry,
     StageTelemetry,
 )
-from parsezen.revision import RevisionKind, build_revision_draft
+from parsezen.revision import RevisionDraft, RevisionKind, build_revision_draft
 from parsezen.translation_quality import (
     LinguisticReviewCoverage,
     LinguisticReviewMode,
@@ -36,7 +39,33 @@ from parsezen.translation_quality import (
 )
 
 _SNAPSHOT_MEDIA_TYPE = "application/vnd.parsezen.result+json"
+_MARKDOWN_MEDIA_TYPE = "text/markdown; charset=utf-8"
+_V2_MANIFEST_ID = "manifest"
 LOGGER = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True, slots=True)
+class ReviewResourceReference:
+    """Encrypted resource referenced by one immutable snapshot generation."""
+
+    path: PurePosixPath
+    media_type: str
+    artifact_id: str
+
+
+@dataclass(frozen=True, slots=True)
+class ReviewSnapshot:
+    """Minimal durable contract needed to resume one pending human review."""
+
+    generation: str
+    destination: Path
+    source_identity: SourceIdentity | None
+    base_text_artifact_id: str
+    proposed_text_artifact_id: str | None
+    review_text_artifact_id: str
+    resources: tuple[ReviewResourceReference, ...]
+    revision_kinds: frozenset[RevisionKind]
+    state: dict[str, Any]
 
 
 class ResultSnapshotStore:
@@ -47,84 +76,194 @@ class ResultSnapshotStore:
         self._artifacts = artifacts
         self._lock = RLock()
 
-    def save(self, job_id: str, result: ProcessResult) -> str:
+    def save(
+        self,
+        job_id: str,
+        result: ProcessResult,
+        *,
+        source_identity: SourceIdentity | None = None,
+    ) -> str:
         with self._lock:
-            previous_manifest_id = self._state.load_result_snapshot(job_id)
-            previous_artifact_ids = self._snapshot_artifact_ids(
-                job_id,
-                previous_manifest_id,
-            )
-            created_artifact_ids: list[str] = []
-            manifest_id: str | None = None
+            previous_pointer = self._state.load_result_snapshot(job_id)
+            generation = f"gen-{secrets.token_hex(16)}"
             try:
-                resources: list[dict[str, str]] = []
-                for resource in result.revision_resources:
-                    record = self._artifacts.put(
-                        job_id=job_id,
-                        payload=resource.content,
-                        media_type=resource.media_type,
-                    )
-                    created_artifact_ids.append(record.id)
-                    resources.append(
-                        {
-                            "path": resource.relative_path.as_posix(),
-                            "media_type": resource.media_type,
-                            "artifact_id": record.id,
-                        }
-                    )
-                payload = _result_to_json(result)
-                payload["revision_resources"] = resources
-                manifest = self._artifacts.put_text(
+                snapshot = self._write_generation(
+                    job_id,
+                    generation,
+                    result,
+                    source_identity,
+                )
+                self._artifacts.put_text(
                     job_id=job_id,
                     text=json.dumps(
-                        payload,
+                        _snapshot_to_json(snapshot),
                         ensure_ascii=False,
                         separators=(",", ":"),
                         sort_keys=True,
                     ),
                     media_type=_SNAPSHOT_MEDIA_TYPE,
+                    artifact_id=_V2_MANIFEST_ID,
+                    generation=generation,
                 )
-                manifest_id = manifest.id
-                created_artifact_ids.append(manifest.id)
-                self._state.save_result_snapshot(job_id, manifest.id)
+                self._state.save_result_snapshot(job_id, generation)
             except Exception:
-                if not self._snapshot_pointer_matches(job_id, manifest_id):
-                    self._remove_after_failed_save(job_id, tuple(created_artifact_ids))
+                if not self._snapshot_pointer_matches(job_id, generation):
+                    self._remove_generation_after_failed_save(job_id, generation)
                 raise
 
-            if previous_manifest_id is not None and previous_manifest_id != manifest_id:
+            if previous_pointer is not None and previous_pointer != generation:
                 try:
-                    self._remove_artifacts(job_id, previous_artifact_ids)
+                    self._remove_snapshot(job_id, previous_pointer)
                 except OSError:
                     LOGGER.warning("stale_result_snapshot_artifact_cleanup_failed")
-            if manifest_id is None:
-                raise AssertionError("A saved snapshot always has a manifest.")
-            return manifest_id
+            return generation
 
-    def load(self, job_id: str) -> ProcessResult | None:
+    def load(
+        self,
+        job_id: str,
+        *,
+        source_identity: SourceIdentity | None = None,
+    ) -> ProcessResult | None:
         with self._lock:
-            artifact_id = self._state.load_result_snapshot(job_id)
-            if artifact_id is None:
+            pointer = self._state.load_result_snapshot(job_id)
+            if pointer is None:
                 return None
-            raw = json.loads(self._artifacts.read_text(job_id, artifact_id))
+            if not self._artifacts.generation_exists(job_id, pointer):
+                return self._load_v1(job_id, pointer)
+            raw = json.loads(
+                self._artifacts.read_text(
+                    job_id,
+                    _V2_MANIFEST_ID,
+                    generation=pointer,
+                )
+            )
             if not isinstance(raw, dict):
                 raise ValueError("La instantánea de revisión no es válida.")
-            resources = tuple(
-                ConvertedResource(
-                    relative_path=PurePosixPath(str(item["path"])),
-                    content=self._artifacts.read(job_id, str(item["artifact_id"])),
-                    media_type=str(item["media_type"]),
-                )
-                for item in raw.get("revision_resources", ())
-            )
-            return _result_from_json(raw, resources)
+            snapshot = _snapshot_from_json(pointer, raw)
+            if source_identity is not None and snapshot.source_identity != source_identity:
+                raise ValueError("La instantánea pertenece a otra versión del original.")
+            result = self._result_from_snapshot(job_id, snapshot)
+            self._artifacts.prune_orphaned_generations(job_id, (pointer,))
+            return result
 
     def discard(self, job_id: str) -> None:
         with self._lock:
-            manifest_id = self._state.load_result_snapshot(job_id)
-            artifact_ids = self._snapshot_artifact_ids(job_id, manifest_id)
+            pointer = self._state.load_result_snapshot(job_id)
             self._state.delete_result_snapshot(job_id)
-            self._remove_artifacts(job_id, artifact_ids)
+            if pointer is not None:
+                self._remove_snapshot(job_id, pointer)
+
+    def _write_generation(
+        self,
+        job_id: str,
+        generation: str,
+        result: ProcessResult,
+        source_identity: SourceIdentity | None,
+    ) -> ReviewSnapshot:
+        draft = result.revision_draft
+        base_text = draft.original_markdown if draft is not None else result.review_markdown
+        if base_text is None or result.review_markdown is None:
+            raise ValueError("La revisión no contiene el texto necesario para recuperarse.")
+
+        text_artifacts: dict[str, str] = {}
+
+        def store_text(text: str) -> str:
+            existing = text_artifacts.get(text)
+            if existing is not None:
+                return existing
+            record = self._artifacts.put_text(
+                job_id=job_id,
+                generation=generation,
+                text=text,
+                media_type=_MARKDOWN_MEDIA_TYPE,
+            )
+            text_artifacts[text] = record.id
+            return record.id
+
+        base_id = store_text(base_text)
+        proposed_id = store_text(draft.proposed_markdown) if draft is not None else None
+        review_id = store_text(result.review_markdown)
+        resources = tuple(
+            ReviewResourceReference(
+                resource.relative_path,
+                resource.media_type,
+                self._artifacts.put(
+                    job_id=job_id,
+                    generation=generation,
+                    payload=resource.content,
+                    media_type=resource.media_type,
+                ).id,
+            )
+            for resource in result.revision_resources
+        )
+        return ReviewSnapshot(
+            generation=generation,
+            destination=result.final_path,
+            source_identity=source_identity,
+            base_text_artifact_id=base_id,
+            proposed_text_artifact_id=proposed_id,
+            review_text_artifact_id=review_id,
+            resources=resources,
+            revision_kinds=draft.kinds if draft is not None else frozenset(),
+            state=_result_recovery_state(result),
+        )
+
+    def _result_from_snapshot(self, job_id: str, snapshot: ReviewSnapshot) -> ProcessResult:
+        def read_text(artifact_id: str) -> str:
+            return self._artifacts.read_text(
+                job_id,
+                artifact_id,
+                generation=snapshot.generation,
+            )
+
+        base_text = read_text(snapshot.base_text_artifact_id)
+        proposed_text = (
+            read_text(snapshot.proposed_text_artifact_id)
+            if snapshot.proposed_text_artifact_id is not None
+            else None
+        )
+        draft = (
+            build_revision_draft(
+                base_text,
+                proposed_text,
+                kinds=snapshot.revision_kinds,
+            )
+            if proposed_text is not None
+            else None
+        )
+        resources = tuple(
+            ConvertedResource(
+                reference.path,
+                self._artifacts.read(
+                    job_id,
+                    reference.artifact_id,
+                    generation=snapshot.generation,
+                ),
+                reference.media_type,
+            )
+            for reference in snapshot.resources
+        )
+        return _result_from_recovery_state(
+            snapshot.destination,
+            snapshot.state,
+            draft=draft,
+            resources=resources,
+            review_markdown=read_text(snapshot.review_text_artifact_id),
+        )
+
+    def _load_v1(self, job_id: str, manifest_id: str) -> ProcessResult:
+        raw = json.loads(self._artifacts.read_text(job_id, manifest_id))
+        if not isinstance(raw, dict):
+            raise ValueError("La instantánea de revisión no es válida.")
+        resources = tuple(
+            ConvertedResource(
+                relative_path=PurePosixPath(str(item["path"])),
+                content=self._artifacts.read(job_id, str(item["artifact_id"])),
+                media_type=str(item["media_type"]),
+            )
+            for item in raw.get("revision_resources", ())
+        )
+        return _result_from_json(raw, resources)
 
     def _snapshot_artifact_ids(
         self,
@@ -144,25 +283,25 @@ class ResultSnapshotStore:
             LOGGER.warning("result_snapshot_manifest_cleanup_degraded")
         return tuple(dict.fromkeys(identifiers))
 
-    def _snapshot_pointer_matches(self, job_id: str, manifest_id: str | None) -> bool:
-        if manifest_id is None:
-            return False
+    def _snapshot_pointer_matches(self, job_id: str, pointer: str) -> bool:
         try:
-            return self._state.load_result_snapshot(job_id) == manifest_id
+            return self._state.load_result_snapshot(job_id) == pointer
         except (OSError, RuntimeError, ValueError):
             # If persistence is unreadable, retaining encrypted files is safer
             # than deleting a snapshot that may already have been committed.
             return True
 
-    def _remove_after_failed_save(
-        self,
-        job_id: str,
-        artifact_ids: tuple[str, ...],
-    ) -> None:
+    def _remove_generation_after_failed_save(self, job_id: str, generation: str) -> None:
         try:
-            self._remove_artifacts(job_id, artifact_ids)
+            self._artifacts.remove_generation(job_id, generation)
         except OSError:
             LOGGER.warning("failed_result_snapshot_artifact_cleanup_failed")
+
+    def _remove_snapshot(self, job_id: str, pointer: str) -> None:
+        if self._artifacts.generation_exists(job_id, pointer):
+            self._artifacts.remove_generation(job_id, pointer)
+            return
+        self._remove_artifacts(job_id, self._snapshot_artifact_ids(job_id, pointer))
 
     def _remove_artifacts(self, job_id: str, artifact_ids: tuple[str, ...]) -> None:
         failure: OSError | None = None
@@ -173,6 +312,149 @@ class ResultSnapshotStore:
                 failure = failure or exc
         if failure is not None:
             raise failure
+
+
+def _snapshot_to_json(snapshot: ReviewSnapshot) -> dict[str, Any]:
+    identity = snapshot.source_identity
+    return {
+        "version": 2,
+        "destination": str(snapshot.destination),
+        "source_identity": (
+            {
+                "size_bytes": identity.size_bytes,
+                "modified_ns": identity.modified_ns,
+                "sha256": identity.sha256,
+            }
+            if identity is not None
+            else None
+        ),
+        "texts": {
+            "base_artifact_id": snapshot.base_text_artifact_id,
+            "proposed_artifact_id": snapshot.proposed_text_artifact_id,
+            "review_artifact_id": snapshot.review_text_artifact_id,
+        },
+        "resources": [
+            {
+                "path": resource.path.as_posix(),
+                "media_type": resource.media_type,
+                "artifact_id": resource.artifact_id,
+            }
+            for resource in snapshot.resources
+        ],
+        "revision_kinds": sorted(kind.value for kind in snapshot.revision_kinds),
+        "review_state": snapshot.state,
+    }
+
+
+def _snapshot_from_json(generation: str, raw: dict[str, Any]) -> ReviewSnapshot:
+    if int(raw.get("version", 0)) != 2:
+        raise ValueError("La versión de la instantánea de revisión no es compatible.")
+    texts = raw.get("texts")
+    state = raw.get("review_state")
+    if not isinstance(texts, dict) or not isinstance(state, dict):
+        raise ValueError("La instantánea de revisión no es válida.")
+    identity_raw = raw.get("source_identity")
+    identity = (
+        SourceIdentity(
+            size_bytes=int(identity_raw["size_bytes"]),
+            modified_ns=int(identity_raw["modified_ns"]),
+            sha256=str(identity_raw["sha256"]),
+        )
+        if isinstance(identity_raw, dict)
+        else None
+    )
+    try:
+        base_id = str(texts["base_artifact_id"])
+        review_id = str(texts["review_artifact_id"])
+        proposed_value = texts.get("proposed_artifact_id")
+        return ReviewSnapshot(
+            generation=generation,
+            destination=Path(str(raw["destination"])),
+            source_identity=identity,
+            base_text_artifact_id=base_id,
+            proposed_text_artifact_id=(str(proposed_value) if proposed_value is not None else None),
+            review_text_artifact_id=review_id,
+            resources=tuple(
+                ReviewResourceReference(
+                    PurePosixPath(str(item["path"])),
+                    str(item["media_type"]),
+                    str(item["artifact_id"]),
+                )
+                for item in raw.get("resources", ())
+                if isinstance(item, dict)
+            ),
+            revision_kinds=frozenset(
+                RevisionKind(value) for value in raw.get("revision_kinds", ())
+            ),
+            state=state,
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError("La instantánea de revisión no es válida.") from exc
+
+
+def _result_recovery_state(result: ProcessResult) -> dict[str, Any]:
+    """Persist only state needed to resume review and publish a decision."""
+
+    serialized = _result_to_json(result)
+    retained = (
+        "review_original_path",
+        "problematic_pdf_pages",
+        "pdf_quality_report",
+        "translation_quality_report",
+        "linguistic_review_coverage",
+        "preserved_translation_chunks",
+        "preserved_images",
+        "epub_chapters",
+        "revision_epub_metadata",
+        "review_required",
+        "revision_approved",
+        "final_integrity_report",
+        "markdown_organization",
+        "markdown_include_metadata",
+        "markdown_include_page_references",
+        "markdown_source_name",
+    )
+    return {key: serialized[key] for key in retained}
+
+
+def _result_from_recovery_state(
+    destination: Path,
+    state: dict[str, Any],
+    *,
+    draft: RevisionDraft | None,
+    resources: tuple[ConvertedResource, ...],
+    review_markdown: str,
+) -> ProcessResult:
+    return ProcessResult(
+        final_path=destination,
+        review_original_path=_optional_path(state.get("review_original_path")),
+        problematic_pdf_pages=tuple(int(value) for value in state.get("problematic_pdf_pages", ())),
+        pdf_quality_report=_pdf_report_from_json(state.get("pdf_quality_report")),
+        translation_quality_report=_translation_report_from_json(
+            state.get("translation_quality_report")
+        ),
+        linguistic_review_coverage=_linguistic_review_coverage_from_json(
+            state.get("linguistic_review_coverage")
+        ),
+        preserved_translation_chunks=tuple(
+            int(value) for value in state.get("preserved_translation_chunks", ())
+        ),
+        preserved_images=max(0, int(state.get("preserved_images", 0))),
+        epub_chapters=max(0, int(state.get("epub_chapters", 0))),
+        revision_draft=draft,
+        revision_resources=resources,
+        revision_epub_metadata=_epub_metadata_from_json(state.get("revision_epub_metadata")),
+        review_markdown=review_markdown,
+        review_required=bool(state.get("review_required", True)),
+        revision_approved=bool(state.get("revision_approved", False)),
+        final_integrity_report=_integrity_report_from_json(state.get("final_integrity_report")),
+        markdown_organization=MarkdownOrganization(
+            state.get("markdown_organization", MarkdownOrganization.SINGLE_FILE.value)
+        ),
+        markdown_include_metadata=bool(state.get("markdown_include_metadata", False)),
+        markdown_include_page_references=bool(state.get("markdown_include_page_references", False)),
+        markdown_source_name=state.get("markdown_source_name"),
+    )
 
 
 def _result_to_json(result: ProcessResult) -> dict[str, Any]:
@@ -270,24 +552,7 @@ def _result_from_json(
         if isinstance(draft_raw, dict)
         else None
     )
-    metadata_raw = raw.get("revision_epub_metadata")
-    metadata = (
-        EpubBookMetadata(
-            title=str(metadata_raw["title"]),
-            language=str(metadata_raw["language"]),
-            author=metadata_raw.get("author"),
-            cover_resource=(
-                PurePosixPath(str(metadata_raw["cover_resource"]))
-                if metadata_raw.get("cover_resource")
-                else None
-            ),
-            identifiers=tuple(str(value) for value in metadata_raw.get("identifiers", ())),
-            publisher=metadata_raw.get("publisher"),
-            publication_date=metadata_raw.get("publication_date"),
-        )
-        if isinstance(metadata_raw, dict)
-        else None
-    )
+    metadata = _epub_metadata_from_json(raw.get("revision_epub_metadata"))
     return ProcessResult(
         final_path=Path(str(raw["final_path"])),
         raw_markdown_path=_optional_path(raw.get("raw_markdown_path")),
@@ -326,6 +591,22 @@ def _result_from_json(
         markdown_include_metadata=bool(raw.get("markdown_include_metadata", False)),
         markdown_include_page_references=bool(raw.get("markdown_include_page_references", False)),
         markdown_source_name=raw.get("markdown_source_name"),
+    )
+
+
+def _epub_metadata_from_json(raw: object) -> EpubBookMetadata | None:
+    if not isinstance(raw, dict):
+        return None
+    return EpubBookMetadata(
+        title=str(raw["title"]),
+        language=str(raw["language"]),
+        author=raw.get("author"),
+        cover_resource=(
+            PurePosixPath(str(raw["cover_resource"])) if raw.get("cover_resource") else None
+        ),
+        identifiers=tuple(str(value) for value in raw.get("identifiers", ())),
+        publisher=raw.get("publisher"),
+        publication_date=raw.get("publication_date"),
     )
 
 

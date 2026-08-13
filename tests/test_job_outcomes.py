@@ -23,7 +23,14 @@ class SnapshotRepository:
         self.saved: list[str] = []
         self.discarded: list[str] = []
 
-    def save(self, job_id: str, _result: ProcessResult) -> str:
+    def save(
+        self,
+        job_id: str,
+        _result: ProcessResult,
+        *,
+        source_identity=None,
+    ) -> str:
+        del source_identity
         job = self.queue.get(job_id)
         assert job is not None
         assert job.status is JobStatus.RUNNING

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+from dataclasses import replace
 from pathlib import Path, PurePosixPath
 
 import pytest
@@ -7,6 +9,7 @@ import pytest
 import parsezen.infrastructure.result_snapshots as result_snapshots_module
 from parsezen.document_model import ConvertedResource
 from parsezen.domain.jobs import DocumentJob, DocumentSource, JobConfiguration
+from parsezen.domain.source_identity import SourceIdentity
 from parsezen.epub_builder import EpubBookMetadata
 from parsezen.final_integrity import FinalIntegrityReport, IntegrityLedger
 from parsezen.infrastructure.artifact_store import ArtifactStore
@@ -127,17 +130,33 @@ def test_round_trips_a_sensitive_pending_result_encrypted(tmp_path: Path) -> Non
         terminology_terms=4,
     )
 
-    snapshots.save(job.id, result)
+    identity = SourceIdentity.inspect(source)
+    snapshots.save(job.id, result, source_identity=identity)
     recovered = snapshots.load(job.id)
 
-    assert recovered == result
-    manifest_id = state.load_result_snapshot(job.id)
-    assert manifest_id is not None
-    assert (
-        (tmp_path / "artifacts" / job.id / f"{manifest_id}.pza")
-        .read_bytes()
-        .startswith(b"protected:")
+    assert recovered == replace(
+        result,
+        telemetry=None,
+        front_matter_blocks=0,
+        toc_blocks=0,
+        terminology_terms=0,
     )
+    generation = state.load_result_snapshot(job.id)
+    assert generation is not None
+    generation_directory = tmp_path / "artifacts" / job.id / generation
+    assert all(
+        path.read_bytes().startswith(b"protected:") for path in generation_directory.iterdir()
+    )
+    manifest = json.loads(artifacts.read_text(job.id, "manifest", generation=generation))
+    assert manifest["version"] == 2
+    assert manifest["source_identity"] == {
+        "size_bytes": identity.size_bytes,
+        "modified_ns": identity.modified_ns,
+        "sha256": identity.sha256,
+    }
+    assert "telemetry" not in manifest["review_state"]
+    assert manifest["texts"]["proposed_artifact_id"] == manifest["texts"]["review_artifact_id"]
+    assert len(tuple(generation_directory.glob("*.pza"))) == 4
 
 
 def test_missing_snapshot_is_not_an_error(tmp_path: Path) -> None:
@@ -149,6 +168,35 @@ def test_missing_snapshot_is_not_an_error(tmp_path: Path) -> None:
     )
 
     assert ResultSnapshotStore(state, artifacts).load("missing") is None
+
+
+def test_v2_snapshot_rejects_a_different_source_identity(tmp_path: Path) -> None:
+    source = tmp_path / "book.md"
+    source.write_text("first", encoding="utf-8")
+    job = DocumentJob.create(
+        DocumentSource.inspect(source),
+        JobConfiguration(),
+        order=0,
+        job_id="identity",
+    )
+    state = StateStore(tmp_path / "state.sqlite3")
+    state.upsert_job(job)
+    artifacts = ArtifactStore(
+        tmp_path / "artifacts",
+        protect=lambda payload: payload,
+        unprotect=lambda payload: payload,
+    )
+    snapshots = ResultSnapshotStore(state, artifacts)
+    identity = SourceIdentity.inspect(source)
+    snapshots.save(
+        job.id,
+        ProcessResult(tmp_path / "result.md", review_markdown="Proposal", review_required=True),
+        source_identity=identity,
+    )
+    stale = SourceIdentity(identity.size_bytes, identity.modified_ns, "0" * 64)
+
+    with pytest.raises(ValueError, match="otra versión"):
+        snapshots.load(job.id, source_identity=stale)
 
 
 def test_failed_snapshot_save_removes_only_artifacts_created_by_that_attempt(
@@ -229,13 +277,11 @@ def test_replacing_and_discarding_a_snapshot_removes_only_its_private_artifacts(
     )
 
     first_manifest = snapshots.save(job.id, first)
-    first_files = {path.name for path in (tmp_path / "artifacts" / job.id).glob("*.pza")} - {
-        f"{unrelated.id}.pza"
-    }
+    first_directory = tmp_path / "artifacts" / job.id / first_manifest
     second_manifest = snapshots.save(job.id, second)
 
     assert first_manifest != second_manifest
-    assert not any((tmp_path / "artifacts" / job.id / name).exists() for name in first_files)
+    assert not first_directory.exists()
     assert snapshots.load(job.id) == second
     assert (tmp_path / "artifacts" / job.id / f"{unrelated.id}.pza").exists()
 
@@ -243,3 +289,112 @@ def test_replacing_and_discarding_a_snapshot_removes_only_its_private_artifacts(
 
     assert state.load_result_snapshot(job.id) is None
     assert {path.stem for path in (tmp_path / "artifacts" / job.id).glob("*.pza")} == {unrelated.id}
+
+
+def test_loads_a_legacy_v1_snapshot(tmp_path: Path) -> None:
+    source = tmp_path / "legacy.md"
+    source.write_text("Original", encoding="utf-8")
+    job = DocumentJob.create(
+        DocumentSource.inspect(source),
+        JobConfiguration(),
+        order=0,
+        job_id="legacy",
+    )
+    state = StateStore(tmp_path / "state.sqlite3")
+    state.upsert_job(job)
+    artifacts = ArtifactStore(
+        tmp_path / "artifacts",
+        protect=lambda payload: payload,
+        unprotect=lambda payload: payload,
+    )
+    result = ProcessResult(
+        tmp_path / "legacy.out.md",
+        review_original_path=source,
+        review_markdown="Propuesta",
+        review_required=True,
+    )
+    raw = result_snapshots_module._result_to_json(result)  # noqa: SLF001
+    manifest = artifacts.put_text(
+        job_id=job.id,
+        text=json.dumps(raw),
+        media_type="application/vnd.parsezen.result+json",
+    )
+    state.save_result_snapshot(job.id, manifest.id)
+
+    assert ResultSnapshotStore(state, artifacts).load(job.id) == result
+
+
+def test_crash_before_pointer_update_keeps_previous_generation(tmp_path: Path, monkeypatch) -> None:
+    source = tmp_path / "source.md"
+    source.write_text("Original", encoding="utf-8")
+    job = DocumentJob.create(
+        DocumentSource.inspect(source),
+        JobConfiguration(),
+        order=0,
+        job_id="before-pointer",
+    )
+    state = StateStore(tmp_path / "state.sqlite3")
+    state.upsert_job(job)
+    artifacts = ArtifactStore(
+        tmp_path / "artifacts",
+        protect=lambda payload: payload,
+        unprotect=lambda payload: payload,
+    )
+    snapshots = ResultSnapshotStore(state, artifacts)
+    first = ProcessResult(tmp_path / "first.md", review_markdown="Primero", review_required=True)
+    second = ProcessResult(tmp_path / "second.md", review_markdown="Segundo", review_required=True)
+    first_generation = snapshots.save(job.id, first)
+    monkeypatch.setattr(
+        state,
+        "save_result_snapshot",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("crash before pointer")),
+    )
+
+    with pytest.raises(OSError, match="before pointer"):
+        snapshots.save(job.id, second)
+
+    assert state.load_result_snapshot(job.id) == first_generation
+    assert snapshots.load(job.id) == first
+    generation_directories = tuple(
+        path.name for path in (tmp_path / "artifacts" / job.id).iterdir() if path.is_dir()
+    )
+    assert generation_directories == (first_generation,)
+
+
+def test_crash_after_pointer_update_recovers_new_generation_and_collects_old(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    source = tmp_path / "source.md"
+    source.write_text("Original", encoding="utf-8")
+    job = DocumentJob.create(
+        DocumentSource.inspect(source),
+        JobConfiguration(),
+        order=0,
+        job_id="after-pointer",
+    )
+    state = StateStore(tmp_path / "state.sqlite3")
+    state.upsert_job(job)
+    artifacts = ArtifactStore(
+        tmp_path / "artifacts",
+        protect=lambda payload: payload,
+        unprotect=lambda payload: payload,
+    )
+    snapshots = ResultSnapshotStore(state, artifacts)
+    first = ProcessResult(tmp_path / "first.md", review_markdown="Primero", review_required=True)
+    second = ProcessResult(tmp_path / "second.md", review_markdown="Segundo", review_required=True)
+    first_generation = snapshots.save(job.id, first)
+    save_pointer = state.save_result_snapshot
+
+    def commit_then_crash(job_id: str, generation: str) -> None:
+        save_pointer(job_id, generation)
+        raise OSError("crash after pointer")
+
+    monkeypatch.setattr(state, "save_result_snapshot", commit_then_crash)
+    with pytest.raises(OSError, match="after pointer"):
+        snapshots.save(job.id, second)
+    active_generation = state.load_result_snapshot(job.id)
+    assert active_generation is not None and active_generation != first_generation
+
+    assert snapshots.load(job.id) == second
+    assert not (tmp_path / "artifacts" / job.id / first_generation).exists()

@@ -9,6 +9,10 @@
 - `pipeline/transform.py` concentra traducción, corrección, verificación bilingüe, calidad y
   borradores de revisión sin publicar archivos. La fachada coordina ahora explícitamente validación,
   preparación, transformación y publicación.
+- Las instantáneas de revisión nuevas usan un manifest v2 mínimo y generaciones cifradas: cada
+  texto lógico se almacena una sola vez, los recursos se referencian por id y la telemetría no se
+  conserva. La lectura v1 sigue disponible y el arranque elimina solo generaciones huérfanas
+  verificables.
 - La cola y sus informes se proyectan por eventos. El polling general de 200 ms se sustituye por un
   refresco de un segundo limitado a tiempo restante y reintento de persistencia diferida.
 - La nueva `QueueSession` Qt-free posee el plan preparado, runtimes, documento activo, pausa y cierre

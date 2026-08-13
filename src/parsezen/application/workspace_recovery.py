@@ -8,7 +8,7 @@ from typing import Protocol
 from parsezen.application.job_runtime import JobRuntime
 from parsezen.application.runtime_mapping import request_and_settings_from_job
 from parsezen.domain.jobs import DocumentJob, DocumentSource, JobStatus
-from parsezen.domain.source_identity import sha256_file
+from parsezen.domain.source_identity import SourceIdentity, sha256_file
 from parsezen.pipeline.contracts import ProcessResult
 from parsezen.settings import AppSettings
 
@@ -19,7 +19,12 @@ SOURCE_CHANGED_MESSAGE = (
 
 
 class ResultSnapshotLoader(Protocol):
-    def load(self, job_id: str) -> ProcessResult | None: ...
+    def load(
+        self,
+        job_id: str,
+        *,
+        source_identity: SourceIdentity | None = None,
+    ) -> ProcessResult | None: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -68,7 +73,18 @@ def recover_workspace(
             result = ProcessResult(final_path=job.result_path)
         elif job.status is JobStatus.WAITING_REVIEW and source_unchanged:
             try:
-                result = snapshots.load(job.id)
+                result = snapshots.load(
+                    job.id,
+                    source_identity=(
+                        SourceIdentity(
+                            job.source.size_bytes,
+                            job.source.modified_ns,
+                            job.source.content_sha256,
+                        )
+                        if job.source.content_sha256 is not None
+                        else None
+                    ),
+                )
             except (OSError, RuntimeError, ValueError):
                 result = None
             if result is not None and result.final_path.is_file():

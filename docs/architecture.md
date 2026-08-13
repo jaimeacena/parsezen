@@ -49,6 +49,15 @@ La ruta EPUB→EPUB separa además traducción del paquete, preparación
 editable/revisión y publicación. Estos límites usan contratos concretos y evitan una jerarquía
 genérica de procesadores que no aportaría comportamiento actual.
 
+Las revisiones pendientes se recuperan mediante manifests cifrados v2 bajo generaciones
+`artifacts/<job>/<generation>/`. El puntero SQLite cambia solo después de escribir textos, recursos y
+manifest; cada texto lógico se guarda una vez y el manifest contiene referencias, estado mínimo de
+publicación e identidad fuerte del origen cuando ya fue calculada en preflight. Se mantiene lectura
+v1, mientras la escritura es siempre v2. Tras un cierre abrupto solo se eliminan generaciones
+completas y no referenciadas; archivos desconocidos se conservan. Los recursos se materializan al
+recuperar porque `ProcessResult` aún los expone como bytes; hacerlos lazy requeriría estrechar ese
+contrato en una fase posterior y no compensa introducir un proxy ahora.
+
 Los dos procesadores más grandes conservan una fachada estable, pero sus subsistemas con invariantes
 propias ya no están mezclados:
 

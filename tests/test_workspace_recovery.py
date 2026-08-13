@@ -29,7 +29,8 @@ from parsezen.settings import AppSettings
 class SnapshotLoaderStub:
     results: dict[str, ProcessResult] = field(default_factory=dict)
 
-    def load(self, job_id: str) -> ProcessResult | None:
+    def load(self, job_id: str, *, source_identity=None) -> ProcessResult | None:
+        del source_identity
         return self.results.get(job_id)
 
 
@@ -131,7 +132,7 @@ def test_workspace_recovery_rejects_an_incomplete_review_snapshot(tmp_path: Path
         unprotect=lambda payload: payload,
     )
     snapshots = ResultSnapshotStore(state, artifacts)
-    manifest_id = snapshots.save(
+    generation = snapshots.save(
         "review",
         ProcessResult(
             destination,
@@ -146,9 +147,9 @@ def test_workspace_recovery_rejects_an_incomplete_review_snapshot(tmp_path: Path
             ),
         ),
     )
-    manifest = json.loads(artifacts.read_text("review", manifest_id))
-    resource_id = manifest["revision_resources"][0]["artifact_id"]
-    artifacts.remove_artifact("review", resource_id)
+    manifest = json.loads(artifacts.read_text("review", "manifest", generation=generation))
+    resource_id = manifest["resources"][0]["artifact_id"]
+    artifacts.remove_artifact("review", resource_id, generation=generation)
 
     recovered = recover_workspace(queue.jobs, snapshots, AppSettings())
 
