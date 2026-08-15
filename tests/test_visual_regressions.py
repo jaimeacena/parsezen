@@ -45,12 +45,12 @@ from parsezen.recent_activity import RecentJob, RecentJobStatus
 from parsezen.settings import AppSettings
 
 
-def _make_job(path: Path) -> DocumentJob:
+def _make_job(path: Path, *, order: int = 0) -> DocumentJob:
     path.write_text("Original", encoding="utf-8")
     return DocumentJob.create(
         DocumentSource.inspect(path),
         JobConfiguration(output=OutputConfiguration(configured=True)),
-        order=0,
+        order=order,
     )
 
 
@@ -202,25 +202,112 @@ def test_workspace_render_matrix_keeps_core_actions_inside_the_viewport(
     assert snapshot.toImage().pixelColor(width // 2, 10).alpha() == 255
 
     for control in (
-        workspace.theme_button,
+        workspace.settings_button,
         workspace.local_ai_button,
         workspace.output_directory_button,
         workspace.primary_button,
-        workspace.drop_area,
+        workspace.add_button,
+        workspace.queue_toolbar,
         workspace.table_panel,
         workspace.content_stack,
     ):
         _assert_fully_visible(control, workspace)
 
-    theme_rect = _relative_rect(workspace.theme_button, workspace)
+    settings_rect = _relative_rect(workspace.settings_button, workspace)
     ai_rect = _relative_rect(workspace.local_ai_button, workspace)
     output_rect = _relative_rect(workspace.output_directory_button, workspace)
-    if width <= 760:
-        assert ai_rect.top() > theme_rect.top()
+    if width <= 960:
+        assert ai_rect.top() > settings_rect.top()
         assert output_rect.top() == ai_rect.top()
     else:
-        assert abs(ai_rect.center().y() - theme_rect.center().y()) <= 2
-        assert abs(output_rect.center().y() - theme_rect.center().y()) <= 2
+        assert abs(ai_rect.center().y() - settings_rect.center().y()) <= 2
+        assert abs(output_rect.center().y() - settings_rect.center().y()) <= 2
+
+
+@pytest.mark.parametrize("theme", [ThemeMode.LIGHT, ThemeMode.DARK])
+@pytest.mark.parametrize("width", [320, 768, 1440])
+def test_empty_workspace_render_matrix_keeps_one_clear_import_action(
+    qtbot,
+    tmp_path: Path,
+    theme: ThemeMode,
+    width: int,
+) -> None:
+    application = QApplication.instance()
+    assert isinstance(application, QApplication)
+    apply_parsezen_theme(application, theme)
+    workspace = ParsezenWorkspace()
+    qtbot.addWidget(workspace)
+    workspace.resize(width, 760)
+    workspace.show()
+    qtbot.waitExposed(workspace)
+    QApplication.processEvents()
+
+    snapshot = workspace.grab()
+    assert snapshot.size() == QSize(width, 760)
+    assert snapshot.save(str(tmp_path / f"workspace-empty-{theme.value}-{width}.png"))
+    assert workspace.drop_area.isVisible()
+    assert workspace.drop_area.width() <= 620
+    assert workspace.drop_area.height() == (140 if width <= 640 else 92)
+    assert workspace.drop_area.primary_label.text() == "Arrastra documentos aquí"
+    assert workspace.drop_area.browse_button.text() == "Seleccionar archivos"
+    assert not workspace.queue_toolbar.isVisible()
+    assert not workspace.table_panel.isVisible()
+    for control in (
+        workspace.settings_button,
+        workspace.local_ai_button,
+        workspace.output_directory_button,
+        workspace.drop_area,
+        workspace.drop_area.browse_button,
+    ):
+        _assert_fully_visible(control, workspace)
+
+
+@pytest.mark.parametrize("theme", [ThemeMode.LIGHT, ThemeMode.DARK])
+@pytest.mark.parametrize("job_count", [0, 1, 4, 8])
+def test_workspace_wide_tall_matrix_preserves_intentional_queue_geometry(
+    qtbot,
+    tmp_path: Path,
+    theme: ThemeMode,
+    job_count: int,
+) -> None:
+    application = QApplication.instance()
+    assert isinstance(application, QApplication)
+    apply_parsezen_theme(application, theme)
+    workspace = ParsezenWorkspace()
+    qtbot.addWidget(workspace)
+    jobs = tuple(
+        _make_job(
+            tmp_path / f"wide-{theme.value}-{job_count}-{index}.txt",
+            order=index,
+        )
+        for index in range(job_count)
+    )
+    workspace.set_jobs(jobs)
+    workspace.resize(2160, 1280)
+    workspace.show()
+    qtbot.waitExposed(workspace)
+    QApplication.processEvents()
+
+    snapshot = workspace.grab()
+    assert snapshot.size() == QSize(2160, 1280)
+    assert snapshot.save(str(tmp_path / f"workspace-wide-{theme.value}-{job_count}.png"))
+    if not jobs:
+        assert workspace.drop_area.geometry().center().y() < workspace.queue_pane.height() // 3
+        assert workspace.drop_area.width() <= 620
+        assert not workspace.table_panel.isVisible()
+        assert not workspace.queue_toolbar.isVisible()
+    else:
+        assert workspace.job_table.job_model.rowCount() == job_count
+        assert workspace.queue_toolbar.geometry().top() == 0
+        assert (
+            workspace.table_panel.geometry().top() - workspace.queue_toolbar.geometry().bottom()
+            <= 12
+        )
+        assert workspace.table_panel.height() == workspace.job_table.height() + 2
+        assert workspace.table_panel.width() <= 1280
+        assert workspace.queue_toolbar.width() == workspace.table_panel.width()
+        assert workspace.add_button.isVisible()
+        assert workspace.drop_area.isHidden()
 
 
 @pytest.mark.parametrize("theme", [ThemeMode.LIGHT, ThemeMode.DARK])
@@ -334,6 +421,8 @@ def test_epub_editor_render_matrix_keeps_safe_exit_and_helper_visible(
     assert dialog.review_helper.isVisible()
     assert dialog.save_later_button.text() == "Guardar y salir"
     assert dialog.cancel_button.text() == "Descartar cambios"
+    assert dialog.content_tool_strip.horizontalScrollBarPolicy() == Qt.ScrollBarAlwaysOff
+    assert dialog.editor_more_button.isVisible() is (width <= 960)
 
 
 @pytest.mark.parametrize("theme", [ThemeMode.LIGHT, ThemeMode.DARK])
@@ -446,6 +535,7 @@ def test_configuration_contextual_controls_stay_in_one_vertical_flow(
     assert editor.pages_row.isVisible()
     assert editor.pages_row.value.text() == "25–140"
     assert editor.ocr_row.isVisible()
+    assert editor.translation_route.y() > editor.ocr_row.y()
     assert not hasattr(editor, "page_first")
     assert not hasattr(editor, "scroll_area")
     assert editor.content.sizeHint().height() <= editor.height()

@@ -116,6 +116,9 @@ Las capturas iniciales se conservaron fuera del repositorio en
    de elección, por ser una decisión primaria fácil de reconocer; Revisión con IA usa un interruptor.
    Las demás decisiones usan `Etiqueta — Valor — ›` y solo el espaciado vertical separa grupos.
    Traductor y glosario dependen del idioma, mientras páginas y OCR aparecen solo para PDF.
+7. Cada texto, contenedor y control debe justificar una decisión o una acción. La información ya
+   inferible se retira, la ayuda repetida se oculta en contexto y las funciones secundarias se agrupan
+   antes de ocupar espacio permanente.
 
 ## Densidad y elevación
 
@@ -225,10 +228,12 @@ Los estados no dependen solo del color: incluyen copia, icono, borde, selección
 - `ChevronComboBox`: selector nativo con chevron vectorial, navegación de teclado y rueda desactivada
   cuando no tiene foco.
 - `Switch`: interruptor con `Space`, foco visible, nombre accesible y estados on/off/disabled.
-- `StatusMessage`: información, éxito, aviso o error inline; admite acción de recuperación y recibe
-  foco cuando requiere atención.
-- `HorizontalToolStrip`: conserva todas las herramientas del editor, permite desplazamiento
-  horizontal controlado y evita ensanchar la ventana.
+- `StatusMessage`: información, éxito, aviso o error inline; admite acción de recuperación, recibe
+  foco cuando requiere atención, calcula altura desde el ancho disponible y nunca sobrevive al
+  trabajo contextual que lo originó.
+- `HorizontalToolStrip`: contiene tiras largas sin ensanchar la ventana. En el editor de contenido,
+  las herramientas secundarias pasan a **Más herramientas** en anchos compacto e intermedio, por lo
+  que la barra principal no necesita desplazamiento horizontal.
 - Botones principales, secundarios, destructivos e icon buttons consumen la hoja semántica común.
 
 Los controles nativos se mantienen cuando ya resuelven correctamente semántica, teclado y
@@ -236,22 +241,40 @@ accesibilidad.
 
 ## Responsive y reflow
 
+La cabecera usa una fila por encima de 960 px y dos filas hasta ese ancho. Contiene solo marca, IA,
+destino y el acceso único a ajustes, actividad, apariencia y diagnóstico; el contador y la acción
+principal pertenecen a la barra local de la cola. En escritorio comparte con títulos, mensajes,
+toolbar y tabla un rail exterior centrado de hasta 1.280 px. El acceso global incorpora un marcador
+solo para errores, pausas, revisiones o recomendaciones accionables; nunca funciona como decoración.
+
 Desde 320 px:
 
-- la cabecera pasa a tres filas y conserva IA, destino, apariencia y acción principal;
+- la cabecera pasa a dos filas y conserva IA, destino y ajustes;
 - la cola combina Documento + Flujo y mantiene la acción contextual y eliminar;
-- la zona de añadir documentos apila icono, instrucción, enlace y formatos;
+- la cola vacía ancla una única zona de entrada acotada cerca de la cabecera, sin hacerla flotar en el
+  centro del viewport;
+- la entrada vacía usa un límite neutral visible, un icono de documento local y un botón real
+  `Seleccionar archivos`; el acento discontinuo se reserva para interacción y arrastre;
+- tras la primera importación, la tabla abraza las filas visibles dentro de un rail máximo común. Una
+  barra sin contenedor, alineada con ese rail, reúne contador, `Añadir` secundario y la única acción
+  principal; en ancho compacto las acciones ocupan una segunda fila;
+- la tabla usa cabecera de 44 px, filas de 80 px y las columnas Documento, Flujo, Salida y Estado;
 - las tarjetas de formato se apilan y el resto de la configuración conserva una única columna; sus
   selectores viven en menús o diálogos puntuales, se anclan al valor de la fila y nunca dejan campos
   permanentes en la página; el bloque completo permanece centrado en el espacio disponible;
 - los formularios envuelven etiqueta y campo;
 - las acciones de imágenes se apilan;
 - los comparadores y el editor EPUB cambian a orientación vertical;
+- la revisión documental mantiene las decisiones en la cabecera de cada panel, mueve localizar y
+  restaurar al menú `…`, oculta la navegación inexistente y no muestra una acción masiva para un solo
+  caso;
+- el editor EPUB conserva sus dos paneles en escritorio; en ancho reducido mueve las herramientas
+  menos frecuentes a un menú único sin retirar comandos;
 - el gestor de modelos distribuye nombre, tamaño, menú y acción en filas;
 - los pies pasan a grids y ninguna acción esencial queda fuera del viewport.
 
-Las barras horizontales solo aparecen dentro de tiras de herramientas explícitas. Las áreas de
-contenido y tablas usan `ScrollBarAlwaysOff` horizontal.
+Las barras horizontales solo aparecen dentro de tiras cuya navegación espacial lo requiere. La
+barra de contenido EPUB, las áreas de contenido y las tablas usan `ScrollBarAlwaysOff` horizontal.
 
 ## Accesibilidad
 
@@ -319,6 +342,18 @@ Estado validado el 30 de julio de 2026 tras la evolución visual ligera:
 - Aceptación: 27 pruebas aprobadas.
 - Arranque fuente e inspección manual: cola, Configurar e IA local comprobados en claro y oscuro.
 - No se construyó ni empaquetó la aplicación durante esta fase.
+
+Revalidación del 16 de agosto de 2026 tras la depuración visual minimalista y la simplificación de
+la revisión documental:
+
+- Ruff check y format: correctos.
+- Mypy: correcto sobre 120 módulos de producto.
+- Pytest: 1.547 pruebas aprobadas y 4 omitidas por entorno o herramientas externas.
+- Matriz visual: cola, revisión, gestor de modelos y editor EPUB comprobados en claro y oscuro a
+  320, 768 y 1.440 px. La cola se verifica además a 2.160 × 1.280 px con 0, 1, 4 y 8 documentos para
+  detectar altura sobrante, deriva horizontal y pérdida del scroll.
+- Arranque fuente e inspección con UI Automation: estado vacío anclado bajo la cabecera, nombres
+  accesibles y menú global comprobados.
 
 Al modificar un token o componente base se deben ejecutar, como mínimo:
 

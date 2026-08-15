@@ -426,11 +426,12 @@ class JobConfigurationDialog(QDialog):
         self.options_layout.addWidget(self.translate_row)
         self.options_layout.addWidget(self.translator_row)
         self.options_layout.addWidget(self.glossary_row)
-        self.options_layout.addWidget(self.translation_route)
         self.options_layout.addSpacing(SPACING.sm)
         self.options_layout.addWidget(self.review_row)
         self.options_layout.addWidget(self.pages_row)
         self.options_layout.addWidget(self.ocr_row)
+        self.options_layout.addSpacing(SPACING.sm)
+        self.options_layout.addWidget(self.translation_route)
 
         self.validation_label = QLabel(self.content)
         self.validation_label.setObjectName("configurationValidation")

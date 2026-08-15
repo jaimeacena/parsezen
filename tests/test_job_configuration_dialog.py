@@ -122,6 +122,12 @@ def test_translation_choice_reveals_only_translator_and_glossary(
     assert "Coste aproximado bajo" in dialog.translation_route.text()
     assert "no revisión semántica" in dialog.translation_route.text()
     assert "1 pasada" in dialog.translation_route.text()
+    assert dialog.options_layout.indexOf(dialog.translation_route) > dialog.options_layout.indexOf(
+        dialog.ocr_row
+    )
+    assert dialog.options_layout.indexOf(dialog.translation_route) < dialog.options_layout.indexOf(
+        dialog.validation_label
+    )
 
     dialog._set_review_enabled(True)  # noqa: SLF001
 

@@ -36,9 +36,9 @@ python scripts/sync_version.py --check
   fila por documento mediante ambos métodos.
 - TXT, Markdown, DOCX, PDF y EPUB muestran icono, nombre, tamaño y configuración compatible.
 - Cada formato muestra un distintivo propio y Salida no duplica el icono del documento.
-- La pantalla usa exactamente Documento, Flujo, Salida y Siguiente paso, en ese orden, además de
+- La pantalla usa exactamente Documento, Flujo, Salida y Estado, en ese orden, además de
   tracks sin encabezado para reordenar y retirar.
-- Un documento nuevo muestra `Sin salida` y ofrece `Configurar` en Siguiente paso; todavía no es
+- Un documento nuevo muestra `Sin salida` y ofrece `Configurar` en Estado; todavía no es
   ejecutable ni cuenta como revisión.
 - `Configurar` abre una página compacta dentro de la ventana principal. Markdown y EPUB usan dos
   tarjetas visuales exclusivas, Revisión con IA un interruptor, y Traducir, Traductor, Glosario,
@@ -127,8 +127,8 @@ python scripts/sync_version.py --check
   cualquier problema de validación se muestra al usuario.
 - Cada trabajo ejecutable muestra un intervalo de tiempo automático antes de empezar; tras varias
   ejecuciones compatibles indica que la estimación está calibrada en este equipo.
-- El preanálisis no guarda nombres, rutas ni contenido y solo pide confirmación adicional para un
-  plan largo o con riesgo alto; la revisión manual se explica aparte del tiempo automático.
+- El preanálisis no guarda nombres, rutas ni contenido, proyecta la estimación en la cola y no añade
+  una confirmación informativa entre `Procesar` y la preparación real.
 - Tras diez segundos de progreso medible, la fila puede actualizar el tiempo restante y explica si
   descontó tiempo o lo recalculó con el ritmo real; al superar el máximo inicial deja de mostrar una
   cuenta atrás precisa.
@@ -136,6 +136,8 @@ python scripts/sync_version.py --check
   revisión manual, sin presentar la ausencia de señales como equivalencia semántica.
 - El cierre del lote cuenta documentos listos, pendientes de revisión, fallidos, pausados y
   cancelados; ofrece actividad cuando existen resultados, errores o cancelaciones consultables.
+- Los avisos largos crecen sin recortar texto; una pausa y una interrupción usan copias distintas. Al
+  retirar trabajos, el aviso se recalcula con los supervivientes y desaparece con el último.
 - Las notificaciones de Windows aparecen al terminar o requerir atención solo con Parsezen
   minimizado o inactivo.
 - Actividad reciente conserva como máximo 20 intentos, no contiene texto documental, puede abrir
@@ -220,14 +222,20 @@ python scripts/sync_version.py --check
 - Solo aparecen las opciones de la fase actual.
 - Original y propuesta son selecciones excluyentes.
 - Una unidad nueva no marca ninguna elección: la recomendación se muestra como provisional.
+- El caso común no repite posición, prioridad media ni la necesidad obvia de confirmar; solo una
+  prioridad alta o crítica, un aviso, una etiqueta o una sugerencia concreta añaden contexto.
 - La elección confirmada se ve en el botón y en el tintado del panel, sin borde turquesa alrededor
   de todo el panel.
 - Editar la propuesta la selecciona.
 - Restaurar recupera la propuesta inicial.
+- `Ir al inicio` y `Restaurar propuesta` permanecen operables desde el menú `…` del panel; no crean
+  una segunda fila de botones bajo el contenido.
 - En OCR y traducción el origen dice `Solo contexto` y no ofrece botón para seleccionarlo.
 - OCR permite `No hay texto que añadir` sin perder recursos ni anclas.
 - Aprobar todas las traducciones o correcciones resuelve solo la fase actual; nunca aprueba la
   estructura.
+- La acción masiva solo se muestra para dos o más correcciones y `Anterior` solo cuando existe un
+  caso o una fase previa; el pie mantiene `Guardar y salir` y una única acción primaria.
 - Las propuestas que cambian cifras, fechas, nombres, párrafos o demasiado contenido seleccionan el
   original por defecto y la aprobación masiva no las acepta.
 - La pre-organización no convierte un párrafo largo en encabezado aunque conserve todas sus palabras

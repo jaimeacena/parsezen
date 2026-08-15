@@ -11,7 +11,6 @@ from PySide6.QtGui import (
     QDragLeaveEvent,
     QDropEvent,
     QIcon,
-    QKeyEvent,
     QMouseEvent,
     QPainter,
     QPainterPath,
@@ -45,7 +44,7 @@ from parsezen.application.preflight import (
     format_duration_range,
 )
 from parsezen.branding import BRAND_DARK_LOGO_PATH, BRAND_LOGO_PATH
-from parsezen.domain.jobs import DocumentJob
+from parsezen.domain.jobs import DocumentJob, JobStatus
 from parsezen.domain.stages import StageKind
 from parsezen.failure_recovery import RecoveryAction, RecoveryPlan
 from parsezen.final_integrity import FinalIntegrityReport
@@ -56,17 +55,20 @@ from parsezen.presentation.design_system import (
     COLORS,
     SPACING,
     ThemeMode,
+    add_documents_icon,
     back_icon,
-    cloud_upload_icon,
     current_theme_mode,
     folder_icon,
     local_ai_icon,
     pause_icon,
     play_icon,
-    theme_toggle_icon,
+    settings_icon,
 )
 from parsezen.presentation.job_table import JobTableView
 from parsezen.presentation.job_view_model import queue_header_view
+
+_CONTENT_RAIL_MAX_WIDTH = 1280
+_EMPTY_DROP_MAX_WIDTH = 620
 
 
 class _RoundedTableOverlay(QWidget):
@@ -149,7 +151,7 @@ class InternalBackButton(QPushButton):
 
 
 class DocumentDropArea(QFrame):
-    """Compact, keyboard-operable drop target with one explicit browse link."""
+    """Visible local drop target with one conventional file-picker button."""
 
     activated = Signal()
 
@@ -157,10 +159,10 @@ class DocumentDropArea(QFrame):
         super().__init__(parent)
         self.setObjectName("documentDropArea")
         self.setAccessibleName("Añadir documentos TXT, Markdown, Word, PDF o EPUB")
-        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-        self.setFixedHeight(76)
+        self.setFixedHeight(92)
 
         layout = QBoxLayout(QBoxLayout.Direction.LeftToRight, self)
         self.content_layout = layout
@@ -173,7 +175,7 @@ class DocumentDropArea(QFrame):
         layout.addWidget(self.icon_label, 0, Qt.AlignmentFlag.AlignVCenter)
 
         self.text_host = QWidget(self)
-        self.text_host.setMinimumWidth(280)
+        self.text_host.setMinimumWidth(260)
         text_layout = QVBoxLayout(self.text_host)
         text_layout.setContentsMargins(0, 0, 0, 0)
         text_layout.setSpacing(3)
@@ -185,13 +187,8 @@ class DocumentDropArea(QFrame):
             QSizePolicy.Policy.Preferred,
             QSizePolicy.Policy.Preferred,
         )
-        self.primary_label.setTextFormat(Qt.TextFormat.RichText)
-        self.primary_label.setTextInteractionFlags(
-            Qt.TextInteractionFlag.LinksAccessibleByMouse
-            | Qt.TextInteractionFlag.LinksAccessibleByKeyboard
-        )
-        self.primary_label.setOpenExternalLinks(False)
-        self.primary_label.linkActivated.connect(lambda _link: self.activated.emit())
+        self.primary_label.setTextFormat(Qt.TextFormat.PlainText)
+        self.primary_label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
         self.secondary_label = QLabel(
             "TXT · MD · DOCX · PDF · EPUB",
             self.text_host,
@@ -207,15 +204,53 @@ class DocumentDropArea(QFrame):
         text_layout.addWidget(self.primary_label)
         text_layout.addWidget(self.secondary_label)
         layout.addWidget(self.text_host, 0, Qt.AlignmentFlag.AlignVCenter)
+        self.browse_button = QPushButton("Seleccionar archivos", self)
+        self.browse_button.setObjectName("dropBrowseButton")
+        self.browse_button.setAccessibleName("Seleccionar documentos para añadir")
+        self.browse_button.setMinimumWidth(156)
+        self.browse_button.setMaximumWidth(180)
+        self.browse_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.browse_button.setFocusPolicy(Qt.FocusPolicy.TabFocus)
+        self.browse_button.clicked.connect(self.activated)
+        layout.addWidget(self.browse_button, 0, Qt.AlignmentFlag.AlignVCenter)
         layout.addStretch(1)
         self.refresh_theme()
 
     def refresh_theme(self) -> None:
-        self.icon_label.setPixmap(cloud_upload_icon().pixmap(30, 30))
-        self.primary_label.setText(
-            'Arrastra documentos aquí o <a href="browse" style="color:'
-            f'{COLORS.info}; text-decoration:underline">examínalos</a>'
-        )
+        self.icon_label.setPixmap(add_documents_icon().pixmap(30, 30))
+        self.primary_label.setText("Arrastra documentos aquí")
+
+    def set_display_mode(self, *, compact: bool) -> None:
+        """Reflow the empty-state action without changing its meaning."""
+
+        if compact:
+            self.setFixedHeight(140)
+            self.content_layout.setDirection(QBoxLayout.Direction.TopToBottom)
+            self.content_layout.setContentsMargins(12, 10, 12, 10)
+            self.content_layout.setSpacing(6)
+            self.text_host.setMinimumWidth(0)
+            self.primary_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.secondary_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.content_layout.setAlignment(
+                self.browse_button,
+                Qt.AlignmentFlag.AlignHCenter,
+            )
+        else:
+            self.setFixedHeight(92)
+            self.content_layout.setDirection(QBoxLayout.Direction.LeftToRight)
+            self.content_layout.setContentsMargins(18, 10, 18, 10)
+            self.content_layout.setSpacing(14)
+            self.text_host.setMinimumWidth(260)
+            alignment = Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter
+            self.primary_label.setAlignment(alignment)
+            self.secondary_label.setAlignment(alignment)
+            self.content_layout.setAlignment(
+                self.browse_button,
+                Qt.AlignmentFlag.AlignVCenter,
+            )
+        self.refresh_theme()
+        self.style().unpolish(self)
+        self.style().polish(self)
 
     def mouseReleaseEvent(self, event: QMouseEvent) -> None:  # noqa: N802
         if event.button() is Qt.MouseButton.LeftButton and self.rect().contains(
@@ -225,13 +260,6 @@ class DocumentDropArea(QFrame):
             event.accept()
             return
         super().mouseReleaseEvent(event)
-
-    def keyPressEvent(self, event: QKeyEvent) -> None:  # noqa: N802
-        if event.key() in {Qt.Key.Key_Return, Qt.Key.Key_Enter, Qt.Key.Key_Space}:
-            self.activated.emit()
-            event.accept()
-            return
-        super().keyPressEvent(event)
 
 
 def _stage_label(stage: StageKind) -> str:
@@ -249,7 +277,6 @@ class ParsezenWorkspace(QWidget):
     files_dropped = Signal(object)
     settings_requested = Signal()
     local_ai_requested = Signal()
-    theme_toggle_requested = Signal()
     configure_requested = Signal(str, object)
     review_requested = Signal(str, object)
     ai_review_requested = Signal(str)
@@ -286,7 +313,9 @@ class ParsezenWorkspace(QWidget):
         self._message_stage: StageKind | None = None
         self._message_primary_action: RecoveryAction | None = None
         self._message_secondary_action: RecoveryAction | None = None
+        self._batch_message_job_ids: frozenset[str] = frozenset()
         self._compact_layout: bool | None = None
+        self._layout_mode: str | None = None
 
         layout = QVBoxLayout(self)
         self.root_layout = layout
@@ -296,6 +325,11 @@ class ParsezenWorkspace(QWidget):
 
         self.app_header = QWidget(self)
         self.app_header.setObjectName("appHeader")
+        self.app_header.setMaximumWidth(_CONTENT_RAIL_MAX_WIDTH)
+        self.app_header.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Fixed,
+        )
         header_layout = QGridLayout(self.app_header)
         self.header_layout = header_layout
         header_layout.setContentsMargins(8, 2, 0, 2)
@@ -305,21 +339,7 @@ class ParsezenWorkspace(QWidget):
         self.logo.setAccessibleName(APP_DISPLAY_NAME)
         self._apply_logo()
         header_layout.addWidget(self.logo, 0, 0)
-        self.header_separator = QFrame(self.app_header)
-        self.header_separator.setObjectName("headerSeparator")
-        self.header_separator.setFrameShape(QFrame.Shape.VLine)
-        self.header_separator.setFixedHeight(32)
-        header_layout.addWidget(self.header_separator, 0, 1)
-        self.queue_summary = QLabel("0 documentos", self.app_header)
-        self.queue_summary.setObjectName("queueSummary")
-        self.queue_summary.setWordWrap(True)
-        self.queue_summary.setMinimumWidth(0)
-        self.queue_summary.setSizePolicy(
-            QSizePolicy.Policy.Preferred,
-            QSizePolicy.Policy.Preferred,
-        )
-        header_layout.addWidget(self.queue_summary, 0, 2)
-        header_layout.setColumnStretch(3, 1)
+        header_layout.setColumnStretch(1, 1)
 
         self.local_ai_button = QPushButton("IA local", self.app_header)
         self.local_ai_button.setObjectName("localAiSettings")
@@ -329,9 +349,9 @@ class ParsezenWorkspace(QWidget):
         self.local_ai_button.setCursor(Qt.CursorShape.PointingHandCursor)
         self.local_ai_button.setFocusPolicy(Qt.FocusPolicy.TabFocus)
         self.local_ai_button.clicked.connect(self.local_ai_requested)
-        header_layout.addWidget(self.local_ai_button, 0, 4)
+        header_layout.addWidget(self.local_ai_button, 0, 2)
 
-        self.output_directory_button = QPushButton("Destino: Original", self.app_header)
+        self.output_directory_button = QPushButton("Destino · Original", self.app_header)
         self.output_directory_button.setObjectName("globalOutputDirectory")
         self.output_directory_button.setAccessibleName("Cambiar la carpeta de destino")
         self.output_directory_button.setIcon(folder_icon())
@@ -339,39 +359,77 @@ class ParsezenWorkspace(QWidget):
         self.output_directory_button.setCursor(Qt.CursorShape.PointingHandCursor)
         self.output_directory_button.setFocusPolicy(Qt.FocusPolicy.TabFocus)
         self.output_directory_button.clicked.connect(self._show_output_directory_menu)
-        header_layout.addWidget(self.output_directory_button, 0, 5)
+        header_layout.addWidget(self.output_directory_button, 0, 3)
 
-        self.theme_button = QPushButton(self.app_header)
-        self.theme_button.setObjectName("themeToggle")
-        self.theme_button.setAccessibleName("Elegir apariencia: sistema, claro u oscuro")
-        self.theme_button.setToolTip("Cambiar apariencia")
-        self.theme_button.setIcon(theme_toggle_icon())
-        self.theme_button.setIconSize(QSize(20, 20))
-        self.theme_button.setFixedSize(42, 42)
-        self.theme_button.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.theme_button.setFocusPolicy(Qt.FocusPolicy.TabFocus)
-        self.theme_button.clicked.connect(self.theme_toggle_requested)
-        header_layout.addWidget(self.theme_button, 0, 6)
-
-        self.primary_button = QPushButton(self.app_header)
-        self.primary_button.setObjectName("primaryAction")
-        self.primary_button.setMinimumWidth(156)
-        self.primary_button.setIconSize(QSize(18, 18))
-        self.primary_button.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.primary_button.clicked.connect(self._emit_primary_action)
-        self.primary_button.hide()
-        header_layout.addWidget(self.primary_button, 0, 7)
-        layout.addWidget(self.app_header)
+        self.settings_button = QPushButton(self.app_header)
+        self.settings_button.setObjectName("globalMenu")
+        self.settings_button.setAccessibleName("Abrir ajustes y actividad")
+        self.settings_button.setToolTip("Ajustes y actividad")
+        self.settings_button.setIcon(settings_icon())
+        self.settings_button.setIconSize(QSize(20, 20))
+        self.settings_button.setFixedSize(42, 42)
+        self.settings_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.settings_button.setFocusPolicy(Qt.FocusPolicy.TabFocus)
+        self.settings_button.clicked.connect(self.settings_requested)
+        header_layout.addWidget(self.settings_button, 0, 4)
+        layout.addWidget(self.app_header, 0, Qt.AlignmentFlag.AlignHCenter)
 
         self.content_stack = QStackedWidget(self)
         self.content_stack.setObjectName("workspacePages")
 
         self.queue_pane = QWidget(self.content_stack)
         queue_layout = QVBoxLayout(self.queue_pane)
+        self.queue_layout = queue_layout
         queue_layout.setContentsMargins(0, 0, 0, 0)
-        queue_layout.setSpacing(16)
+        queue_layout.setSpacing(10)
+        self.queue_toolbar = QWidget(self.queue_pane)
+        self.queue_toolbar.setObjectName("queueToolbar")
+        self.queue_toolbar.setMaximumWidth(_CONTENT_RAIL_MAX_WIDTH)
+        self.queue_toolbar.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Fixed,
+        )
+        queue_toolbar_layout = QGridLayout(self.queue_toolbar)
+        self.queue_toolbar_layout = queue_toolbar_layout
+        queue_toolbar_layout.setContentsMargins(0, 0, 0, 0)
+        queue_toolbar_layout.setHorizontalSpacing(SPACING.sm)
+        queue_toolbar_layout.setVerticalSpacing(SPACING.xs)
+        self.queue_summary = QLabel("0 documentos", self.queue_toolbar)
+        self.queue_summary.setObjectName("queueSummary")
+        self.queue_summary.setWordWrap(True)
+        self.queue_summary.setMinimumWidth(0)
+        self.queue_summary.setSizePolicy(
+            QSizePolicy.Policy.Preferred,
+            QSizePolicy.Policy.Preferred,
+        )
+        queue_toolbar_layout.addWidget(self.queue_summary, 0, 0)
+        queue_toolbar_layout.setColumnStretch(1, 1)
+        self.add_button = QPushButton("Añadir", self.queue_toolbar)
+        self.add_button.setObjectName("queueAddAction")
+        self.add_button.setAccessibleName("Añadir más documentos")
+        self.add_button.setIcon(add_documents_icon())
+        self.add_button.setIconSize(QSize(18, 18))
+        self.add_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.add_button.setFocusPolicy(Qt.FocusPolicy.TabFocus)
+        self.add_button.clicked.connect(self.add_requested)
+        queue_toolbar_layout.addWidget(self.add_button, 0, 2)
+        self.primary_button = QPushButton(self.queue_toolbar)
+        self.primary_button.setObjectName("primaryAction")
+        self.primary_button.setMinimumWidth(156)
+        self.primary_button.setIconSize(QSize(18, 18))
+        self.primary_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.primary_button.clicked.connect(self._emit_primary_action)
+        self.primary_button.hide()
+        queue_toolbar_layout.addWidget(self.primary_button, 0, 3)
+        queue_layout.addWidget(self.queue_toolbar)
+        queue_layout.setAlignment(self.queue_toolbar, Qt.AlignmentFlag.AlignHCenter)
         self.table_panel = RoundedTablePanel(self.queue_pane)
         self.table_panel.setObjectName("jobTablePanel")
+        self.table_panel.setMaximumWidth(_CONTENT_RAIL_MAX_WIDTH)
+        self.table_panel.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Fixed,
+        )
         table_layout = QVBoxLayout(self.table_panel)
         table_layout.setContentsMargins(1, 1, 1, 1)
         table_layout.setSpacing(0)
@@ -387,11 +445,11 @@ class ParsezenWorkspace(QWidget):
         self.job_table.move_requested.connect(self.move_requested)
         table_layout.addWidget(self.job_table)
         queue_layout.addWidget(self.table_panel)
-
+        queue_layout.setAlignment(self.table_panel, Qt.AlignmentFlag.AlignHCenter)
         self.drop_area = DocumentDropArea(self.queue_pane)
         self.drop_area.activated.connect(self.add_requested)
-        self.add_button = self.drop_area
         queue_layout.addWidget(self.drop_area)
+        queue_layout.setAlignment(self.drop_area, Qt.AlignmentFlag.AlignHCenter)
         self.recovery_warning = QLabel(self.queue_pane)
         self.recovery_warning.setObjectName("recoveryWarning")
         self.recovery_warning.setWordWrap(True)
@@ -404,6 +462,9 @@ class ParsezenWorkspace(QWidget):
         self.job_message.actionRequested.connect(self._run_primary_recovery)
         self.job_message.secondaryActionRequested.connect(self._run_secondary_recovery)
         queue_layout.addWidget(self.job_message)
+        for message in (self.recovery_warning, self.batch_message, self.job_message):
+            message.setMaximumWidth(_CONTENT_RAIL_MAX_WIDTH)
+            queue_layout.setAlignment(message, Qt.AlignmentFlag.AlignHCenter)
         queue_layout.addStretch(1)
         self.content_stack.addWidget(self.queue_pane)
 
@@ -424,10 +485,11 @@ class ParsezenWorkspace(QWidget):
         self._apply_logo()
         self.local_ai_button.setIcon(local_ai_icon())
         self.output_directory_button.setIcon(folder_icon())
-        self.theme_button.setIcon(theme_toggle_icon())
+        self._refresh_settings_attention()
+        self.add_button.setIcon(add_documents_icon())
         self.drop_area.refresh_theme()
         self._apply_local_styles()
-        self._refresh_header()
+        self._refresh_queue_commands()
         self.job_table.viewport().update()
         self.update()
 
@@ -441,7 +503,7 @@ class ParsezenWorkspace(QWidget):
         else:
             self.logo.setText("")
             self.logo.setPixmap(logo.scaledToWidth(132, Qt.TransformationMode.SmoothTransformation))
-        target_width = 96 if self._compact_layout else 132
+        target_width = 96 if self._layout_mode == "compact" else 132
         self.logo.setStyleSheet("background: transparent; padding: 4px 2px;")
         if not logo.isNull():
             self.logo.setPixmap(
@@ -457,9 +519,54 @@ class ParsezenWorkspace(QWidget):
 
     def set_jobs(self, jobs: tuple[DocumentJob, ...]) -> None:
         self._jobs = tuple(sorted(jobs, key=lambda job: job.order))
+        self._refresh_settings_attention()
+        self._reconcile_contextual_messages()
         self.job_table.set_jobs(self._jobs)
         self.table_panel.setVisible(bool(self._jobs))
-        self._refresh_header()
+        self.queue_toolbar.setVisible(bool(self._jobs))
+        self.drop_area.setVisible(not self._jobs)
+        self.table_panel.setFixedHeight(self.job_table.height() + 2)
+        self._apply_queue_state_layout()
+        self._refresh_queue_commands()
+
+    def _refresh_settings_attention(self) -> None:
+        attention = any(
+            job.status in {JobStatus.FAILED, JobStatus.PAUSED, JobStatus.WAITING_REVIEW}
+            or job.review_recommendation is not None
+            for job in self._jobs
+        )
+        self.settings_button.setIcon(settings_icon(attention=attention))
+        self.settings_button.setAccessibleName(
+            "Abrir ajustes y actividad. Hay acciones pendientes."
+            if attention
+            else "Abrir ajustes y actividad"
+        )
+        self.settings_button.setToolTip(
+            "Ajustes y actividad · Hay acciones pendientes" if attention else "Ajustes y actividad"
+        )
+
+    def _apply_queue_state_layout(self) -> None:
+        empty = not self._jobs
+        compact = self._layout_mode == "compact"
+        top_margin = SPACING.xl if empty and compact else SPACING.xxxl if empty else 0
+        self.queue_layout.setContentsMargins(0, top_margin, 0, 0)
+        root_margins = self.root_layout.contentsMargins()
+        available_width = max(
+            1,
+            self.width() - root_margins.left() - root_margins.right(),
+        )
+        rail_width = min(_CONTENT_RAIL_MAX_WIDTH, available_width)
+        self.app_header.setFixedWidth(rail_width)
+        self.queue_toolbar.setFixedWidth(rail_width)
+        self.table_panel.setFixedWidth(rail_width)
+        self.recovery_warning.setFixedWidth(rail_width)
+        self.batch_message.setFixedWidth(rail_width)
+        self.job_message.setFixedWidth(rail_width)
+        for header in self.findChildren(QFrame, "internalPageHeader"):
+            header.setFixedWidth(rail_width)
+        self.drop_area.setFixedWidth(min(_EMPTY_DROP_MAX_WIDTH, available_width))
+        self.drop_area.set_display_mode(compact=compact)
+        self.queue_layout.invalidate()
 
     def set_preparing_jobs(
         self,
@@ -471,7 +578,7 @@ class ParsezenWorkspace(QWidget):
         self._preparing_job_ids = tuple(job_ids)
         self._preparing_can_pause = bool(job_ids) and can_pause
         self.job_table.set_preparing_jobs(self._preparing_job_ids, details)
-        self._refresh_header()
+        self._refresh_queue_commands()
 
     def set_preflight(
         self,
@@ -483,7 +590,7 @@ class ParsezenWorkspace(QWidget):
         self._forecasts = dict(forecasts)
         self._queue_preflight = queue_preflight
         self.job_table.set_forecasts(self._forecasts)
-        self._refresh_header()
+        self._refresh_queue_commands()
 
     def set_runtime_estimates(
         self,
@@ -509,7 +616,8 @@ class ParsezenWorkspace(QWidget):
         else:
             label = directory.name or str(directory)
             tooltip = str(directory)
-        self.output_directory_button.setText(label if self._compact_layout else f"Destino: {label}")
+        condensed = self._layout_mode in {"compact", "medium"}
+        self.output_directory_button.setText(label if condensed else f"Destino · {label}")
         self.output_directory_button.setToolTip(tooltip)
 
     def set_local_ai_status(
@@ -522,7 +630,7 @@ class ParsezenWorkspace(QWidget):
         self._local_ai_status = status
         self._local_ai_model = model
         label = {
-            None: "Sin comprobar",
+            None: "Revisar",
             OllamaStatus.READY: "Lista",
             OllamaStatus.NOT_INSTALLED: "No configurada",
             OllamaStatus.STOPPED: "Detenida",
@@ -532,7 +640,8 @@ class ParsezenWorkspace(QWidget):
         }[status]
         compact_text = "IA"
         full_text = f"IA local · {label}"
-        self.local_ai_button.setText(compact_text if self._compact_layout else full_text)
+        condensed = self._layout_mode in {"compact", "medium"}
+        self.local_ai_button.setText(compact_text if condensed else full_text)
         details = f"Modelo predeterminado: {model}." if model else "Sin modelo predeterminado."
         self.local_ai_button.setToolTip(f"IA local: {label}. {details}")
         self.local_ai_button.setAccessibleName(f"Abrir IA local. Estado: {label}. {details}")
@@ -566,7 +675,9 @@ class ParsezenWorkspace(QWidget):
         *,
         tone: str,
         activity_available: bool = True,
+        job_ids: tuple[str, ...] = (),
     ) -> None:
+        self._batch_message_job_ids = frozenset(job_ids)
         self.batch_message.show_message(
             message,
             tone=tone,
@@ -574,7 +685,27 @@ class ParsezenWorkspace(QWidget):
         )
 
     def clear_batch_summary(self) -> None:
+        self._batch_message_job_ids = frozenset()
         self.batch_message.hide()
+
+    def clear_job_error(self, job_id: str | None = None) -> None:
+        if job_id is not None and self._message_job_id != job_id:
+            return
+        self._message_job_id = None
+        self._message_stage = None
+        self._message_primary_action = None
+        self._message_secondary_action = None
+        self.job_message.hide()
+
+    def _reconcile_contextual_messages(self) -> None:
+        valid_job_ids = frozenset(job.id for job in self._jobs)
+        if self._batch_message_job_ids and not self._batch_message_job_ids.issubset(valid_job_ids):
+            self.clear_batch_summary()
+        if self._message_job_id is not None and self._message_job_id not in valid_job_ids:
+            self.clear_job_error()
+        if not valid_job_ids:
+            self.clear_batch_summary()
+            self.clear_job_error()
 
     def show_job_error(
         self,
@@ -604,13 +735,15 @@ class ParsezenWorkspace(QWidget):
     def _run_recovery(self, action: RecoveryAction | None) -> None:
         if self._message_job_id is None:
             return
-        self.job_message.hide()
+        job_id = self._message_job_id
+        stage = self._message_stage
+        self.clear_job_error()
         if action is RecoveryAction.RETRY:
-            self.retry_requested.emit(self._message_job_id)
+            self.retry_requested.emit(job_id)
         elif action is RecoveryAction.LOCAL_AI:
             self.local_ai_requested.emit()
         elif action is RecoveryAction.CONFIGURE:
-            self.configure_requested.emit(self._message_job_id, self._message_stage)
+            self.configure_requested.emit(job_id, stage)
 
     def show_internal_view(
         self,
@@ -630,6 +763,8 @@ class ParsezenWorkspace(QWidget):
         page_layout.setSpacing(0)
         header = QFrame(page)
         header.setObjectName("internalPageHeader")
+        header.setMaximumWidth(_CONTENT_RAIL_MAX_WIDTH)
+        header.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         header_layout = QHBoxLayout(header)
         header_layout.setContentsMargins(8, 6, 8, 10)
         back = InternalBackButton(header)
@@ -643,7 +778,14 @@ class ParsezenWorkspace(QWidget):
         heading.setObjectName("internalPageTitle")
         header_layout.addWidget(heading)
         header_layout.addStretch(1)
-        page_layout.addWidget(header)
+        root_margins = self.root_layout.contentsMargins()
+        header.setFixedWidth(
+            min(
+                _CONTENT_RAIL_MAX_WIDTH,
+                max(1, self.width() - root_margins.left() - root_margins.right()),
+            )
+        )
+        page_layout.addWidget(header, 0, Qt.AlignmentFlag.AlignHCenter)
         if scroll:
             viewport = QScrollArea(page)
             viewport.setWidgetResizable(True)
@@ -665,6 +807,7 @@ class ParsezenWorkspace(QWidget):
         self.current_internal_widget = widget
         self.content_stack.setCurrentWidget(page)
         self.app_header.setVisible(not replace_app_header)
+        self.primary_button.hide()
         widget.show()
         if hasattr(widget, "set_compact_mode"):
             widget.set_compact_mode(bool(self._compact_layout))
@@ -685,6 +828,10 @@ class ParsezenWorkspace(QWidget):
         page.deleteLater()
         if replaced_header:
             self.app_header.show()
+        if previous is self.queue_pane:
+            self._refresh_queue_commands()
+        else:
+            self.primary_button.hide()
         previous_internal = next(
             (
                 candidate
@@ -737,23 +884,31 @@ class ParsezenWorkspace(QWidget):
 
     def resizeEvent(self, event: QResizeEvent) -> None:  # noqa: N802
         super().resizeEvent(event)
-        self._apply_responsive_layout(event.size().width() <= BREAKPOINTS.compact)
+        self._apply_responsive_layout(event.size().width())
+        self._apply_queue_state_layout()
 
-    def _apply_responsive_layout(self, compact: bool) -> None:
-        if self._compact_layout is compact:
+    def _apply_responsive_layout(self, width: int) -> None:
+        mode = (
+            "compact"
+            if width <= BREAKPOINTS.compact
+            else "medium"
+            if width <= BREAKPOINTS.medium
+            else "wide"
+        )
+        if self._layout_mode == mode:
             return
+        self._layout_mode = mode
+        compact = mode == "compact"
+        medium = mode == "medium"
         self._compact_layout = compact
         for widget in (
             self.logo,
-            self.header_separator,
-            self.queue_summary,
             self.local_ai_button,
             self.output_directory_button,
-            self.theme_button,
-            self.primary_button,
+            self.settings_button,
         ):
             self.header_layout.removeWidget(widget)
-        for column in range(8):
+        for column in range(5):
             self.header_layout.setColumnStretch(column, 0)
         if compact:
             self.root_layout.setContentsMargins(
@@ -766,68 +921,73 @@ class ParsezenWorkspace(QWidget):
             self.header_layout.setHorizontalSpacing(SPACING.sm)
             self.header_layout.setVerticalSpacing(SPACING.sm)
             self.header_layout.addWidget(self.logo, 0, 0)
-            self.header_layout.addWidget(self.queue_summary, 0, 1)
-            self.header_layout.addWidget(self.theme_button, 0, 2)
+            self.header_layout.addWidget(self.settings_button, 0, 2)
             self.header_layout.addWidget(self.local_ai_button, 1, 0)
             self.header_layout.addWidget(self.output_directory_button, 1, 1, 1, 2)
-            self.header_layout.addWidget(self.primary_button, 2, 0, 1, 3)
             self.header_layout.setColumnStretch(1, 1)
-            self.header_separator.hide()
-            self.set_local_ai_status(self._local_ai_status, self._local_ai_model)
-            self._apply_logo()
-            self.set_output_directory(self._output_directory)
-            self.primary_button.setMinimumWidth(0)
-            self.drop_area.setFixedHeight(96)
-            self.drop_area.content_layout.setDirection(QBoxLayout.Direction.TopToBottom)
-            self.drop_area.content_layout.setContentsMargins(12, 10, 12, 10)
-            self.drop_area.content_layout.setSpacing(SPACING.xs)
-            self.drop_area.content_layout.setAlignment(
-                self.drop_area.icon_label,
-                Qt.AlignmentFlag.AlignHCenter,
+        elif medium:
+            self.root_layout.setContentsMargins(
+                SPACING.lg,
+                SPACING.sm,
+                SPACING.lg,
+                SPACING.md,
             )
-            self.drop_area.text_host.setMinimumWidth(0)
-            self.drop_area.primary_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            self.drop_area.secondary_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.header_layout.setContentsMargins(0, SPACING.xs, 0, SPACING.xs)
+            self.header_layout.setHorizontalSpacing(SPACING.sm)
+            self.header_layout.setVerticalSpacing(SPACING.sm)
+            self.header_layout.addWidget(self.logo, 0, 0)
+            self.header_layout.addWidget(self.settings_button, 0, 3)
+            self.header_layout.addWidget(self.local_ai_button, 1, 0)
+            self.header_layout.addWidget(self.output_directory_button, 1, 1, 1, 3)
+            self.header_layout.setColumnStretch(1, 1)
         else:
             self.root_layout.setContentsMargins(24, 16, 24, 20)
             self.header_layout.setContentsMargins(8, 2, 0, 2)
             self.header_layout.setSpacing(8)
             self.header_layout.addWidget(self.logo, 0, 0)
-            self.header_layout.addWidget(self.header_separator, 0, 1)
-            self.header_layout.addWidget(self.queue_summary, 0, 2)
-            self.header_layout.addWidget(self.local_ai_button, 0, 4)
-            self.header_layout.addWidget(self.output_directory_button, 0, 5)
-            self.header_layout.addWidget(self.theme_button, 0, 6)
-            self.header_layout.addWidget(self.primary_button, 0, 7)
-            self.header_layout.setColumnStretch(3, 1)
-            self.header_separator.show()
-            self.set_local_ai_status(self._local_ai_status, self._local_ai_model)
-            self._apply_logo()
-            self.set_output_directory(self._output_directory)
-            self.primary_button.setMinimumWidth(156)
-            self.drop_area.setFixedHeight(76)
-            self.drop_area.content_layout.setDirection(QBoxLayout.Direction.LeftToRight)
-            self.drop_area.content_layout.setContentsMargins(18, 8, 18, 8)
-            self.drop_area.content_layout.setSpacing(12)
-            self.drop_area.content_layout.setAlignment(
-                self.drop_area.icon_label,
-                Qt.AlignmentFlag.AlignVCenter,
-            )
-            self.drop_area.text_host.setMinimumWidth(280)
-            self.drop_area.primary_label.setAlignment(
-                Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter
-            )
-            self.drop_area.secondary_label.setAlignment(
-                Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter
-            )
-        self.job_table.set_compact_mode(compact)
+            self.header_layout.addWidget(self.local_ai_button, 0, 2)
+            self.header_layout.addWidget(self.output_directory_button, 0, 3)
+            self.header_layout.addWidget(self.settings_button, 0, 4)
+            self.header_layout.setColumnStretch(1, 1)
+        self.set_local_ai_status(self._local_ai_status, self._local_ai_model)
+        self._apply_logo()
+        self.set_output_directory(self._output_directory)
+        self._apply_queue_toolbar_layout(compact=compact)
+        self.job_table.set_compact_mode(compact or medium)
+        self._apply_queue_state_layout()
         self.batch_message.set_compact_mode(compact)
         self.job_message.set_compact_mode(compact)
         current = self.current_internal_widget
         if current is not None and hasattr(current, "set_compact_mode"):
             current.set_compact_mode(compact)
 
-    def _refresh_header(self) -> None:
+    def _apply_queue_toolbar_layout(self, *, compact: bool) -> None:
+        for widget in (self.queue_summary, self.add_button, self.primary_button):
+            self.queue_toolbar_layout.removeWidget(widget)
+        for column in range(4):
+            self.queue_toolbar_layout.setColumnStretch(column, 0)
+        if compact:
+            self.queue_toolbar_layout.addWidget(self.queue_summary, 0, 0, 1, 2)
+            self.queue_toolbar_layout.addWidget(self.add_button, 1, 0)
+            self.queue_toolbar_layout.addWidget(self.primary_button, 1, 1)
+            self.queue_toolbar_layout.setColumnStretch(1, 1)
+            self.primary_button.setMinimumWidth(0)
+            self.primary_button.setSizePolicy(
+                QSizePolicy.Policy.Expanding,
+                QSizePolicy.Policy.Fixed,
+            )
+            return
+        self.queue_toolbar_layout.addWidget(self.queue_summary, 0, 0)
+        self.queue_toolbar_layout.addWidget(self.add_button, 0, 2)
+        self.queue_toolbar_layout.addWidget(self.primary_button, 0, 3)
+        self.queue_toolbar_layout.setColumnStretch(1, 1)
+        self.primary_button.setMinimumWidth(156)
+        self.primary_button.setSizePolicy(
+            QSizePolicy.Policy.Preferred,
+            QSizePolicy.Policy.Fixed,
+        )
+
+    def _refresh_queue_commands(self) -> None:
         view = queue_header_view(self._jobs)
         if view.review_count:
             self.queue_summary.setText(view.summary)
@@ -880,7 +1040,7 @@ class ParsezenWorkspace(QWidget):
     def _clear_pause_feedback(self) -> None:
         if self._pause_feedback_pending:
             self._pause_feedback_pending = False
-            self._refresh_header()
+            self._refresh_queue_commands()
 
     def _apply_local_styles(self) -> None:
         self.setStyleSheet(
@@ -888,10 +1048,8 @@ class ParsezenWorkspace(QWidget):
             QWidget#appHeader {{
                 background-color: transparent;
             }}
-            QFrame#headerSeparator {{
-                color: {COLORS.divider};
-                background-color: {COLORS.divider};
-                max-width: 1px;
+            QWidget#queueToolbar {{
+                background-color: transparent;
             }}
             QLabel#queueSummary {{
                 color: {COLORS.text_secondary};
@@ -899,13 +1057,12 @@ class ParsezenWorkspace(QWidget):
             }}
             QFrame#documentDropArea {{
                 color: {COLORS.text_primary};
-                background-color: {COLORS.surface_subtle};
-                border: 2px dashed {COLORS.action_primary};
+                background-color: {COLORS.surface_raised};
+                border: 1px solid {COLORS.divider};
                 border-radius: 8px;
             }}
-            QFrame#documentDropArea:hover,
-            QFrame#documentDropArea:focus {{
-                border-color: {COLORS.action_primary_hover};
+            QFrame#documentDropArea:hover {{
+                border: 1px dashed {COLORS.action_primary};
                 background-color: {COLORS.action_primary_soft};
             }}
             QFrame#documentDropArea[dragActive="true"] {{
@@ -925,6 +1082,27 @@ class ParsezenWorkspace(QWidget):
             QLabel#dropAreaSecondary {{
                 color: {COLORS.text_secondary};
                 font-size: 9pt;
+            }}
+            QPushButton#dropBrowseButton,
+            QPushButton#queueAddAction {{
+                min-height: 38px;
+                max-height: 38px;
+                color: {COLORS.text_primary};
+                background-color: transparent;
+                border: 1px solid {COLORS.divider};
+                border-radius: 7px;
+                font-weight: 550;
+            }}
+            QPushButton#queueAddAction {{
+                padding: 0 10px;
+            }}
+            QPushButton#dropBrowseButton:hover,
+            QPushButton#dropBrowseButton:focus,
+            QPushButton#queueAddAction:hover,
+            QPushButton#queueAddAction:focus {{
+                color: {COLORS.action_primary};
+                background-color: {COLORS.surface_hover};
+                border-color: {COLORS.action_primary};
             }}
             QLabel#recoveryWarning {{
                 color: {COLORS.warning};
@@ -972,18 +1150,18 @@ class ParsezenWorkspace(QWidget):
             }}
             QPushButton#globalOutputDirectory:hover,
             QPushButton#localAiSettings:hover,
-            QPushButton#themeToggle:hover {{
+            QPushButton#globalMenu:hover {{
                 color: {COLORS.text_primary};
                 background-color: {COLORS.surface_hover};
                 border-color: transparent;
             }}
             QPushButton#globalOutputDirectory:focus,
             QPushButton#localAiSettings:focus,
-            QPushButton#themeToggle:focus {{
+            QPushButton#globalMenu:focus {{
                 background-color: {COLORS.surface_hover};
                 border-color: transparent;
             }}
-            QPushButton#themeToggle {{
+            QPushButton#globalMenu {{
                 padding: 0;
                 background-color: transparent;
                 border-color: transparent;

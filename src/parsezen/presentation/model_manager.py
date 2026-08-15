@@ -301,10 +301,6 @@ class ModelManagerDialog(QDialog):
         root.setContentsMargins(32, 12, 32, 24)
         root.setSpacing(16)
 
-        intro = QLabel("IA local", self)
-        intro.setObjectName("modelManagerIntro")
-        root.addWidget(intro)
-
         self.status_card = QFrame(self)
         self.status_card.setObjectName("localAiStatusCard")
         status_layout = QGridLayout(self.status_card)
@@ -1038,11 +1034,6 @@ class ModelManagerDialog(QDialog):
     def _apply_styles(self) -> None:
         self.setStyleSheet(
             f"""
-            QLabel#modelManagerIntro {{
-                color: {COLORS.text_primary};
-                font-size: 14pt;
-                font-weight: 600;
-            }}
             QFrame#localAiStatusCard,
             QFrame#executionSettings,
             QFrame#modelOperation {{

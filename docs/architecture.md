@@ -106,12 +106,16 @@ preferencias nativas.
 
 `presentation/components.py` contiene solo abstracciones repetidas con una necesidad real:
 selector con chevron vectorial, interruptor de teclado, mensaje inline recuperable y tira de
-herramientas desplazable. Layout, estado y contenido específico continúan en su pantalla.
+herramientas desplazable. El mensaje calcula su altura desde el ancho disponible y su pantalla liga
+la vigencia al trabajo que lo originó; el historial durable pertenece a Actividad. Layout, estado y
+contenido específico continúan en su pantalla.
 
-El breakpoint compacto es 640 px y todos los flujos esenciales aceptan reflow hasta 320 px. En ese
-modo se reorganizan cabecera, columnas, formularios, pies y comparadores; no se ocultan acciones ni
-se habilita desplazamiento horizontal accidental. El contrato, paleta y matriz de contraste están
-en `docs/ui-design-system.md`.
+El shell tiene composiciones de escritorio, intermedia y compacta en 960 y 640 px, y todos los
+flujos esenciales aceptan reflow hasta 320 px. Ajustes, actividad, apariencia y diagnóstico comparten
+un único menú global. Los workbenches de revisión sustituyen la cabecera general para no repetir
+títulos ni acciones ajenas al contexto. El editor EPUB conserva los dos paneles en escritorio y, al
+reducir el ancho, agrupa herramientas secundarias en un menú en vez de introducir desplazamiento
+horizontal. El contrato, paleta y matriz de contraste están en `docs/ui-design-system.md`.
 
 ## Trabajo independiente
 
@@ -231,9 +235,9 @@ previsibles, advertencias por OCR completo, reconstrucción PDF→EPUB o cambios
 revisión, y un intervalo de tiempo automático. La estimación parte de coeficientes conservadores y
 se calibra mediante la mediana de hasta 200 ejecuciones locales comparables. SQLite conserva
 únicamente formato, opciones, unidades, huella no reversible del modelo y duración; nunca rutas,
-nombres, tamaño original ni texto. Un plan solo exige una confirmación adicional si supera media
-hora en su
-límite superior o contiene un riesgo alto.
+nombres, tamaño original ni texto. Esta información se proyecta en la cola y en sus ayudas sin
+interrumpir `Procesar` con una confirmación informativa. Los problemas de configuración continúan
+bloqueando antes de crear el trabajador.
 
 `should_run_early_check` limita la comprobación representativa a PDFs cuyo coste o incertidumbre
 pueden justificarla: al menos 120 unidades, o 60 con OCR forzado, IA local o salida EPUB.
@@ -280,12 +284,19 @@ Cada `StageState` distingue disponibilidad y ejecución:
 Las transiciones inválidas se rechazan en el dominio. La configuración se bloquea al empezar y una
 modificación anterior invalida únicamente sus fases dependientes.
 
-La ventana principal contiene una pila de páginas. La cola usa una tabla compacta de ancho completo
-y deriva con `job_view_model` el siguiente paso, el contador y la única acción contextual de la
-cabecera. Configuración, IA local, revisiones y editor EPUB se presentan dentro de la pila; solo el
-editor compacto de glosario y el selector de intervalo son diálogos modales acotados sobre su
-contexto. Como no existen cambios pendientes, la flecha de vuelta y Escape cierran configuración sin
-confirmación. Si hay una inconsistencia muestra su causa y conserva la página para
+La ventana principal contiene una pila de páginas. Cabecera global, títulos internos, mensajes y cola
+comparten un rail exterior centrado de 1.280 px; los formularios conservan límites interiores más
+estrechos cuando su lectura lo requiere. La cola usa una tabla compacta: su panel ajusta la altura a
+una, varias o seis filas visibles y después desplaza solo el contenido. En vacío, la importación se
+ancla bajo la cabecera; tras añadir documentos se reduce a una acción secundaria dentro de una barra
+local sobre la tabla. Esa barra mantiene juntos el contador, `Añadir` y la única acción principal del
+lote; la cabecera general queda reservada a marca, IA, destino y ajustes. `job_view_model` deriva el
+estado, el contador y la acción contextual. Los mensajes terminales conservan los identificadores del
+lote: se recalculan si se retira parte y desaparecen al eliminar el último trabajo relacionado.
+Configuración, IA local, revisiones y editor EPUB se presentan dentro de la pila;
+solo el editor compacto de glosario y el selector de intervalo son diálogos modales acotados sobre su
+contexto. Como no existen cambios pendientes, la flecha de vuelta y Escape cierran
+configuración sin confirmación. Si hay una inconsistencia muestra su causa y conserva la página para
 corregirla. Las opciones de una fase apagada quedan inhabilitadas y no participan en su validación
 ni en el `ProcessRequest`. Los controladores de revisión conservan sus contratos y
 checkpoints: la navegación interna sustituye al contenedor de ventana, no a la lógica de
@@ -457,7 +468,11 @@ La persona debe pulsar un botón de elección o editar la propuesta; el botón c
 estado y el panel elegido se tiñe sin dibujar un borde de selección alrededor de todo el panel. La
 salida por guardar, volver o cerrar conserva una edición o una elección cambiada del caso visible;
 abrir y salir sin interacción no marca la recomendación como resuelta. `Guardar y salir` cifra el
-estado y permite reanudar en la primera unidad pendiente.
+estado y permite reanudar en la primera unidad pendiente. La presentación omite el resumen del caso
+cuando solo repetiría el progreso: enseña prioridad alta o crítica, aviso, etiqueta o sugerencia
+concreta únicamente cuando aportan una decisión. `Anterior` se oculta si no existe un destino real,
+las acciones de localizar y restaurar viven en el menú del panel y la acción masiva solo aparece en
+fases de corrección con varias unidades.
 
 Las unidades OCR se anclan al tramo completo de la página dentro del Markdown ya transformado,
 desde su marcador privado hasta el marcador siguiente. Así, en un flujo con traducción, la persona
@@ -476,8 +491,10 @@ ya aplicada, la reconciliación vuelve a esa primera fase pendiente, descarta ú
 revisiones posteriores dependientes y conserva los intentos y la instantánea del procesamiento.
 
 La presentación expone ese coordinador como una única superficie `Revisión del documento`, con
-progreso global y fase actual; no obliga a elegir qué editor abrir. Un documento bloqueado queda
-fuera de la selección automática, pero la cola continúa con el siguiente trabajo elegible.
+progreso global y fase actual; no obliga a elegir qué editor abrir. Los controles visibles forman un
+recorrido único: elegir original o propuesta, `Siguiente` y la acción final propia de la fase. Un
+documento bloqueado queda fuera de la selección automática, pero la cola continúa con el siguiente
+trabajo elegible.
 
 ### Decisión sobre separar el review gate
 

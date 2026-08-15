@@ -130,7 +130,6 @@ from parsezen.presentation.job_configuration_dialog import JobConfigurationDialo
 from parsezen.presentation.local_ai_controller import LocalAIController
 from parsezen.presentation.local_ai_workflow import LocalAIWorkflow
 from parsezen.presentation.phase_review_dialog import PhaseReviewDialog
-from parsezen.presentation.preflight_dialog import PreflightDialog
 from parsezen.presentation.preflight_runner import (
     ForecastBatch,
     PreflightRunner,
@@ -231,6 +230,7 @@ class ParsezenMainWindow(QMainWindow):
         self.settings_menu.setObjectName("settingsMenu")
         self._queue_configuration = QueueConfigurationService(self._job_queue)
         self._last_projection: tuple[DocumentJob, ...] = ()
+        self._finished_batch_job_ids: tuple[str, ...] = ()
         self._state_recovery_notice: str | None = startup_message
         state_destination = (
             state_path or user_data_path(APP_STORAGE_NAME, appauthor=False) / _STATE_FILENAME
@@ -347,7 +347,7 @@ class ParsezenMainWindow(QMainWindow):
             return
         self._replace_sources(tuple(selected))
         self._queue_session.reset_idle_selection()
-        self.parsezen_workspace.clear_batch_summary()
+        self._clear_batch_summary()
         self._ensure_configurations()
         self._sync_workspace(force_persist=True)
 
@@ -357,7 +357,7 @@ class ParsezenMainWindow(QMainWindow):
         added = [path for path in candidates if _path_key(path) not in known]
         if not added:
             return
-        self.parsezen_workspace.clear_batch_summary()
+        self._clear_batch_summary()
         self._replace_sources(tuple(job.source.path for job in self._job_queue.jobs) + tuple(added))
         self._sync_workspace(force_persist=True)
 
@@ -414,7 +414,7 @@ class ParsezenMainWindow(QMainWindow):
             self.parsezen_workspace.set_preparing_jobs(())
             self._queue_session.finish(SessionTermination.CANCELLED)
             return
-        self.parsezen_workspace.clear_batch_summary()
+        self._clear_batch_summary()
         self._sleep_blocker.start()
         self._start_next_batch_entry()
 
@@ -814,7 +814,6 @@ class ParsezenMainWindow(QMainWindow):
         workspace.files_dropped.connect(self._add_dropped_paths)
         workspace.settings_requested.connect(self._show_parsezen_settings)
         workspace.local_ai_requested.connect(self._local_ai_workflow.show_model_manager)
-        workspace.theme_toggle_requested.connect(self._toggle_theme)
         workspace.output_directory_requested.connect(self._choose_global_output_directory)
         workspace.output_directory_reset_requested.connect(self._reset_global_output_directory)
         workspace.internal_back_requested.connect(self._close_internal_workflow)
@@ -833,12 +832,12 @@ class ParsezenMainWindow(QMainWindow):
 
     def _install_settings_actions(self) -> None:
         self.settings_menu.clear()
-        self.models_settings_action = QAction("IA local", self.settings_menu)
-        self.models_settings_action.triggered.connect(self._local_ai_workflow.show_model_manager)
-        self.settings_menu.addAction(self.models_settings_action)
         self.activity_action = QAction("Actividad reciente", self.settings_menu)
         self.activity_action.triggered.connect(self._show_recent_activity)
         self.settings_menu.addAction(self.activity_action)
+        self.models_settings_action = QAction("IA local", self.settings_menu)
+        self.models_settings_action.triggered.connect(self._local_ai_workflow.show_model_manager)
+        self.settings_menu.addAction(self.models_settings_action)
         self.settings_menu.addSeparator()
 
         self.checkpoint_retention_menu = self.settings_menu.addMenu("Conservar trabajo temporal")
@@ -954,7 +953,7 @@ class ParsezenMainWindow(QMainWindow):
     @Slot()
     def _toggle_theme(self) -> None:
         menu_size = self.appearance_menu.sizeHint()
-        button = self.parsezen_workspace.theme_button
+        button = self.parsezen_workspace.settings_button
         bottom_right = button.mapToGlobal(QPoint(button.width(), button.height()))
         self.appearance_menu.popup(
             QPoint(bottom_right.x() - menu_size.width(), bottom_right.y() + 4)
@@ -989,7 +988,7 @@ class ParsezenMainWindow(QMainWindow):
     @Slot()
     def _show_parsezen_settings(self) -> None:
         menu_size = self.settings_menu.sizeHint()
-        button = self.parsezen_workspace.theme_button
+        button = self.parsezen_workspace.settings_button
         bottom_right = button.mapToGlobal(QPoint(button.width(), button.height()))
         self.settings_menu.popup(QPoint(bottom_right.x() - menu_size.width(), bottom_right.y() + 4))
 
@@ -1129,10 +1128,11 @@ class ParsezenMainWindow(QMainWindow):
             return
 
         entry.result = base_result
-        self.parsezen_workspace.clear_batch_summary()
+        self._clear_batch_summary()
         self.parsezen_workspace.show_batch_summary(
             "Revisión local iniciada. " + recommendation_summary(job.review_recommendation),
             tone="warning",
+            job_ids=(job.id,),
         )
         self._sleep_blocker.start()
         self._sync_workspace(force_persist=True)
@@ -1271,11 +1271,17 @@ class ParsezenMainWindow(QMainWindow):
             title = dialog.internal_page_title
         elif isinstance(dialog, BookEditorDialog):
             title = "Revisión final del EPUB"
+            dialog.set_embedded_mode(True)
+        replace_app_header = isinstance(dialog, (BookEditorDialog, PhaseReviewDialog))
         dialog.setModal(False)
         dialog.setWindowFlags(Qt.WindowType.Widget)
         loop = QEventLoop(self)
         dialog.finished.connect(loop.quit)
-        self.parsezen_workspace.show_internal_view(dialog, title)
+        self.parsezen_workspace.show_internal_view(
+            dialog,
+            title,
+            replace_app_header=replace_app_header,
+        )
         loop.exec()
         result = dialog.result()
         self.parsezen_workspace.close_internal_view(dialog)
@@ -1962,6 +1968,7 @@ class ParsezenMainWindow(QMainWindow):
                 reviews=finalized.reviews,
                 activity=self._activity_for_job(current_job.id),
             )
+            self._clear_batch_summary()
             self.parsezen_workspace.show_batch_summary(
                 (
                     "Resultado final listo: la revisión se aplicó y la integridad técnica "
@@ -1971,6 +1978,7 @@ class ParsezenMainWindow(QMainWindow):
                     "No consta un informe detallado del control técnico."
                 ),
                 tone="success",
+                job_ids=(current_job.id,),
             )
             self._show_system_notification(
                 "Resultado listo",
@@ -2096,9 +2104,26 @@ class ParsezenMainWindow(QMainWindow):
             if job_id not in current_ids:
                 del self._terminal_attempt_activity[job_id]
 
-    def _show_finished_batch_summary(self, job_ids: tuple[str, ...]) -> None:
-        jobs = tuple(job for job_id in job_ids if (job := self._job_queue.get(job_id)) is not None)
+    def _clear_batch_summary(self) -> None:
+        self._finished_batch_job_ids = ()
+        self.parsezen_workspace.clear_batch_summary()
+
+    def _show_finished_batch_summary(
+        self,
+        job_ids: tuple[str, ...],
+        *,
+        notify: bool = True,
+    ) -> None:
+        self._finished_batch_job_ids = tuple(
+            dict.fromkeys(job_id for job_id in job_ids if self._job_queue.get(job_id) is not None)
+        )
+        jobs = tuple(
+            job
+            for job_id in self._finished_batch_job_ids
+            if (job := self._job_queue.get(job_id)) is not None
+        )
         if not jobs:
+            self._clear_batch_summary()
             return
         completed = sum(job.status is JobStatus.COMPLETED for job in jobs)
         reviews = sum(job.status is JobStatus.WAITING_REVIEW for job in jobs)
@@ -2117,13 +2142,22 @@ class ParsezenMainWindow(QMainWindow):
         if cancelled:
             parts.append(f"{cancelled} {'cancelado' if cancelled == 1 else 'cancelados'}")
         if not parts:
+            self._clear_batch_summary()
             return
-        message = "Procesamiento terminado: " + " · ".join(parts) + "."
+        document_count = len(jobs)
+        document_label = "1 documento" if document_count == 1 else f"{document_count} documentos"
+        if paused == document_count:
+            message = f"Procesamiento pausado: {document_label}."
+        elif cancelled == document_count:
+            message = f"Procesamiento detenido: {document_label}."
+        else:
+            message = "Procesamiento terminado: " + " · ".join(parts) + "."
         tone = "error" if failed else "warning" if reviews or paused or cancelled else "success"
         self.parsezen_workspace.show_batch_summary(
             message,
             tone=tone,
             activity_available=bool(completed or failed or cancelled),
+            job_ids=self._finished_batch_job_ids,
         )
         icon = (
             QSystemTrayIcon.MessageIcon.Critical
@@ -2132,7 +2166,8 @@ class ParsezenMainWindow(QMainWindow):
             if reviews or paused or cancelled
             else QSystemTrayIcon.MessageIcon.Information
         )
-        self._show_system_notification("Parsezen", message, icon)
+        if notify:
+            self._show_system_notification("Parsezen", message, icon)
 
     def _show_system_notification(
         self,
@@ -2263,6 +2298,14 @@ class ParsezenMainWindow(QMainWindow):
                     LOGGER.warning("paused_job_checkpoint_cleanup_failed")
         self._job_queue.remove(job_id)
         self._queue_session.remove_runtime(job_id)
+        self.parsezen_workspace.clear_job_error(job_id)
+        if job_id in self._finished_batch_job_ids:
+            remaining_summary_jobs = tuple(
+                summary_job_id
+                for summary_job_id in self._finished_batch_job_ids
+                if summary_job_id != job_id
+            )
+            self._show_finished_batch_summary(remaining_summary_jobs, notify=False)
         if self._selected_result_job_id == job_id:
             self._selected_result_job_id = None
             self._result = None
@@ -2365,24 +2408,6 @@ class ParsezenMainWindow(QMainWindow):
                 f"{first_issue.document_name}: {first_issue.message}",
             )
             self._queue_session.set_prepared_run(None)
-            return
-        if (
-            prepared.preflight is not None
-            and prepared.preflight.requires_confirmation
-            and PreflightDialog(
-                prepared.preflight,
-                {
-                    job.id: job.source.path.name
-                    for job in self._job_queue.jobs
-                    if job.id in prepared.plan.job_ids
-                },
-                self,
-            ).exec()
-            != QDialog.DialogCode.Accepted
-        ):
-            self.parsezen_workspace.set_preparing_jobs(())
-            self._queue_session.set_prepared_run(None)
-            self._sync_workspace()
             return
         self._start_processing()
         failed_to_start = not self._queue_session.running and any(

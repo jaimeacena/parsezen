@@ -39,6 +39,14 @@ de Ollama y nunca envía el documento fuera del equipo. Es open source, privado 
   original con la propuesta y comprueba el resultado antes de publicarlo. Una recomendación nunca
   ejecuta IA por sí sola y puedes ignorarla sin perder el resultado ya creado.
 
+- **Interfaz concentrada en el trabajo.** La entrada inicial queda cerca de la cabecera y la cola
+  reúne `Añadir` y su única acción principal justo sobre los documentos a los que afectan. Crece con
+  uno o varios archivos sin convertir las filas en un panel vacío. `Procesar` arranca directamente:
+  las estimaciones permanecen en la cola y solo un error real interrumpe la preparación. Revisiones y
+  editor EPUB se adaptan al ancho disponible y agrupan herramientas secundarias sin recortar
+  funciones. Durante una revisión solo permanecen visibles la comparación, las dos decisiones y el
+  avance; localizar, restaurar y aprobar en lote aparecen únicamente cuando son útiles.
+
 - **Pensado para trabajos largos.** Puedes procesar varios documentos, consultar el tiempo
   aproximado, pausar, continuar más tarde y reintentar únicamente la fase que haya fallado. En EPUB,
   también se conserva de forma privada cada subfragmento de IA ya validado y cada decisión segura de

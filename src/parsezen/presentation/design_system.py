@@ -324,8 +324,8 @@ def load_application_font() -> str:
     return _FONT_FAMILY
 
 
-def settings_icon() -> QIcon:
-    """Create a crisp vector-like gear without depending on emoji fonts."""
+def settings_icon(*, attention: bool = False) -> QIcon:
+    """Create a crisp gear with an optional actionable-attention marker."""
 
     pixmap = QPixmap(24, 24)
     pixmap.fill(Qt.GlobalColor.transparent)
@@ -345,22 +345,44 @@ def settings_icon() -> QIcon:
     painter.setBrush(Qt.BrushStyle.NoBrush)
     painter.drawEllipse(QRectF(-5.8, -5.8, 11.6, 11.6))
     painter.drawEllipse(QRectF(-1.7, -1.7, 3.4, 3.4))
+    if attention:
+        painter.resetTransform()
+        painter.setPen(QPen(QColor(COLORS.canvas), 1.2))
+        painter.setBrush(QColor(COLORS.warning))
+        painter.drawEllipse(QRectF(17, 1, 6, 6))
     painter.end()
     return QIcon(pixmap)
 
 
 def add_documents_icon() -> QIcon:
-    """Create a large, unambiguous plus for the document drop area."""
+    """Create a local document-plus icon without suggesting cloud transfer."""
 
     pixmap = QPixmap(30, 30)
     pixmap.fill(Qt.GlobalColor.transparent)
     painter = QPainter(pixmap)
     painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-    pen = QPen(QColor(COLORS.action_primary), 2.4)
+    pen = QPen(QColor(COLORS.action_primary), 1.8)
     pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+    pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
     painter.setPen(pen)
-    painter.drawLine(15, 5, 15, 25)
-    painter.drawLine(5, 15, 25, 15)
+    painter.setBrush(Qt.BrushStyle.NoBrush)
+    document = QPainterPath()
+    document.moveTo(7, 3)
+    document.lineTo(18, 3)
+    document.lineTo(24, 9)
+    document.lineTo(24, 14)
+    document.moveTo(7, 3)
+    document.lineTo(7, 27)
+    document.lineTo(16, 27)
+    document.moveTo(18, 3)
+    document.lineTo(18, 9)
+    document.lineTo(24, 9)
+    painter.drawPath(document)
+    plus_pen = QPen(QColor(COLORS.action_primary), 2.2)
+    plus_pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+    painter.setPen(plus_pen)
+    painter.drawLine(21, 17, 21, 27)
+    painter.drawLine(16, 22, 26, 22)
     painter.end()
     return QIcon(pixmap)
 
@@ -558,6 +580,11 @@ def editor_icon(name: str) -> QIcon:
             QPointF(10 + direction * 2, 10),
             QPointF(10 - direction * 4, 15.5),
         )
+    elif name == "more":
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor(COLORS.text_primary))
+        for x in (5, 10, 15):
+            painter.drawEllipse(QRectF(x - 1.2, 8.8, 2.4, 2.4))
     elif name in {"move_up", "move_down"}:
         direction = -1 if name == "move_up" else 1
         painter.drawLine(QPointF(10, 4), QPointF(10, 16))
@@ -1192,6 +1219,17 @@ def apply_parsezen_theme(
         QToolButton:focus {{
             background-color: {COLORS.action_primary_soft};
             border-color: transparent;
+        }}
+        QToolButton#reviewPaneMore {{
+            min-width: 32px;
+            max-width: 32px;
+            min-height: 32px;
+            max-height: 32px;
+            padding: 0;
+            font-size: 16px;
+        }}
+        QToolButton#reviewPaneMore::menu-indicator {{
+            image: none;
         }}
         QLineEdit, QComboBox, QSpinBox, QTextEdit, QPlainTextEdit, QTreeView {{
             min-height: {CONTROL_HEIGHT}px;

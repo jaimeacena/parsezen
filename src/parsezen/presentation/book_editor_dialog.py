@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from functools import partial
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote, unquote
@@ -10,6 +11,7 @@ from urllib.parse import quote, unquote
 from lxml import etree, html
 from PySide6.QtCore import QSize, Qt, QUrl
 from PySide6.QtGui import (
+    QAction,
     QColor,
     QFont,
     QImage,
@@ -32,6 +34,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QLayout,
     QLineEdit,
+    QMenu,
     QMessageBox,
     QPushButton,
     QSplitter,
@@ -141,6 +144,8 @@ class BookEditorDialog(QDialog):
         self._dirty = False
         self._initial_book = book
         self._zoom_percent = 100
+        self._embedded = False
+        self._toolbar_mode: str | None = None
         self.setWindowTitle("Revisión final del EPUB · Parsezen")
         self.resize(1320, 820)
 
@@ -149,21 +154,26 @@ class BookEditorDialog(QDialog):
         layout.setSizeConstraint(QLayout.SizeConstraint.SetNoConstraint)
         layout.setContentsMargins(14, 12, 14, 12)
         layout.setSpacing(8)
+        self.intro_host = QWidget(self)
+        intro_layout = QVBoxLayout(self.intro_host)
+        intro_layout.setContentsMargins(0, 0, 0, 0)
+        intro_layout.setSpacing(4)
         header = QHBoxLayout()
-        self.dialog_title = QLabel("Revisión final del EPUB", self)
+        self.dialog_title = QLabel("Revisión final del EPUB", self.intro_host)
         self.dialog_title.setObjectName("dialogTitle")
         self.dialog_title.setWordWrap(True)
         header.addWidget(self.dialog_title)
         header.addStretch(1)
-        layout.addLayout(header)
+        intro_layout.addLayout(header)
         self.review_helper = QLabel(
             "Revisa capítulos, portada y contenido. El original no se modificará.",
-            self,
+            self.intro_host,
         )
         self.review_helper.setObjectName("editorReviewHelper")
         self.review_helper.setWordWrap(True)
         self.review_helper.setAccessibleName("Ayuda de la revisión final del EPUB")
-        layout.addWidget(self.review_helper)
+        intro_layout.addWidget(self.review_helper)
+        layout.addWidget(self.intro_host)
 
         self.metadata_button = QPushButton("Metadatos", self)
         self.metadata_button.setObjectName("metadataToggle")
@@ -279,10 +289,27 @@ class BookEditorDialog(QDialog):
             None,
             "Rehacer",
         )
-        self._add_toolbar_separator(content_tools)
-        self._add_format_button(content_tools, "B", self._bold, "Negrita", bold=True)
-        self._add_icon_tool(content_tools, "italic", self._italic, "Cursiva")
-        self._add_format_button(content_tools, "U", self._underline, "Subrayado", underline=True)
+        self.format_separator = self._add_toolbar_separator(content_tools)
+        self.bold_button = self._add_format_button(
+            content_tools,
+            "B",
+            self._bold,
+            "Negrita",
+            bold=True,
+        )
+        self.italic_button = self._add_icon_tool(
+            content_tools,
+            "italic",
+            self._italic,
+            "Cursiva",
+        )
+        self.underline_button = self._add_format_button(
+            content_tools,
+            "U",
+            self._underline,
+            "Subrayado",
+            underline=True,
+        )
         self.heading = QComboBox(self.content_toolbar)
         self.heading.addItem("Párrafo", 0)
         for level in range(1, 7):
@@ -294,13 +321,13 @@ class BookEditorDialog(QDialog):
         self.heading.setMinimumWidth(104)
         self.heading.setMaximumWidth(118)
         content_tools.addWidget(self.heading)
-        self._add_icon_tool(
+        self.bullet_button = self._add_icon_tool(
             content_tools,
             "bullet_list",
             self._bullet_list,
             "Lista con viñetas",
         )
-        self._add_icon_tool(
+        self.numbered_button = self._add_icon_tool(
             content_tools,
             "numbered_list",
             self._numbered_list,
@@ -323,13 +350,34 @@ class BookEditorDialog(QDialog):
         self.alignment.setMaximumWidth(118)
         self.alignment.currentIndexChanged.connect(self._alignment_changed)
         content_tools.addWidget(self.alignment)
-        self._add_icon_tool(content_tools, "link", self._insert_link, "Insertar enlace")
-        self._add_icon_tool(
+        self.link_button = self._add_icon_tool(
+            content_tools,
+            "link",
+            self._insert_link,
+            "Insertar enlace",
+        )
+        self.clear_format_button = self._add_icon_tool(
             content_tools,
             "clear_formatting",
             self._clear_formatting,
             "Limpiar formato",
         )
+        self.editor_more_menu = QMenu(self.content_toolbar)
+        self.editor_more_menu.setObjectName("editorMoreMenu")
+        self.editor_more_button = QToolButton(self.content_toolbar)
+        self.editor_more_button.setObjectName("editorMore")
+        self.editor_more_button.setIcon(editor_icon("more"))
+        self.editor_more_button.setIconSize(QSize(_EDITOR_ICON_SIZE, _EDITOR_ICON_SIZE))
+        self.editor_more_button.setFixedSize(
+            _EDITOR_TOOL_CONTENT_SIZE,
+            _EDITOR_TOOL_CONTENT_SIZE,
+        )
+        self.editor_more_button.setMenu(self.editor_more_menu)
+        self.editor_more_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        self.editor_more_button.setToolTip("Más herramientas")
+        self.editor_more_button.setAccessibleName("Más herramientas de edición")
+        self.editor_more_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        content_tools.addWidget(self.editor_more_button)
         content_tools.addStretch(1)
         self.zoom_out_button = self._add_icon_tool(
             content_tools,
@@ -352,7 +400,7 @@ class BookEditorDialog(QDialog):
             self._zoom_in,
             "Ampliar texto del editor",
         )
-        self._add_toolbar_separator(content_tools)
+        self.navigation_separator = self._add_toolbar_separator(content_tools)
         self.previous_button = self._add_icon_tool(
             content_tools,
             "previous",
@@ -371,6 +419,7 @@ class BookEditorDialog(QDialog):
             lambda: self._navigate(1),
             "Capítulo siguiente",
         )
+        self._build_editor_overflow_menu()
         self.content_tool_strip = HorizontalToolStrip(
             self.content_toolbar,
             content_pane,
@@ -432,10 +481,25 @@ class BookEditorDialog(QDialog):
         self._compact = False
         self._apply_styles()
         self._populate()
+        self._apply_toolbar_mode(self.width())
 
     def resizeEvent(self, event: QResizeEvent) -> None:  # noqa: N802
         super().resizeEvent(event)
         self.set_compact_mode(event.size().width() <= BREAKPOINTS.compact)
+        self._apply_toolbar_mode(event.size().width())
+
+    def set_embedded_mode(self, embedded: bool) -> None:
+        """Remove title copy already supplied by the internal workbench header."""
+
+        self._embedded = embedded
+        self.intro_host.setVisible(not embedded)
+        if not self._compact:
+            self.root_layout.setContentsMargins(
+                14,
+                0 if embedded else 12,
+                14,
+                12,
+            )
 
     def set_compact_mode(self, compact: bool) -> None:
         if compact == self._compact:
@@ -463,7 +527,12 @@ class BookEditorDialog(QDialog):
             self.save_later_button.setText("Guardar y salir")
             self.publish_button.setText("Generar EPUB")
         else:
-            self.root_layout.setContentsMargins(14, 12, 14, 12)
+            self.root_layout.setContentsMargins(
+                14,
+                0 if self._embedded else 12,
+                14,
+                12,
+            )
             self.splitter.setOrientation(Qt.Orientation.Horizontal)
             self.splitter.setSizes([300, 980])
             self.footer_layout.addWidget(self.save_later_button, 0, 0)
@@ -480,12 +549,151 @@ class BookEditorDialog(QDialog):
             icon_name = button.property("editorIconName")
             if isinstance(icon_name, str):
                 button.setIcon(editor_icon(icon_name))
+        self.editor_more_button.setIcon(editor_icon("more"))
         for index, icon_name in enumerate(
             ("align_left", "align_center", "align_right", "align_justify")
         ):
             self.alignment.setItemIcon(index, editor_icon(icon_name))
         self.editor.viewport().update()
         self.tree.viewport().update()
+
+    def _build_editor_overflow_menu(self) -> None:
+        self._overflow_actions: dict[str, QAction] = {}
+
+        def add_action(
+            menu: QMenu,
+            key: str,
+            label: str,
+            callback: Callable[[], None],
+        ) -> QAction:
+            action = menu.addAction(label)
+            action.triggered.connect(lambda _checked=False, handler=callback: handler())
+            self._overflow_actions[key] = action
+            return action
+
+        add_action(self.editor_more_menu, "redo", "Rehacer", self.redo_button.click)
+        add_action(
+            self.editor_more_menu,
+            "underline",
+            "Subrayado",
+            self.underline_button.click,
+        )
+        add_action(
+            self.editor_more_menu,
+            "bullet_list",
+            "Lista con viñetas",
+            self.bullet_button.click,
+        )
+        add_action(
+            self.editor_more_menu,
+            "numbered_list",
+            "Lista numerada",
+            self.numbered_button.click,
+        )
+        self.editor_more_menu.addSeparator()
+        alignment_menu = self.editor_more_menu.addMenu("Alineación")
+        self._overflow_alignment_action = alignment_menu.menuAction()
+        for index, label in enumerate(("Izquierda", "Centro", "Derecha", "Justificar")):
+            add_action(
+                alignment_menu,
+                f"alignment_{index}",
+                label,
+                partial(self.alignment.setCurrentIndex, index),
+            )
+        add_action(self.editor_more_menu, "link", "Insertar enlace", self.link_button.click)
+        add_action(
+            self.editor_more_menu,
+            "clear_formatting",
+            "Limpiar formato",
+            self.clear_format_button.click,
+        )
+        self.editor_more_menu.addSeparator()
+        add_action(
+            self.editor_more_menu,
+            "zoom_out",
+            "Reducir texto",
+            self.zoom_out_button.click,
+        )
+        add_action(
+            self.editor_more_menu,
+            "zoom_reset",
+            "Restablecer zoom",
+            self.zoom_reset_button.click,
+        )
+        add_action(
+            self.editor_more_menu,
+            "zoom_in",
+            "Ampliar texto",
+            self.zoom_in_button.click,
+        )
+        self.editor_more_menu.addSeparator()
+        add_action(
+            self.editor_more_menu,
+            "previous",
+            "Capítulo anterior",
+            self.previous_button.click,
+        )
+        add_action(
+            self.editor_more_menu,
+            "next",
+            "Capítulo siguiente",
+            self.next_button.click,
+        )
+        self.editor_more_menu.aboutToShow.connect(self._sync_editor_overflow_menu)
+
+    def _apply_toolbar_mode(self, width: int) -> None:
+        mode = (
+            "compact"
+            if width <= BREAKPOINTS.compact
+            else "medium"
+            if width <= BREAKPOINTS.medium
+            else "wide"
+        )
+        if mode == self._toolbar_mode:
+            return
+        self._toolbar_mode = mode
+        compact = mode == "compact"
+        wide = mode == "wide"
+        self.redo_button.setVisible(not compact)
+        self.underline_button.setVisible(not compact)
+        self.bullet_button.setVisible(not compact)
+        self.numbered_button.setVisible(not compact)
+        for widget in (
+            self.alignment,
+            self.link_button,
+            self.clear_format_button,
+            self.zoom_out_button,
+            self.zoom_reset_button,
+            self.zoom_in_button,
+            self.navigation_separator,
+            self.previous_button,
+            self.position_label,
+            self.next_button,
+        ):
+            widget.setVisible(wide)
+        self.editor_more_button.setVisible(not wide)
+        for key in ("redo", "underline", "bullet_list", "numbered_list"):
+            self._overflow_actions[key].setVisible(compact)
+        self.content_tool_strip.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.content_toolbar.adjustSize()
+        self.content_tool_strip.updateGeometry()
+
+    def _sync_editor_overflow_menu(self) -> None:
+        sources = {
+            "redo": self.redo_button,
+            "underline": self.underline_button,
+            "bullet_list": self.bullet_button,
+            "numbered_list": self.numbered_button,
+            "link": self.link_button,
+            "clear_formatting": self.clear_format_button,
+            "zoom_out": self.zoom_out_button,
+            "zoom_reset": self.zoom_reset_button,
+            "zoom_in": self.zoom_in_button,
+            "previous": self.previous_button,
+            "next": self.next_button,
+        }
+        for key, source in sources.items():
+            self._overflow_actions[key].setEnabled(source.isEnabled())
 
     def _toggle_metadata(self, visible: bool) -> None:
         self.metadata_panel.setVisible(visible)
@@ -964,12 +1172,13 @@ class BookEditorDialog(QDialog):
         layout.addWidget(button)
         return button
 
-    def _add_toolbar_separator(self, layout: QHBoxLayout) -> None:
+    def _add_toolbar_separator(self, layout: QHBoxLayout) -> QFrame:
         separator = QFrame(layout.parentWidget() or self)
         separator.setObjectName("editorToolbarSeparator")
         separator.setFrameShape(QFrame.Shape.VLine)
         separator.setFixedSize(1, 20)
         layout.addWidget(separator)
+        return separator
 
     def _add_format_button(
         self,
@@ -978,7 +1187,7 @@ class BookEditorDialog(QDialog):
         callback: Callable[[], None],
         tooltip: str,
         **font_options: bool,
-    ) -> None:
+    ) -> QToolButton:
         button = QToolButton(layout.parentWidget() or self)
         button.setText(text)
         button.setFixedSize(_EDITOR_TOOL_CONTENT_SIZE, _EDITOR_TOOL_CONTENT_SIZE)
@@ -993,6 +1202,7 @@ class BookEditorDialog(QDialog):
         button.setCursor(Qt.CursorShape.PointingHandCursor)
         button.clicked.connect(callback)
         layout.addWidget(button)
+        return button
 
     def _add_text_tool(
         self,
@@ -1075,6 +1285,10 @@ class BookEditorDialog(QDialog):
                 max-width: 56px;
                 color: {COLORS.text_secondary};
                 background-color: transparent;
+            }}
+            QToolButton#editorMore::menu-indicator {{
+                image: none;
+                width: 0;
             }}
             QFrame#editorToolbarSeparator {{
                 color: {COLORS.divider};

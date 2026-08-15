@@ -129,6 +129,19 @@ def test_phase_review_requires_an_explicit_choice_before_next(
     assert messages == ["Elige una versión o indica que no hay texto que añadir para continuar."]
 
 
+def test_single_common_case_keeps_only_essential_context_and_actions(qtbot, tmp_path: Path) -> None:
+    store = ArtifactStore(tmp_path / "artifacts", protect=reversible, unprotect=reversible)
+    dialog = PhaseReviewDialog(make_review(store), store)
+    qtbot.addWidget(dialog)
+
+    assert dialog.case_summary.isHidden()
+    assert dialog.previous_button.isHidden()
+    assert dialog.approve_all_button.isHidden()
+    assert dialog.next_button.text() == "Aplicar correcciones"
+    assert dialog.original_pane.selector.text() == "Conservar"
+    assert dialog.proposed_pane.selector.text() == "Usar"
+
+
 def test_translation_bulk_action_keeps_important_context_only_cases_pending(
     qtbot,
     tmp_path: Path,
@@ -211,7 +224,7 @@ def test_translation_review_describes_the_flagged_result_without_calling_it_a_pr
 
     assert dialog.original_pane.heading.text() == "Extracto original · Contexto"
     assert dialog.proposed_pane.heading.text() == "Resultado actual · Editable"
-    assert dialog.proposed_pane.selector.text() == "Confirmar sin cambios"
+    assert dialog.proposed_pane.selector.text() == "Confirmar"
     assert dialog.proposed_pane.restore_button is not None
     assert dialog.proposed_pane.restore_button.text() == "Restaurar resultado"
     assert "Corrige el resultado" in dialog.instruction_label.text()
@@ -322,7 +335,8 @@ def test_phase_review_defaults_to_proposal_and_navigates_restores(
     assert dialog._index == 0
     dialog._next()
     dialog.proposed_pane.editor.setPlainText("Manual second")
-    dialog.proposed_pane._restore()
+    assert dialog.proposed_pane.restore_action is not None
+    dialog.proposed_pane.restore_action.trigger()
     assert dialog.proposed_pane.text() == "Second proposal"
     dialog._next()
 
@@ -355,7 +369,7 @@ def test_reopened_complete_review_walks_every_case_before_finishing(qtbot, tmp_p
 
     assert dialog._manual_navigation
     assert dialog._index == 0
-    assert dialog.next_button.text() == "Confirmar y siguiente"
+    assert dialog.next_button.text() == "Siguiente"
 
     dialog._next()
     assert dialog._index == 1
@@ -390,7 +404,7 @@ def test_phase_review_can_approve_every_proposal_at_once(qtbot, tmp_path: Path) 
     dialog = PhaseReviewDialog(review, store)
     qtbot.addWidget(dialog)
 
-    assert dialog.approve_all_button.text() == "Aplicar recomendaciones seguras"
+    assert dialog.approve_all_button.text() == "Aplicar seguras"
     dialog._approve_all()
 
     assert dialog.result() == dialog.DialogCode.Accepted
@@ -473,7 +487,7 @@ def test_phase_review_preserves_risky_originals_in_the_safe_bulk_action(
 
     assert not dialog.original_pane.selector.isChecked()
     assert dialog.unit_warning.text() == "La propuesta elimina contenido."
-    assert dialog.approve_all_button.text() == "Aplicar recomendaciones seguras"
+    assert dialog.approve_all_button.text() == "Aplicar seguras"
     dialog._approve_all()
 
     assert tuple(unit.choice for unit in dialog.review.units) == (
@@ -572,9 +586,17 @@ def test_phase_review_progress_is_proportional_and_controls_are_explicit(
     dialog.progress_indicator.resize(220, 62)
     assert not dialog.progress_indicator.grab().isNull()
     assert dialog.findChild(QSplitter).handleWidth() == 1
-    assert dialog.original_pane.locate_button.text() == "Ir al inicio"
+    assert dialog.original_pane.locate_button.isHidden()
+    assert dialog.original_pane.more_button.isVisible()
+    assert {action.text() for action in dialog.original_pane.more_menu.actions()} == {
+        "Ir al inicio"
+    }
     assert dialog.proposed_pane.restore_button is not None
     assert dialog.proposed_pane.restore_button.text() == "Restaurar propuesta"
+    assert {action.text() for action in dialog.proposed_pane.more_menu.actions()} == {
+        "Ir al inicio",
+        "Restaurar propuesta",
+    }
     assert dialog.original_pane.selector.minimumWidth() >= (
         dialog.original_pane.selector.sizeHint().width()
     )
@@ -643,8 +665,8 @@ def test_review_pane_displays_binary_page_images(qtbot, tmp_path: Path) -> None:
 
     assert not dialog.original_pane.image_scroll.isHidden()
     assert dialog.original_pane.editor.isHidden()
-    assert "idioma del resultado" in dialog.instruction_label.text()
-    assert "no necesitas traducirlo" in dialog.instruction_label.text()
+    assert "idioma final" in dialog.instruction_label.text()
+    assert "solo sirve como referencia" in dialog.instruction_label.text()
     assert not dialog.proposed_pane.selector.isChecked()
     assert dialog.proposed_pane.no_text_button is not None
 
@@ -662,15 +684,13 @@ def test_phase_review_stacks_panes_and_actions_on_compact_width(
 
     assert dialog.width() == 320
     assert dialog.splitter.orientation() is Qt.Orientation.Vertical
-    previous_position = dialog.footer_layout.getItemPosition(
-        dialog.footer_layout.indexOf(dialog.previous_button)
-    )
     next_position = dialog.footer_layout.getItemPosition(
         dialog.footer_layout.indexOf(dialog.next_button)
     )
     save_position = dialog.footer_layout.getItemPosition(
         dialog.footer_layout.indexOf(dialog.save_later_button)
     )
-    assert previous_position[0] == next_position[0]
-    assert save_position[0] > next_position[0]
+    assert dialog.previous_button.isHidden()
+    assert next_position[0] > save_position[0]
+    assert next_position[1:] == (0, 1, 3)
     assert dialog.progress_indicator.accessibleDescription()

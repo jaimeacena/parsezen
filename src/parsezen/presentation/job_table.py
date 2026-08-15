@@ -90,7 +90,7 @@ HEADERS = {
     JobColumn.DOCUMENT: "Documento",
     JobColumn.FLOW: "Flujo",
     JobColumn.RESULT: "Salida",
-    JobColumn.NEXT_STEP: "Siguiente paso",
+    JobColumn.NEXT_STEP: "Estado",
     JobColumn.REMOVE: "",
 }
 
@@ -501,8 +501,6 @@ class JobTableModel(QAbstractTableModel):
             column = COLUMNS[section]
             if self._compact and column is JobColumn.DOCUMENT:
                 return "Documento y flujo"
-            if self._compact and column is JobColumn.NEXT_STEP:
-                return "Acción"
             return HEADERS[column]
         return None
 
@@ -522,7 +520,7 @@ class JobTableModel(QAbstractTableModel):
 class JobHeaderView(QHeaderView):
     """Paint one calm header without artificial column partitions."""
 
-    HEIGHT = 48
+    HEIGHT = 44
     FONT_SIZE = 10.0
 
     def paintSection(  # noqa: N802
@@ -557,7 +555,7 @@ class JobHeaderView(QHeaderView):
 
 
 class JobCellDelegate(QStyledItemDelegate):
-    ROW_HEIGHT = 84
+    ROW_HEIGHT = 80
 
     def paint(
         self,
@@ -573,12 +571,13 @@ class JobCellDelegate(QStyledItemDelegate):
         cell_hovered = bool(option.state & QStyle.StateFlag.State_MouseOver)
         table = self.parent()
         row_hovered = isinstance(table, JobTableView) and table.hovered_row == index.row()
+        selection_emphasized = selected and isinstance(table, JobTableView) and table.hasFocus()
         configuring = bool(index.data(CONFIGURING_ROLE))
         job_running = bool(index.data(JOB_RUNNING_ROLE))
         column = COLUMNS[index.column()]
         background = (
             COLORS.table_selected
-            if selected
+            if selection_emphasized
             else COLORS.table_hover
             if row_hovered
             else COLORS.table_surface
@@ -587,7 +586,7 @@ class JobCellDelegate(QStyledItemDelegate):
 
         if column is JobColumn.DRAG:
             self._paint_drag_handle(painter, option)
-            if selected or job_running:
+            if selection_emphasized or job_running:
                 painter.fillRect(
                     QRectF(option.rect.left(), option.rect.top(), 3, option.rect.height()),
                     QColor(COLORS.action_primary),
@@ -1295,10 +1294,10 @@ class JobTableView(QTableView):
         }
         semantic_available = available - sum(utility_widths.values())
         weights = {
-            JobColumn.DOCUMENT: 1.75,
-            JobColumn.FLOW: 2.0,
-            JobColumn.RESULT: 0.95,
-            JobColumn.NEXT_STEP: 1.45,
+            JobColumn.DOCUMENT: 33,
+            JobColumn.FLOW: 29,
+            JobColumn.RESULT: 16,
+            JobColumn.NEXT_STEP: 22,
         }
         total = sum(weights.values())
         used = 0

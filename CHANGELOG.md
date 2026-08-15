@@ -2,6 +2,20 @@
 
 ## Próxima versión
 
+- La revisión documental elimina contexto y botones redundantes: resume el progreso como `fase ·
+  resueltas/total`, muestra prioridad o sugerencia solo cuando aportan información, agrupa localizar y
+  restaurar en el menú de cada panel, oculta `Anterior` sin destino y reserva la acción masiva para
+  fases con varias correcciones. El editor EPUB conserva sin cambios su flujo y sus dos paneles.
+- La interfaz reduce cabeceras y ayudas repetidas, reúne ajustes, actividad y apariencia en un único
+  acceso global y añade una composición intermedia que evita recortes. La entrada vacía se ancla bajo
+  la cabecera y usa un botón convencional de selección local; con uno o varios documentos la cola
+  ajusta su altura a las filas y reúne sobre el mismo rail `Añadir` y la acción principal del lote. El
+  rail centra también la cabecera y los títulos internos; `Estado` sustituye a `Siguiente paso`, las
+  columnas priorizan el documento y los avisos crecen con su texto y desaparecen al retirar el trabajo
+  que los originó. El menú global prioriza Actividad y solo señala incidencias accionables. Desaparecen
+  el contador y el procesamiento de la cabecera global. El editor EPUB mantiene sus dos paneles y
+  todas sus herramientas, agrupando las secundarias cuando falta ancho en vez de usar desplazamiento
+  horizontal.
 - Los benchmarks locales miden ahora tiempo por página, OCR y recursos PDF, y añaden un perfil
   sintético para DPAPI, snapshots, recuperación, arranque en frío, disco temporal y tamaños de
   instalación/instalador. No se aplica ninguna optimización sin una referencia medida.
@@ -118,8 +132,8 @@
 - Errores de procesamiento explicados por fase en la cola y en Actividad reciente, con trabajo
   reutilizable, recorrido temporal, recuperación contextual mientras el documento siga en la cola y
   diagnóstico copiable sin nombres, rutas, contenido ni secretos.
-- La confirmación previa a trabajos largos presenta ahora un resumen compacto del recorrido, la
-  duración y la revisión necesaria, y mantiene los detalles técnicos ocultos hasta solicitarlos.
+- El preanálisis mantiene carga, duración y advertencias en la cola sin interponer una confirmación
+  informativa al pulsar `Procesar`; la validación real y la comprobación temprana continúan activas.
 - Salida Markdown portable configurable como archivo único o índice con un archivo por capítulo,
   con metadatos y referencias a páginas PDF opcionales, enlaces de recursos relativos y
   regeneración coherente después de una revisión.
@@ -238,8 +252,8 @@
 - Recuperación contextual de fallos con acciones para reintentar solo la fase y el documento
   afectados, revisar configuración o destino y abrir la IA local, sin mezclar otros trabajos de la
   cola ni descartar checkpoints válidos.
-- Preanálisis explicable antes de procesar: la cola anticipa carga, revisiones y tiempo automático;
-  los trabajos largos o de riesgo alto muestran una comprobación concisa antes de arrancar.
+- Preanálisis explicable antes de procesar: la cola anticipa carga, revisiones y tiempo automático sin
+  exigir una segunda confirmación; los problemas reales siguen bloqueando antes de crear el worker.
 - Comprobación temprana de PDFs largos o inciertos sobre tres páginas representativas, con
   continuación automática cuando la muestra es segura, bloqueo accionable solo ante señales
   repetidas y reutilización de la extracción/OCR en el trabajo completo.

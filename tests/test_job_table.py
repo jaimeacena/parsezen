@@ -162,7 +162,7 @@ def test_running_progress_explains_the_remaining_time() -> None:
 
 def test_running_progress_track_sits_below_remaining_time_inside_the_row() -> None:
     option = QStyleOptionViewItem()
-    option.rect = QRect(0, 0, 260, 84)
+    option.rect = QRect(0, 0, 260, JobCellDelegate.ROW_HEIGHT)
     presentation = job_table_module.CellPresentation(
         "Traduciendo · 25 %",
         "Quedan aprox. 12 min–20 min",
@@ -237,7 +237,7 @@ def test_completed_result_exposes_open_action() -> None:
 
     assert presentation.action == "Abrir resultado"
     assert presentation.title == "Listo"
-    assert "Siguiente paso · Listo" in index.data(Qt.ItemDataRole.AccessibleTextRole)
+    assert "Estado · Listo" in index.data(Qt.ItemDataRole.AccessibleTextRole)
 
 
 def test_completed_result_with_evidence_offers_targeted_ai_review(qtbot) -> None:
@@ -540,3 +540,35 @@ def test_compact_table_preserves_flow_and_actions_without_scrolling(qtbot) -> No
     assert "Traducir" in str(document.data(Qt.ItemDataRole.AccessibleTextRole))
     assert document.data(CONFIGURABLE_ROLE) is True
     assert table.horizontalScrollBarPolicy() == Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+
+
+def test_wide_table_prioritizes_document_and_names_the_live_state(qtbot) -> None:
+    table = JobTableView()
+    qtbot.addWidget(table)
+    table.resize(1280, 300)
+    table.set_jobs((make_job(),))
+    table.show()
+    qtbot.waitExposed(table)
+
+    semantic_columns = (
+        JobColumn.DOCUMENT,
+        JobColumn.FLOW,
+        JobColumn.RESULT,
+        JobColumn.NEXT_STEP,
+    )
+    widths = {column: table.columnWidth(COLUMNS.index(column)) for column in semantic_columns}
+    semantic_width = sum(widths.values())
+
+    assert (
+        table.job_model.headerData(
+            COLUMNS.index(JobColumn.NEXT_STEP),
+            Qt.Orientation.Horizontal,
+        )
+        == "Estado"
+    )
+    assert abs(widths[JobColumn.DOCUMENT] / semantic_width - 0.33) < 0.02
+    assert abs(widths[JobColumn.FLOW] / semantic_width - 0.29) < 0.02
+    assert abs(widths[JobColumn.RESULT] / semantic_width - 0.16) < 0.02
+    assert abs(widths[JobColumn.NEXT_STEP] / semantic_width - 0.22) < 0.02
+    assert table.horizontalHeader().height() == 44
+    assert table.rowHeight(0) == 80

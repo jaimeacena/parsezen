@@ -18,6 +18,7 @@ import parsezen.presentation.main_window as main_window_module
 from parsezen.application.job_execution import JobExecutionController
 from parsezen.application.job_queue import JobQueue
 from parsezen.application.job_runtime import JobRuntime
+from parsezen.application.preflight import DocumentPreflight, combine_preflights
 from parsezen.application.quality_review_adapter import create_translation_review
 from parsezen.application.review_materialization import (
     phase_plan_with_materialized_reviews,
@@ -36,6 +37,7 @@ from parsezen.domain.attempt_activity import (
     ReusableWork,
     durable_failure_message,
 )
+from parsezen.domain.estimates import DurationEstimate
 from parsezen.domain.jobs import (
     AIProfileConfiguration,
     DocumentFormat,
@@ -366,6 +368,7 @@ def test_settings_menu_changes_encrypted_checkpoint_retention(
     )
     qtbot.addWidget(window)
 
+    assert window.settings_menu.actions()[0] is window.activity_action
     assert window.checkpoint_retention_actions[7].isChecked()
 
     window.checkpoint_retention_actions[0].trigger()
@@ -603,8 +606,96 @@ def test_cancelled_batch_has_an_explicit_summary_and_activity_action(
 
     window._show_finished_batch_summary(("cancelled",))  # noqa: SLF001
 
-    assert "1 cancelado" in window.parsezen_workspace.batch_message.message.text()
+    assert window.parsezen_workspace.batch_message.message.text() == (
+        "Procesamiento detenido: 1 documento."
+    )
     assert not window.parsezen_workspace.batch_message.action.isHidden()
+
+    paused_job = Mock(status=JobStatus.PAUSED)
+    monkeypatch.setattr(window._job_queue, "get", lambda _job_id: paused_job)  # noqa: SLF001
+
+    window._show_finished_batch_summary(("paused",))  # noqa: SLF001
+
+    assert window.parsezen_workspace.batch_message.message.text() == (
+        "Procesamiento pausado: 1 documento."
+    )
+    assert window.parsezen_workspace.batch_message.action.isHidden()
+
+
+def test_finished_summary_is_recomputed_and_removed_with_its_documents(
+    qtbot,
+    tmp_path: Path,
+) -> None:
+    first = tmp_path / "first.txt"
+    second = tmp_path / "second.txt"
+    first.write_text("First", encoding="utf-8")
+    second.write_text("Second", encoding="utf-8")
+    window = ParsezenMainWindow(
+        auto_discover_ai=False,
+        state_path=tmp_path / "workspace.sqlite3",
+    )
+    qtbot.addWidget(window)
+    window.set_source_paths((first, second))
+    entries = _entries(window)
+    for entry in entries:
+        entry.status = JobStatus.CANCELLED
+    window._sync_workspace()  # noqa: SLF001
+    job_ids = tuple(entry.job.id for entry in entries)
+
+    window._show_finished_batch_summary(job_ids)  # noqa: SLF001
+    assert window.parsezen_workspace.batch_message.message.text() == (
+        "Procesamiento detenido: 2 documentos."
+    )
+
+    window._remove_job(job_ids[0])  # noqa: SLF001
+    assert window.parsezen_workspace.batch_message.message.text() == (
+        "Procesamiento detenido: 1 documento."
+    )
+
+    window._remove_job(job_ids[1])  # noqa: SLF001
+    assert window.parsezen_workspace.batch_message.isHidden()
+
+
+def test_long_preflight_starts_without_a_redundant_confirmation(
+    qtbot,
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    source = tmp_path / "long.pdf"
+    source.write_bytes(b"%PDF")
+    window = ParsezenMainWindow(
+        auto_discover_ai=False,
+        state_path=tmp_path / "workspace.sqlite3",
+    )
+    qtbot.addWidget(window)
+    window.set_source_paths((source,))
+    job = window._job_queue.jobs[0]  # noqa: SLF001
+    forecast = DocumentPreflight(
+        job.id,
+        "438 páginas",
+        DurationEstimate(5_400, 9_000, 18_000, 0),
+        (),
+        (),
+    )
+    window._queue_session.set_prepared_run(  # noqa: SLF001
+        PreparedQueueRun(
+            QueueRunPlan(RunMode.NEW, (job.id,)),
+            (),
+            (),
+            combine_preflights((forecast,)),
+        )
+    )
+    started: list[bool] = []
+
+    def start() -> None:
+        started.append(True)
+        window._queue_session._running = True  # noqa: SLF001
+
+    monkeypatch.setattr(window, "_start_processing", start)
+
+    window._start_prepared_run()  # noqa: SLF001
+
+    assert started == [True]
 
 
 def test_main_window_inspects_each_source_only_when_its_snapshot_is_created(

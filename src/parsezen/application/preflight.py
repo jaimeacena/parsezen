@@ -76,14 +76,6 @@ class QueuePreflight:
     documents: tuple[DocumentPreflight, ...]
     estimate: DurationEstimate
 
-    @property
-    def requires_confirmation(self) -> bool:
-        """Interrupt only for material risk or a long unattended run."""
-
-        return self.estimate.upper_seconds >= 30 * 60 or any(
-            item.severity is PreflightSeverity.HIGH for item in self.documents
-        )
-
 
 @dataclass(frozen=True, slots=True)
 class RuntimeEstimate:

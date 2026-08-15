@@ -108,7 +108,7 @@ class StatusMessage(QFrame):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setObjectName("statusMessage")
-        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         layout = QGridLayout(self)
         self.layout_grid = layout
@@ -119,6 +119,8 @@ class StatusMessage(QFrame):
         layout.addWidget(self.icon, 0, 0)
         self.message = QLabel(self)
         self.message.setWordWrap(True)
+        self.message.setMinimumWidth(0)
+        self.message.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         self.message.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         layout.addWidget(self.message, 0, 1)
         layout.setColumnStretch(1, 1)
@@ -158,6 +160,8 @@ class StatusMessage(QFrame):
         self.secondary_action.setText(secondary_action_label or "")
         self.secondary_action.setVisible(bool(secondary_action_label))
         self.show()
+        self.layout_grid.invalidate()
+        self.updateGeometry()
 
     def set_compact_mode(self, compact: bool) -> None:
         if compact == self._compact:

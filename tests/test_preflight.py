@@ -109,7 +109,7 @@ def test_preflight_explains_review_load_and_unsafe_automatic_changes(tmp_path: P
     )
     assert "texto revisado por IA local" in analysis.expected_reviews
     assert "confirmación EPUB final" in analysis.expected_reviews
-    assert not combine_preflights((analysis,)).requires_confirmation
+    assert combine_preflights((analysis,)).documents == (analysis,)
 
 
 def test_zero_duration_is_not_saved_as_learning_history() -> None:

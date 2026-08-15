@@ -205,7 +205,11 @@ def test_book_editor_uses_one_compact_content_toolbar_without_redundant_headings
     assert all(tool.height() == tools[0].height() for tool in tools)
     assert tools[0].height() <= 34
     assert all(tool.parentWidget() is dialog.content_toolbar for tool in tools)
-    assert all(tool.geometry().center().y() == tools[0].geometry().center().y() for tool in tools)
+    visible_tools = [tool for tool in tools if not tool.isHidden()]
+    assert all(
+        tool.geometry().center().y() == visible_tools[0].geometry().center().y()
+        for tool in visible_tools
+    )
     assert all(
         not tool.icon().isNull()
         for tool in tools
@@ -405,7 +409,12 @@ def test_book_editor_reflows_panes_toolbars_and_footer_at_320(
     assert dialog.width() == 320
     assert dialog.splitter.orientation() is Qt.Orientation.Vertical
     assert dialog.structure_tool_strip.horizontalScrollBarPolicy() == Qt.ScrollBarAsNeeded
-    assert dialog.content_tool_strip.horizontalScrollBarPolicy() == Qt.ScrollBarAsNeeded
+    assert dialog.content_tool_strip.horizontalScrollBarPolicy() == Qt.ScrollBarAlwaysOff
+    assert dialog.editor_more_button.isVisible()
+    assert dialog.redo_button.isHidden()
+    assert dialog.alignment.isHidden()
+    overflow_labels = {action.text() for action in dialog.editor_more_menu.actions()}
+    assert {"Rehacer", "Alineación", "Insertar enlace", "Capítulo siguiente"} <= overflow_labels
     save_position = dialog.footer_layout.getItemPosition(
         dialog.footer_layout.indexOf(dialog.save_later_button)
     )
@@ -417,3 +426,25 @@ def test_book_editor_reflows_panes_toolbars_and_footer_at_320(
     )
     assert publish_position[0] == cancel_position[0]
     assert save_position[0] < publish_position[0]
+
+
+def test_book_editor_removes_repeated_intro_when_embedded(
+    qtbot,
+    tmp_path: Path,
+) -> None:
+    store = ArtifactStore(tmp_path / "artifacts", protect=reversible, unprotect=reversible)
+    book = create_book_from_markdown(
+        "# Chapter\n\nReadable content.",
+        (),
+        EpubBookMetadata("Book", "en"),
+        store,
+        job_id="job",
+    )
+    dialog = BookEditorDialog(book, store, job_id="job", destination=None)
+    qtbot.addWidget(dialog)
+
+    dialog.set_embedded_mode(True)
+
+    assert dialog.intro_host.isHidden()
+    assert dialog.dialog_title.text() == "Revisión final del EPUB"
+    assert dialog.review_helper.text()

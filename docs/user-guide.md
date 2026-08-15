@@ -9,12 +9,13 @@ Cada documento ocupa una fila. Las columnas muestran el recorrido real:
 - **Documento**: origen, tamaño y páginas PDF.
 - **Flujo**: procesamiento Directo o Revisión completa con IA local y traducción opcional.
 - **Salida**: archivo final y su destino.
-- **Siguiente paso**: fase actual, avance y acción necesaria.
+- **Estado**: fase actual, avance y acción necesaria.
 
 Al añadir un documento, **Salida** abre una página breve dentro de la aplicación. **Markdown** y
 **EPUB** se eligen con dos tarjetas visuales; **Revisión con IA** usa un interruptor. **Traducir** y,
 para PDF, **Páginas** y **OCR** mantienen el patrón `Etiqueta — Valor actual — ›`. No hay secciones
-avanzadas, resumen técnico, pie de botones ni scroll en el tamaño normal.
+avanzadas, pie de botones ni scroll en el tamaño normal. Cuando hay traducción, una única línea tras
+la última opción resume su recorrido y coste aproximado; no se presenta como ayuda de **Glosario**.
 
 **Traducir** parte en **No traducir**. Al elegir un idioma aparecen dos filas idénticas:
 **Traductor** —Argos o IA local— y **Glosario**. La revisión completa con IA parte activada en los
@@ -31,19 +32,19 @@ Cada acción se encuentra en la celda a la que pertenece: configurar el flujo o 
 ver un error o abrir el archivo. La pantalla principal no añade un inspector lateral ni repite la
 información de la fila.
 
-`Destino:` en la cabecera define el único destino general y lo recuerda. Cada documento lo hereda;
+`Destino ·` en la cabecera define el único destino general y lo recuerda. Cada documento lo hereda;
 para cambiarlo usa los ajustes generales. No existen excepciones por documento ni otro selector de
 destino en la página de configuración.
 
-Cuando una fila termina, pulsa `Abrir resultado` en **Siguiente paso**. Su menú secundario permite abrir
+Cuando una fila termina, pulsa `Abrir resultado` en **Estado**. Su menú secundario permite abrir
 el archivo o su carpeta concreta. Las fases omitidas no ocupan columnas ni ofrecen acciones
 imposibles.
 
 ## Añadir y ordenar documentos
 
-- Arrastra TXT, Markdown, DOCX, PDF o EPUB a la zona discontinua, situada justo debajo de la
-  última fila, o pulsa `examínalos` para seleccionarlos. La cola crece hasta seis filas
-  visibles antes de usar desplazamiento.
+- En vacío, arrastra TXT, Markdown, DOCX, PDF o EPUB a la zona situada bajo la cabecera o pulsa
+  `Seleccionar archivos`. Después aparece como `Añadir` en la barra situada sobre la tabla, junto a
+  la acción principal del lote. La cola crece hasta seis filas visibles antes de usar desplazamiento.
 - Arrastra una fila para cambiar el orden.
 - La configuración, las acciones de estado y el resultado responden al pasar el puntero; el asa de
   ordenación muestra un cursor de arrastre.
@@ -58,17 +59,18 @@ imposibles.
 La configuración queda bloqueada al empezar para evitar que el resultado deje de corresponderse con
 lo mostrado.
 
-El botón contextual de la cabecera utiliza exclusivamente la configuración guardada de cada fila. Si un
-documento no puede arrancar, Parsezen muestra el motivo en la interfaz actual en lugar de dejar el
-fallo en segundo plano.
+El botón contextual situado sobre la cola utiliza exclusivamente la configuración guardada de cada
+fila. Si un documento no puede arrancar, Parsezen muestra el motivo en la interfaz actual en lugar de
+dejar el fallo en segundo plano.
 
-La interfaz sigue por defecto la apariencia de Windows. El botón vectorial de la cabecera abre las
-opciones **Seguir el sistema**, **Claro** y **Oscuro**; la elección se aplica sin recargar y se
-conserva para la siguiente sesión.
+La interfaz sigue por defecto la apariencia de Windows. En **Ajustes → Apariencia** puedes elegir
+**Seguir el sistema**, **Claro** u **Oscuro**; la elección se aplica sin recargar y se conserva para
+la siguiente sesión. El engranaje solo muestra un indicador cuando algún documento tiene una acción
+pendiente; **Actividad reciente** es la primera opción del menú.
 
-Con una ventana estrecha o zoom alto, la cabecera y la cola se reorganizan en varias filas. No se
-eliminan operaciones: el flujo se integra en Documento, las acciones permanecen en su fila y las
-comparaciones pasan a orientación vertical.
+Con una ventana intermedia, estrecha o con zoom alto, la cabecera y la cola se reorganizan sin
+recortar controles. No se eliminan operaciones: el flujo se integra en Documento, las acciones
+permanecen en su fila y las comparaciones pasan a orientación vertical.
 
 ## Elegir un resultado
 
@@ -223,14 +225,11 @@ decisiones concretas de encabezado.
 
 ## Procesamiento y cola
 
-Parsezen ejecuta una sola tarea pesada cada vez. La cabecera reúne el total, las revisiones reales y
-la acción global disponible. Antes de empezar, la cola muestra un intervalo aproximado para el
+Parsezen ejecuta una sola tarea pesada cada vez. La barra de la cola reúne el total, las revisiones
+reales y la acción principal disponible. Antes de empezar, muestra un intervalo aproximado para el
 trabajo automático. Esta estimación mejora con ejecuciones similares realizadas en el equipo y no
-guarda nombres, rutas ni contenido. Los planes largos o con una decisión de riesgo alto muestran un
-resumen final de carga, revisiones previstas y aspectos que conviene comprobar.
-Ese resumen muestra primero el documento, el recorrido, la duración redondeada y lo que necesitará
-tu atención. Las explicaciones internas de la estimación, la comprobación y las fases de revisión
-permanecen disponibles en **Ver detalles técnicos**, sin recargar la confirmación principal.
+guarda nombres, rutas ni contenido. Al pulsar `Procesar`, la preparación comienza directamente; solo
+una configuración inválida o un problema real impide crear el trabajador.
 
 Un documento que llega a revisión queda pendiente, pero no detiene los demás: Parsezen continúa con
 el siguiente trabajo elegible y reúne las decisiones en una única superficie `Revisión del
@@ -251,7 +250,7 @@ se descontó el tiempo transcurrido o si la observación amplió el intervalo. S
 inicial, muestra `Más tiempo del previsto` en lugar de fingir una precisión que ya no existe.
 
 Desde que Parsezen fija y valida la ejecución, y mientras lee, convierte, aplica OCR o prepara
-recursos, la fila activa muestra siempre `Preparando`. Después, **Siguiente paso** muestra
+recursos, la fila activa muestra siempre `Preparando`. Después, **Estado** muestra
 `Traduciendo`, `Corrigiendo`, `Personalizando` o `Publicando` según la fase real, además del porcentaje
 cuando existe una medida. Si un documento necesita
 revisión, su fase muestra `Revisar` y la cola continúa con otro. Un error también queda aislado; la
@@ -277,12 +276,15 @@ Al terminar, `Ver resumen` separa cuatro conceptos que no deben confundirse:
   una garantía de calidad literaria.
 - **Revisión manual**: decisiones que una persona realizó o que todavía se esperan.
 
-La cabecera resume también el lote completo. Si Parsezen está minimizado o en segundo plano, Windows
-muestra un aviso al terminar o al requerir atención; no duplica ese aviso mientras la ventana está
-activa.
+La barra sobre la cola resume también el lote completo. Si Parsezen está minimizado o en segundo
+plano, Windows muestra un aviso al terminar o al requerir atención; no duplica ese aviso mientras la
+ventana está activa.
 
 `Pausar` solicita detenerse en el siguiente punto seguro. Al volver, Parsezen usa los checkpoints
-cifrados en lugar de repetir trabajo válido.
+cifrados en lugar de repetir trabajo válido. Un lote pausado dice `Procesamiento pausado`; uno
+interrumpido definitivamente dice `Procesamiento detenido`. El aviso se recalcula al retirar parte
+del lote y desaparece al eliminar el último documento relacionado; el registro histórico permanece
+solo en **Actividad reciente**.
 
 En **Ajustes → Conservar trabajo temporal** puedes elegir `No conservar al finalizar`, 7, 30 o
 90 días. Los checkpoints siguen ligados al documento y a su configuración exacta, están cifrados
@@ -310,22 +312,23 @@ La revisión se divide por fase y solo muestra los casos dudosos de la sesión a
 pestañas que no correspondan al problema actual.
 
 1. Compara el original de la izquierda con la propuesta de la derecha.
-2. Lee la recomendación provisional; ninguna opción aparece elegida por adelantado.
+2. Si aparece una prioridad, aviso o sugerencia, revísala; el caso común no añade texto auxiliar.
 3. Pulsa el botón de la versión que quieras confirmar. Si editas la derecha, confirma la edición.
-4. Usa `Restaurar propuesta` si quieres descartar tu edición.
-5. Pulsa `Confirmar y siguiente`. En el último elemento, pulsa `Terminar revisión`.
+4. El menú `…` de cada panel reúne `Ir al inicio` y, en la propuesta, `Restaurar propuesta`.
+5. Pulsa `Siguiente`. El último elemento muestra directamente la acción final de la fase.
 
-La cabecera compacta muestra la síntesis del caso, la recomendación provisional, la fase actual y el
-progreso global real. Cuenta únicamente unidades de sesiones realmente materializadas: las fases
-anteriores completas, la fase actual parcial y las futuras a cero. No suma cambios estructurales
-futuros ni incidencias del informe que no pudieron convertirse en una decisión; en ventanas estrechas
-usa una versión corta como `Global 3/12 · OCR 1/2`.
+La cabecera muestra solo la fase y el progreso global real, por ejemplo `Corrección · 3/12`. Cuenta
+únicamente unidades de sesiones materializadas: las fases anteriores completas, la fase actual
+parcial y las futuras a cero. No suma cambios estructurales futuros ni incidencias del informe que no
+pudieron convertirse en una decisión. La prioridad, el aviso o una sugerencia concreta aparecen en
+una línea adicional únicamente cuando cambian la decisión que conviene tomar.
 
 Dentro de cada fase, Parsezen presenta primero las incidencias críticas y altas, mantiene estable el
-orden entre elementos de la misma gravedad y muestra esa prioridad sobre la comparación. La cabecera
-indica cuántas decisiones quedan y cuántas son importantes. Si guardaste una revisión a medias, se
+orden entre elementos de la misma gravedad y muestra solo las prioridades alta o crítica sobre la
+comparación. Si guardaste una revisión a medias, se
 abre directamente el primer caso pendiente; las decisiones ya tomadas siguen disponibles al volver
-con `Anterior`, pero no se recorren de nuevo de forma obligatoria. `Alt+O` conserva el resultado
+con `Anterior`, que solo aparece cuando existe un paso anterior. No se recorren de nuevo de forma
+obligatoria. `Alt+O` conserva el resultado
 actual cuando esa opción es válida, `Alt+P` elige la propuesta y `Ctrl+Intro` guarda la decisión y
 avanza.
 
@@ -349,8 +352,8 @@ la conversión o la IA.
 
 En traducción, cada panel muestra únicamente el fragmento dudoso: no presenta el resultado actual
 como una sugerencia fiable ni permite aprobarlo en bloque. Debes corregirlo en el idioma solicitado
-o usar `Confirmar sin cambios` solo si realmente es correcto. `Aplicar recomendaciones seguras`
-queda reservado a las correcciones que sí tienen una propuesta validada.
+o usar `Confirmar` solo si realmente es correcto. `Aplicar seguras` aparece únicamente cuando una
+fase de corrección contiene varias propuestas validadas; no ocupa espacio en una decisión individual.
 
 Cuando un documento requiere varias revisiones, Parsezen las presenta en el orden en que se generó
 el contenido: OCR, traducción, corrección y estructura. Cada paso queda aplicado antes de mostrar el
