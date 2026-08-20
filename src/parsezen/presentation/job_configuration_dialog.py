@@ -408,14 +408,14 @@ class JobConfigurationDialog(QDialog):
         review_layout = QHBoxLayout(self.review_row)
         review_layout.setContentsMargins(SPACING.sm, SPACING.sm, SPACING.sm, SPACING.sm)
         review_layout.setSpacing(SPACING.sm)
-        self.review_label = QLabel("Revisión con IA", self.review_row)
+        self.review_label = QLabel("Revisión automática con IA", self.review_row)
         self.review_label.setObjectName("configurationOptionLabel")
         review_layout.addWidget(self.review_label)
         review_layout.addStretch(1)
         self.plan_reviewed = Switch(self.review_row)
-        self.plan_reviewed.setAccessibleName("Revisión con IA")
+        self.plan_reviewed.setAccessibleName("Revisión automática con IA")
         self.plan_reviewed.setAccessibleDescription(
-            "Revisa todo el documento con el modelo de IA local."
+            "La IA corrige el contenido y, para EPUB, también propone una estructura."
         )
         review_layout.addWidget(self.plan_reviewed)
         self.pages_row = _OptionRow("Páginas", "", parent=self.content)

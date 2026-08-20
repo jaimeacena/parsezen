@@ -41,16 +41,24 @@ python scripts/sync_version.py --check
 - Un documento nuevo muestra `Sin salida` y ofrece `Configurar` en Estado; todavía no es
   ejecutable ni cuenta como revisión.
 - `Configurar` abre una página compacta dentro de la ventana principal. Markdown y EPUB usan dos
-  tarjetas visuales exclusivas, Revisión con IA un interruptor, y Traducir, Traductor, Glosario,
+  tarjetas visuales exclusivas, Revisión automática con IA un interruptor, y Traducir, Traductor, Glosario,
   Páginas y OCR una fila `Etiqueta — Valor — ›`. No hay segmentos, encabezados ni pie, y se ve entera
   sin scroll al tamaño normal.
 - El bloque de configuración está centrado horizontalmente; los menús de cada fila aparecen bajo su
   valor, alineados a la derecha, y no saltan al margen izquierdo de la ventana.
 - Los documentos nuevos parten con revisión completa activada. Una configuración ya guardada conserva
   su plan. Argos y OCR automático siguen siendo valores iniciales sin preguntas técnicas.
-- Revisión completa con IA local activa una pasada proactiva de texto y, solo en EPUB, también de
+- Revisión automática con IA local activa una pasada proactiva de texto y, solo en EPUB, también de
   estructura; no existen interruptores independientes ni un resumen técnico del recorrido en esta
   página.
+- Flujo usa `Convertir`, `OCR`, `Traducir`, `Corregir contenido`, `Verificar traducción`,
+  `Organizar EPUB` y `Personalizar EPUB`; no usa `Revisar con IA` para describir trabajo automático.
+- `→` separa fases y `y` une acciones integradas. El idioma de destino siempre aparece al traducir y
+  el motor queda en la ayuda contextual.
+- La segunda línea de Flujo se omite cuando no aporta una decisión. Muestra `Tu revisión si hay
+  cambios` en recorridos revisados no EPUB y `Tu revisión antes de publicar` en toda salida EPUB.
+- Varias filas calculan su flujo de manera independiente; añadir documentos no mezcla idiomas,
+  motores, OCR ni políticas de revisión.
 - La IA local muestra un estado breve y deja el modelo general heredado en la ayuda contextual, sin
   excepciones por documento. Si falta, la acción principal abre su configuración.
 - Cada elección válida se aplica y persiste inmediatamente. No hay botones Cancelar o Crear/Guardar;

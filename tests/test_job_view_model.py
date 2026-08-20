@@ -62,7 +62,7 @@ def test_next_step_keeps_missing_configuration_distinct_from_review() -> None:
 
     assert (missing.label, missing.action) == ("Pendiente", JobAction.CONFIGURE)
     assert (review.label, review.action) == (
-        "Revisión necesaria",
+        "Necesita tu revisión",
         JobAction.REVIEW,
     )
 

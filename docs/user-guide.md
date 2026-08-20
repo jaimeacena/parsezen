@@ -7,26 +7,31 @@ Esta guía describe la versión actual de Parsezen.
 Cada documento ocupa una fila. Las columnas muestran el recorrido real:
 
 - **Documento**: origen, tamaño y páginas PDF.
-- **Flujo**: procesamiento Directo o Revisión completa con IA local y traducción opcional.
+- **Flujo**: acciones automáticas en orden y, solo cuando corresponda, tu intervención posterior.
 - **Salida**: archivo final y su destino.
 - **Estado**: fase actual, avance y acción necesaria.
 
 Al añadir un documento, **Salida** abre una página breve dentro de la aplicación. **Markdown** y
-**EPUB** se eligen con dos tarjetas visuales; **Revisión con IA** usa un interruptor. **Traducir** y,
+**EPUB** se eligen con dos tarjetas visuales; **Revisión automática con IA** usa un interruptor. **Traducir** y,
 para PDF, **Páginas** y **OCR** mantienen el patrón `Etiqueta — Valor actual — ›`. No hay secciones
 avanzadas, pie de botones ni scroll en el tamaño normal. Cuando hay traducción, una única línea tras
 la última opción resume su recorrido y coste aproximado; no se presenta como ayuda de **Glosario**.
 
 **Traducir** parte en **No traducir**. Al elegir un idioma aparecen dos filas idénticas:
-**Traductor** —Argos o IA local— y **Glosario**. La revisión completa con IA parte activada en los
+**Traductor** —Argos o IA local— y **Glosario**. La revisión automática con IA parte activada en los
 documentos nuevos. Cada elección válida se guarda inmediatamente; **Volver** y Escape solo regresan
 a la cola. Si falta la IA exigida por una elección, Parsezen mantiene la intención y abre el gestor
 local. Una configuración guardada conserva sus decisiones.
 
 **Procesamiento directo** convierte o traduce, comprueba la salida y puede recomendar después una
-revisión dirigida si encuentra señales concretas. **Revisar todo con IA** examina proactivamente el
+revisión dirigida si encuentra señales concretas. **Revisión automática con IA** examina el
 texto completo y, si el resultado es EPUB, también su estructura. No se pueden combinar corrección
 y estructura por separado.
+
+En **Flujo**, `→` separa fases y `y` une acciones realizadas en la misma pasada. La IA traduce,
+corrige, verifica u organiza; `Tu revisión` se reserva para una decisión humana. Un EPUB siempre
+muestra `Tu revisión antes de publicar`; otros resultados solo anticipan `Tu revisión si hay cambios`
+cuando la configuración puede producir propuestas.
 
 Cada acción se encuentra en la celda a la que pertenece: configurar el flujo o la salida, revisar,
 ver un error o abrir el archivo. La pantalla principal no añade un inspector lateral ni repite la

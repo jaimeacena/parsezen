@@ -3,7 +3,9 @@ from __future__ import annotations
 import pytest
 
 from parsezen.application.processing_explanation import (
+    HumanReviewPolicy,
     linguistic_review_summary,
+    processing_flow,
     processing_flow_steps,
     processing_pass_summary,
     translation_route_summary,
@@ -82,13 +84,13 @@ def test_linguistic_summary_omits_missing_translation_coverage() -> None:
                 output=OutputConfiguration(format=DocumentFormat.EPUB),
                 plan=ProcessingPlan.LOCAL_AI_REVIEWED,
             ),
-            "Revisión de estructura con IA local",
+            "Organizar EPUB con IA local",
             "2 pasadas de IA",
         ),
         (
             DocumentFormat.PDF,
             JobConfiguration(plan=ProcessingPlan.LOCAL_AI_REVIEWED),
-            "Revisión semántica con IA local",
+            "Corregir contenido con IA local",
             "1 pasada de IA para la revisión semántica",
         ),
         (
@@ -105,7 +107,7 @@ def test_linguistic_summary_omits_missing_translation_coverage() -> None:
                 translation=TranslationConfiguration(True, TranslationMethod.OFFLINE, "es"),
                 plan=ProcessingPlan.LOCAL_AI_REVIEWED,
             ),
-            "Revisión bilingüe con IA local",
+            "Verificar traducción con IA local",
             "2 pasadas: Argos",
         ),
         (
@@ -115,7 +117,7 @@ def test_linguistic_summary_omits_missing_translation_coverage() -> None:
                 translation=TranslationConfiguration(True, TranslationMethod.OFFLINE, "es"),
                 plan=ProcessingPlan.LOCAL_AI_REVIEWED,
             ),
-            "Revisión bilingüe con IA local",
+            "Verificar traducción con IA local",
             "3 pasadas",
         ),
         (
@@ -142,13 +144,13 @@ def test_linguistic_summary_omits_missing_translation_coverage() -> None:
                 translation=TranslationConfiguration(True, TranslationMethod.LOCAL_AI, "es"),
                 plan=ProcessingPlan.LOCAL_AI_REVIEWED,
             ),
-            "Revisión de estructura con IA local",
+            "Organizar EPUB con IA local",
             "2 pasadas de IA: traducción y corrección",
         ),
         (
             DocumentFormat.EPUB,
             JobConfiguration(output=OutputConfiguration(format=DocumentFormat.EPUB)),
-            "Personalizar",
+            "Personalizar EPUB",
             "Sin pasadas de IA",
         ),
     ),
@@ -161,3 +163,106 @@ def test_flow_and_pass_summary_cover_product_routes(
 ) -> None:
     assert flow_fragment in processing_flow_steps(source, configuration)
     assert pass_fragment in processing_pass_summary(configuration)
+
+
+@pytest.mark.parametrize(
+    ("source", "configuration", "steps", "review_policy", "review_note"),
+    (
+        (
+            DocumentFormat.PDF,
+            JobConfiguration(),
+            ("Convertir",),
+            HumanReviewPolicy.NONE,
+            None,
+        ),
+        (
+            DocumentFormat.PDF,
+            JobConfiguration(force_pdf_ocr=True),
+            ("OCR", "Convertir"),
+            HumanReviewPolicy.NONE,
+            None,
+        ),
+        (
+            DocumentFormat.MARKDOWN,
+            JobConfiguration(plan=ProcessingPlan.LOCAL_AI_REVIEWED),
+            ("Corregir contenido",),
+            HumanReviewPolicy.IF_CHANGES,
+            "Tu revisión si hay cambios",
+        ),
+        (
+            DocumentFormat.DOCX,
+            JobConfiguration(
+                translation=TranslationConfiguration(
+                    True,
+                    TranslationMethod.LOCAL_AI,
+                    "es",
+                )
+            ),
+            ("Traducir a español",),
+            HumanReviewPolicy.NONE,
+            None,
+        ),
+        (
+            DocumentFormat.DOCX,
+            JobConfiguration(
+                translation=TranslationConfiguration(
+                    True,
+                    TranslationMethod.LOCAL_AI,
+                    "es",
+                ),
+                plan=ProcessingPlan.LOCAL_AI_REVIEWED,
+            ),
+            ("Traducir y corregir a español",),
+            HumanReviewPolicy.IF_CHANGES,
+            "Tu revisión si hay cambios",
+        ),
+        (
+            DocumentFormat.DOCX,
+            JobConfiguration(
+                translation=TranslationConfiguration(
+                    True,
+                    TranslationMethod.OFFLINE,
+                    "es",
+                ),
+                plan=ProcessingPlan.LOCAL_AI_REVIEWED,
+            ),
+            ("Traducir a español", "Verificar traducción"),
+            HumanReviewPolicy.IF_CHANGES,
+            "Tu revisión si hay cambios",
+        ),
+        (
+            DocumentFormat.PDF,
+            JobConfiguration(
+                output=OutputConfiguration(format=DocumentFormat.EPUB),
+                translation=TranslationConfiguration(
+                    True,
+                    TranslationMethod.LOCAL_AI,
+                    "es",
+                ),
+                plan=ProcessingPlan.LOCAL_AI_REVIEWED,
+            ),
+            ("Traducir y corregir a español", "Organizar EPUB"),
+            HumanReviewPolicy.BEFORE_PUBLISHING,
+            "Tu revisión antes de publicar",
+        ),
+        (
+            DocumentFormat.EPUB,
+            JobConfiguration(output=OutputConfiguration(format=DocumentFormat.EPUB)),
+            ("Personalizar EPUB",),
+            HumanReviewPolicy.BEFORE_PUBLISHING,
+            "Tu revisión antes de publicar",
+        ),
+    ),
+)
+def test_compact_flow_uses_one_vocabulary_and_explicit_human_policy(
+    source: DocumentFormat,
+    configuration: JobConfiguration,
+    steps: tuple[str, ...],
+    review_policy: HumanReviewPolicy,
+    review_note: str | None,
+) -> None:
+    flow = processing_flow(source, configuration)
+
+    assert flow.compact_steps == steps
+    assert flow.human_review is review_policy
+    assert flow.human_review_note == review_note

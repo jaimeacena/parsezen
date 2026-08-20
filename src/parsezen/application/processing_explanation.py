@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+from enum import StrEnum
+
 from parsezen.domain.jobs import (
     DocumentFormat,
     JobConfiguration,
@@ -23,42 +26,122 @@ _FORMAT_LABELS = {
 }
 
 
+class HumanReviewPolicy(StrEnum):
+    """Expected user involvement after the automatic document route."""
+
+    NONE = "none"
+    IF_CHANGES = "if_changes"
+    BEFORE_PUBLISHING = "before_publishing"
+
+
+@dataclass(frozen=True, slots=True)
+class ProcessingFlow:
+    """One shared projection for compact and expanded workflow explanations."""
+
+    compact_steps: tuple[str, ...]
+    detailed_steps: tuple[str, ...]
+    human_review: HumanReviewPolicy
+
+    @property
+    def human_review_note(self) -> str | None:
+        return {
+            HumanReviewPolicy.NONE: None,
+            HumanReviewPolicy.IF_CHANGES: "Tu revisión si hay cambios",
+            HumanReviewPolicy.BEFORE_PUBLISHING: "Tu revisión antes de publicar",
+        }[self.human_review]
+
+
+def processing_flow(
+    source_format: DocumentFormat,
+    configuration: JobConfiguration,
+) -> ProcessingFlow:
+    """Describe automatic actions separately from the later human decision."""
+
+    reviewed = configuration.plan is ProcessingPlan.LOCAL_AI_REVIEWED
+    translation = configuration.translation
+    output_format = configuration.output.format
+    compact_steps: list[str] = []
+    detailed_steps: list[str] = []
+
+    def add_step(compact: str, detailed: str | None = None) -> None:
+        compact_steps.append(compact)
+        detailed_steps.append(detailed or compact)
+
+    if source_format is DocumentFormat.PDF and configuration.force_pdf_ocr:
+        add_step("OCR")
+
+    automatic_transformations = 0
+    if translation.enabled:
+        target = _display_language(translation.target_language)
+        suffix = f" a {target}" if target else ""
+        if translation.method is TranslationMethod.OFFLINE:
+            add_step(
+                f"Traducir{suffix}",
+                f"Traducir con Argos{suffix}",
+            )
+            automatic_transformations += 1
+            if reviewed:
+                add_step(
+                    "Verificar traducción",
+                    "Verificar traducción con IA local",
+                )
+                automatic_transformations += 1
+        elif reviewed:
+            add_step(
+                f"Traducir y corregir{suffix}",
+                f"Traducir y corregir con IA local{suffix}",
+            )
+            automatic_transformations += 1
+        else:
+            add_step(
+                f"Traducir{suffix}",
+                f"Traducir con IA local{suffix}",
+            )
+            automatic_transformations += 1
+    elif reviewed:
+        add_step("Corregir contenido", "Corregir contenido con IA local")
+        automatic_transformations += 1
+
+    if reviewed and output_format is DocumentFormat.EPUB:
+        add_step("Organizar EPUB", "Organizar EPUB con IA local")
+        automatic_transformations += 1
+    elif (
+        source_format is DocumentFormat.EPUB
+        and output_format is DocumentFormat.EPUB
+        and automatic_transformations == 0
+    ):
+        add_step("Personalizar EPUB")
+        automatic_transformations += 1
+
+    if automatic_transformations == 0:
+        add_step("Convertir")
+
+    human_review = (
+        HumanReviewPolicy.BEFORE_PUBLISHING
+        if output_format is DocumentFormat.EPUB
+        else HumanReviewPolicy.IF_CHANGES
+        if reviewed
+        else HumanReviewPolicy.NONE
+    )
+    return ProcessingFlow(
+        tuple(compact_steps),
+        tuple(detailed_steps),
+        human_review,
+    )
+
+
 def processing_flow_steps(
     source_format: DocumentFormat,
     configuration: JobConfiguration,
 ) -> tuple[str, ...]:
     """Return the real user-visible transformations in execution order."""
 
-    reviewed = configuration.plan is ProcessingPlan.LOCAL_AI_REVIEWED
-    translation = configuration.translation
-    output_format = configuration.output.format
-    steps = [_FORMAT_LABELS[source_format]]
-
-    if translation.enabled:
-        target = _display_language(translation.target_language)
-        suffix = f" a {target}" if target else ""
-        if translation.method is TranslationMethod.OFFLINE:
-            steps.append(f"Traducir con Argos{suffix}")
-            if reviewed:
-                steps.append("Revisión bilingüe con IA local")
-        elif reviewed:
-            steps.append(f"Traducir y corregir con IA local{suffix}")
-        else:
-            steps.append(f"Traducir con IA local{suffix}")
-    elif reviewed:
-        steps.append("Revisión semántica con IA local")
-
-    if reviewed and output_format is DocumentFormat.EPUB:
-        steps.append("Revisión de estructura con IA local")
-    elif (
-        source_format is DocumentFormat.EPUB
-        and output_format is DocumentFormat.EPUB
-        and len(steps) == 1
-    ):
-        steps.append("Personalizar")
-
-    steps.append(_FORMAT_LABELS[output_format])
-    return tuple(steps)
+    flow = processing_flow(source_format, configuration)
+    return (
+        _FORMAT_LABELS[source_format],
+        *flow.detailed_steps,
+        _FORMAT_LABELS[configuration.output.format],
+    )
 
 
 def processing_pass_summary(configuration: JobConfiguration) -> str:

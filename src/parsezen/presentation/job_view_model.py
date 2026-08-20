@@ -98,7 +98,7 @@ def next_step_view(job: DocumentJob) -> NextStepView:
     stage = focus_stage(job)
     if stage.status is StageStatus.BLOCKED_FOR_REVIEW:
         return NextStepView(
-            "Revisión necesaria",
+            "Necesita tu revisión",
             "review",
             JobAction.REVIEW,
             "Revisar",

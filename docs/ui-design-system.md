@@ -113,12 +113,14 @@ Las capturas iniciales se conservaron fuera del repositorio en
 5. Las revisiones conservan siempre la comparación y la elección; en compacto pasan de dos columnas
    a una secuencia vertical.
 6. La configuración es una página compacta de la pila principal. Markdown/EPUB son las únicas tarjetas
-   de elección, por ser una decisión primaria fácil de reconocer; Revisión con IA usa un interruptor.
+   de elección, por ser una decisión primaria fácil de reconocer; Revisión automática con IA usa un interruptor.
    Las demás decisiones usan `Etiqueta — Valor — ›` y solo el espaciado vertical separa grupos.
    Traductor y glosario dependen del idioma, mientras páginas y OCR aparecen solo para PDF.
 7. Cada texto, contenedor y control debe justificar una decisión o una acción. La información ya
    inferible se retira, la ayuda repetida se oculta en contexto y las funciones secundarias se agrupan
    antes de ocupar espacio permanente.
+8. Flujo separa el trabajo automático de la intervención humana: usa verbos de resultado en orden y
+   reserva una segunda línea atenuada para `Tu revisión` cuando sea condicional u obligatoria.
 
 ## Densidad y elevación
 

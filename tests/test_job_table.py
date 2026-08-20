@@ -19,6 +19,7 @@ from parsezen.domain.jobs import (
     ReviewRecommendation,
     ReviewSignal,
     TranslationConfiguration,
+    TranslationMethod,
 )
 from parsezen.domain.stages import StageKind, StageStatus
 from parsezen.presentation.job_table import (
@@ -183,8 +184,58 @@ def test_configuration_summary_remains_visible_and_accessible() -> None:
     presentation = index.data(CELL_PRESENTATION_ROLE)
 
     assert presentation.title == ""
-    assert presentation.operations == ("Traducir", "Revisar con IA")
+    assert presentation.operations == (
+        "Traducir a español",
+        "Verificar traducción",
+        "Organizar EPUB",
+    )
+    assert presentation.subtitle == "Tu revisión antes de publicar"
     assert index.data(Qt.ItemDataRole.AccessibleTextRole).startswith("Flujo")
+
+
+def test_multiple_documents_keep_independent_clear_flows() -> None:
+    jobs = (
+        DocumentJob.create(
+            DocumentSource(Path("direct.pdf"), DocumentFormat.PDF, 100, 1),
+            JobConfiguration(),
+            order=0,
+            job_id="direct",
+        ),
+        DocumentJob.create(
+            DocumentSource(Path("offline.docx"), DocumentFormat.DOCX, 100, 1),
+            JobConfiguration(
+                translation=TranslationConfiguration(
+                    True,
+                    TranslationMethod.OFFLINE,
+                    "es",
+                ),
+                plan=ProcessingPlan.LOCAL_AI_REVIEWED,
+            ),
+            order=1,
+            job_id="offline",
+        ),
+        replace(make_job(), order=2),
+    )
+    model = JobTableModel(jobs)
+
+    presentations = tuple(
+        model.index(row, COLUMNS.index(JobColumn.FLOW)).data(CELL_PRESENTATION_ROLE)
+        for row in range(3)
+    )
+
+    assert presentations[0].operations == ("Convertir",)
+    assert presentations[0].subtitle is None
+    assert presentations[1].operations == (
+        "Traducir a español",
+        "Verificar traducción",
+    )
+    assert presentations[1].subtitle == "Tu revisión si hay cambios"
+    assert presentations[2].operations == (
+        "Traducir a español",
+        "Verificar traducción",
+        "Organizar EPUB",
+    )
+    assert presentations[2].subtitle == "Tu revisión antes de publicar"
 
 
 def test_execution_preflight_is_presented_as_preparing() -> None:

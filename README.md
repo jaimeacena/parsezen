@@ -71,7 +71,7 @@ de Ollama y nunca envía el documento fuera del equipo. Es open source, privado 
 
 2. **Añade tu documento.** Puedes trabajar con PDF, Word, EPUB, Markdown y archivos de texto.
 3. **Configura el resultado.** Dentro de Parsezen, dos tarjetas claras permiten elegir Markdown o
-   EPUB; traducción, páginas y OCR usan filas breves `Etiqueta — Valor — ›`, y la revisión con IA un
+   EPUB; traducción, páginas y OCR usan filas breves `Etiqueta — Valor — ›`, y la revisión automática con IA un
    único interruptor. Al elegir un idioma aparecen traductor y glosario; un intervalo se resume como
    `25–140`. Bajo el traductor se explica el recorrido efectivo, el número de pasadas y un coste
    cualitativo que cambia con el formato y la revisión elegidos. Cada elección válida se guarda al

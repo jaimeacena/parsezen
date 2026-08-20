@@ -133,7 +133,7 @@ horizontal. El contrato, paleta y matriz de contraste están en `docs/ui-design-
 `OutputConfiguration.configured` separa un documento recién añadido de un trabajo ejecutable.
 Mientras sea falso, el planificador no lo incluye y `PUBLISH` no participa. La presentación abre
 una página de ajustes dentro de la pila de la ventana principal. El formato se proyecta como dos
-tarjetas visuales exclusivas, la revisión con IA como interruptor y el resto de decisiones como una
+tarjetas visuales exclusivas, la revisión automática con IA como interruptor y el resto de decisiones como una
 fila de etiqueta, valor y chevron. Los documentos nuevos presentan
 `LOCAL_AI_REVIEWED` activado; una configuración guardada conserva su plan. Argos y OCR automático
 son valores iniciales. Traductor y glosario dependen del idioma; Páginas y OCR aparecen solo para
@@ -155,6 +155,13 @@ producir correcciones conservadoras, no una mejora universal, por lo que la inte
 y conserva `STANDARD` como alternativa inmediata. El informe de validación registra por separado las
 propuestas de contenido y estructura, sus decisiones recomendadas, las incidencias objetivas y el
 tiempo; una propuesta aceptable no se interpreta por sí sola como evidencia de mejor calidad.
+
+`application.processing_explanation.processing_flow` es la única proyección del recorrido visible.
+Deriva pasos compactos, pasos detallados y una política humana (`NONE`, `IF_CHANGES` o
+`BEFORE_PUBLISHING`) sin depender de Qt. La cola muestra solo verbos automáticos en orden y reserva
+`Tu revisión` para la segunda línea; preflight reutiliza la misma ruta con motor y formato. La salida
+EPUB exige revisión antes de publicar, mientras Markdown solo la anticipa cuando el plan puede
+producir propuestas. Las incidencias excepcionales siguen apareciendo dinámicamente en Estado.
 
 Al completar `STANDARD` sin otra revisión bloqueante, `review_recommendation` deriva una
 `ReviewRecommendation` determinista de los informes ya calculados. Sus señales son daño de

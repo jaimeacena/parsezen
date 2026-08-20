@@ -48,7 +48,8 @@ from parsezen.application.preflight import (
     RuntimeEstimate,
     format_duration_range,
 )
-from parsezen.domain.jobs import DocumentFormat, DocumentJob, JobStatus, ProcessingPlan
+from parsezen.application.processing_explanation import ProcessingFlow, processing_flow
+from parsezen.domain.jobs import DocumentFormat, DocumentJob, JobStatus
 from parsezen.domain.stages import StageKind
 from parsezen.final_integrity import FinalIntegrityReport
 from parsezen.presentation.design_system import COLORS, SPACING
@@ -124,13 +125,8 @@ _STAGE_LABELS = {
 }
 
 
-def _flow_operations(job: DocumentJob) -> tuple[str, ...]:
-    operations: list[str] = []
-    if job.configuration.translation.enabled:
-        operations.append("Traducir")
-    if job.configuration.plan is ProcessingPlan.LOCAL_AI_REVIEWED:
-        operations.append("Revisar con IA")
-    return tuple(operations)
+def _flow(job: DocumentJob) -> ProcessingFlow:
+    return processing_flow(job.source.format, job.configuration)
 
 
 def cell_presentation(
@@ -165,9 +161,12 @@ def cell_presentation(
         )
         if compact and job.is_configured:
             output = job.configuration.output
-            flow = ", ".join(_flow_operations(job)) or "Conversión"
+            route = _flow(job)
+            flow = " → ".join(route.compact_steps)
             output_label = output.format.value.upper() if output.configured else "Sin salida"
             details = f"{details} · {flow} → {output_label}"
+            if route.human_review_note:
+                details = f"{details} · {route.human_review_note}"
         return CellPresentation(
             job.source.path.stem,
             details,
@@ -177,10 +176,11 @@ def cell_presentation(
     if column is JobColumn.FLOW:
         if not job.is_configured:
             return CellPresentation("", tone="disabled")
-        operations = _flow_operations(job)
+        route = _flow(job)
         return CellPresentation(
             "",
-            operations=operations,
+            route.human_review_note,
+            operations=route.compact_steps,
         )
 
     if column is JobColumn.NEXT_STEP:
@@ -416,7 +416,15 @@ class JobTableModel(QAbstractTableModel):
             if column is JobColumn.DOCUMENT:
                 return f"{job.source.path.name}\n{job.source.path.parent}"
             if presentation.operations:
-                return " → ".join(presentation.operations)
+                route = _flow(job)
+                return "\n".join(
+                    value
+                    for value in (
+                        " → ".join(route.detailed_steps),
+                        route.human_review_note,
+                    )
+                    if value
+                )
             if column is JobColumn.NEXT_STEP and runtime_estimate is not None:
                 return "\n".join(
                     (
@@ -478,8 +486,8 @@ class JobTableModel(QAbstractTableModel):
                 for value in (
                     HEADERS[column],
                     presentation.title,
-                    presentation.subtitle,
                     ", ".join(presentation.operations) if presentation.operations else None,
+                    presentation.subtitle,
                     presentation.status,
                     presentation.action if presentation.action != presentation.status else None,
                 )
@@ -607,7 +615,7 @@ class JobCellDelegate(QStyledItemDelegate):
         if column is JobColumn.DOCUMENT:
             self._paint_document(painter, option, presentation)
         elif column is JobColumn.FLOW and presentation.operations:
-            self._paint_operation_chips(painter, option, presentation.operations)
+            self._paint_flow(painter, option, presentation)
         elif column is JobColumn.NEXT_STEP:
             self._paint_next_step(painter, option, presentation, hovered=cell_hovered)
         elif column not in {JobColumn.DRAG, JobColumn.REMOVE}:
@@ -766,25 +774,35 @@ class JobCellDelegate(QStyledItemDelegate):
         )
         return QRectF(left, track_top, min(190, width), 5)
 
-    @staticmethod
-    def _paint_operation_chips(
+    @classmethod
+    def _paint_flow(
+        cls,
         painter: QPainter,
         option: QStyleOptionViewItem,
-        operations: tuple[str, ...],
+        presentation: CellPresentation,
     ) -> None:
         font = QFont(option.font)
         font.setPointSizeF(max(8.5, font.pointSizeF() - 0.25))
         painter.setFont(font)
-        metrics = QFontMetrics(font)
-        available = option.rect.adjusted(14, 0, -12, 0)
-        text = "  →  ".join(operations)
-        text = metrics.elidedText(text, Qt.TextElideMode.ElideRight, available.width())
         painter.setPen(QColor(COLORS.text_secondary))
-        painter.drawText(
-            available,
-            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
-            text,
+        available = QRectF(option.rect.adjusted(14, 0, -12, 0))
+        has_review_note = bool(presentation.subtitle)
+        primary_top = option.rect.center().y() - (20 if has_review_note else 10)
+        cls._draw_elided(
+            painter,
+            QRectF(available.left(), primary_top, available.width(), 21),
+            "  →  ".join(presentation.operations),
         )
+        if presentation.subtitle:
+            note_font = QFont(option.font)
+            note_font.setPointSizeF(max(8.0, note_font.pointSizeF() - 0.75))
+            painter.setFont(note_font)
+            painter.setPen(QColor(COLORS.text_muted))
+            cls._draw_elided(
+                painter,
+                QRectF(available.left(), primary_top + 23, available.width(), 19),
+                presentation.subtitle,
+            )
 
     @staticmethod
     def _draw_elided(

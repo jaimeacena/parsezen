@@ -99,8 +99,8 @@ def test_preflight_explains_review_load_and_unsafe_automatic_changes(tmp_path: P
     assert analysis.flow_steps == (
         "Markdown",
         "Traducir con Argos a español",
-        "Revisión bilingüe con IA local",
-        "Revisión de estructura con IA local",
+        "Verificar traducción con IA local",
+        "Organizar EPUB con IA local",
         "EPUB",
     )
     assert any(
