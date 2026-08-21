@@ -15,6 +15,8 @@
 - La comprobación temprana convierte todas las páginas representativas, pero prueba traducción en un
   máximo de tres y omite revisión, reestructuración y construcción EPUB finales. Ollama y OCR añaden
   deadlines totales acotados y métricas privadas de tiempo, tokens y rendimiento sin contenido.
+- Los locks general y CPU de Windows actualizan `pip` a 26.2.1 para corregir
+  `PYSEC-2026-3721`; ambas auditorías conservan cobertura completa y hashes fijados.
 - La revisión documental elimina contexto y botones redundantes: resume el progreso como `fase ·
   resueltas/total`, muestra prioridad o sugerencia solo cuando aportan información, agrupa localizar y
   restaurar en el menú de cada panel, oculta `Anterior` sin destino y reserva la acción masiva para
