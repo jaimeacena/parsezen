@@ -617,6 +617,8 @@ def translation_quality_report(
     if source is None:
         return None
     target_language = request.offline_translation_language or request.target_language
+    if target_language is None:
+        raise AssertionError("A validated translation always has a target language.")
     target_language_code = resolve_language_code(target_language)
     if target_language_code is None:
         raise AssertionError("A completed translation always has a supported target language.")
@@ -681,6 +683,8 @@ def repair_translation_warnings(
     """Retry aligned blocks with source-language residue or a critical fidelity warning."""
 
     target_language = request.offline_translation_language or request.target_language
+    if target_language is None:
+        raise AssertionError("A validated translation always has a target language.")
     target_language_code = resolve_language_code(target_language)
     if target_language_code is None:
         raise AssertionError("A validated translation always has a supported target language.")
@@ -721,7 +725,7 @@ def repair_translation_warnings(
                     source_segment,
                     current_segment,
                     settings,
-                    request.target_language or target_language,
+                    target_language,
                     source_language_code=source_language_code,
                     cancellation=cancellation,
                 )
@@ -735,7 +739,7 @@ def repair_translation_warnings(
                 protected.text,
                 ImprovementMode.TRANSLATE,
                 settings,
-                request.target_language,
+                target_language,
                 source_language_code=source_language_code,
                 **repair_arguments,
             )

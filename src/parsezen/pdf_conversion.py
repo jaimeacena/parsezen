@@ -1876,6 +1876,14 @@ def _reconcile_suspicious_toc_numbers(
         confirmed = candidates & confirmed_numbers
         return next(iter(confirmed)) if len(confirmed) == 1 else token
 
+    def reconciliation_callback(
+        confirmed_numbers: set[str],
+    ) -> Callable[[re.Match[str]], str]:
+        def reconcile_confirmed_token(match: re.Match[str]) -> str:
+            return reconcile_token(match, confirmed_numbers)
+
+        return reconcile_confirmed_token
+
     reconciled: list[_PdfLine] = []
     for line in lines:
         native_sequence = native_sequence_numbers(line)
@@ -1883,7 +1891,7 @@ def _reconcile_suspicious_toc_numbers(
         native_ocr_consensus = native_sequence & ocr_confirmed_numbers
         confirmed_numbers = native_ocr_consensus or native_sequence or ocr_confirmed_numbers
         text = _SUSPICIOUS_NUMERIC_GLYPH_PATTERN.sub(
-            lambda match, confirmed=confirmed_numbers: reconcile_token(match, confirmed),
+            reconciliation_callback(confirmed_numbers),
             line.text,
         )
         reconciled.append(replace(line, text=text) if text != line.text else line)
@@ -2420,9 +2428,9 @@ def _arbitrate_visual_text_disagreements(
         with pdfplumber.open(source_path, unicode_norm="NFC") as pdf:
             for disagreement in selected:
                 check_cancelled(cancellation)
-                page = pdf.pages[disagreement.page_number - 1]
+                document_page = pdf.pages[disagreement.page_number - 1]
                 try:
-                    crop = _render_visual_text_crop(page, disagreement.line)
+                    crop = _render_visual_text_crop(document_page, disagreement.line)
                     proposed = arbiter(
                         crop,
                         disagreement.line.text,
@@ -2437,7 +2445,7 @@ def _arbitrate_visual_text_disagreements(
                     LOGGER.warning("pdf_visual_region_skipped reviewed=%d", reviewed)
                     continue
                 finally:
-                    page.close()
+                    document_page.close()
                 if proposed is None:
                     continue
                 accepted = _validated_visual_reading(

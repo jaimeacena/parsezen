@@ -606,6 +606,8 @@ def improve_markdown(
     if mode in {ImprovementMode.TRANSLATE, ImprovementMode.CLEAN_AND_TRANSLATE}:
         source_language = source_language_code or detect_language_code(markdown)
         target_code = resolve_language_code(target_language)
+        if target_code is None:
+            raise ImprovementError("Indica un idioma de destino compatible para traducir.")
         if (
             mode is ImprovementMode.TRANSLATE
             and target_code is not None
@@ -629,7 +631,7 @@ def improve_markdown(
         protect_paragraphs=translation_context is not None,
     )
     hierarchical_contexts = (
-        _hierarchical_translation_contexts(parts)
+        _hierarchical_translation_contexts(tuple(parts))
         if translation_context is not None
         else ("",) * len(parts)
     )

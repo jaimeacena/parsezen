@@ -35,7 +35,7 @@ class _MarkdownPart:
 @dataclass(frozen=True, slots=True)
 class _TranslationContext:
     source_language: str | None
-    target_language: str | None
+    target_language: str
     preserve_paragraphs: bool
     preserved_segments: list[str] = field(default_factory=list, compare=False)
 

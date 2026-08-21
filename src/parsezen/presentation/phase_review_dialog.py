@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
 
-from PySide6.QtCore import QEvent, QRectF, Qt, QTimer
+from PySide6.QtCore import QEvent, QObject, QRectF, Qt, QTimer
 from PySide6.QtGui import (
     QAction,
     QColor,
@@ -977,7 +977,7 @@ class _ReviewPane(QFrame):
             self.image_scroll.verticalScrollBar().setValue(0)
             self.image_scroll.horizontalScrollBar().setValue(0)
 
-    def eventFilter(self, watched: object, event: QEvent) -> bool:  # noqa: N802
+    def eventFilter(self, watched: QObject, event: QEvent) -> bool:  # noqa: N802
         if (
             watched is self.image_scroll.viewport()
             and event.type() is QEvent.Type.Resize

@@ -685,7 +685,7 @@ def _collect_epub_translation_units(
         ):
             source = (
                 _translation_text_wrapper(
-                    element.text if text_slot == "text" else element.tail or ""
+                    (element.text or "") if text_slot == "text" else (element.tail or "")
                 )
                 if text_slot is not None
                 else _serialize_xml_element(element)
@@ -793,7 +793,8 @@ def _select_translation_elements(
         *,
         translate_direct_text: bool,
     ) -> Iterator[tuple[tuple[int, ...], XmlElementTree.Element, str | None]]:
-        if not isinstance(element.tag, str):
+        element_tag: object = element.tag
+        if not isinstance(element_tag, str):
             return
         name = _local_name(element).casefold()
         if name in _UNSAFE_TRANSLATION_CONTENT:
@@ -829,7 +830,9 @@ def _select_translation_elements(
 
 
 def _contains_alphabetic_text(value: str | None) -> bool:
-    return bool(value) and any(character.isalpha() for character in value)
+    if not value:
+        return False
+    return any(character.isalpha() for character in value)
 
 
 def _translation_text_wrapper(value: str) -> str:

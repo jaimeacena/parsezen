@@ -137,6 +137,8 @@ class ReviewPublicationCoordinator:
         )
         preserve_existing_package = False
         if package_edit_allowed:
+            if book.source_package_artifact_id is None:
+                raise AssertionError("A package-bound draft must retain its source artifact.")
             replacements = {
                 section.source_archive_path: self._artifacts.read(
                     job_id,

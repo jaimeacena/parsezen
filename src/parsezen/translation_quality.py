@@ -2070,8 +2070,8 @@ def _report_blocks(document: str) -> tuple[str, ...]:
             for index, marker in enumerate(page_markers)
         )
         return tuple(blocks)
-    parts, blocks = _repairable_report_blocks(document)
-    return tuple(parts[block.part_index] for block in blocks)
+    parts, repairable_blocks = _repairable_report_blocks(document)
+    return tuple(parts[block.part_index] for block in repairable_blocks)
 
 
 def _translation_segment_issue(
