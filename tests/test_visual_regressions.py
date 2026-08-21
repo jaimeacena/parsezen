@@ -535,7 +535,7 @@ def test_configuration_contextual_controls_stay_in_one_vertical_flow(
     assert editor.pages_row.isVisible()
     assert editor.pages_row.value.text() == "25–140"
     assert editor.ocr_row.isVisible()
-    assert editor.translation_route.y() > editor.ocr_row.y()
+    assert not hasattr(editor, "translation_route")
     assert not hasattr(editor, "page_first")
     assert not hasattr(editor, "scroll_area")
     assert editor.content.sizeHint().height() <= editor.height()

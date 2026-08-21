@@ -266,6 +266,18 @@ def format_duration_range(estimate: DurationEstimate) -> str:
     return lower if lower == upper else f"{lower}–{upper}"
 
 
+def _format_compact_remaining_range(estimate: DurationEstimate) -> str:
+    """Keep the live countdown short without losing its uncertainty range."""
+
+    if estimate.upper_seconds < 60:
+        return "<1 min"
+    if estimate.upper_seconds < 3_600:
+        lower = str(max(1, round(estimate.lower_seconds / 60)))
+        upper = str(max(1, round(estimate.upper_seconds / 60)))
+        return f"{lower}–{upper} min" if lower != upper else f"{lower} min"
+    return format_duration_range(estimate).replace("menos de 1 min", "<1 min")
+
+
 def should_run_early_check(profile: WorkloadProfile) -> bool:
     """Limit representative work to PDFs where it can prevent a material wait."""
 
@@ -342,8 +354,9 @@ def estimate_remaining_time(
             "Las fases posteriores conservan el margen del plan inicial."
         )
     remaining = DurationEstimate(lower, likely, upper, forecast.sample_count)
+    remaining_range = _format_compact_remaining_range(remaining)
     return RuntimeEstimate(
-        f"Quedan aprox. {format_duration_range(remaining)}",
+        "Queda <1 min" if remaining_range == "<1 min" else f"Quedan ~{remaining_range}",
         explanation,
         remaining,
     )

@@ -1468,20 +1468,22 @@ def apply_parsezen_theme(
         QLabel#activityFeedback {{
             color: {COLORS.text_secondary};
         }}
-        QFrame#activityDetails {{
+        QFrame#activityHistoryPanel, QFrame#activityDetails {{
+            background-color: {COLORS.surface_raised};
+            border: 1px solid {COLORS.divider};
+            border-radius: {RADIUS_SMALL}px;
+        }}
+        QSplitter#activityPanels::handle {{
             background-color: transparent;
-            border: none;
-            border-top: 1px solid {COLORS.divider};
         }}
         QListWidget#recentJobsList {{
             background-color: transparent;
-            border-left: none;
-            border-right: none;
-            border-radius: 0;
+            border: none;
         }}
         QListWidget#recentJobsList::item {{
-            min-height: 48px;
-            padding: 7px 8px;
+            min-height: 54px;
+            padding: 8px 10px;
+            border-radius: {RADIUS_SMALL}px;
         }}
         QListWidget {{
             color: {COLORS.text_primary};

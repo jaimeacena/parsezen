@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import StrEnum
 
-from parsezen.domain.jobs import DocumentJob, JobStatus
+from parsezen.domain.jobs import DocumentFormat, DocumentJob, JobStatus
 from parsezen.domain.stages import StageKind, StageState, StageStatus
 
 
@@ -97,11 +97,16 @@ def next_step_view(job: DocumentJob) -> NextStepView:
 
     stage = focus_stage(job)
     if stage.status is StageStatus.BLOCKED_FOR_REVIEW:
+        action_label = (
+            "Revisar y publicar"
+            if job.configuration.output.format is DocumentFormat.EPUB
+            else "Revisar cambios"
+        )
         return NextStepView(
             "Necesita tu revisión",
             "review",
             JobAction.REVIEW,
-            "Revisar",
+            action_label,
             stage.kind,
         )
     if stage.status is StageStatus.RUNNING:
@@ -143,8 +148,7 @@ def queue_header_view(jobs: tuple[DocumentJob, ...]) -> QueueHeaderView:
     if completed:
         summary_parts.append(f"{completed} {'listo' if completed == 1 else 'listos'}")
     if reviews:
-        review_verb = "requiere" if len(reviews) == 1 else "requieren"
-        summary_parts.append(f"{len(reviews)} {review_verb} atención")
+        summary_parts.append(f"{len(reviews)} por revisar")
     if failed:
         summary_parts.append(f"{failed} con error")
     summary = " · ".join(summary_parts)

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import re
 import unicodedata
 from collections import Counter
@@ -11,6 +12,8 @@ from difflib import SequenceMatcher
 from enum import StrEnum
 from hashlib import sha256
 
+LOGGER = logging.getLogger(__name__)
+
 MAX_DETECTION_CHARACTERS = 20_000
 MIN_LANGUAGE_CONFIDENCE = 0.65
 MIN_LANGUAGE_VALIDATION_LETTERS = 120
@@ -18,6 +21,9 @@ MIN_BLOCK_LANGUAGE_LETTERS = 180
 MIN_SOURCE_TEXT_REPORT_LETTERS = 24
 MIN_CONTENT_RATIO = 0.55
 MAX_CONTENT_RATIO = 1.80
+MIN_SHORT_CONTENT_COVERAGE_LETTERS = 20
+MAX_SHORT_CONTENT_RATIO = 2.50
+MIN_SHORT_CONTENT_ADDED_LETTERS = 80
 MAX_REPORT_ISSUES = 20
 MAX_REPORT_EXCERPT_CHARACTERS = 320
 MAX_AUTOMATIC_SOURCE_TEXT_REPAIRS = 20
@@ -65,45 +71,353 @@ TITLE_LANGUAGE_HINTS = {
             "contents",
             "part",
             "volume",
+            "rulership",
             "book",
             "section",
             "preface",
             "foreword",
             "appendix",
             "ancient",
+            "afterword",
             "astrology",
             "aquarius",
             "appendices",
             "cancer",
             "capricorn",
             "condition",
+            "benefic",
+            "bodyguard",
+            "bodyguards",
             "exercise",
             "fortune",
             "gemini",
             "judgment",
             "lot",
             "moon",
+            "money",
             "nodes",
-            "planet",
             "planets",
             "planetary",
+            "phases",
             "pisces",
             "quadrant",
             "readings",
+            "reception",
+            "rejoicing",
             "releasing",
             "sagittarius",
             "scorpio",
             "scorpion",
             "source",
+            "sect",
+            "striking",
             "taurus",
+            "your",
+            "level",
+            "overview",
+            "rulerships",
+            "triplicity",
+            "triplicities",
         }
     ),
-    "es": frozenset({"el", "la", "los", "las", "de", "del", "y", "día", "capítulo"}),
-    "fr": frozenset({"le", "la", "les", "de", "du", "et", "jour", "chapitre"}),
-    "de": frozenset({"der", "die", "das", "und", "von", "tag", "kapitel"}),
-    "it": frozenset({"il", "la", "i", "le", "di", "e", "giorno", "capitolo"}),
-    "pt": frozenset({"o", "a", "os", "as", "de", "do", "e", "dia", "capítulo"}),
+    "es": frozenset(
+        {
+            "el",
+            "la",
+            "los",
+            "las",
+            "de",
+            "del",
+            "y",
+            "día",
+            "capítulo",
+            "contenido",
+            "índice",
+            "introducción",
+            "parte",
+            "libro",
+            "sección",
+            "prefacio",
+            "prólogo",
+            "epílogo",
+            "apéndice",
+            "apéndices",
+            "exposición",
+            "edición",
+            "ediciones",
+            "lujo",
+            "centro",
+            "nutrición",
+            "realidad",
+        }
+    ),
+    "fr": frozenset(
+        {
+            "le",
+            "la",
+            "les",
+            "de",
+            "du",
+            "et",
+            "jour",
+            "chapitre",
+            "contenu",
+            "sommaire",
+            "introduction",
+            "partie",
+            "livre",
+            "section",
+            "préface",
+            "annexe",
+        }
+    ),
+    "de": frozenset(
+        {
+            "der",
+            "die",
+            "das",
+            "und",
+            "von",
+            "tag",
+            "kapitel",
+            "inhalt",
+            "einleitung",
+            "teil",
+            "buch",
+            "abschnitt",
+            "vorwort",
+            "anhang",
+        }
+    ),
+    "it": frozenset(
+        {
+            "il",
+            "la",
+            "i",
+            "le",
+            "di",
+            "e",
+            "giorno",
+            "capitolo",
+            "indice",
+            "introduzione",
+            "parte",
+            "libro",
+            "sezione",
+            "prefazione",
+            "appendice",
+        }
+    ),
+    "pt": frozenset(
+        {
+            "o",
+            "a",
+            "os",
+            "as",
+            "de",
+            "do",
+            "e",
+            "dia",
+            "capítulo",
+            "conteúdo",
+            "índice",
+            "introdução",
+            "parte",
+            "livro",
+            "seção",
+            "prefácio",
+            "apêndice",
+        }
+    ),
 }
+
+_ESTABLISHED_TITLE_TRANSLATIONS = {
+    ("en", "es"): {
+        "afterword": "epílogo",
+        "aries": "Aries",
+        "art of judgment": "arte del juicio",
+        "benefic": "benéfico",
+        "benefic and malefic planets, conditions, and houses": (
+            "planetas benéficos y maléficos, condiciones y casas"
+        ),
+        "bodyguard": "guardaespaldas",
+        "bodyguards": "guardaespaldas",
+        "bonding": "vinculación",
+        "bound lord": "señor de los términos",
+        "bound lords": "señores de los términos",
+        "bound rulerships": "regencias por término",
+        "taurus": "Tauro",
+        "gemini": "Géminis",
+        "cancer": "Cáncer",
+        "leo": "Leo",
+        "virgo": "Virgo",
+        "libra": "Libra",
+        "scorpio": "Escorpio",
+        "sagittarius": "Sagitario",
+        "capricorn": "Capricornio",
+        "aquarius": "Acuario",
+        "pisces": "Piscis",
+        "domicile rulerships": "regencias por domicilio",
+        "delineating a planet in a house": "delineación de un planeta en una casa",
+        "delineating a planet with its condition in a house": (
+            "delineación de un planeta con su condición en una casa"
+        ),
+        "according to zodiacal sign": "según el signo zodiacal",
+        "historical overview": "panorama histórico",
+        "historical overview of aspect doctrine": (
+            "panorama histórico de la doctrina de los aspectos"
+        ),
+        "malefic": "maléfico",
+        "maltreatment": "maltrato",
+        "maltreatment by striking with a ray": "maltrato al golpear con un rayo",
+        "planetary phases": "fases planetarias",
+        "planetary reception": "recepción planetaria",
+        "planetary domiciles": "domicilios planetarios",
+        "primary source readings": "lecturas de fuentes primarias",
+        "ray": "rayo",
+        "rays": "rayos",
+        "rejoicing": "gozo",
+        "rulership": "regencia",
+        "rulerships": "regencias",
+        "sect": "secta",
+        "sect rejoicing": "gozo por secta",
+        "sect rejoicing by hemisphere": "gozo por secta según el hemisferio",
+        "science of judgment": "ciencia del juicio",
+        "source readings": "lecturas de fuentes",
+        "spear-bearing bodyguards": "guardaespaldas portadores de lanza",
+        "striking with a ray": "golpear con un rayo",
+        "summary and source readings": "resumen y lecturas de fuentes",
+        "part six: the art of judgment": "parte seis: el arte del juicio",
+        "the art of judgment": "el arte del juicio",
+        "the bound lord": "el señor de los términos",
+        "the bound lords": "los señores de los términos",
+        "the first house": "la primera casa",
+        "the second house": "la segunda casa",
+        "the third house": "la tercera casa",
+        "the fourth house": "la cuarta casa",
+        "the fifth house": "la quinta casa",
+        "the sixth house": "la sexta casa",
+        "the seventh house": "la séptima casa",
+        "the eighth house": "la octava casa",
+        "the ninth house": "la novena casa",
+        "the tenth house": "la décima casa",
+        "the eleventh house": "la undécima casa",
+        "the twelfth house": "la duodécima casa",
+        "the science of judgment": "la ciencia del juicio",
+        "the triplicity lord": "el señor de la triplicidad",
+        "the triplicity lords": "los señores de la triplicidad",
+        "triplicity": "triplicidad",
+        "triplicities": "triplicidades",
+        "triplicity lord": "señor de la triplicidad",
+        "triplicity lords": "señores de la triplicidad",
+        "triplicity rulerships": "regencias por triplicidad",
+        "three types of bodyguards": "tres tipos de guardaespaldas",
+        "zodiacal sign rulerships": "regencias de los signos zodiacales",
+    },
+    ("es", "en"): {
+        "aries": "Aries",
+        "tauro": "Taurus",
+        "géminis": "Gemini",
+        "cáncer": "Cancer",
+        "leo": "Leo",
+        "virgo": "Virgo",
+        "libra": "Libra",
+        "escorpio": "Scorpio",
+        "sagitario": "Sagittarius",
+        "capricornio": "Capricorn",
+        "acuario": "Aquarius",
+        "piscis": "Pisces",
+        "regencia": "rulership",
+    },
+}
+
+_ESTABLISHED_UNCHANGED_TITLE_TERMS = {
+    languages: frozenset(
+        source for source, target in translations.items() if source == target.casefold()
+    )
+    for languages, translations in _ESTABLISHED_TITLE_TRANSLATIONS.items()
+}
+
+
+def established_term_translation(
+    source_term: str,
+    source_language: str,
+    target_language: str,
+) -> str | None:
+    """Return a curated conventional equivalent independently of document layout."""
+
+    return _ESTABLISHED_TITLE_TRANSLATIONS.get(
+        (source_language, target_language),
+        {},
+    ).get(source_term.strip().casefold())
+
+
+def established_terms_requiring_translation(
+    source: str,
+    source_language: str,
+    target_language: str,
+) -> tuple[str, ...]:
+    """Return conventional terms present in source whose target spelling changes."""
+
+    translations = _ESTABLISHED_TITLE_TRANSLATIONS.get(
+        (source_language, target_language),
+        {},
+    )
+    candidates = {term for term, target in translations.items() if term != target.casefold()}
+    found: list[str] = []
+    seen: set[str] = set()
+    for term in sorted(candidates, key=len, reverse=True):
+        if " " not in term:
+            continue
+        if re.search(rf"(?<!\w){re.escape(term)}(?!\w)", source, re.IGNORECASE):
+            seen.add(term)
+            found.append(term)
+    for match in re.finditer(r"[^\W\d_]+", source, re.UNICODE):
+        term = match.group(0).casefold()
+        if term in candidates and term not in seen:
+            seen.add(term)
+            found.append(term)
+    return tuple(found)
+
+
+def contains_established_translation_candidate(source: str) -> bool:
+    """Return whether source contains any conventional term that changes by language."""
+
+    candidates = {
+        term
+        for translations in _ESTABLISHED_TITLE_TRANSLATIONS.values()
+        for term, target in translations.items()
+        if term != target.casefold()
+    }
+    return any(
+        re.search(rf"(?<!\w){re.escape(term)}(?!\w)", source, re.IGNORECASE) for term in candidates
+    )
+
+
+_SOURCE_LANGUAGE_WORD_RESIDUE_HINTS = {
+    "en": frozenset(
+        {
+            "although",
+            "because",
+            "between",
+            "during",
+            "however",
+            "through",
+            "toward",
+            "towards",
+            "whereas",
+            "whether",
+            "while",
+            "within",
+            "without",
+        }
+    ),
+}
+
+_SOURCE_LANGUAGE_MORPHOLOGICAL_RESIDUE_SUFFIXES = {
+    "en": ("fulness", "lessness", "manship", "ness", "ship", "wards"),
+}
+MAX_SOURCE_WORD_TRANSLATION_ATTENTION_TERMS = 12
 
 ORGANIZATION_NAME_SUFFIXES = frozenset(
     {
@@ -175,6 +489,68 @@ WRITTEN_NUMBER_VALUES = {
     "hundred": 100,
     "cien": 100,
     "ciento": 100,
+}
+WRITTEN_ORDINAL_VALUES = {
+    "first": 1,
+    "primero": 1,
+    "primera": 1,
+    "second": 2,
+    "segundo": 2,
+    "segunda": 2,
+    "third": 3,
+    "tercero": 3,
+    "tercera": 3,
+    "fourth": 4,
+    "cuarto": 4,
+    "cuarta": 4,
+    "fifth": 5,
+    "quinto": 5,
+    "quinta": 5,
+    "sixth": 6,
+    "sexto": 6,
+    "sexta": 6,
+    "seventh": 7,
+    "séptimo": 7,
+    "séptima": 7,
+    "eighth": 8,
+    "octavo": 8,
+    "octava": 8,
+    "ninth": 9,
+    "noveno": 9,
+    "novena": 9,
+    "tenth": 10,
+    "décimo": 10,
+    "décima": 10,
+    "eleventh": 11,
+    "undécimo": 11,
+    "undécima": 11,
+    "twelfth": 12,
+    "duodécimo": 12,
+    "duodécima": 12,
+    "thirteenth": 13,
+    "decimotercero": 13,
+    "decimotercera": 13,
+    "fourteenth": 14,
+    "decimocuarto": 14,
+    "decimocuarta": 14,
+    "fifteenth": 15,
+    "decimoquinto": 15,
+    "decimoquinta": 15,
+    "sixteenth": 16,
+    "decimosexto": 16,
+    "decimosexta": 16,
+    "seventeenth": 17,
+    "decimoséptimo": 17,
+    "decimoséptima": 17,
+    "eighteenth": 18,
+    "decimoctavo": 18,
+    "decimoctava": 18,
+    "nineteenth": 19,
+    "decimonoveno": 19,
+    "decimonovena": 19,
+    "twentieth": 20,
+    "vigésimo": 20,
+    "vigésima": 20,
 }
 TITLE_ROMAN_REFERENCE_PATTERN = re.compile(
     r"(?<![A-Za-z])([IVXLCDM]+)(?=[ \t]+[+-]?\d)",
@@ -497,6 +873,14 @@ def _build_translation_quality_report(
             resolved_source_language,
             target_language,
         )
+        if issue is None and check_heading_fidelity:
+            issue = _source_language_word_residue_issue(
+                index,
+                source_block,
+                translated_block,
+                resolved_source_language,
+                target_language,
+            )
         if (
             issue is not None
             and issue.kind is TranslationIssueKind.SOURCE_TEXT
@@ -518,6 +902,21 @@ def _build_translation_quality_report(
             target_language=target_language,
         ):
             add_issue(issue)
+        for source_title, current_title in _title_source_language_residues(
+            source,
+            translated,
+            resolved_source_language,
+            target_language,
+        ):
+            add_issue(
+                _report_issue(
+                    0,
+                    TranslationIssueKind.SOURCE_TEXT,
+                    "Un título o entrada de índice conserva texto del idioma original.",
+                    source_title,
+                    current_title,
+                )
+            )
 
     return TranslationQualityReport(
         source_language=resolved_source_language,
@@ -791,6 +1190,7 @@ def repair_untranslated_source_text(
     attempted = 0
     repaired = 0
     attempted_fragments: set[tuple[int, str]] = set()
+    rejected_proposals: Counter[str] = Counter()
 
     def propose_repair(
         source_fragment: str,
@@ -808,6 +1208,7 @@ def repair_untranslated_source_text(
         attempted += 1
         proposal = translate_segment(source_fragment, current_fragment)
         if not isinstance(proposal, str) or not proposal.strip() or proposal == current_fragment:
+            rejected_proposals["unchanged"] += 1
             return None
         try:
             validate_translation_quality(
@@ -818,6 +1219,15 @@ def repair_untranslated_source_text(
                 preserve_paragraphs=True,
             )
         except TranslationQualityError:
+            rejected_proposals["quality"] += 1
+            return None
+        if _title_source_language_residues(
+            source_fragment,
+            proposal,
+            resolved_source_language,
+            target_language,
+        ):
+            rejected_proposals["source_title"] += 1
             return None
         proposal_issue = _translation_segment_issue(
             segment_number,
@@ -826,7 +1236,18 @@ def repair_untranslated_source_text(
             resolved_source_language,
             target_language,
         )
-        return proposal if proposal_issue is None else None
+        if proposal_issue is None:
+            proposal_issue = _source_language_word_residue_issue(
+                segment_number,
+                source_fragment,
+                proposal,
+                resolved_source_language,
+                target_language,
+            )
+        if proposal_issue is not None:
+            rejected_proposals["segment"] += 1
+            return None
+        return proposal
 
     def localized_page_is_safe(
         source_part: str,
@@ -849,6 +1270,48 @@ def repair_untranslated_source_text(
             return False
         return True
 
+    title_repairs = 0
+    for source_title, current_title in _title_source_language_residues(
+        source,
+        translated,
+        resolved_source_language,
+        target_language,
+    ):
+        matching_parts = [
+            part_index
+            for part_index, (source_part, translated_part) in enumerate(
+                zip(source_parts, translated_parts, strict=False)
+            )
+            if _stripped_line_occurrences(source_part, source_title) == 1
+            and _stripped_line_occurrences(translated_part, current_title) == 1
+        ]
+        if len(matching_parts) != 1:
+            continue
+        part_index = matching_parts[0]
+        proposal = propose_repair(
+            source_title,
+            current_title,
+            part_index + 1,
+        )
+        if proposal is None:
+            continue
+        replaced = _replace_unique_stripped_line(
+            translated_parts[part_index],
+            current_title,
+            proposal,
+        )
+        if replaced is None:
+            continue
+        translated_parts[part_index] = replaced
+        title_repairs += 1
+        repaired += 1
+
+    if title_repairs:
+        candidate_parts, candidate_blocks = _repairable_report_blocks("".join(translated_parts))
+        if len(candidate_blocks) == len(source_blocks):
+            translated_parts = candidate_parts
+            translated_blocks = candidate_blocks
+
     for source_block, translated_block in zip(source_blocks, translated_blocks, strict=True):
         issue = _translation_segment_issue(
             source_block.segment_number,
@@ -857,6 +1320,14 @@ def repair_untranslated_source_text(
             resolved_source_language,
             target_language,
         )
+        if issue is None:
+            issue = _source_language_word_residue_issue(
+                source_block.segment_number,
+                source_block.natural_text,
+                translated_block.natural_text,
+                resolved_source_language,
+                target_language,
+            )
         if issue is None or issue.kind not in {
             TranslationIssueKind.SOURCE_TEXT,
             TranslationIssueKind.FIDELITY,
@@ -887,6 +1358,14 @@ def repair_untranslated_source_text(
                         resolved_source_language,
                         target_language,
                     )
+                    if subissue is None:
+                        subissue = _source_language_word_residue_issue(
+                            source_subblock.segment_number,
+                            source_subblock.natural_text,
+                            translated_subblock.natural_text,
+                            resolved_source_language,
+                            target_language,
+                        )
                     if subissue is None or subissue.kind not in {
                         TranslationIssueKind.SOURCE_TEXT,
                         TranslationIssueKind.FIDELITY,
@@ -1033,6 +1512,13 @@ def repair_untranslated_source_text(
             repaired += 1
 
     if repaired == 0:
+        if rejected_proposals:
+            LOGGER.info(
+                "translation_repair_proposals_rejected counts=%s",
+                ",".join(
+                    f"{reason}:{count}" for reason, count in sorted(rejected_proposals.items())
+                ),
+            )
         return TranslationRepairResult(translated, attempted, 0)
 
     candidate = "".join(translated_parts)
@@ -1045,7 +1531,17 @@ def repair_untranslated_source_text(
         _validate_structure(translated, candidate, preserve_paragraphs=True)
         _validate_content_coverage(translated, candidate)
     except TranslationQualityError:
+        rejected_proposals["document"] += repaired
+        LOGGER.info(
+            "translation_repair_proposals_rejected counts=%s",
+            ",".join(f"{reason}:{count}" for reason, count in sorted(rejected_proposals.items())),
+        )
         return TranslationRepairResult(translated, attempted, 0)
+    if rejected_proposals:
+        LOGGER.info(
+            "translation_repair_proposals_rejected counts=%s",
+            ",".join(f"{reason}:{count}" for reason, count in sorted(rejected_proposals.items())),
+        )
     return TranslationRepairResult(candidate, attempted, repaired)
 
 
@@ -1073,22 +1569,19 @@ def find_untranslated_title_lines(
         if not _looks_like_title(stripped):
             continue
         source_text = natural_language_text(stripped)
-        source_words = set(re.findall(r"[^\W\d_]+", source_text.casefold()))
         detected_source = detect_language_code(
             stripped,
             minimum_letters=12,
             minimum_confidence=0.80,
         )
+        has_language_hint = _has_title_language_hint(source_text, source_language)
         if (
-            _letter_count(source_text) >= 12
+            (_letter_count(source_text) >= 12 or has_language_hint)
             and source_text.casefold() in translated_titles
             and not _looks_like_probable_proper_name(source_text, source_language)
             and uppercase_person_name_base(stripped, source_language)
             not in repeated_uppercase_names
-            and (
-                detected_source == source_language
-                or source_words & TITLE_LANGUAGE_HINTS.get(source_language, frozenset())
-            )
+            and (detected_source == source_language or has_language_hint)
             and stripped not in seen
         ):
             untranslated.append(stripped)
@@ -1116,7 +1609,6 @@ def find_titles_with_source_language_residue(
         return ()
     source_lines = source.splitlines()
     translated_lines = translated.splitlines()
-    hints = TITLE_LANGUAGE_HINTS.get(source_language, frozenset())
     residues: list[tuple[str, str]] = []
     if len(source_lines) == len(translated_lines):
         for source_line, translated_line in zip(source_lines, translated_lines, strict=True):
@@ -1124,13 +1616,10 @@ def find_titles_with_source_language_residue(
             translated_title = translated_line.strip()
             if not _looks_like_title(source_title) or not translated_title:
                 continue
-            source_words = set(
-                re.findall(r"[^\W\d_]+", natural_language_text(source_title).casefold())
-            )
-            translated_words = set(
-                re.findall(r"[^\W\d_]+", natural_language_text(translated_title).casefold())
-            )
-            if source_words & hints and translated_words & hints:
+            if _has_title_language_hint(
+                source_title,
+                source_language,
+            ) and _has_title_language_hint(translated_title, source_language):
                 residues.append((source_title, translated_title))
         return tuple(residues)
 
@@ -1139,8 +1628,7 @@ def find_titles_with_source_language_residue(
         source_title = source_line.strip()
         if not _looks_like_title(source_title):
             continue
-        source_words = set(re.findall(r"[^\W\d_]+", natural_language_text(source_title).casefold()))
-        if source_words & hints:
+        if _has_title_language_hint(source_title, source_language):
             source_titles.append((source_title, Counter(NUMBER_PATTERN.findall(source_title))))
     if not source_titles:
         return ()
@@ -1149,11 +1637,8 @@ def find_titles_with_source_language_residue(
         translated_title = translated_line.strip()
         if not _looks_like_title(translated_title):
             continue
-        translated_words = set(
-            re.findall(r"[^\W\d_]+", natural_language_text(translated_title).casefold())
-        )
         if (
-            not translated_words & hints
+            not _has_title_language_hint(translated_title, source_language)
             or is_probable_organization_name_line(translated_title)
             or _looks_like_probable_proper_name(translated_title, source_language)
         ):
@@ -1167,6 +1652,118 @@ def find_titles_with_source_language_residue(
         source_title = numbered_matches[0] if len(numbered_matches) == 1 else translated_title
         residues.append((source_title, translated_title))
     return tuple(residues)
+
+
+def _has_title_language_hint(text: str, language: str) -> bool:
+    """Recognize compact source-language terms despite accents or OCR word joining."""
+
+    hints = {_normalized_word(hint) for hint in TITLE_LANGUAGE_HINTS.get(language, frozenset())}
+    words = {
+        _normalized_word(word) for word in re.findall(r"[^\W\d_]+", natural_language_text(text))
+    }
+    if words & hints:
+        return True
+    long_hints = {hint for hint in hints if len(hint) >= 4}
+    return any(hint in word and len(word) - len(hint) >= 3 for word in words for hint in long_hints)
+
+
+def _title_source_language_residues(
+    source: str,
+    translated: str,
+    source_language: str | None,
+    target_language: str | None = None,
+) -> tuple[tuple[str, str], ...]:
+    """Return unique untranslated or partially translated compact title lines."""
+
+    if source_language is None:
+        return ()
+    residues: list[tuple[str, str]] = [
+        (title, title)
+        for title in find_untranslated_title_lines(
+            source,
+            translated,
+            source_language,
+        )
+    ]
+    residues.extend(
+        find_titles_with_source_language_residue(
+            source,
+            translated,
+            source_language,
+        )
+    )
+    unique: list[tuple[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for source_title, current_title in residues:
+        if _is_established_unchanged_title_term(
+            source_title,
+            current_title,
+            source_language,
+            target_language,
+        ):
+            continue
+        key = (source_title.casefold(), current_title.casefold())
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append((source_title, current_title))
+    return tuple(unique)
+
+
+def _is_established_unchanged_title_term(
+    source_title: str,
+    current_title: str,
+    source_language: str,
+    target_language: str | None,
+) -> bool:
+    terms = _ESTABLISHED_UNCHANGED_TITLE_TERMS.get(
+        (source_language, target_language or ""),
+        frozenset(),
+    )
+    if not terms:
+        return False
+
+    def lexical_base(value: str) -> tuple[str, ...]:
+        return tuple(
+            word
+            for word in (
+                _normalized_word(token)
+                for token in re.findall(r"[^\W\d_]+", natural_language_text(value))
+            )
+            if word and not re.fullmatch(r"[ivxlcdm]+", word)
+        )
+
+    source_base = lexical_base(source_title)
+    return (
+        len(source_base) == 1
+        and source_base == lexical_base(current_title)
+        and source_base[0] in terms
+    )
+
+
+def _stripped_line_occurrences(markdown: str, candidate: str) -> int:
+    return sum(line.strip() == candidate for line in markdown.splitlines())
+
+
+def _replace_unique_stripped_line(
+    markdown: str,
+    current: str,
+    replacement: str,
+) -> str | None:
+    if "\n" in replacement or "\r" in replacement:
+        return None
+    lines = markdown.splitlines(keepends=True)
+    matches = [index for index, line in enumerate(lines) if line.strip() == current]
+    if len(matches) != 1:
+        return None
+    index = matches[0]
+    line = lines[index]
+    content = line.rstrip("\r\n")
+    line_ending = line[len(content) :]
+    leading = content[: len(content) - len(content.lstrip())]
+    trailing = content[len(content.rstrip()) :]
+    lines[index] = f"{leading}{replacement.strip()}{trailing}{line_ending}"
+    return "".join(lines)
 
 
 def find_untranslated_source_sentences(
@@ -1210,7 +1807,7 @@ def find_untranslated_source_sentences(
         normalized_natural_candidate = natural_candidate.casefold()
         if (
             is_reference_or_catalogue_text(candidate)
-            or (has_index_context and _is_index_entry(candidate))
+            or (has_index_context and is_index_entry(candidate))
             or normalized_natural_candidate in catalogue_cells
             or any(normalized_natural_candidate in prefix for prefix in compact_reference_prefixes)
         ):
@@ -1452,6 +2049,27 @@ def _paragraph_repairable_report_blocks(
 
 
 def _report_blocks(document: str) -> tuple[str, ...]:
+    page_markers = tuple(PDF_PAGE_MARKER_PATTERN.finditer(document))
+    if page_markers:
+        # Page markers are protected throughout translation, so they are the
+        # strongest alignment boundary available for converted PDFs.  Keep
+        # every page here, including image-only or accidentally empty pages.
+        # Filtering empty pages independently from source and result shifts all
+        # subsequent pairs as soon as just one side contains visible text.
+        blocks: list[str] = []
+        if page_markers[0].start() > 0:
+            blocks.append(document[: page_markers[0].start()])
+        blocks.extend(
+            document[
+                marker.start() : (
+                    page_markers[index + 1].start()
+                    if index + 1 < len(page_markers)
+                    else len(document)
+                )
+            ]
+            for index, marker in enumerate(page_markers)
+        )
+        return tuple(blocks)
     parts, blocks = _repairable_report_blocks(document)
     return tuple(parts[block.part_index] for block in blocks)
 
@@ -1466,11 +2084,11 @@ def _translation_segment_issue(
     source_natural = natural_language_text(source)
     translated_natural = natural_language_text(translated)
     source_letters = _letter_count(source_natural)
-    source_words = {word.casefold() for word in re.findall(r"[^\W\d_]+", source_natural)}
     is_web_identifier = _looks_like_web_identifier(source_natural)
     is_reference_or_catalogue = is_reference_or_catalogue_text(source)
-    has_source_language_hint = bool(
-        source_words & TITLE_LANGUAGE_HINTS.get(source_language or "", frozenset())
+    has_source_language_hint = _has_title_language_hint(
+        source_natural,
+        source_language or "",
     )
     unchanged = (
         _unchanged_source_sentence(source, translated, source_language)
@@ -1510,9 +2128,25 @@ def _translation_segment_issue(
             translated_natural.casefold(),
             autojunk=False,
         ).ratio()
+        compact_source = "".join(
+            character.casefold() for character in source_natural if character.isalpha()
+        )
+        compact_translated = "".join(
+            character.casefold() for character in translated_natural if character.isalpha()
+        )
+        compact_similarity = (
+            SequenceMatcher(
+                None,
+                compact_source,
+                compact_translated,
+                autojunk=False,
+            ).ratio()
+            if compact_source and compact_translated
+            else 0.0
+        )
         if (
             not is_reference_or_catalogue
-            and similarity >= 0.92
+            and (similarity >= 0.92 or compact_similarity >= 0.97)
             and _likely_language(source, source_language)
             and not _is_translated_name_credit(source, translated, source_language)
         ):
@@ -1539,9 +2173,9 @@ def _translation_segment_issue(
         )
 
     translated_letters = _letter_count(translated_natural)
-    if source_letters >= 80:
+    if source_letters >= MIN_SHORT_CONTENT_COVERAGE_LETTERS:
         ratio = translated_letters / source_letters
-        if ratio < MIN_CONTENT_RATIO:
+        if source_letters >= 80 and ratio < MIN_CONTENT_RATIO:
             return _report_issue(
                 segment_number,
                 TranslationIssueKind.LENGTH,
@@ -1549,7 +2183,12 @@ def _translation_segment_issue(
                 source,
                 translated,
             )
-        if ratio > MAX_CONTENT_RATIO:
+        excessive_growth = (source_letters >= 80 and ratio > MAX_CONTENT_RATIO) or (
+            source_letters < 80
+            and ratio > MAX_SHORT_CONTENT_RATIO
+            and translated_letters - source_letters >= MIN_SHORT_CONTENT_ADDED_LETTERS
+        )
+        if excessive_growth:
             return _report_issue(
                 segment_number,
                 TranslationIssueKind.LENGTH,
@@ -1558,6 +2197,115 @@ def _translation_segment_issue(
                 translated,
             )
     return None
+
+
+def _source_language_word_residue(
+    source: str,
+    translated: str,
+    source_language: str,
+) -> bool:
+    return bool(source_language_word_residues(source, translated, source_language))
+
+
+def source_language_word_residues(
+    source: str,
+    translated: str,
+    source_language: str,
+) -> tuple[str, ...]:
+    """Return bounded unambiguous source-language words copied into a translation."""
+
+    residues: list[str] = []
+    for word in source_words_requiring_translation(source, source_language):
+        pattern = rf"(?<!\w){re.escape(word)}(?!\w)"
+        if re.search(
+            pattern,
+            translated,
+            re.IGNORECASE,
+        ):
+            residues.append(word)
+    return tuple(sorted(residues, key=lambda word: translated.casefold().find(word)))
+
+
+def source_words_requiring_translation(
+    source: str,
+    source_language: str,
+) -> tuple[str, ...]:
+    """Identify high-confidence natural-language words before model generation.
+
+    These candidates let the initial translation request disambiguate ordinary vocabulary from
+    names and opaque identifiers. Detection remains deliberately narrow: generic function-word
+    hints plus productive, unambiguous suffixes on lowercase source tokens.
+    """
+
+    hints = _SOURCE_LANGUAGE_WORD_RESIDUE_HINTS.get(source_language, frozenset())
+    morphological_candidates = set(
+        source_words_requiring_focused_translation(source, source_language)
+    )
+    candidates: list[tuple[int, str]] = []
+    seen: set[str] = set()
+    for match in re.finditer(r"[^\W\d_]+", source, re.UNICODE):
+        token = match.group(0)
+        word = token.casefold()
+        if word in seen:
+            continue
+        is_hint = word in hints
+        is_morphological_candidate = word in morphological_candidates
+        if not (is_hint or is_morphological_candidate):
+            continue
+        seen.add(word)
+        candidates.append((match.start(), word))
+        if len(candidates) >= MAX_SOURCE_WORD_TRANSLATION_ATTENTION_TERMS:
+            break
+    return tuple(word for _position, word in candidates)
+
+
+def source_words_requiring_focused_translation(
+    source: str,
+    source_language: str,
+) -> tuple[str, ...]:
+    """Return morphology-backed terms that benefit from smaller initial model requests."""
+
+    suffixes = _SOURCE_LANGUAGE_MORPHOLOGICAL_RESIDUE_SUFFIXES.get(source_language, ())
+    if not suffixes:
+        return ()
+    words: list[str] = []
+    seen: set[str] = set()
+    for token in re.findall(r"[^\W\d_]{7,}", source, re.UNICODE):
+        word = token.casefold()
+        if token.islower() and word.endswith(suffixes) and word not in seen:
+            seen.add(word)
+            words.append(word)
+            if len(words) >= MAX_SOURCE_WORD_TRANSLATION_ATTENTION_TERMS:
+                break
+    return tuple(words)
+
+
+def _source_language_word_residue_issue(
+    segment_number: int,
+    source: str,
+    translated: str,
+    source_language: str | None,
+    target_language: str,
+) -> TranslationQualityIssue | None:
+    if (
+        source_language is None
+        or source_language == target_language
+        or _looks_like_web_identifier(natural_language_text(source))
+        or is_reference_or_catalogue_text(source)
+        or not _source_language_word_residue(
+            natural_language_text(source),
+            natural_language_text(translated),
+            source_language,
+        )
+    ):
+        return None
+    return _report_issue(
+        segment_number,
+        TranslationIssueKind.SOURCE_TEXT,
+        "El fragmento conserva una palabra funcional inequívoca del idioma original.",
+        source,
+        translated,
+    )
 
 
 def is_reference_or_catalogue_text(text: str) -> bool:
@@ -1678,10 +2426,12 @@ def _is_collapsed_index(text: str) -> bool:
     separators = r"\s*;\s*" if ";" in body else r"\r?\n+"
     entries = [entry.strip() for entry in re.split(separators, body) if entry.strip()]
     minimum_entries = 1 if heading is not None else 2
-    return len(entries) >= minimum_entries and all(_is_index_entry(entry) for entry in entries)
+    return len(entries) >= minimum_entries and all(is_index_entry(entry) for entry in entries)
 
 
-def _is_index_entry(text: str) -> bool:
+def is_index_entry(text: str) -> bool:
+    """Recognize a compact index or TOC entry ending in a plausible folio."""
+
     candidate = re.sub(r"\A\s*(?:[-*+]\s+|\d+[.)]\s+)", "", text)
     if re.search(r"[.!?](?=\s|$)", candidate):
         return False
@@ -1690,6 +2440,77 @@ def _is_index_entry(text: str) -> bool:
         return False
     folio = match.group(1)
     return not folio.isdigit() or 1 <= int(folio) <= 999
+
+
+def translate_established_index_classification(
+    text: str,
+    source_language: str,
+    target_language: str,
+) -> str | None:
+    """Translate an unambiguous standard classification followed by index references."""
+
+    translations = _ESTABLISHED_TITLE_TRANSLATIONS.get(
+        (source_language, target_language),
+        {},
+    )
+    if not translations:
+        return None
+    match = re.fullmatch(
+        r"(?P<prefix>[ \t]*(?:\*\*|__)?)"
+        r"(?P<label>[^\W\d_]+)"
+        r"(?P<references>(?:[ \t]+[ivxlcdm]+)?[ \t]+\d{1,4})"
+        r"(?P<suffix>(?:\*\*|__)?[ \t]*)",
+        text,
+        re.IGNORECASE,
+    )
+    if match is None:
+        return None
+    source_label = match.group("label")
+    target_label = translations.get(source_label.casefold())
+    if target_label is None:
+        return None
+    if source_label.isupper():
+        target_label = target_label.upper()
+    elif source_label.islower():
+        target_label = target_label.lower()
+    return (
+        f"{match.group('prefix')}{target_label}{match.group('references')}{match.group('suffix')}"
+    )
+
+
+def replace_established_index_term_residues(
+    source: str,
+    translated: str,
+    source_language: str,
+    target_language: str,
+) -> str:
+    """Localize known terms that a model copied inside an aligned TOC entry."""
+
+    if not is_index_entry(source):
+        return translated
+    translations = _ESTABLISHED_TITLE_TRANSLATIONS.get(
+        (source_language, target_language),
+        {},
+    )
+    result = translated
+    for source_term, target_term in translations.items():
+        if re.search(rf"(?<!\w){re.escape(source_term)}(?!\w)", source, re.IGNORECASE) is None:
+            continue
+
+        def replacement(match: re.Match[str], term: str = target_term) -> str:
+            if match.group().isupper():
+                return term.upper()
+            if match.group().islower():
+                return term.lower()
+            return term
+
+        result = re.sub(
+            rf"(?<!\w){re.escape(source_term)}(?!\w)",
+            replacement,
+            result,
+            flags=re.IGNORECASE,
+        )
+    return result
 
 
 def _compact_reference_prefix(text: str) -> str | None:
@@ -1939,9 +2760,7 @@ def link_destination_spans(markdown: str) -> list[tuple[int, int, str]]:
 def _validate_structure(source: str, translated: str, *, preserve_paragraphs: bool) -> None:
     if not numeric_tokens_are_conserved(source, translated):
         raise TranslationQualityError("La traducción cambió u omitió números o fechas.")
-    if Counter(TITLE_ROMAN_REFERENCE_PATTERN.findall(source)) != Counter(
-        TITLE_ROMAN_REFERENCE_PATTERN.findall(translated)
-    ):
+    if not _roman_reference_tokens_are_conserved(source, translated):
         raise TranslationQualityError("La traducción cambió números romanos de un título o índice.")
     if markdown_link_destinations(source) != markdown_link_destinations(translated):
         raise TranslationQualityError("La traducción cambió u omitió destinos de enlaces.")
@@ -1977,13 +2796,18 @@ def _validate_structure(source: str, translated: str, *, preserve_paragraphs: bo
 
 def _validate_content_coverage(source: str, translated: str) -> None:
     source_letters = _letter_count(natural_language_text(source))
-    if source_letters < 80:
+    if source_letters < MIN_SHORT_CONTENT_COVERAGE_LETTERS:
         return
     translated_letters = _letter_count(natural_language_text(translated))
     ratio = translated_letters / source_letters
-    if ratio < MIN_CONTENT_RATIO:
+    if source_letters >= 80 and ratio < MIN_CONTENT_RATIO:
         raise TranslationQualityError("La traducción parece haber omitido parte del contenido.")
-    if ratio > MAX_CONTENT_RATIO:
+    excessive_growth = (source_letters >= 80 and ratio > MAX_CONTENT_RATIO) or (
+        source_letters < 80
+        and ratio > MAX_SHORT_CONTENT_RATIO
+        and translated_letters - source_letters >= MIN_SHORT_CONTENT_ADDED_LETTERS
+    )
+    if excessive_growth:
         raise TranslationQualityError("La traducción parece haber duplicado o añadido contenido.")
 
 
@@ -2234,11 +3058,78 @@ def numeric_tokens_are_conserved(source: str, translated: str) -> bool:
 
 
 def _written_number_value_counts(text: str) -> Counter[int]:
+    values: list[int] = []
+    for word in re.findall(r"[^\W\d_]+", natural_language_text(text)):
+        normalized = word.casefold()
+        value = WRITTEN_NUMBER_VALUES.get(normalized)
+        if value is None and normalized.endswith("fold"):
+            # English index and classification labels commonly use compounds
+            # such as ``eightfold`` or ``elevenfold``. A faithful translation
+            # may render those as an explicit digit (for example ``11
+            # partes``), so account for the written value without weakening
+            # conservation of any pre-existing numeric token.
+            value = WRITTEN_NUMBER_VALUES.get(normalized.removesuffix("fold"))
+        if value is not None:
+            values.append(value)
+    return Counter(values)
+
+
+def _roman_reference_tokens_are_conserved(source: str, translated: str) -> bool:
+    source_lines = source.splitlines()
+    translated_lines = translated.splitlines()
+    if len(source_lines) == len(translated_lines):
+        return all(
+            _roman_reference_line_is_conserved(source_line, translated_line)
+            for source_line, translated_line in zip(
+                source_lines,
+                translated_lines,
+                strict=True,
+            )
+        )
+    return _roman_reference_line_is_conserved(source, translated)
+
+
+def _roman_reference_line_is_conserved(source: str, translated: str) -> bool:
+    source_tokens = Counter(TITLE_ROMAN_REFERENCE_PATTERN.findall(source))
+    translated_tokens = Counter(TITLE_ROMAN_REFERENCE_PATTERN.findall(translated))
+    if source_tokens - translated_tokens:
+        return False
+    added_tokens = translated_tokens - source_tokens
+    if not added_tokens:
+        return True
+    source_ordinals = _written_ordinal_value_counts(source)
+    translated_ordinals = _written_ordinal_value_counts(translated)
+    available_conversions = source_ordinals - translated_ordinals
+    for token, count in added_tokens.items():
+        value = _roman_numeral_value(token)
+        if value is None or available_conversions[value] < count:
+            return False
+        available_conversions[value] -= count
+    return True
+
+
+def _written_ordinal_value_counts(text: str) -> Counter[int]:
     return Counter(
-        WRITTEN_NUMBER_VALUES[word.casefold()]
+        WRITTEN_ORDINAL_VALUES[word.casefold()]
         for word in re.findall(r"[^\W\d_]+", natural_language_text(text))
-        if word.casefold() in WRITTEN_NUMBER_VALUES
+        if word.casefold() in WRITTEN_ORDINAL_VALUES
     )
+
+
+def _roman_numeral_value(token: str) -> int | None:
+    values = {"I": 1, "V": 5, "X": 10, "L": 50, "C": 100, "D": 500, "M": 1000}
+    total = 0
+    previous = 0
+    for character in reversed(token.upper()):
+        value = values.get(character)
+        if value is None:
+            return None
+        if value < previous:
+            total -= value
+        else:
+            total += value
+            previous = value
+    return total or None
 
 
 def markdown_heading_levels(markdown: str) -> tuple[int, ...]:

@@ -55,6 +55,37 @@ def test_book_document_rejects_duplicate_source_filenames() -> None:
         )
 
 
+def test_book_document_rejects_incomplete_or_duplicate_package_sources() -> None:
+    with pytest.raises(ValueError, match="complete"):
+        BookSection(
+            "first",
+            "First",
+            "first-xhtml",
+            source_archive_path="EPUB/first.xhtml",
+        )
+    with pytest.raises(ValueError, match="archive paths"):
+        BookDocument(
+            BookMetadata("Book"),
+            (
+                BookSection(
+                    "first",
+                    "First",
+                    "first-xhtml",
+                    source_archive_path="EPUB/first.xhtml",
+                    source_xhtml_artifact_id="first-source",
+                ),
+                BookSection(
+                    "second",
+                    "Second",
+                    "second-xhtml",
+                    source_archive_path="epub/FIRST.XHTML",
+                    source_xhtml_artifact_id="second-source",
+                ),
+            ),
+            ("first", "second"),
+        )
+
+
 def test_book_metadata_accepts_only_normalized_bounded_values() -> None:
     metadata = BookMetadata(
         "Book",

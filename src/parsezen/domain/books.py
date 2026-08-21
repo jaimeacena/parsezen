@@ -75,6 +75,8 @@ class BookSection:
     xhtml_artifact_id: str
     children: tuple[BookSection, ...] = ()
     source_filename: str | None = None
+    source_archive_path: str | None = None
+    source_xhtml_artifact_id: str | None = None
 
     def __post_init__(self) -> None:
         if not self.id or not self.xhtml_artifact_id:
@@ -89,6 +91,20 @@ class BookSection:
                 or any(character in self.source_filename for character in "?#\\\0")
             ):
                 raise ValueError("Book source filenames must be safe XHTML basenames.")
+        if self.source_archive_path is not None:
+            archive_path = PurePosixPath(self.source_archive_path)
+            if (
+                archive_path.is_absolute()
+                or not archive_path.parts
+                or any(part in {"", ".", ".."} for part in archive_path.parts)
+                or archive_path.suffix.casefold() not in {".xhtml", ".html", ".htm"}
+                or any(character in self.source_archive_path for character in "?#\\\0")
+            ):
+                raise ValueError("Book source archive paths must be safe XHTML paths.")
+        if self.source_xhtml_artifact_id is not None and not self.source_xhtml_artifact_id:
+            raise ValueError("Book source XHTML artifacts must use stable identifiers.")
+        if (self.source_archive_path is None) != (self.source_xhtml_artifact_id is None):
+            raise ValueError("Book package source references must be complete.")
 
     def walk(self) -> tuple[BookSection, ...]:
         return (self, *(child for item in self.children for child in item.walk()))
@@ -102,6 +118,10 @@ class BookDocument:
     resources: tuple[BookResource, ...] = ()
     stylesheet_artifact_ids: tuple[str, ...] = ()
     cover_resource_id: str | None = None
+    source_fingerprint: str | None = None
+    baseline_fingerprint: str | None = None
+    source_package_artifact_id: str | None = None
+    package_structure_fingerprint: str | None = None
 
     def __post_init__(self) -> None:
         pending = [(section, 1) for section in reversed(self.sections)]
@@ -127,6 +147,13 @@ class BookDocument:
         )
         if len(source_filenames) != len(set(source_filenames)):
             raise ValueError("Book source filenames must be unique.")
+        source_archive_paths = tuple(
+            section.source_archive_path.casefold()
+            for section in all_sections
+            if section.source_archive_path is not None
+        )
+        if len(source_archive_paths) != len(set(source_archive_paths)):
+            raise ValueError("Book source archive paths must be unique.")
         if self.spine != section_ids:
             raise ValueError("The spine must follow the complete section tree exactly once.")
         resource_ids = tuple(resource.id for resource in self.resources)
@@ -139,6 +166,23 @@ class BookDocument:
             raise ValueError("Book stylesheets must be unique.")
         if self.cover_resource_id is not None and self.cover_resource_id not in resource_ids:
             raise ValueError("The cover must reference a known resource.")
+        if self.source_fingerprint is not None and not re.fullmatch(
+            r"[0-9a-f]{64}",
+            self.source_fingerprint,
+        ):
+            raise ValueError("The book source fingerprint must be a SHA-256 digest.")
+        if self.baseline_fingerprint is not None and not re.fullmatch(
+            r"[0-9a-f]{64}",
+            self.baseline_fingerprint,
+        ):
+            raise ValueError("The book baseline fingerprint must be a SHA-256 digest.")
+        if self.source_package_artifact_id is not None and not self.source_package_artifact_id:
+            raise ValueError("The source package must reference a stable artifact.")
+        if self.package_structure_fingerprint is not None and not re.fullmatch(
+            r"[0-9a-f]{64}",
+            self.package_structure_fingerprint,
+        ):
+            raise ValueError("The package structure fingerprint must be a SHA-256 digest.")
 
     def section(self, section_id: str) -> BookSection:
         for root in self.sections:

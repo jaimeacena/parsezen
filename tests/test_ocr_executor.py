@@ -299,6 +299,33 @@ def test_cancelled_worker_is_force_stopped_after_the_grace_period(
     assert process.terminated
 
 
+def test_ocr_worker_is_force_stopped_after_the_total_execution_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    connection = _Connection()
+    process = _Process()
+    monkeypatch.setattr(executor.time, "monotonic", lambda: 11.0)
+    monkeypatch.setattr(executor, "_stop_worker", lambda worker: worker.terminate())
+
+    with pytest.raises(ConversionError, match="tiempo máximo de ejecución"):
+        executor._receive_worker_result(
+            connection,  # type: ignore[arg-type]
+            process,  # type: ignore[arg-type]
+            "job",
+            {1},
+            None,
+            execution_deadline=10.0,
+        )
+
+    assert process.terminated
+
+
+def test_ocr_execution_deadline_scales_with_the_bounded_page_batch() -> None:
+    assert executor._ocr_execution_timeout_seconds(1) == 180.0
+    assert executor._ocr_execution_timeout_seconds(8) == 1_440.0
+    assert executor._ocr_execution_timeout_seconds(100) == 1_800.0
+
+
 def test_start_worker_process_builds_an_isolated_command(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

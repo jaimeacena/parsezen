@@ -139,6 +139,54 @@ def test_early_check_uses_temporary_outputs_and_reports_safe_progress(
     assert report.warning_pages == 0
 
 
+def test_early_check_skips_final_review_and_limits_translation_to_three_diverse_pages(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    source = tmp_path / "book.pdf"
+    source.write_bytes(b"local pdf identity")
+    monkeypatch.setattr(
+        early_check_module,
+        "representative_pdf_pages",
+        lambda _request: (1, 50, 100, 150, 200),
+    )
+    sampled: list[tuple[int, str | None, OutputFormat, bool, bool]] = []
+
+    def processor(request, **_arguments):
+        assert request.pdf_page_range is not None
+        page = request.pdf_page_range.first_page
+        sampled.append(
+            (
+                page,
+                request.offline_translation_language,
+                request.output_format,
+                request.review_content,
+                request.review_structure,
+            )
+        )
+        return ProcessResult(request.output_directory / f"sample-{page}.md")
+
+    run_early_check(
+        ProcessRequest(
+            source,
+            convert_to_markdown=False,
+            output_format=OutputFormat.EPUB,
+            offline_translation_language="es",
+            review_content=True,
+            review_structure=True,
+            epub_first_page_cover=True,
+        ),
+        AppSettings(),
+        cancellation=CancellationToken(),
+        work_checkpoint_root=tmp_path / "checkpoints",
+        processor=processor,
+    )
+
+    assert [page for page, language, *_rest in sampled if language is not None] == [1, 100, 200]
+    assert all(output_format is OutputFormat.MARKDOWN for _, _, output_format, _, _ in sampled)
+    assert all(not content and not structure for _, _, _, content, structure in sampled)
+
+
 def test_preserved_visual_endpoints_warn_without_counting_as_material_failures(
     tmp_path: Path,
     monkeypatch,

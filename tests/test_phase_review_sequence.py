@@ -271,7 +271,7 @@ def test_out_of_order_or_stale_review_is_rejected() -> None:
         kind=ReviewKind.REFINEMENT,
     )
 
-    with pytest.raises(ValueError, match="next pending"):
+    with pytest.raises(ValueError, match="siguiente fase pendiente"):
         sequence.prepare(job_id, result, refinement)
 
 

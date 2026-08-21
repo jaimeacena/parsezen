@@ -493,7 +493,7 @@ def _write_resource_directory(
             resource_destination = staging_directory.joinpath(*relative_path.parts)
             resource_destination.parent.mkdir(parents=True, exist_ok=True)
             with resource_destination.open("xb") as resource_file:
-                resource_file.write(resource.content)
+                resource_file.write(resource.read_content())
                 resource_file.flush()
                 os.fsync(resource_file.fileno())
         publishing_directory = True
@@ -525,7 +525,7 @@ def _stage_resource_directory(
             resource_destination = staging_directory.joinpath(*relative_path.parts)
             resource_destination.parent.mkdir(parents=True, exist_ok=True)
             with resource_destination.open("xb") as resource_file:
-                resource_file.write(resource.content)
+                resource_file.write(resource.read_content())
                 resource_file.flush()
                 os.fsync(resource_file.fileno())
         return staging_directory

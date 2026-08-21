@@ -285,7 +285,7 @@ def verify_epub_payload(
                     )
                     continue
                 actual_payload = archive.read(archive_name)
-                if sha256(actual_payload).digest() != sha256(resource.content).digest():
+                if sha256(actual_payload).digest() != sha256(resource.read_content()).digest():
                     findings.append(
                         IntegrityFinding(
                             "resource_changed",

@@ -6,6 +6,7 @@ import hashlib
 import json
 import logging
 import re
+import zlib
 from base64 import b64decode, b64encode
 from dataclasses import dataclass
 from pathlib import Path
@@ -31,7 +32,7 @@ from parsezen.infrastructure.user_data_protection import (
 LOGGER = logging.getLogger(__name__)
 
 _SCHEMA_VERSION = 1
-_IMPLEMENTATION_REVISION = "expensive-work-v2"
+_IMPLEMENTATION_REVISION = "expensive-work-v3-structure-guards"
 _KEY_PATTERN = re.compile(r"[0-9a-f]{64}")
 _MAX_PAYLOAD_BYTES = 8 * 1024 * 1024
 _MAX_CHECKPOINT_BYTES = 12 * 1024 * 1024
@@ -69,9 +70,13 @@ class WorkCheckpoints:
         ):
             return None
         try:
-            payload = _unprotect_for_current_user(
-                b64decode(protected_payload, validate=True)
-            ).decode("utf-8")
+            protected = _unprotect_for_current_user(b64decode(protected_payload, validate=True))
+            try:
+                decoded = zlib.decompress(protected)
+            except zlib.error:
+                # Checkpoints written before compression remain reusable.
+                decoded = protected
+            payload = decoded.decode("utf-8")
         except (OSError, UnicodeError, ValueError):
             return None
         if not payload.strip() or len(payload.encode("utf-8")) > _MAX_PAYLOAD_BYTES:
@@ -92,7 +97,9 @@ class WorkCheckpoints:
             record = {
                 "schema_version": _SCHEMA_VERSION,
                 "key": key,
-                "protected_payload": b64encode(_protect_for_current_user(encoded)).decode("ascii"),
+                "protected_payload": b64encode(
+                    _protect_for_current_user(zlib.compress(encoded, level=6))
+                ).decode("ascii"),
             }
             atomic_write_bytes(
                 self.directory / f"{key}.json",

@@ -283,6 +283,30 @@ def test_phase_plan_uses_materialized_review_units_and_excludes_structure() -> N
     ) == ((ReviewKind.REFINEMENT, 1),)
 
 
+def test_quality_review_rebuild_keeps_the_original_and_updates_the_proposal() -> None:
+    draft = build_revision_draft(
+        "Resultado antes de corregir.\n",
+        "Propuesta corregida.\n",
+        kinds=frozenset({RevisionKind.CONTENT}),
+    )
+    result = ProcessResult(
+        Path("book.epub"),
+        revision_draft=draft,
+        review_markdown=draft.proposed_markdown,
+        review_required=True,
+    )
+
+    rebuilt = ParsezenMainWindow._rebuild_revision_draft_after_quality(  # noqa: SLF001
+        result,
+        "Propuesta corregida y revisada.\n",
+    )
+
+    assert rebuilt is not None
+    assert rebuilt.original_markdown == "Resultado antes de corregir.\n"
+    assert rebuilt.proposed_markdown == "Propuesta corregida y revisada.\n"
+    assert rebuilt.render() == "Propuesta corregida y revisada.\n"
+
+
 def test_main_window_has_no_legacy_shell_or_hidden_form(qtbot, tmp_path: Path) -> None:
     window = ParsezenMainWindow(
         auto_discover_ai=False,
@@ -1817,6 +1841,8 @@ def test_contextual_retry_targets_only_the_failed_document(
         )
     failed_job = window._job_queue.for_source(failed_source)  # noqa: SLF001
     assert failed_job is not None
+    inspected_source = DocumentSource.inspect(failed_source)
+    window._job_queue.replace(replace(failed_job, source=inspected_source))  # noqa: SLF001
     window._job_execution.start_next(failed_job.id)  # noqa: SLF001
     window._job_execution.fail(  # noqa: SLF001
         failed_job.id,
@@ -2161,16 +2187,16 @@ def test_quality_review_rebuilds_revision_candidate_after_applied_quality_choice
     entry = _entries(window)[0]  # noqa: SLF001
 
     raw_text = "# Title\n\nRaw paragraph.\n\nAnchor paragraph.\n\nStable paragraph.\n"
-    reviewed_text = "# Title\n\nRaw paragraph.\n\nAnchor paragraph.\n\nStable correction.\n"
     proposed_text = "# Title\n\nRaw correction.\n\nAnchor paragraph.\n\nStable correction.\n"
+    reviewed_text = "# Title\n\nRaw correction.\n\nAnchor paragraph.\n\nStable reviewed.\n"
     raw_draft = build_revision_draft(
         raw_text,
         proposed_text,
         kinds=frozenset({RevisionKind.CONTENT}),
     )
     post_quality_draft = build_revision_draft(
+        raw_text,
         reviewed_text,
-        proposed_text,
         kinds=frozenset({RevisionKind.CONTENT}),
     )
     raw_candidate = create_revision_review(
@@ -2192,7 +2218,6 @@ def test_quality_review_rebuilds_revision_candidate_after_applied_quality_choice
     assert tuple(unit.id for unit in raw_candidate.units) != tuple(
         unit.id for unit in saved_refinement.units
     )
-    assert len(raw_candidate.units) != len(saved_refinement.units)
     saved_refinement = saved_refinement.decide(
         saved_refinement.units[0].id,
         ReviewChoice.PROPOSED,
@@ -2212,14 +2237,14 @@ def test_quality_review_rebuilds_revision_candidate_after_applied_quality_choice
                 TranslationIssueKind.ALIGNMENT,
                 "Revisar",
                 "Stable paragraph.",
-                "Stable paragraph.",
+                "Stable correction.",
                 "quality-choice",
             ),
         ),
     )
     quality_input = window._artifact_store.put_text(  # noqa: SLF001
         job_id=job.id,
-        text=raw_text,
+        text=proposed_text,
     )
     quality_candidate = create_translation_review(
         quality_report,
@@ -2231,7 +2256,7 @@ def test_quality_review_rebuilds_revision_candidate_after_applied_quality_choice
     assert quality_candidate is not None
     edited = window._artifact_store.put_text(  # noqa: SLF001
         job_id=job.id,
-        text="Stable correction.",
+        text="Stable reviewed.",
     )
     applied_quality = quality_candidate.decide(
         quality_candidate.units[0].id,
@@ -2243,7 +2268,7 @@ def test_quality_review_rebuilds_revision_candidate_after_applied_quality_choice
 
     entry.result = ProcessResult(
         tmp_path / "book.md.out",
-        review_markdown=raw_text,
+        review_markdown=proposed_text,
         translation_quality_report=quality_report,
         revision_draft=raw_draft,
         review_required=True,

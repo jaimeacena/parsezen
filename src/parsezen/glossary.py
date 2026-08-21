@@ -79,8 +79,15 @@ def validate_glossary(entries: tuple[GlossaryEntry, ...]) -> tuple[GlossaryEntry
     return tuple(normalized)
 
 
-def protect_glossary(text: str, entries: tuple[GlossaryEntry, ...]) -> ProtectedGlossaryText:
+def protect_glossary(
+    text: str,
+    entries: tuple[GlossaryEntry, ...],
+    *,
+    marker_prefix: str = "PZDOCGLOSSARY",
+) -> ProtectedGlossaryText:
     """Replace natural-language glossary matches, leaving code and destinations untouched."""
+    if not re.fullmatch(r"PZDOC[A-Z]{3,24}", marker_prefix):
+        raise RequestValidationError("El prefijo interno del glosario no es válido.")
     normalized = validate_glossary(entries)
     if not normalized or not text:
         return ProtectedGlossaryText(text, ())
@@ -97,7 +104,7 @@ def protect_glossary(text: str, entries: tuple[GlossaryEntry, ...]) -> Protected
                     "El glosario coincide demasiadas veces en este documento."
                 )
             target = by_source[match.group(0).casefold()]
-            marker = f"<!-- PZDOCGLOSSARY{len(replacements):05d}XZQ -->"
+            marker = f"<!-- {marker_prefix}{len(replacements):05d}XZQ -->"
             replacements.append((marker, target))
             return marker
 

@@ -19,12 +19,17 @@ from parsezen.presentation.job_view_model import (
 )
 
 
-def make_job(identifier: str, *, configured: bool = True) -> DocumentJob:
+def make_job(
+    identifier: str,
+    *,
+    configured: bool = True,
+    output_format: DocumentFormat = DocumentFormat.EPUB,
+) -> DocumentJob:
     job = DocumentJob.create(
         DocumentSource(Path(f"{identifier}.pdf"), DocumentFormat.PDF, 1_000, 2),
         JobConfiguration(
             output=OutputConfiguration(
-                format=DocumentFormat.EPUB,
+                format=output_format,
                 configured=configured,
             )
         ),
@@ -34,8 +39,12 @@ def make_job(identifier: str, *, configured: bool = True) -> DocumentJob:
     return activate_next_stage(job) if configured else job
 
 
-def make_review_job(identifier: str) -> DocumentJob:
-    job = make_job(identifier)
+def make_review_job(
+    identifier: str,
+    *,
+    output_format: DocumentFormat = DocumentFormat.EPUB,
+) -> DocumentJob:
+    job = make_job(identifier, output_format=output_format)
     return job.replace_stage(
         job.stage(StageKind.PREPARE)
         .transition(StageStatus.RUNNING)
@@ -65,6 +74,15 @@ def test_next_step_keeps_missing_configuration_distinct_from_review() -> None:
         "Necesita tu revisión",
         JobAction.REVIEW,
     )
+    assert review.action_label == "Revisar y publicar"
+
+
+def test_review_action_names_the_human_decision_for_editable_output() -> None:
+    review = next_step_view(
+        make_review_job("review-markdown", output_format=DocumentFormat.MARKDOWN)
+    )
+
+    assert review.action_label == "Revisar cambios"
 
 
 def test_next_step_exposes_ready_result() -> None:
@@ -78,7 +96,7 @@ def test_next_step_exposes_ready_result() -> None:
 def test_header_pluralization_and_review_priority() -> None:
     view = queue_header_view((make_review_job("one"), make_review_job("two"), make_job("ready")))
 
-    assert view.summary == "3 documentos · 2 requieren atención"
+    assert view.summary == "3 documentos · 2 por revisar"
     assert view.review_count == 2
     assert view.primary_mode == "review"
     assert view.primary_label == "Revisar 2 pendientes"

@@ -119,8 +119,14 @@ Las capturas iniciales se conservaron fuera del repositorio en
 7. Cada texto, contenedor y control debe justificar una decisión o una acción. La información ya
    inferible se retira, la ayuda repetida se oculta en contexto y las funciones secundarias se agrupan
    antes de ocupar espacio permanente.
-8. Flujo separa el trabajo automático de la intervención humana: usa verbos de resultado en orden y
-   reserva una segunda línea atenuada para `Tu revisión` cuando sea condicional u obligatoria.
+8. Flujo distingue el trabajo automático de la intervención humana con vocabulario explícito: usa
+   verbos de resultado en orden e integra `Tu revisión` como último paso cuando sea condicional u
+   obligatoria. Si necesita dos líneas, parte la secuencia entre pasos sin degradar visualmente ninguno
+   y conserva la flecha después de cada paso que tenga continuación. Flujo recibe más ancho que las
+   demás columnas semánticas porque es el contenido más variable.
+9. La jerarquía de Flujo comunica progreso, no decoración: el paso actual usa acento y semibold, los
+   completados una marca discreta con texto atenuado, los futuros gris y la revisión humana pendiente
+   el tono de aviso. No usa tachado, fondos de etiqueta ni números.
 
 ## Densidad y elevación
 

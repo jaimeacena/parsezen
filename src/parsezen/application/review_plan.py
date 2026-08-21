@@ -35,7 +35,7 @@ def review_steps_for_result(
     pdf_report = result.pdf_quality_report
     if result.problematic_pdf_pages or (pdf_report is not None and bool(pdf_report.issues)):
         steps.append(ReviewStep(ReviewKind.OCR, StageKind.PREPARE))
-    translation_report = result.translation_quality_report
+    translation_report = result.translation_quality_for_review
     if translation_report is not None and bool(translation_report.issues):
         steps.append(ReviewStep(ReviewKind.TRANSLATION, StageKind.TRANSLATE))
     draft = result.revision_draft
@@ -75,8 +75,8 @@ def review_workload_for_result(
         ReviewKind.OCR: len(result.pdf_quality_report.issues)
         if result.pdf_quality_report is not None
         else len(result.problematic_pdf_pages),
-        ReviewKind.TRANSLATION: len(result.translation_quality_report.issues)
-        if result.translation_quality_report is not None
+        ReviewKind.TRANSLATION: len(result.translation_quality_for_review.issues)
+        if result.translation_quality_for_review is not None
         else 0,
         ReviewKind.REFINEMENT: sum(
             change.kind is RevisionKind.CONTENT and change.proposal_selectable

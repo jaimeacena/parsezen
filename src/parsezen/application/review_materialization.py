@@ -94,13 +94,13 @@ class ReviewMaterializationService:
                 ReviewKind.TRANSLATION,
                 lambda: (
                     create_translation_review(
-                        result.translation_quality_report,
+                        result.translation_quality_for_review,
                         job_id=job.id,
                         configuration_revision=job.configuration_revision,
                         input_artifact_id=input_record.id,
                         artifacts=self._artifacts,
                     )
-                    if result.translation_quality_report is not None
+                    if result.translation_quality_for_review is not None
                     else None
                 ),
             ),
@@ -117,7 +117,11 @@ class ReviewMaterializationService:
                     )
                 materialized.append((kind, None))
                 continue
-            review = review_for_current_candidate(saved_review, candidate)
+            review = review_for_current_candidate(
+                saved_review,
+                candidate,
+                artifacts=self._artifacts,
+            )
             if (
                 saved_review is None
                 or not review_matches_candidate(saved_review, candidate)
@@ -164,7 +168,11 @@ class ReviewMaterializationService:
             if candidate is None:
                 continue
             saved_review = next((item for item in saved if item.kind is review_kind), None)
-            review = review_for_current_candidate(saved_review, candidate)
+            review = review_for_current_candidate(
+                saved_review,
+                candidate,
+                artifacts=self._artifacts,
+            )
             if saved_review is None or not review_matches_candidate(saved_review, candidate):
                 self._reviews.save_review(review)
 
@@ -190,7 +198,11 @@ class ReviewMaterializationService:
             if candidate is None:
                 materialized.append((revision_kind, review_kind, None))
                 continue
-            review = review_for_current_candidate(saved_review, candidate)
+            review = review_for_current_candidate(
+                saved_review,
+                candidate,
+                artifacts=self._artifacts,
+            )
             if (
                 saved_review is None
                 or not review_matches_candidate(saved_review, candidate)
@@ -243,14 +255,13 @@ def review_matches_candidate(saved: ReviewSession, candidate: ReviewSession) -> 
 def review_for_current_candidate(
     saved: ReviewSession | None,
     candidate: ReviewSession,
+    *,
+    artifacts: ArtifactRepository | None = None,
 ) -> ReviewSession:
     if saved is None:
         return candidate
     if not review_matches_candidate(saved, candidate):
         return replace(candidate, id=saved.id)
-    if candidate.kind is not ReviewKind.TRANSLATION:
-        return saved
-
     current_units = {unit.id: unit for unit in candidate.units}
     merged_units = []
     invalidated_choice = False
@@ -260,13 +271,30 @@ def review_for_current_candidate(
             saved_unit,
             original_artifact_id=current.original_artifact_id,
             proposed_artifact_id=current.proposed_artifact_id,
+            required=current.required,
             label=current.label,
-            original_selectable=False,
+            original_selectable=(
+                False if candidate.kind is ReviewKind.TRANSLATION else current.original_selectable
+            ),
+            target=current.target,
             recommended_choice=current.recommended_choice,
             warning=current.warning,
             severity=current.severity,
+            proposed_selectable=current.proposed_selectable,
         )
-        if merged.choice is ReviewChoice.ORIGINAL:
+        edited_is_missing = bool(
+            merged.choice is ReviewChoice.EDITED
+            and merged.edited_artifact_id is not None
+            and artifacts is not None
+            and not _artifact_is_readable(
+                artifacts,
+                saved.job_id,
+                merged.edited_artifact_id,
+            )
+        )
+        if (
+            candidate.kind is ReviewKind.TRANSLATION and merged.choice is ReviewChoice.ORIGINAL
+        ) or edited_is_missing:
             merged = replace(merged, choice=None, edited_artifact_id=None)
             invalidated_choice = True
         merged_units.append(merged)
@@ -276,6 +304,18 @@ def review_for_current_candidate(
         units=tuple(merged_units),
         status=ReviewStatus.PENDING if invalidated_choice else saved.status,
     )
+
+
+def _artifact_is_readable(
+    artifacts: ArtifactRepository,
+    job_id: str,
+    artifact_id: str,
+) -> bool:
+    try:
+        artifacts.read(job_id, artifact_id)
+    except (KeyError, OSError, UnicodeError, ValueError):
+        return False
+    return True
 
 
 def phase_plan_with_materialized_reviews(

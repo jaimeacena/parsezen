@@ -91,6 +91,14 @@ def test_all_optional_improvement_combinations_complete_without_losing_the_sourc
     monkeypatch.setattr(transform_module, "improve_markdown", improve)
     monkeypatch.setattr(
         transform_module,
+        "review_translation_markdown",
+        lambda _source, current, *_args, **_kwargs: current.replace(
+            "error menor de conversión",
+            "error de conversión corregido",
+        ),
+    )
+    monkeypatch.setattr(
+        transform_module,
         "repair_translation_warnings",
         lambda _request, _source, translated, **_kwargs: translated,
     )
@@ -112,17 +120,14 @@ def test_all_optional_improvement_combinations_complete_without_losing_the_sourc
 
     result = process_document(request, settings=settings, on_stage=stages.append)
 
-    if translate and review_content:
-        expected_calls = [ImprovementMode.CLEAN_AND_TRANSLATE]
-    else:
-        expected_calls = [
-            mode
-            for enabled, mode in (
-                (translate, ImprovementMode.TRANSLATE),
-                (review_content, ImprovementMode.REVIEW_CONTENT),
-            )
-            if enabled
-        ]
+    expected_calls = [
+        mode
+        for enabled, mode in (
+            (translate, ImprovementMode.TRANSLATE),
+            (review_content and not translate, ImprovementMode.REVIEW_CONTENT),
+        )
+        if enabled
+    ]
     if review_structure:
         expected_calls.append(ImprovementMode.REVIEW_STRUCTURE)
     assert calls == expected_calls
@@ -130,7 +135,7 @@ def test_all_optional_improvement_combinations_complete_without_losing_the_sourc
     assert source.read_bytes() == source_bytes
     assert result.final_path.is_file()
 
-    expects_revision = review_structure or (review_content and not translate)
+    expects_revision = review_structure or review_content
     if expects_revision:
         assert result.revision_draft is not None
         result = apply_reviewed_revision(result, result.revision_draft.proposed_markdown)

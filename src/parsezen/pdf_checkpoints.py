@@ -14,7 +14,7 @@ from parsezen.pdf_layout import (
     _TableRendering,
 )
 
-_PDF_PAGE_CHECKPOINT_VERSION = 11
+_PDF_PAGE_CHECKPOINT_VERSION = 12
 _MAX_PDF_PAGE_CHECKPOINT_BYTES = 8 * 1024 * 1024
 _MAX_PDF_PAGE_LINES = 50_000
 _MAX_PDF_LINE_CHARACTERS = 100_000
@@ -64,6 +64,7 @@ def _serialize_page_checkpoint(page: _PdfPage) -> str:
                 "bottom": line.bottom,
                 "font_size": line.font_size,
                 "bold": line.bold,
+                "italic": line.italic,
                 "links": [
                     [link.target, link.x0, link.x1, link.top, link.bottom] for link in line.links
                 ],
@@ -163,6 +164,7 @@ def _line_from_checkpoint(raw: object, page_number: int) -> _PdfLine:
         "bottom",
         "font_size",
         "bold",
+        "italic",
         "links",
         "soft_hyphen_end",
         "hard_hyphen_end",
@@ -181,6 +183,7 @@ def _line_from_checkpoint(raw: object, page_number: int) -> _PdfLine:
         or not isinstance(raw_links, list)
         or len(raw_links) > _MAX_PDF_LINE_LINKS
         or type(raw["bold"]) is not bool
+        or type(raw["italic"]) is not bool
         or type(raw["soft_hyphen_end"]) is not bool
         or type(raw["hard_hyphen_end"]) is not bool
         or type(raw["rotated"]) is not bool
@@ -204,6 +207,7 @@ def _line_from_checkpoint(raw: object, page_number: int) -> _PdfLine:
         soft_hyphen_end=raw["soft_hyphen_end"],
         hard_hyphen_end=raw["hard_hyphen_end"],
         rotated=raw["rotated"],
+        italic=raw["italic"],
     )
 
 

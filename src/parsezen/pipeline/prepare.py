@@ -18,6 +18,7 @@ from parsezen.pdf_conversion import (
     PdfProgressCallback,
     PdfProgressPhase,
     PdfQualityReport,
+    PdfVisualArbiterFactory,
     extract_pdf_warning_pages,
     resolve_pdf_page_range,
 )
@@ -27,12 +28,12 @@ from parsezen.pipeline.contracts import (
     ProgressCallback,
     StageCallback,
 )
-from parsezen.semantic_blocks import DocumentTerm, analyze_markdown
+from parsezen.semantic_blocks import DocumentTerm, analyze_markdown, reconcile_document_evidence
 from parsezen.work_checkpoints import WorkCheckpoints, checkpoint_key
 from parsezen.workflow import OutputFormat
 
 _PDF_OCR_CHECKPOINT_PREFIX = "\x1eParsezen PDF OCR "
-_PDF_OCR_CHECKPOINT_HEADER = f"{_PDF_OCR_CHECKPOINT_PREFIX}v3\x1f"
+_PDF_OCR_CHECKPOINT_HEADER = f"{_PDF_OCR_CHECKPOINT_PREFIX}v4\x1f"
 _MAX_INFERRED_TERMINOLOGY_OCCURRENCES = 64
 
 DocumentConverter = Callable[..., ConvertedDocument]
@@ -50,6 +51,7 @@ class _ConversionArguments(TypedDict, total=False):
     save_pdf_ocr_checkpoint: Callable[[int, str], bool]
     load_pdf_page_checkpoint: Callable[[int], str | None]
     save_pdf_page_checkpoint: Callable[[int, str], bool]
+    pdf_visual_arbiter_factory: PdfVisualArbiterFactory
 
 
 def encode_pdf_ocr_checkpoint(markdown: str) -> str:
@@ -105,6 +107,7 @@ def prepare_document_input(
     *,
     converter: DocumentConverter = convert_document,
     page_range_resolver: PageRangeResolver = resolve_pdf_page_range,
+    pdf_visual_arbiter_factory: PdfVisualArbiterFactory | None = None,
 ) -> PreparedDocument:
     """Convert and analyze the source without changing its content or publishing output."""
 
@@ -163,11 +166,11 @@ def prepare_document_input(
         conversion_arguments["on_pdf_quality_report"] = capture_pdf_quality_report
         if pdf_checkpoints is not None:
             conversion_arguments["load_pdf_page_checkpoint"] = lambda page_number: (
-                pdf_checkpoints.load(checkpoint_key("pdf-native-page", str(page_number)))
+                pdf_checkpoints.load(checkpoint_key("pdf-native-page-v2", str(page_number)))
             )
             conversion_arguments["save_pdf_page_checkpoint"] = lambda page_number, text: (
                 pdf_checkpoints.save(
-                    checkpoint_key("pdf-native-page", str(page_number)),
+                    checkpoint_key("pdf-native-page-v2", str(page_number)),
                     text,
                 )
             )
@@ -186,6 +189,8 @@ def prepare_document_input(
             conversion_arguments["pdf_page_range"] = resolved_page_range
         if request.force_pdf_ocr:
             conversion_arguments["force_pdf_ocr"] = True
+        if pdf_visual_arbiter_factory is not None:
+            conversion_arguments["pdf_visual_arbiter_factory"] = pdf_visual_arbiter_factory
     if cancellation is not None:
         conversion_arguments["cancellation"] = cancellation
     generated_epub = request.output_format is OutputFormat.EPUB
@@ -208,6 +213,7 @@ def prepare_document_input(
         if request.include_images
         else without_markdown_images(converted_document.markdown)
     )
+    markdown, _evidence_changes = reconcile_document_evidence(markdown)
     if source_cover_path is not None and (
         request.epub_cover_path is not None or request.epub_remove_cover
     ):

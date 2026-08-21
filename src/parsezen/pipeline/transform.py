@@ -17,6 +17,7 @@ from parsezen.glossary import GlossaryEntry, glossary_fingerprint, protect_gloss
 from parsezen.improvement import (
     ImprovementMode,
     improve_markdown,
+    retranslate_residual_title,
     review_translation_markdown,
 )
 from parsezen.offline_translation import translate_markdown_offline
@@ -41,9 +42,12 @@ from parsezen.settings import AppSettings
 from parsezen.translation_quality import (
     LinguisticReviewCoverage,
     LinguisticReviewMode,
+    TranslationIssueKind,
     TranslationQualityReport,
     build_translation_quality_report,
     detect_language_code,
+    find_titles_with_source_language_residue,
+    find_untranslated_title_lines,
     natural_language_text,
     numeric_tokens_are_conserved,
     repair_untranslated_source_text,
@@ -109,6 +113,14 @@ def transform_prepared_document(
     transformed_markdown = markdown
     translation_source: str | None = None
     preserved_translation_chunks: list[int] = []
+    translation_repair_attempted = 0
+    translation_repair_accepted = 0
+
+    def record_translation_repair(attempted: int, accepted: int) -> None:
+        nonlocal translation_repair_attempted, translation_repair_accepted
+        translation_repair_attempted += attempted
+        translation_repair_accepted += accepted
+
     effective_ai_mode = effective_ai_improvement_mode(request)
     ai_translation_is_redundant = (
         request.improvement_mode is ImprovementMode.TRANSLATE
@@ -173,6 +185,7 @@ def transform_prepared_document(
                 cancellation=cancellation,
                 translation_glossary=translation_glossary,
                 work_checkpoints=work_checkpoints,
+                on_result=record_translation_repair,
             )
     elif ai_translation_is_redundant:
         LOGGER.info("translation_skipped already_in_target_language=true engine=ai")
@@ -223,6 +236,7 @@ def transform_prepared_document(
             cancellation=cancellation,
             translation_glossary=translation_glossary,
             work_checkpoints=work_checkpoints,
+            on_result=record_translation_repair,
         )
     elif offline_translation_is_redundant:
         LOGGER.info("translation_skipped already_in_target_language=true engine=offline")
@@ -240,19 +254,11 @@ def transform_prepared_document(
         if settings is None:
             raise AssertionError("Validated review requests always have settings.")
         _announce(on_stage, ProcessStage.REVIEWING_CONTENT)
-        if _content_review_was_fused(request, effective_ai_mode, translation_source):
-            linguistic_review_mode = LinguisticReviewMode.CORRECTED_DURING_TRANSLATION
-            transformed_markdown = improve_selected_content(
-                transformed_markdown,
-                settings,
-                request,
-                on_progress,
-                cancellation,
-                work_checkpoints,
-                semantic_document=analyze_markdown(transformed_markdown),
-                pdf_quality_report=pdf_quality_report,
-            )
-        elif translation_source is not None:
+        selected_translation_cleanup = _uses_local_ai_translation_content_cleanup(
+            request,
+            translation_source,
+        )
+        if translation_source is not None:
             linguistic_review_mode = LinguisticReviewMode.INDEPENDENT_BILINGUAL
             translation_review_source = translation_source
             transformed_markdown = review_translation_with_checkpoints(
@@ -263,8 +269,20 @@ def transform_prepared_document(
                 on_progress,
                 cancellation,
                 work_checkpoints,
+                quality_report=translation_quality,
             )
-        else:
+            if selected_translation_cleanup:
+                transformed_markdown = improve_selected_content(
+                    transformed_markdown,
+                    settings,
+                    request,
+                    on_progress,
+                    cancellation,
+                    work_checkpoints,
+                    semantic_document=analyze_markdown(transformed_markdown),
+                    pdf_quality_report=pdf_quality_report,
+                )
+        elif not selected_translation_cleanup:
             transformed_markdown = improve_with_checkpoints(
                 transformed_markdown,
                 ImprovementMode.REVIEW_CONTENT,
@@ -290,14 +308,11 @@ def transform_prepared_document(
             work_checkpoints,
         )
         revision_kinds.add(RevisionKind.STRUCTURE)
-    if translation_source is not None and (
-        translation_review_source is not None or request.review_structure
-    ):
-        translation_quality = translation_quality_report(
-            request,
-            translation_source,
-            transformed_markdown,
-        )
+    # Quality belongs to the translation that will actually be published. A
+    # bilingual or structural review can create a pending revision draft, but
+    # its unaccepted proposal must never hide residual source text in the base
+    # EPUB. The report was already built from ``revision_source`` immediately
+    # after the guarded automatic repair.
     revision_candidate = (
         build_revision_draft(
             revision_source,
@@ -317,10 +332,30 @@ def transform_prepared_document(
         if revision_candidate is not None and revision_candidate.changes
         else None
     )
+    review_translation_quality = translation_quality
+    if translation_source is not None and transformed_markdown != revision_source:
+        review_translation_quality = translation_quality_report(
+            request,
+            translation_source,
+            transformed_markdown,
+        )
     linguistic_coverage = linguistic_review_coverage(
-        translation_quality,
+        review_translation_quality,
         mode=linguistic_review_mode,
     )
+
+    if preserved_translation_chunks and _preserved_translation_was_fully_repaired(
+        len(preserved_translation_chunks),
+        attempted=translation_repair_attempted,
+        accepted=translation_repair_accepted,
+        report=translation_quality,
+    ):
+        LOGGER.info(
+            "translation_preserved_chunks_resolved count=%d repaired_segments=%d",
+            len(preserved_translation_chunks),
+            translation_repair_accepted,
+        )
+        preserved_translation_chunks.clear()
 
     published_markdown = revision_source if revision_draft is not None else transformed_markdown
     review_required = (
@@ -344,14 +379,15 @@ def transform_prepared_document(
     )
 
     return TransformedDocument(
-        transformed_markdown,
-        translation_quality,
-        linguistic_coverage,
-        tuple(preserved_translation_chunks),
-        revision_draft,
-        published_markdown,
-        review_required,
-        public_markdown,
+        transformed_markdown=transformed_markdown,
+        translation_quality_report=translation_quality,
+        review_translation_quality_report=review_translation_quality,
+        linguistic_review_coverage=linguistic_coverage,
+        preserved_translation_chunks=tuple(preserved_translation_chunks),
+        revision_draft=revision_draft,
+        published_markdown=published_markdown,
+        review_required=review_required,
+        public_markdown=public_markdown,
     )
 
 
@@ -389,6 +425,8 @@ def review_translation_with_checkpoints(
     on_progress: ProgressCallback | None,
     cancellation: CancellationToken | None,
     checkpoints: WorkCheckpoints | None,
+    *,
+    quality_report: TranslationQualityReport | None = None,
 ) -> str:
     """Review a translation against its aligned source using only local Ollama."""
 
@@ -405,14 +443,13 @@ def review_translation_with_checkpoints(
         load_checkpoint=checkpoints.load if checkpoints is not None else None,
         save_checkpoint=checkpoints.save if checkpoints is not None else None,
         priority_block_count=max(analyze_markdown(source_markdown).front_matter_blocks, 8),
+        quality_report=quality_report,
     )
 
 
 def effective_ai_improvement_mode(request: ProcessRequest) -> ImprovementMode | None:
-    """Fuse AI translation and requested correction into one conservative pass."""
+    """Keep translation aligned so a later bilingual verification remains possible."""
 
-    if request.review_content and request.improvement_mode is ImprovementMode.TRANSLATE:
-        return ImprovementMode.CLEAN_AND_TRANSLATE
     return request.improvement_mode
 
 
@@ -427,9 +464,10 @@ def epub_translation_resume_key(
     effective_mode = effective_ai_improvement_mode(request)
     return repr(
         (
-            "epub-translation-v10",
+            "epub-translation-v11",
             language_code,
             effective_mode.value if effective_mode is not None else "none",
+            request.review_content,
             request.offline_translation_language is not None,
             settings.model if settings is not None else None,
             settings.context_window if settings is not None else None,
@@ -439,16 +477,15 @@ def epub_translation_resume_key(
     )
 
 
-def _content_review_was_fused(
+def _uses_local_ai_translation_content_cleanup(
     request: ProcessRequest,
-    effective_mode: ImprovementMode | None,
     translation_source: str | None,
 ) -> bool:
     return bool(
         request.review_content
         and translation_source is not None
         and request.offline_translation_language is None
-        and effective_mode is ImprovementMode.CLEAN_AND_TRANSLATE
+        and request.improvement_mode is ImprovementMode.TRANSLATE
     )
 
 
@@ -474,6 +511,7 @@ def improve_selected_content(
         block
         for block in semantic_document.blocks
         if block.role not in {SemanticRole.PROVENANCE, SemanticRole.CODE, SemanticRole.IMAGE}
+        and natural_language_text(block.markdown).strip()
         and (block.page_number in problem_pages or contains_conversion_damage(block.markdown))
     )
     if not selected:
@@ -638,6 +676,7 @@ def repair_translation_warnings(
     source_language_code: str | None = None,
     translation_glossary: tuple[GlossaryEntry, ...] | None = None,
     work_checkpoints: WorkCheckpoints | None = None,
+    on_result: Callable[[int, int], None] | None = None,
 ) -> str:
     """Retry aligned blocks with source-language residue or a critical fidelity warning."""
 
@@ -662,6 +701,30 @@ def repair_translation_warnings(
                 return protected.restore(repaired)
             if settings is None:
                 raise AssertionError("Validated AI translations always have settings.")
+            has_title_residue = bool(
+                source_language_code
+                and (
+                    find_untranslated_title_lines(
+                        source_segment,
+                        current_segment,
+                        source_language_code,
+                    )
+                    or find_titles_with_source_language_residue(
+                        source_segment,
+                        current_segment,
+                        source_language_code,
+                    )
+                )
+            )
+            if has_title_residue and source_language_code is not None:
+                return retranslate_residual_title(
+                    source_segment,
+                    current_segment,
+                    settings,
+                    request.target_language or target_language,
+                    source_language_code=source_language_code,
+                    cancellation=cancellation,
+                )
             repair_arguments: _ImprovementArguments = {"plain_text": False}
             if cancellation is not None:
                 repair_arguments["cancellation"] = cancellation
@@ -702,6 +765,8 @@ def repair_translation_warnings(
             repair.attempted_segments,
             repair.repaired_segments,
         )
+    if on_result is not None:
+        on_result(repair.attempted_segments, repair.repaired_segments)
     if source_language_code is None or source_language_code == target_language_code:
         return repair.translated
     restored = restore_changed_third_language_headings(
@@ -714,6 +779,24 @@ def repair_translation_warnings(
         LOGGER.warning("translation_third_language_heading_restore_preserved numbers_changed=true")
         return repair.translated
     return restored
+
+
+def _preserved_translation_was_fully_repaired(
+    preserved_chunks: int,
+    *,
+    attempted: int,
+    accepted: int,
+    report: TranslationQualityReport | None,
+) -> bool:
+    """Resolve historical rejections only with complete, independently checked evidence."""
+
+    return bool(
+        preserved_chunks > 0
+        and attempted >= preserved_chunks
+        and accepted >= preserved_chunks
+        and report is not None
+        and TranslationIssueKind.SOURCE_TEXT not in report.issues_by_kind
+    )
 
 
 def _announce(on_stage: StageCallback | None, stage: ProcessStage) -> None:

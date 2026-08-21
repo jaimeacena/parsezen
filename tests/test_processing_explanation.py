@@ -8,7 +8,6 @@ from parsezen.application.processing_explanation import (
     processing_flow,
     processing_flow_steps,
     processing_pass_summary,
-    translation_route_summary,
 )
 from parsezen.domain.jobs import (
     DocumentFormat,
@@ -18,27 +17,8 @@ from parsezen.domain.jobs import (
     TranslationConfiguration,
     TranslationMethod,
 )
+from parsezen.domain.stages import StageKind
 from parsezen.translation_quality import LinguisticReviewCoverage, LinguisticReviewMode
-
-
-@pytest.mark.parametrize(
-    ("method", "reviewed", "epub", "expected"),
-    (
-        (TranslationMethod.OFFLINE, False, False, "Argos traduce sin Ollama"),
-        (TranslationMethod.OFFLINE, True, False, "independiente (2 pasadas)"),
-        (TranslationMethod.OFFLINE, True, True, "estructura (3 pasadas)"),
-        (TranslationMethod.LOCAL_AI, False, False, "Coste aproximado medio"),
-        (TranslationMethod.LOCAL_AI, True, False, "no es una verificación"),
-        (TranslationMethod.LOCAL_AI, True, True, "segunda verificación bilingüe"),
-    ),
-)
-def test_translation_route_explains_every_effective_path(
-    method: TranslationMethod,
-    reviewed: bool,
-    epub: bool,
-    expected: str,
-) -> None:
-    assert expected in translation_route_summary(method, reviewed=reviewed, epub=epub)
 
 
 @pytest.mark.parametrize(
@@ -243,14 +223,14 @@ def test_flow_and_pass_summary_cover_product_routes(
             ),
             ("Traducir y corregir a español", "Organizar EPUB"),
             HumanReviewPolicy.BEFORE_PUBLISHING,
-            "Tu revisión antes de publicar",
+            "Tu revisión final",
         ),
         (
             DocumentFormat.EPUB,
             JobConfiguration(output=OutputConfiguration(format=DocumentFormat.EPUB)),
             ("Personalizar EPUB",),
             HumanReviewPolicy.BEFORE_PUBLISHING,
-            "Tu revisión antes de publicar",
+            "Tu revisión final",
         ),
     ),
 )
@@ -265,4 +245,34 @@ def test_compact_flow_uses_one_vocabulary_and_explicit_human_policy(
 
     assert flow.compact_steps == steps
     assert flow.human_review is review_policy
-    assert flow.human_review_note == review_note
+    assert flow.human_review_step == review_note
+    assert flow.compact_sequence == steps + ((review_note,) if review_note else ())
+    assert flow.detailed_sequence[-1] == (review_note or flow.detailed_steps[-1])
+    assert len(flow.step_stages) == len(steps)
+    assert len(flow.sequence_stages) == len(flow.compact_sequence)
+
+
+def test_combined_user_step_tracks_all_of_its_real_execution_phases() -> None:
+    flow = processing_flow(
+        DocumentFormat.PDF,
+        JobConfiguration(
+            output=OutputConfiguration(format=DocumentFormat.EPUB),
+            translation=TranslationConfiguration(
+                True,
+                TranslationMethod.LOCAL_AI,
+                "es",
+            ),
+            plan=ProcessingPlan.LOCAL_AI_REVIEWED,
+        ),
+    )
+
+    assert flow.compact_sequence == (
+        "Traducir y corregir a español",
+        "Organizar EPUB",
+        "Tu revisión final",
+    )
+    assert flow.sequence_stages == (
+        (StageKind.TRANSLATE, StageKind.REFINE),
+        (StageKind.STRUCTURE,),
+        (),
+    )

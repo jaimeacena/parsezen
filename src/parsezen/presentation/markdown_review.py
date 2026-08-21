@@ -139,7 +139,7 @@ class LocalMarkdownView(QTextBrowser):
         # application metadata rather than book content.
         rendered_markdown = _INTERNAL_PDF_MARKER_PATTERN.sub("", markdown)
         for resource in resources:
-            image = QImage.fromData(resource.content)
+            image = QImage.fromData(resource.read_content())
             if image.isNull():
                 continue
             path = resource.relative_path.as_posix()

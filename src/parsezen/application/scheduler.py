@@ -81,7 +81,7 @@ def validate_queue_run_plan(
         not jobs_by_id[job_id].is_configured or jobs_by_id[job_id].status not in eligible_statuses
         for job_id in plan.job_ids
     ):
-        raise ValueError("The requested documents are no longer eligible for this queue run.")
+        raise ValueError("Los documentos seleccionados ya no pueden ejecutarse de este modo.")
 
 
 def prepare_runnable_jobs(jobs: tuple[DocumentJob, ...]) -> tuple[DocumentJob, ...]:

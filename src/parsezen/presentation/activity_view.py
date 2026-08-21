@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from datetime import UTC, datetime
+from html import escape
 from pathlib import Path
 from typing import cast
 
@@ -18,6 +19,7 @@ from PySide6.QtWidgets import (
     QListWidgetItem,
     QPushButton,
     QSizePolicy,
+    QSplitter,
     QVBoxLayout,
     QWidget,
 )
@@ -109,7 +111,18 @@ class ActivityView(QWidget):
         description.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         root.addWidget(description)
 
-        self.jobs_list = QListWidget(self)
+        self.panels = QSplitter(Qt.Orientation.Horizontal, self)
+        self.panels.setObjectName("activityPanels")
+        self.panels.setAccessibleName("Historial y detalle de actividad")
+        self.panels.setChildrenCollapsible(False)
+        self.panels.setHandleWidth(SPACING.md)
+
+        self.history_panel = QFrame(self.panels)
+        self.history_panel.setObjectName("activityHistoryPanel")
+        history_layout = QVBoxLayout(self.history_panel)
+        history_layout.setContentsMargins(SPACING.sm, SPACING.sm, SPACING.sm, SPACING.sm)
+        history_layout.setSpacing(0)
+        self.jobs_list = QListWidget(self.history_panel)
         self.jobs_list.setObjectName("recentJobsList")
         self.jobs_list.setAccessibleName("Operaciones recientes")
         self.jobs_list.setAccessibleDescription(
@@ -123,7 +136,8 @@ class ActivityView(QWidget):
         self.jobs_list.setMinimumHeight(120)
         self.jobs_list.itemSelectionChanged.connect(self._selection_changed)
         self.jobs_list.itemDoubleClicked.connect(self._open_selected)
-        root.addWidget(self.jobs_list, 1)
+        history_layout.addWidget(self.jobs_list, 1)
+        self.panels.addWidget(self.history_panel)
 
         self.empty_label = QLabel(
             "Todavía no hay actividad reciente.",
@@ -134,11 +148,16 @@ class ActivityView(QWidget):
         self.empty_label.setWordWrap(True)
         root.addWidget(self.empty_label, 1)
 
-        self.details = QFrame(self)
+        self.details = QFrame(self.panels)
         self.details.setObjectName("activityDetails")
         details_layout = QVBoxLayout(self.details)
-        details_layout.setContentsMargins(0, SPACING.md, 0, 0)
-        details_layout.setSpacing(SPACING.xs)
+        details_layout.setContentsMargins(
+            SPACING.lg,
+            SPACING.md,
+            SPACING.lg,
+            SPACING.md,
+        )
+        details_layout.setSpacing(SPACING.sm)
         self.details_title = QLabel(self.details)
         self.details_title.setObjectName("activityTitle")
         self.details_title.setWordWrap(True)
@@ -153,6 +172,7 @@ class ActivityView(QWidget):
         self.details_summary = QLabel(self.details)
         self.details_summary.setObjectName("activitySummary")
         self.details_summary.setWordWrap(True)
+        self.details_summary.setTextFormat(Qt.TextFormat.RichText)
         self._make_selectable(self.details_summary)
         self.details_summary.setSizePolicy(
             QSizePolicy.Policy.Expanding,
@@ -201,7 +221,7 @@ class ActivityView(QWidget):
         self.recovery_note.setWordWrap(True)
         self._make_selectable(self.recovery_note)
         details_layout.addWidget(self.recovery_note)
-        root.addWidget(self.details)
+        details_layout.addStretch(1)
 
         self.actions_layout = QGridLayout()
         self.actions_layout.setContentsMargins(0, 0, 0, 0)
@@ -226,7 +246,7 @@ class ActivityView(QWidget):
             "Copia un diagnóstico técnico local sin nombre, ruta ni contenido del documento."
         )
         self.copy_diagnostic_button.clicked.connect(self._copy_diagnostic)
-        self.clear_button = QPushButton("Borrar actividad", self)
+        self.clear_button = QPushButton("Borrar actividad", self.details)
         self.clear_button.setAccessibleName("Borrar actividad")
         self.clear_button.setProperty("dangerAction", True)
         self.clear_button.clicked.connect(self.clear_requested)
@@ -237,15 +257,21 @@ class ActivityView(QWidget):
         self.actions_layout.addWidget(self.copy_diagnostic_button, 0, 3)
         self.actions_layout.setColumnStretch(4, 1)
         self.actions_layout.addWidget(self.clear_button, 0, 5)
-        root.addLayout(self.actions_layout)
+        details_layout.addLayout(self.actions_layout)
 
-        self.copy_feedback = QLabel(self)
+        self.copy_feedback = QLabel(self.details)
         self.copy_feedback.setObjectName("activityFeedback")
         self.copy_feedback.setWordWrap(True)
         self._make_selectable(self.copy_feedback)
         self.copy_feedback.hide()
         self._feedback_timer.timeout.connect(self.copy_feedback.hide)
-        root.addWidget(self.copy_feedback)
+        details_layout.addWidget(self.copy_feedback)
+
+        self.panels.addWidget(self.details)
+        self.panels.setStretchFactor(0, 0)
+        self.panels.setStretchFactor(1, 1)
+        self.panels.setSizes((360, 920))
+        root.addWidget(self.panels, 1)
 
         # Start with the narrow layout so a small standalone view can negotiate
         # a compact minimum width before its first show/resize event.
@@ -273,7 +299,7 @@ class ActivityView(QWidget):
             self.jobs_list.addItem(item)
         self.jobs_list.setVisible(bool(jobs))
         self.empty_label.setVisible(not jobs)
-        self.details.setVisible(bool(jobs))
+        self.panels.setVisible(bool(jobs))
         self.clear_button.setEnabled(bool(jobs))
         if jobs:
             self.jobs_list.setCurrentRow(0)
@@ -300,19 +326,18 @@ class ActivityView(QWidget):
         ):
             self.actions_layout.removeWidget(widget)
         if compact:
-            for row, widget in enumerate(
-                (
-                    self.open_button,
-                    self.folder_button,
-                    self.return_button,
-                    self.copy_diagnostic_button,
-                    self.clear_button,
-                )
-            ):
-                self.actions_layout.addWidget(widget, row, 0, 1, 2)
+            self.panels.setOrientation(Qt.Orientation.Vertical)
+            self.panels.setSizes((190, 430))
+            self.actions_layout.addWidget(self.open_button, 0, 0)
+            self.actions_layout.addWidget(self.folder_button, 0, 1)
+            self.actions_layout.addWidget(self.return_button, 0, 0, 1, 2)
+            self.actions_layout.addWidget(self.copy_diagnostic_button, 1, 0, 1, 2)
+            self.actions_layout.addWidget(self.clear_button, 2, 0, 1, 2)
             self.actions_layout.setColumnStretch(2, 0)
             self.actions_layout.setColumnStretch(4, 0)
         else:
+            self.panels.setOrientation(Qt.Orientation.Horizontal)
+            self.panels.setSizes((360, 920))
             self.actions_layout.addWidget(self.open_button, 0, 0)
             self.actions_layout.addWidget(self.folder_button, 0, 1)
             self.actions_layout.addWidget(self.return_button, 0, 2)
@@ -358,7 +383,7 @@ class ActivityView(QWidget):
 
     def _show_non_failure_details(self, job: RecentJob) -> None:
         self.details_summary.setVisible(True)
-        self.details_summary.setText("\n".join(outcome_summary_lines(job.summary)))
+        self.details_summary.setText(_summary_html(outcome_summary_lines(job.summary)))
         self._set_failure_widgets_visible(False)
         self._set_action_state(job)
 
@@ -484,6 +509,22 @@ class ActivityView(QWidget):
     @staticmethod
     def _make_selectable(widget: QLabel) -> None:
         widget.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+
+
+def _summary_html(lines: tuple[str, ...]) -> str:
+    """Give each result fact a quiet label/value hierarchy without adding copy."""
+
+    blocks: list[str] = []
+    for line in lines:
+        label, separator, value = line.partition(":")
+        if separator and value.strip():
+            blocks.append(
+                '<p style="margin:0 0 9px 0;">'
+                f"<b>{escape(label.strip())}</b><br>{escape(value.strip())}</p>"
+            )
+        else:
+            blocks.append(f'<p style="margin:0 0 9px 0;">{escape(line)}</p>')
+    return "".join(blocks)
 
 
 def outcome_summary_lines(summary: OutcomeSummary | None) -> tuple[str, ...]:

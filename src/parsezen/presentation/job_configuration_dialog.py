@@ -30,7 +30,6 @@ from PySide6.QtWidgets import (
 )
 
 from parsezen.application.configuration_rules import configuration_issues
-from parsezen.application.processing_explanation import translation_route_summary
 from parsezen.domain.jobs import (
     AIProfileConfiguration,
     DocumentFormat,
@@ -399,10 +398,6 @@ class JobConfigurationDialog(QDialog):
         self.translate_row = _OptionRow("Traducir", "", parent=self.content)
         self.translator_row = _OptionRow("Traductor", "", parent=self.content)
         self.glossary_row = _OptionRow("Glosario", "", parent=self.content)
-        self.translation_route = QLabel("", self.content)
-        self.translation_route.setObjectName("sectionHelp")
-        self.translation_route.setWordWrap(True)
-        self.translation_route.setAccessibleName("Recorrido y coste aproximado de traducción")
         self.review_row = QWidget(self.content)
         self.review_row.setObjectName("configurationSwitchRow")
         review_layout = QHBoxLayout(self.review_row)
@@ -414,9 +409,6 @@ class JobConfigurationDialog(QDialog):
         review_layout.addStretch(1)
         self.plan_reviewed = Switch(self.review_row)
         self.plan_reviewed.setAccessibleName("Revisión automática con IA")
-        self.plan_reviewed.setAccessibleDescription(
-            "La IA corrige el contenido y, para EPUB, también propone una estructura."
-        )
         review_layout.addWidget(self.plan_reviewed)
         self.pages_row = _OptionRow("Páginas", "", parent=self.content)
         self.ocr_row = _OptionRow("OCR", "", parent=self.content)
@@ -430,8 +422,6 @@ class JobConfigurationDialog(QDialog):
         self.options_layout.addWidget(self.review_row)
         self.options_layout.addWidget(self.pages_row)
         self.options_layout.addWidget(self.ocr_row)
-        self.options_layout.addSpacing(SPACING.sm)
-        self.options_layout.addWidget(self.translation_route)
 
         self.validation_label = QLabel(self.content)
         self.validation_label.setObjectName("configurationValidation")
@@ -620,15 +610,16 @@ class JobConfigurationDialog(QDialog):
             if glossary_count == 0
             else f"{glossary_count} término{'s' if glossary_count != 1 else ''}"
         )
-        self.translation_route.setVisible(translating)
-        if translating:
-            self.translation_route.setText(
-                translation_route_summary(
-                    self._translation_method,
-                    reviewed=self._review_enabled,
-                    epub=self._output_format is DocumentFormat.EPUB,
-                )
-            )
+        if translating and self._translation_method is TranslationMethod.LOCAL_AI:
+            review_description = "La corrección se integra en la traducción."
+        elif translating:
+            review_description = "La IA verifica la traducción en una pasada posterior."
+        else:
+            review_description = "La IA propone correcciones del contenido."
+        if self._output_format is DocumentFormat.EPUB:
+            review_description += " También propone la estructura del EPUB."
+        self.plan_reviewed.setAccessibleDescription(review_description)
+        self.plan_reviewed.setToolTip(review_description)
         self._set_checked_without_signal(self.plan_reviewed, self._review_enabled)
         is_pdf = self._job.source.format is DocumentFormat.PDF
         self.pages_row.setVisible(is_pdf)

@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+from dataclasses import replace
+from io import BytesIO
 from pathlib import Path
 from typing import cast
+from zipfile import ZipFile
 
 import pytest
 
@@ -24,7 +27,7 @@ from parsezen.domain.jobs import (
 )
 from parsezen.domain.reviews import ReviewSession
 from parsezen.domain.stages import StageKind
-from parsezen.epub_builder import EpubBookMetadata
+from parsezen.epub_builder import EpubBookMetadata, build_epub
 from parsezen.infrastructure.artifact_store import ArtifactStore
 from parsezen.processing import ProcessResult
 
@@ -118,7 +121,14 @@ def test_epub_draft_is_recoverable_and_reused_before_publication(tmp_path: Path)
     )
     coordinator.save_book("job", edited)
 
-    assert coordinator.prepare_book("job", _result(destination), "ignored") is edited
+    assert (
+        coordinator.prepare_book(
+            "job",
+            _result(destination),
+            "<!-- PZDOC PDF PAGE 1 -->\n\n# Chapter\n\nBody.\n",
+        )
+        is edited
+    )
     assert repository.saved_books[0].metadata.title == "Book"
     assert repository.saved_books[0].metadata.identifier is not None
     assert "PZDOC" not in BookEditor(
@@ -126,6 +136,43 @@ def test_epub_draft_is_recoverable_and_reused_before_publication(tmp_path: Path)
         artifacts,
         job_id="job",
     ).editable_html(prepared.spine[0])
+
+
+def test_epub_draft_is_rebuilt_when_reviewed_text_changes(tmp_path: Path) -> None:
+    destination = tmp_path / "book.epub"
+    repository = DraftRepository()
+    artifacts = ArtifactStore(
+        tmp_path / "artifacts",
+        protect=reversible,
+        unprotect=reversible,
+    )
+    source = tmp_path / "source.md"
+    source.write_text("source", encoding="utf-8")
+    queue, execution = _blocked_job(source)
+    coordinator = ReviewPublicationCoordinator(
+        repository,
+        artifacts,
+        ReviewFinalizationCoordinator(queue, execution, repository, artifacts),
+    )
+    first = coordinator.prepare_book(
+        "job",
+        _result(destination),
+        "# Chapter\n\nCrea tu visión.\n",
+    )
+
+    rebuilt = coordinator.prepare_book(
+        "job",
+        _result(destination),
+        "# Chapter\n\nCREA TU VISIÓN.\n",
+    )
+
+    assert rebuilt is not first
+    assert rebuilt.source_fingerprint != first.source_fingerprint
+    assert "CREA TU VISIÓN" in BookEditor(
+        rebuilt,
+        artifacts,
+        job_id="job",
+    ).editable_html(rebuilt.spine[0])
 
 
 def test_epub_publication_replaces_output_before_completing_and_cleans_draft(
@@ -159,6 +206,100 @@ def test_epub_publication_replaces_output_before_completing_and_cleans_draft(
     assert repository.deleted == ["job"]
     assert repository.book is None
     assert not (artifacts.root / "job").exists()
+
+
+def test_unchanged_epub_review_preserves_the_existing_package_byte_for_byte(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source.epub"
+    source.write_bytes(b"source")
+    destination = tmp_path / "book.epub"
+    original = build_epub(
+        "# Chapter\n\nBody.\n",
+        (),
+        EpubBookMetadata("Book", "en", "Author"),
+    ).content
+    destination.write_bytes(original)
+    repository = DraftRepository()
+    artifacts = ArtifactStore(
+        tmp_path / "artifacts",
+        protect=reversible,
+        unprotect=reversible,
+    )
+    queue, execution = _blocked_job(source)
+    coordinator = ReviewPublicationCoordinator(
+        repository,
+        artifacts,
+        ReviewFinalizationCoordinator(queue, execution, repository, artifacts),
+    )
+    result = replace(
+        _result(destination),
+        preserve_epub_package_on_unchanged_review=True,
+    )
+    book = coordinator.prepare_book("job", result, result.review_markdown or "")
+
+    published = coordinator.publish_book(
+        "job",
+        result,
+        result.review_markdown or "",
+        book,
+        (),
+    )
+
+    assert destination.read_bytes() == original
+    assert published.result.revision_approved is True
+    assert published.finalization.job.status is JobStatus.COMPLETED
+
+
+def test_epub_body_edit_preserves_every_other_original_package_member(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source.epub"
+    source.write_bytes(b"source")
+    destination = tmp_path / "book.epub"
+    original = build_epub(
+        "# Chapter\n\nBody.\n",
+        (),
+        EpubBookMetadata("Book", "en", "Author"),
+    ).content
+    destination.write_bytes(original)
+    repository = DraftRepository()
+    artifacts = ArtifactStore(
+        tmp_path / "artifacts",
+        protect=reversible,
+        unprotect=reversible,
+    )
+    queue, execution = _blocked_job(source)
+    coordinator = ReviewPublicationCoordinator(
+        repository,
+        artifacts,
+        ReviewFinalizationCoordinator(queue, execution, repository, artifacts),
+    )
+    result = replace(
+        _result(destination),
+        preserve_epub_package_on_unchanged_review=True,
+    )
+    book = coordinator.prepare_book("job", result, result.review_markdown or "")
+    edited = BookEditor(book, artifacts, job_id="job").update_content(
+        book.spine[0],
+        "<h1>Chapter</h1><p>Edited body.</p>",
+    )
+
+    coordinator.publish_book(
+        "job",
+        result,
+        result.review_markdown or "",
+        edited,
+        (),
+    )
+
+    with ZipFile(BytesIO(original)) as before, ZipFile(destination) as after:
+        chapter_path = book.section(book.spine[0]).source_archive_path
+        assert chapter_path is not None
+        assert b"Edited body." in after.read(chapter_path)
+        assert {name: before.read(name) for name in before.namelist() if name != chapter_path} == {
+            name: after.read(name) for name in after.namelist() if name != chapter_path
+        }
 
 
 def test_failed_completion_keeps_the_published_book_draft_recoverable(

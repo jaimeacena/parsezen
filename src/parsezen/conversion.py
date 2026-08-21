@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 from collections.abc import Callable
 from pathlib import Path, PurePosixPath
+from tempfile import TemporaryDirectory
 from urllib.parse import quote
 from zipfile import BadZipFile, ZipFile, ZipInfo, is_zipfile
 
@@ -21,6 +22,7 @@ from parsezen.pdf_conversion import (
     PdfPageRange,
     PdfProgressCallback,
     PdfQualityReport,
+    PdfVisualArbiterFactory,
     convert_pdf,
     convert_pdf_document,
 )
@@ -55,6 +57,7 @@ def convert_file(
     save_pdf_ocr_checkpoint: Callable[[int, str], bool] | None = None,
     load_pdf_page_checkpoint: Callable[[int], str | None] | None = None,
     save_pdf_page_checkpoint: Callable[[int, str], bool] | None = None,
+    pdf_visual_arbiter_factory: PdfVisualArbiterFactory | None = None,
 ) -> str:
     """Return Markdown from a supported local file without writing output."""
     converted = convert_document(
@@ -69,6 +72,7 @@ def convert_file(
         save_pdf_ocr_checkpoint=save_pdf_ocr_checkpoint,
         load_pdf_page_checkpoint=load_pdf_page_checkpoint,
         save_pdf_page_checkpoint=save_pdf_page_checkpoint,
+        pdf_visual_arbiter_factory=pdf_visual_arbiter_factory,
         preserve_resources=False,
     )
     return materialize_converted_markdown(converted.markdown, None)
@@ -88,6 +92,7 @@ def convert_document(
     save_pdf_page_checkpoint: Callable[[int, str], bool] | None = None,
     preserve_resources: bool = False,
     strict_resource_references: bool = False,
+    pdf_visual_arbiter_factory: PdfVisualArbiterFactory | None = None,
 ) -> ConvertedDocument:
     """Return Markdown and portable resources without writing final output."""
     check_cancelled(cancellation)
@@ -122,18 +127,25 @@ def convert_document(
                 load_page_checkpoint=load_pdf_page_checkpoint,
                 save_page_checkpoint=save_pdf_page_checkpoint,
                 include_images=True,
+                visual_arbiter_factory=pdf_visual_arbiter_factory,
             )
-            return ConvertedDocument(
-                converted_pdf.markdown,
-                tuple(
-                    ConvertedResource(
-                        resource.relative_path,
-                        resource.content,
-                        resource.media_type,
-                    )
-                    for resource in converted_pdf.resources
-                ),
-            )
+            temporary_directory = TemporaryDirectory(prefix="parsezen-pdf-resources-")
+            try:
+                return ConvertedDocument(
+                    converted_pdf.markdown,
+                    tuple(
+                        ConvertedResource.from_path(
+                            resource.relative_path,
+                            _spill_pdf_resource(resource, temporary_directory),
+                            resource.media_type,
+                            owner=temporary_directory,
+                        )
+                        for resource in converted_pdf.resources
+                    ),
+                )
+            except Exception:
+                temporary_directory.cleanup()
+                raise
         return ConvertedDocument(
             convert_pdf(
                 source_path,
@@ -147,6 +159,7 @@ def convert_document(
                 save_ocr_checkpoint=save_pdf_ocr_checkpoint,
                 load_page_checkpoint=load_pdf_page_checkpoint,
                 save_page_checkpoint=save_pdf_page_checkpoint,
+                visual_arbiter_factory=pdf_visual_arbiter_factory,
             )
         )
     if extension == ".epub":
@@ -155,6 +168,18 @@ def convert_document(
         converted = convert_epub(source_path, cancellation=cancellation)
         return converted if preserve_resources else without_internal_resource_images(converted)
     raise ConversionError(f"El formato {extension or '(sin extensión)'} no está soportado.")
+
+
+def _spill_pdf_resource(resource: object, temporary_directory: TemporaryDirectory) -> Path:
+    """Move one PDF image to local temporary storage before it crosses the pipeline boundary."""
+    relative_path = getattr(resource, "relative_path", None)
+    content = getattr(resource, "content", None)
+    if not isinstance(relative_path, PurePosixPath) or not isinstance(content, bytes):
+        raise ConversionError("El recurso binario del PDF no es válido.")
+    destination = Path(temporary_directory.name) / "resources" / relative_path.as_posix()
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_bytes(content)
+    return destination
 
 
 def materialize_converted_markdown(

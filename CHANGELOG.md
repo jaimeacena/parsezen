@@ -2,6 +2,19 @@
 
 ## Próxima versión
 
+- EPUB→EPUB conserva ahora texto visible situado junto a `code`, fórmulas, SVG u otros nodos
+  protegidos sin enviar ese marcado al traductor. La selección cubre también texto XHTML seguro que
+  no estaba dentro de las etiquetas de bloque habituales.
+- La calidad de la traducción publicada y la del candidato de revisión quedan separadas. La
+  verificación bilingüe revisa todas las regiones de riesgo, sus vecinas y una muestra distribuida;
+  si una incidencia no se puede anclar, amplía la comprobación al documento completo. Los fragmentos
+  reciben además el contexto acotado de sus encabezados.
+- La publicación EPUB directa es transaccional. Una revisión sin cambios conserva el paquete exacto
+  y una edición limitada al cuerpo de capítulos mantiene byte por byte OPF, navegación, CSS, fuentes,
+  imágenes y el resto de recursos; cambios estructurales vuelven al constructor normalizado.
+- La comprobación temprana convierte todas las páginas representativas, pero prueba traducción en un
+  máximo de tres y omite revisión, reestructuración y construcción EPUB finales. Ollama y OCR añaden
+  deadlines totales acotados y métricas privadas de tiempo, tokens y rendimiento sin contenido.
 - La revisión documental elimina contexto y botones redundantes: resume el progreso como `fase ·
   resueltas/total`, muestra prioridad o sugerencia solo cuando aportan información, agrupa localizar y
   restaurar en el menú de cada panel, oculta `Anterior` sin destino y reserva la acción masiva para
@@ -27,8 +40,8 @@
   atacante que ya opera como el mismo usuario queda fuera de alcance. También se inventariaron los
   datos en claro y sus vías de limpieza antes de plantear cualquier migración criptográfica.
 - El streaming de Ollama deja de reutilizar el timeout de lectura como duración total accidental.
-  Las generaciones activas respetan el timeout de inactividad de `httpx` y solo tienen un deadline
-  total cuando el consumidor lo solicita explícitamente.
+  Las generaciones activas separan el timeout de inactividad de `httpx` de un deadline total
+  derivado y acotado; cada consumidor puede imponer uno más estricto.
 - OCR y Argos comparten ahora las primitivas mecánicas de su canal privado autenticado, proceso
   oculto, espera cancelable y mensajes JSON acotados. Sus protocolos, límites y máquinas de estado
   siguen separados.
@@ -156,7 +169,9 @@
   guardas de cobertura y tamaño y conserva en orden las filas y columnas de cada tabla nativa. Los
   índices de hasta cuatro columnas mantienen un orden de lectura
   contiguo y vuelven a asociar cada folio separado con su entrada antes de publicarla como una fila
-  semántica, aun cuando el OCR visual se rechaza.
+  semántica, aun cuando el OCR visual se rechaza. Los folios de cuatro cifras ya no quedan como
+  párrafos sueltos; una cifra con un glifo alfabético dudoso exige consenso entre fila, secuencia y
+  OCR, y el OCR solo puede restaurar espacios ausentes sin reemplazar las letras de la capa nativa.
 - Las fronteras de esas tablas se sitúan ahora en el hueco real entre glifos, no a mitad de los
   comienzos de columna, para no partir palabras anchas entre celdas. Dos tablas consecutivas en una
   página se separan por su rótulo explícito y conservan geometrías independientes.

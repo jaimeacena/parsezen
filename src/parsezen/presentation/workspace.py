@@ -396,13 +396,13 @@ class ParsezenWorkspace(QWidget):
         queue_toolbar_layout.setVerticalSpacing(SPACING.xs)
         self.queue_summary = QLabel("0 documentos", self.queue_toolbar)
         self.queue_summary.setObjectName("queueSummary")
-        self.queue_summary.setWordWrap(True)
+        self.queue_summary.setWordWrap(False)
         self.queue_summary.setMinimumWidth(0)
         self.queue_summary.setSizePolicy(
-            QSizePolicy.Policy.Preferred,
-            QSizePolicy.Policy.Preferred,
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Fixed,
         )
-        queue_toolbar_layout.addWidget(self.queue_summary, 0, 0)
+        queue_toolbar_layout.addWidget(self.queue_summary, 0, 0, 1, 2)
         queue_toolbar_layout.setColumnStretch(1, 1)
         self.add_button = QPushButton("Añadir", self.queue_toolbar)
         self.add_button.setObjectName("queueAddAction")
@@ -977,7 +977,7 @@ class ParsezenWorkspace(QWidget):
                 QSizePolicy.Policy.Fixed,
             )
             return
-        self.queue_toolbar_layout.addWidget(self.queue_summary, 0, 0)
+        self.queue_toolbar_layout.addWidget(self.queue_summary, 0, 0, 1, 2)
         self.queue_toolbar_layout.addWidget(self.add_button, 0, 2)
         self.queue_toolbar_layout.addWidget(self.primary_button, 0, 3)
         self.queue_toolbar_layout.setColumnStretch(1, 1)
@@ -995,9 +995,7 @@ class ParsezenWorkspace(QWidget):
         else:
             summary = view.summary
             if view.primary_mode == "process" and self._queue_preflight is not None:
-                summary = (
-                    f"{summary} · aprox. {format_duration_range(self._queue_preflight.estimate)}"
-                )
+                summary = f"{summary} · ~{format_duration_range(self._queue_preflight.estimate)}"
             self.queue_summary.setText(summary)
             self.queue_summary.setTextFormat(Qt.TextFormat.PlainText)
         if self._preparing_job_ids:

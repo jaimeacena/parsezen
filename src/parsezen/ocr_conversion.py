@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import gc
+import logging
 import os
 import re
 import shutil
@@ -23,6 +24,9 @@ from parsezen.errors import ConversionError, ProcessingCancelledError
 
 _IMAGE_PLACEHOLDER_PATTERN = re.compile(r"<!--\s*image\s*-->", re.IGNORECASE)
 _HEADING_PATTERN = re.compile(r"^(#{1,6}\s+)(.+)$")
+_SPACED_HEADING_MARKERS_PATTERN = re.compile(
+    r"^(?P<markers>#(?:[ \t]+#){1,5})[ \t]+(?P<body>\S.*)$"
+)
 _STANDALONE_PAGE_NUMBER_PATTERN = re.compile(r"(?:\d{1,3}|[ivxlcdm]+)", re.IGNORECASE)
 _INVALID_XML_CONTROL_PATTERN = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
 _UNESCAPED_PIPE_PATTERN = re.compile(r"(?<!\\)\|")
@@ -35,7 +39,10 @@ _TABLE_CAPTION_PATTERN = re.compile(
 # Docling keeps page images and intermediate layout tensors alive for the whole
 # conversion call. Small batches cap the peak without rebuilding the worker model.
 _MAX_PAGES_PER_BATCH = 2
+_MAX_PAGES_PER_WORKER = 8
 OCR_LANGUAGES = ("es", "en", "fr", "de", "it", "pt")
+
+LOGGER = logging.getLogger(__name__)
 
 
 def convert_pdf_pages_with_ocr(
@@ -47,28 +54,124 @@ def convert_pdf_pages_with_ocr(
     on_progress: Callable[[int, int], None] | None = None,
     on_page_result: Callable[[int, str], None] | None = None,
 ) -> dict[int, str]:
-    """Return local OCR Markdown from an isolated, short-lived process."""
+    """Return local OCR Markdown from bounded, restartable worker requests.
+
+    A request is deliberately split into the same small ranges used by the
+    in-process converter.  Each range has its own worker lifecycle, so a
+    crashed or poisoned batch can be retried with a fresh process and then
+    degraded to one page at a time without losing successful pages.
+    """
     if not page_numbers:
         return {}
     check_cancelled(cancellation)
     from parsezen.ocr_executor import run_ocr_worker
 
-    if on_page_result is None:
-        return run_ocr_worker(
-            source_path,
-            page_numbers,
-            cancellation,
-            force_full_page_numbers=force_full_page_numbers,
-            on_progress=on_progress,
-        )
-    return run_ocr_worker(
-        source_path,
-        page_numbers,
-        cancellation,
-        force_full_page_numbers=force_full_page_numbers,
-        on_progress=on_progress,
-        on_page_result=on_page_result,
-    )
+    requested = set(page_numbers)
+    forced = set(force_full_page_numbers or ())
+    completed_pages: set[int] = set()
+    results: dict[int, str] = {}
+    last_failure: ConversionError | None = None
+    reported_pages: set[int] = set()
+    streamed_results: dict[int, str] = {}
+    request_completed_offset = 0
+
+    def report_progress(current: int, total: int) -> None:
+        del total
+        if on_progress is not None:
+            on_progress(min(request_completed_offset + current, len(requested)), len(requested))
+
+    def report_page(page_number: int, markdown: str) -> None:
+        streamed_results[page_number] = markdown
+        if page_number in reported_pages:
+            return
+        reported_pages.add(page_number)
+        if on_page_result is not None:
+            on_page_result(page_number, markdown)
+
+    def run_request(batch: set[int]) -> dict[int, str]:
+        nonlocal request_completed_offset
+        request_completed_offset = len(completed_pages | streamed_results.keys())
+        arguments: dict[str, Any] = {
+            "force_full_page_numbers": forced & batch,
+            "on_progress": report_progress,
+            "on_page_result": report_page,
+        }
+        return run_ocr_worker(source_path, batch, cancellation, **arguments)
+
+    for batch in _worker_page_batches(requested):
+        first_page = min(batch)
+        last_page = max(batch)
+        check_cancelled(cancellation)
+        batch_result = {
+            page_number: streamed_results[page_number]
+            for page_number in batch
+            if page_number in streamed_results
+        }
+        pending = batch - batch_result.keys()
+        # A fresh invocation starts a fresh private worker. This is the
+        # watchdog boundary: no worker is reused after a protocol/engine fail.
+        for attempt in range(2):
+            if not pending:
+                break
+            try:
+                batch_result.update(run_request(set(pending)))
+            except ProcessingCancelledError:
+                raise
+            except ConversionError as exc:
+                last_failure = exc
+                LOGGER.warning(
+                    "ocr_worker_batch_retry pages=%d-%d attempt=%d",
+                    first_page,
+                    last_page,
+                    attempt + 1,
+                )
+            batch_result.update(
+                {
+                    page_number: streamed_results[page_number]
+                    for page_number in pending
+                    if page_number in streamed_results
+                }
+            )
+            pending = batch - batch_result.keys()
+        if pending and len(batch) > 1:
+            LOGGER.warning(
+                "ocr_worker_batch_degraded pages=%d-%d",
+                first_page,
+                last_page,
+            )
+            for page_number in sorted(pending):
+                page_result: dict[int, str] | None = None
+                for attempt in range(2):
+                    try:
+                        page_result = run_request({page_number})
+                        break
+                    except ProcessingCancelledError:
+                        raise
+                    except ConversionError as exc:
+                        last_failure = exc
+                        LOGGER.warning(
+                            "ocr_worker_page_retry page=%d attempt=%d",
+                            page_number,
+                            attempt + 1,
+                        )
+                if page_result is not None:
+                    batch_result.update(page_result)
+                if page_number in streamed_results:
+                    batch_result[page_number] = streamed_results[page_number]
+        if not batch_result:
+            continue
+        results.update(batch_result)
+        completed_pages.update(batch_result)
+        # Workers that do not support streaming page callbacks still report
+        # their completed pages here, preserving the checkpoint contract.
+        for page_number, markdown in batch_result.items():
+            report_page(page_number, markdown)
+
+    if not results and streamed_results:
+        results.update(streamed_results)
+    if not results and last_failure is not None:
+        raise last_failure
+    return results
 
 
 def _convert_pdf_pages_in_process(
@@ -153,6 +256,7 @@ def _convert_pdf_pages_in_process(
                         report_result(page_number, cleaned)
                         report_page(page_number)
                 del result
+                gc.collect()
 
         forced_pages = set(force_full_page_numbers or ()) & page_numbers
         recovery_pages = (page_numbers - markdown_pages.keys()) | forced_pages
@@ -558,10 +662,26 @@ def _page_ranges(page_numbers: set[int]) -> list[tuple[int, int]]:
     return ranges
 
 
+def _worker_page_batches(page_numbers: set[int]) -> list[set[int]]:
+    """Group bounded OCR ranges without rebuilding the model for every gap."""
+
+    batches: list[set[int]] = []
+    current: set[int] = set()
+    for first_page, last_page in _page_ranges(page_numbers):
+        page_range = set(range(first_page, last_page + 1)) & page_numbers
+        if current and len(current) + len(page_range) > _MAX_PAGES_PER_WORKER:
+            batches.append(current)
+            current = set()
+        current.update(page_range)
+    if current:
+        batches.append(current)
+    return batches
+
+
 def _clean_ocr_markdown(markdown: str) -> str:
     markdown = _INVALID_XML_CONTROL_PATTERN.sub(" ", markdown)
     cleaned_lines = [
-        _collapse_heading_repetitions(line.strip())
+        _collapse_heading_repetitions(_normalize_spaced_heading_markers(line.strip()))
         for line in _IMAGE_PLACEHOLDER_PATTERN.sub("", markdown).splitlines()
     ]
     while cleaned_lines and not cleaned_lines[0]:
@@ -582,6 +702,16 @@ def _clean_ocr_markdown(markdown: str) -> str:
             continue
         compacted.append(line)
     return _separate_ocr_table_captions("\n".join(compacted).strip())
+
+
+def _normalize_spaced_heading_markers(line: str) -> str:
+    """Repair OCR output that separates every marker in an ATX heading."""
+
+    match = _SPACED_HEADING_MARKERS_PATTERN.fullmatch(line)
+    if match is None:
+        return line
+    level = match.group("markers").count("#")
+    return f"{'#' * level} {match.group('body')}"
 
 
 def _separate_ocr_table_captions(markdown: str) -> str:

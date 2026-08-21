@@ -190,7 +190,7 @@ class ResultSnapshotStore:
                 self._artifacts.put(
                     job_id=job_id,
                     generation=generation,
-                    payload=resource.content,
+                    payload=resource.read_content(),
                     media_type=resource.media_type,
                 ).id,
             )
@@ -401,6 +401,7 @@ def _result_recovery_state(result: ProcessResult) -> dict[str, Any]:
         "problematic_pdf_pages",
         "pdf_quality_report",
         "translation_quality_report",
+        "review_translation_quality_report",
         "linguistic_review_coverage",
         "preserved_translation_chunks",
         "preserved_images",
@@ -408,6 +409,7 @@ def _result_recovery_state(result: ProcessResult) -> dict[str, Any]:
         "revision_epub_metadata",
         "review_required",
         "revision_approved",
+        "preserve_epub_package_on_unchanged_review",
         "final_integrity_report",
         "markdown_organization",
         "markdown_include_metadata",
@@ -433,6 +435,9 @@ def _result_from_recovery_state(
         translation_quality_report=_translation_report_from_json(
             state.get("translation_quality_report")
         ),
+        review_translation_quality_report=_translation_report_from_json(
+            state.get("review_translation_quality_report")
+        ),
         linguistic_review_coverage=_linguistic_review_coverage_from_json(
             state.get("linguistic_review_coverage")
         ),
@@ -447,6 +452,9 @@ def _result_from_recovery_state(
         review_markdown=review_markdown,
         review_required=bool(state.get("review_required", True)),
         revision_approved=bool(state.get("revision_approved", False)),
+        preserve_epub_package_on_unchanged_review=bool(
+            state.get("preserve_epub_package_on_unchanged_review", False)
+        ),
         final_integrity_report=_integrity_report_from_json(state.get("final_integrity_report")),
         markdown_organization=MarkdownOrganization(
             state.get("markdown_organization", MarkdownOrganization.SINGLE_FILE.value)
@@ -473,6 +481,9 @@ def _result_to_json(result: ProcessResult) -> dict[str, Any]:
         "epub_checkpoint_degraded": result.epub_checkpoint_degraded,
         "translation_quality_report": _translation_report_to_json(
             result.translation_quality_report
+        ),
+        "review_translation_quality_report": _translation_report_to_json(
+            result.review_translation_quality_report
         ),
         "linguistic_review_coverage": _linguistic_review_coverage_to_json(
             result.linguistic_review_coverage
@@ -510,6 +521,9 @@ def _result_to_json(result: ProcessResult) -> dict[str, Any]:
         "review_markdown": result.review_markdown,
         "review_required": result.review_required,
         "revision_approved": result.revision_approved,
+        "preserve_epub_package_on_unchanged_review": (
+            result.preserve_epub_package_on_unchanged_review
+        ),
         "final_integrity_report": _integrity_report_to_json(result.final_integrity_report),
         "front_matter_blocks": result.front_matter_blocks,
         "toc_blocks": result.toc_blocks,
@@ -566,6 +580,9 @@ def _result_from_json(
         translation_quality_report=_translation_report_from_json(
             raw.get("translation_quality_report")
         ),
+        review_translation_quality_report=_translation_report_from_json(
+            raw.get("review_translation_quality_report")
+        ),
         linguistic_review_coverage=_linguistic_review_coverage_from_json(
             raw.get("linguistic_review_coverage")
         ),
@@ -580,6 +597,9 @@ def _result_from_json(
         review_markdown=raw.get("review_markdown"),
         review_required=bool(raw.get("review_required", False)),
         revision_approved=bool(raw.get("revision_approved", False)),
+        preserve_epub_package_on_unchanged_review=bool(
+            raw.get("preserve_epub_package_on_unchanged_review", False)
+        ),
         final_integrity_report=_integrity_report_from_json(raw.get("final_integrity_report")),
         telemetry=_telemetry_from_json(raw.get("telemetry")),
         front_matter_blocks=max(0, int(raw.get("front_matter_blocks", 0))),
@@ -712,6 +732,8 @@ def _pdf_report_to_json(report: PdfQualityReport | None) -> dict[str, Any] | Non
         "ocr_pages": list(report.ocr_pages),
         "ocr_replaced_pages": list(report.ocr_replaced_pages),
         "low_confidence_pages": list(report.low_confidence_pages),
+        "ocr_failed_pages": list(report.ocr_failed_pages),
+        "required_ocr_failed_pages": list(report.required_ocr_failed_pages),
         "issues": [
             {
                 "page_number": issue.page_number,
@@ -734,6 +756,10 @@ def _pdf_report_from_json(raw: object) -> PdfQualityReport | None:
         ocr_pages=tuple(int(value) for value in raw.get("ocr_pages", ())),
         ocr_replaced_pages=tuple(int(value) for value in raw.get("ocr_replaced_pages", ())),
         low_confidence_pages=tuple(int(value) for value in raw.get("low_confidence_pages", ())),
+        ocr_failed_pages=tuple(int(value) for value in raw.get("ocr_failed_pages", ())),
+        required_ocr_failed_pages=tuple(
+            int(value) for value in raw.get("required_ocr_failed_pages", ())
+        ),
         issues=tuple(
             PdfReviewIssue(
                 page_number=int(issue["page_number"]),

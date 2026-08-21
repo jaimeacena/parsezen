@@ -50,7 +50,7 @@ from parsezen.application.preflight import (
 )
 from parsezen.application.processing_explanation import ProcessingFlow, processing_flow
 from parsezen.domain.jobs import DocumentFormat, DocumentJob, JobStatus
-from parsezen.domain.stages import StageKind
+from parsezen.domain.stages import StageKind, StageStatus
 from parsezen.final_integrity import FinalIntegrityReport
 from parsezen.presentation.design_system import COLORS, SPACING
 from parsezen.presentation.job_view_model import focus_stage, next_step_view
@@ -94,6 +94,7 @@ HEADERS = {
     JobColumn.NEXT_STEP: "Estado",
     JobColumn.REMOVE: "",
 }
+_REVIEW_ACTION_LABELS = frozenset({"Revisar", "Revisar cambios", "Revisar y publicar"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -106,6 +107,7 @@ class CellPresentation:
     action: str | None = None
     document_format: DocumentFormat | None = None
     operations: tuple[str, ...] = ()
+    operation_tones: tuple[str, ...] = ()
 
 
 def _formatted_size(size_bytes: int) -> str:
@@ -127,6 +129,60 @@ _STAGE_LABELS = {
 
 def _flow(job: DocumentJob) -> ProcessingFlow:
     return processing_flow(job.source.format, job.configuration)
+
+
+def _flow_operation_tones(job: DocumentJob, route: ProcessingFlow) -> tuple[str, ...]:
+    """Project execution state onto the user-visible route without comparing labels."""
+
+    pristine = all(
+        not stage.participates
+        or (stage.status in {StageStatus.PENDING, StageStatus.READY} and stage.attempt == 0)
+        for stage in job.stages
+    )
+    tones: list[str] = []
+    for stage_kinds in route.step_stages:
+        stages = tuple(job.stage(kind) for kind in stage_kinds)
+        statuses = {stage.status for stage in stages}
+        if pristine:
+            tone = "default"
+        elif StageStatus.FAILED in statuses:
+            tone = "failed"
+        elif statuses & {StageStatus.RUNNING, StageStatus.PAUSED}:
+            tone = "current"
+        elif StageStatus.BLOCKED_FOR_REVIEW in statuses:
+            tone = "completed"
+        elif statuses and statuses == {StageStatus.COMPLETED}:
+            tone = "completed"
+        elif StageStatus.COMPLETED in statuses:
+            tone = "current"
+        else:
+            tone = "future"
+        tones.append(tone)
+    if route.human_review_step:
+        if job.status is JobStatus.WAITING_REVIEW:
+            tones.append("current_review")
+        elif job.status is JobStatus.COMPLETED:
+            tones.append("completed")
+        else:
+            tones.append("default" if pristine else "future")
+    return tuple(tones)
+
+
+def _described_operations(
+    operations: tuple[str, ...],
+    tones: tuple[str, ...],
+) -> str:
+    state_labels = {
+        "completed": "Completado",
+        "current": "En curso",
+        "current_review": "Requiere tu revisión",
+        "future": "Después",
+        "failed": "Fallido",
+    }
+    return " → ".join(
+        f"{state_labels[tone]}: {operation}" if tone in state_labels else operation
+        for operation, tone in zip(operations, tones, strict=True)
+    )
 
 
 def cell_presentation(
@@ -162,11 +218,9 @@ def cell_presentation(
         if compact and job.is_configured:
             output = job.configuration.output
             route = _flow(job)
-            flow = " → ".join(route.compact_steps)
+            flow = " → ".join(route.compact_sequence)
             output_label = output.format.value.upper() if output.configured else "Sin salida"
-            details = f"{details} · {flow} → {output_label}"
-            if route.human_review_note:
-                details = f"{details} · {route.human_review_note}"
+            details = f"{details} · {output_label} · {flow}"
         return CellPresentation(
             job.source.path.stem,
             details,
@@ -179,27 +233,29 @@ def cell_presentation(
         route = _flow(job)
         return CellPresentation(
             "",
-            route.human_review_note,
-            operations=route.compact_steps,
+            operations=route.compact_sequence,
+            operation_tones=_flow_operation_tones(job, route),
         )
 
     if column is JobColumn.NEXT_STEP:
         if preparing:
             return CellPresentation("Preparando", preparation_detail, tone="running")
         next_step = next_step_view(job)
-        estimate = (
-            f"Tiempo automático aprox. {format_duration_range(forecast.estimate)}"
-            if forecast is not None and next_step.tone == "pending" and job.is_configured
-            else None
-        )
+        estimate = None
+        accessible_status = None
+        if forecast is not None and next_step.tone == "pending" and job.is_configured:
+            duration = format_duration_range(forecast.estimate)
+            estimate = f"~{duration}"
+            accessible_status = f"Tiempo automático aproximado: {duration}"
         if next_step.tone == "running" and runtime_estimate is not None:
             estimate = runtime_estimate.label
         if next_step.tone == "completed" and integrity_report is not None:
-            estimate = (
+            accessible_status = (
                 "Integridad final comprobada"
                 if integrity_report.verified
                 else "Control final no disponible"
             )
+            estimate = None
         if job.status is JobStatus.COMPLETED and job.review_recommendation is not None:
             block_count = len(job.review_recommendation.block_positions)
             estimate = (
@@ -209,6 +265,7 @@ def cell_presentation(
         return CellPresentation(
             next_step.label,
             estimate,
+            status=accessible_status,
             tone=next_step.tone,
             progress=next_step.progress,
             action=next_step.action_label,
@@ -417,13 +474,9 @@ class JobTableModel(QAbstractTableModel):
                 return f"{job.source.path.name}\n{job.source.path.parent}"
             if presentation.operations:
                 route = _flow(job)
-                return "\n".join(
-                    value
-                    for value in (
-                        " → ".join(route.detailed_steps),
-                        route.human_review_note,
-                    )
-                    if value
+                return _described_operations(
+                    route.detailed_sequence,
+                    presentation.operation_tones,
                 )
             if column is JobColumn.NEXT_STEP and runtime_estimate is not None:
                 return "\n".join(
@@ -452,7 +505,7 @@ class JobTableModel(QAbstractTableModel):
                 return "\n".join(
                     (
                         presentation.title,
-                        presentation.subtitle or "",
+                        presentation.status or presentation.subtitle or "",
                         *integrity_report.checks,
                         inventory,
                     )
@@ -486,7 +539,12 @@ class JobTableModel(QAbstractTableModel):
                 for value in (
                     HEADERS[column],
                     presentation.title,
-                    ", ".join(presentation.operations) if presentation.operations else None,
+                    _described_operations(
+                        presentation.operations,
+                        presentation.operation_tones,
+                    )
+                    if presentation.operations
+                    else None,
                     presentation.subtitle,
                     presentation.status,
                     presentation.action if presentation.action != presentation.status else None,
@@ -783,26 +841,117 @@ class JobCellDelegate(QStyledItemDelegate):
     ) -> None:
         font = QFont(option.font)
         font.setPointSizeF(max(8.5, font.pointSizeF() - 0.25))
-        painter.setFont(font)
-        painter.setPen(QColor(COLORS.text_secondary))
         available = QRectF(option.rect.adjusted(14, 0, -12, 0))
-        has_review_note = bool(presentation.subtitle)
-        primary_top = option.rect.center().y() - (20 if has_review_note else 10)
-        cls._draw_elided(
-            painter,
-            QRectF(available.left(), primary_top, available.width(), 21),
-            "  →  ".join(presentation.operations),
+        tones = presentation.operation_tones or ("default",) * len(presentation.operations)
+        display_operations = tuple(
+            f"✓ {operation}" if tone == "completed" else operation
+            for operation, tone in zip(presentation.operations, tones, strict=True)
         )
-        if presentation.subtitle:
-            note_font = QFont(option.font)
-            note_font.setPointSizeF(max(8.0, note_font.pointSizeF() - 0.75))
-            painter.setFont(note_font)
-            painter.setPen(QColor(COLORS.text_muted))
-            cls._draw_elided(
-                painter,
-                QRectF(available.left(), primary_top + 23, available.width(), 19),
-                presentation.subtitle,
-            )
+        rows = cls._flow_rows(
+            display_operations,
+            QFontMetrics(font),
+            max(0, int(available.width())),
+        )
+        top = option.rect.center().y() - (21 if len(rows) == 2 else 10)
+        for row_offset, indexes in enumerate(rows):
+            left = available.left()
+            for index in indexes:
+                tone = tones[index]
+                operation_font = QFont(font)
+                if tone in {"current", "current_review", "failed"}:
+                    operation_font.setWeight(QFont.Weight.DemiBold)
+                painter.setFont(operation_font)
+                painter.setPen(
+                    QColor(
+                        {
+                            "completed": COLORS.text_muted,
+                            "current": COLORS.action_primary,
+                            "current_review": COLORS.warning,
+                            "future": COLORS.text_muted,
+                            "failed": COLORS.error,
+                        }.get(tone, COLORS.text_secondary)
+                    )
+                )
+                label = display_operations[index]
+                metrics = QFontMetrics(operation_font)
+                label_width = metrics.horizontalAdvance(label)
+                remaining = max(0, int(available.right() - left))
+                drawn_label = metrics.elidedText(
+                    label,
+                    Qt.TextElideMode.ElideRight,
+                    remaining,
+                )
+                painter.drawText(
+                    QRectF(left, top + row_offset * 22, remaining, 21),
+                    Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+                    drawn_label,
+                )
+                left += min(label_width, remaining)
+                if index < len(display_operations) - 1:
+                    painter.setFont(font)
+                    painter.setPen(QColor(COLORS.text_muted))
+                    arrow = "  →  " if index != indexes[-1] else "  →"
+                    arrow_width = QFontMetrics(font).horizontalAdvance(arrow)
+                    painter.drawText(
+                        QRectF(left, top + row_offset * 22, arrow_width, 21),
+                        Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+                        arrow,
+                    )
+                    left += arrow_width
+
+    @staticmethod
+    def _flow_lines(
+        operations: tuple[str, ...],
+        metrics: QFontMetrics,
+        available_width: int,
+    ) -> tuple[str, ...]:
+        """Wrap a route only between stages while keeping every stage equally prominent."""
+
+        return tuple(
+            JobCellDelegate._flow_line_text(operations, indexes)
+            for indexes in JobCellDelegate._flow_rows(operations, metrics, available_width)
+        )
+
+    @staticmethod
+    def _flow_rows(
+        operations: tuple[str, ...],
+        metrics: QFontMetrics,
+        available_width: int,
+    ) -> tuple[tuple[int, ...], ...]:
+        indexes = tuple(range(len(operations)))
+        complete = JobCellDelegate._flow_line_text(operations, indexes)
+        if len(operations) < 2 or metrics.horizontalAdvance(complete) <= available_width:
+            return (indexes,)
+        candidates = tuple(
+            (tuple(range(split)), tuple(range(split, len(operations))))
+            for split in range(1, len(operations))
+        )
+        return min(
+            candidates,
+            key=lambda rows: (
+                max(
+                    metrics.horizontalAdvance(JobCellDelegate._flow_line_text(operations, indexes))
+                    for indexes in rows
+                )
+                > available_width,
+                max(
+                    metrics.horizontalAdvance(JobCellDelegate._flow_line_text(operations, indexes))
+                    for indexes in rows
+                ),
+                abs(
+                    metrics.horizontalAdvance(JobCellDelegate._flow_line_text(operations, rows[0]))
+                    - metrics.horizontalAdvance(
+                        JobCellDelegate._flow_line_text(operations, rows[1])
+                    )
+                ),
+            ),
+        )
+
+    @staticmethod
+    def _flow_line_text(operations: tuple[str, ...], indexes: tuple[int, ...]) -> str:
+        separator = "  →  "
+        text = separator.join(operations[index] for index in indexes)
+        return f"{text}  →" if indexes and indexes[-1] < len(operations) - 1 else text
 
     @staticmethod
     def _draw_elided(
@@ -1096,7 +1245,10 @@ class JobTableView(QTableView):
 
     def _cell_clicked(self, index: QModelIndex) -> None:
         presentation = index.data(CELL_PRESENTATION_ROLE)
-        if isinstance(presentation, CellPresentation) and presentation.action == "Revisar":
+        if (
+            isinstance(presentation, CellPresentation)
+            and presentation.action in _REVIEW_ACTION_LABELS
+        ):
             self.review_requested.emit(str(index.data(JOB_ID_ROLE)), index.data(STAGE_KIND_ROLE))
             return
         if isinstance(presentation, CellPresentation) and presentation.action == "Revisar con IA":
@@ -1237,7 +1389,12 @@ class JobTableView(QTableView):
         else:
             targeted_review = None
         if job.status is JobStatus.WAITING_REVIEW:
-            review = menu.addAction("Revisar")
+            review_label = (
+                "Revisar y publicar"
+                if job.configuration.output.format is DocumentFormat.EPUB
+                else "Revisar cambios"
+            )
+            review = menu.addAction(review_label)
             menu.addSeparator()
         elif job.status in {JobStatus.QUEUED, JobStatus.FAILED, JobStatus.CANCELLED}:
             if job.status is JobStatus.FAILED:
@@ -1286,7 +1443,8 @@ class JobTableView(QTableView):
         return bool(index.data(CONFIGURABLE_ROLE)) or (
             isinstance(presentation, CellPresentation)
             and presentation.action
-            in {"Revisar", "Revisar con IA", "Ver error", "Abrir resultado", "Configurar"}
+            in _REVIEW_ACTION_LABELS
+            | {"Revisar con IA", "Ver error", "Abrir resultado", "Configurar"}
         )
 
     def _resize_columns(self) -> None:
@@ -1312,10 +1470,10 @@ class JobTableView(QTableView):
         }
         semantic_available = available - sum(utility_widths.values())
         weights = {
-            JobColumn.DOCUMENT: 33,
-            JobColumn.FLOW: 29,
-            JobColumn.RESULT: 16,
-            JobColumn.NEXT_STEP: 22,
+            JobColumn.DOCUMENT: 31,
+            JobColumn.FLOW: 36,
+            JobColumn.RESULT: 14,
+            JobColumn.NEXT_STEP: 19,
         }
         total = sum(weights.values())
         used = 0

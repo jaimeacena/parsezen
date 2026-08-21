@@ -72,7 +72,7 @@ def recommend_targeted_review(result: ProcessResult) -> ReviewRecommendation | N
             selected.update(review_indexes[block.position] for block in page_blocks)
             counts[ReviewSignal.CONVERSION_DAMAGE] += len(issue_pages)
 
-    translation_report = result.translation_quality_report
+    translation_report = result.translation_quality_for_review
     if translation_report is not None:
         relevant_issues = tuple(
             issue for issue in translation_report.issues if issue.kind in _TRANSLATION_REVIEW_KINDS

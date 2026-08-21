@@ -104,6 +104,7 @@ def publish_transformed_document(
     semantic_document = prepared.semantic_document
     transformed_markdown = transformed.transformed_markdown
     translation_quality_report = transformed.translation_quality_report
+    review_translation_quality_report = transformed.review_translation_quality_report
     linguistic_review_coverage = transformed.linguistic_review_coverage
     preserved_translation_chunks = transformed.preserved_translation_chunks
     revision_draft = transformed.revision_draft
@@ -194,6 +195,7 @@ def publish_transformed_document(
             pdf_quality_report=pdf_quality_report,
             exhaustive_pdf_ocr_used=request.force_pdf_ocr,
             translation_quality_report=translation_quality_report,
+            review_translation_quality_report=review_translation_quality_report,
             linguistic_review_coverage=linguistic_review_coverage,
             preserved_translation_chunks=tuple(preserved_translation_chunks),
             preserved_images=built_epub.resource_count,
@@ -262,6 +264,7 @@ def publish_transformed_document(
             pdf_quality_report=pdf_quality_report,
             exhaustive_pdf_ocr_used=request.force_pdf_ocr,
             translation_quality_report=translation_quality_report,
+            review_translation_quality_report=review_translation_quality_report,
             linguistic_review_coverage=linguistic_review_coverage,
             preserved_translation_chunks=tuple(preserved_translation_chunks),
             preserved_images=len(converted_resources),

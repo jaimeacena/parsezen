@@ -1,7 +1,7 @@
 from datetime import UTC, datetime
 from pathlib import Path
 
-from PySide6.QtCore import QBuffer, QByteArray, QIODevice, Qt
+from PySide6.QtCore import QBuffer, QByteArray, QIODevice, QSize, Qt
 from PySide6.QtGui import QColor, QPixmap
 from PySide6.QtWidgets import QMessageBox, QSplitter
 
@@ -108,25 +108,53 @@ def test_phase_review_does_not_resolve_an_unmodified_recommendation_on_exit(
     assert dialog.review.units[0].choice is None
 
 
-def test_phase_review_requires_an_explicit_choice_before_next(
+def test_phase_review_selects_the_proposal_and_advances_with_next(
     qtbot,
     tmp_path: Path,
-    monkeypatch,
 ) -> None:
     store = ArtifactStore(tmp_path / "artifacts", protect=reversible, unprotect=reversible)
     dialog = PhaseReviewDialog(make_review(store), store)
     qtbot.addWidget(dialog)
-    messages: list[str] = []
-    monkeypatch.setattr(
-        QMessageBox,
-        "information",
-        lambda _parent, _title, text: messages.append(text),
-    )
+
+    assert dialog.proposed_pane.selector.isChecked()
+    assert dialog.review.units[0].choice is None
 
     dialog._next()
 
+    assert dialog.review.units[0].choice is ReviewChoice.PROPOSED
+
+
+def test_phase_review_defaults_to_the_safe_original_recommendation(
+    qtbot,
+    tmp_path: Path,
+) -> None:
+    store = ArtifactStore(tmp_path / "artifacts", protect=reversible, unprotect=reversible)
+    original = store.put_text(job_id="job", text="Resultado actual")
+    proposed = store.put_text(job_id="job", text="Propuesta arriesgada")
+    review = ReviewSession.create(
+        job_id="job",
+        stage=StageKind.REFINE,
+        kind=ReviewKind.REFINEMENT,
+        input_artifact_id=original.id,
+        input_version=1,
+        units=(
+            ReviewUnit(
+                "unit",
+                original.id,
+                proposed.id,
+                recommended_choice=ReviewChoice.ORIGINAL,
+            ),
+        ),
+    )
+    dialog = PhaseReviewDialog(review, store)
+    qtbot.addWidget(dialog)
+
+    assert dialog.original_pane.selector.isChecked()
     assert dialog.review.units[0].choice is None
-    assert messages == ["Elige una versión o indica que no hay texto que añadir para continuar."]
+
+    dialog._next()
+
+    assert dialog.review.units[0].choice is ReviewChoice.ORIGINAL
 
 
 def test_single_common_case_keeps_only_essential_context_and_actions(qtbot, tmp_path: Path) -> None:
@@ -320,17 +348,14 @@ def test_phase_review_defaults_to_proposal_and_navigates_restores(
     )
     dialog = PhaseReviewDialog(review, store)
     qtbot.addWidget(dialog)
-    assert not dialog.proposed_pane.selector.isChecked()
-    dialog.proposed_pane.selector.setChecked(True)
+    assert dialog.proposed_pane.selector.isChecked()
     dialog._next()
     assert dialog._index == 1
-    assert not dialog.proposed_pane.selector.isChecked()
-    dialog.proposed_pane.selector.setChecked(True)
+    assert dialog.proposed_pane.selector.isChecked()
     dialog._previous()
     dialog.original_pane.selector.setChecked(True)
     dialog._next()
     assert dialog._index == 1
-    dialog.proposed_pane.selector.setChecked(True)
     dialog._previous()
     assert dialog._index == 0
     dialog._next()
@@ -485,7 +510,7 @@ def test_phase_review_preserves_risky_originals_in_the_safe_bulk_action(
     dialog = PhaseReviewDialog(review, store)
     qtbot.addWidget(dialog)
 
-    assert not dialog.original_pane.selector.isChecked()
+    assert dialog.original_pane.selector.isChecked()
     assert dialog.unit_warning.text() == "La propuesta elimina contenido."
     assert dialog.approve_all_button.text() == "Aplicar seguras"
     dialog._approve_all()
@@ -588,12 +613,14 @@ def test_phase_review_progress_is_proportional_and_controls_are_explicit(
     assert dialog.findChild(QSplitter).handleWidth() == 1
     assert dialog.original_pane.locate_button.isHidden()
     assert dialog.original_pane.more_button.isVisible()
-    assert {action.text() for action in dialog.original_pane.more_menu.actions()} == {
-        "Ir al inicio"
-    }
+    assert {
+        action.text() for action in dialog.original_pane.more_menu.actions() if action.isVisible()
+    } == {"Ir al inicio"}
     assert dialog.proposed_pane.restore_button is not None
     assert dialog.proposed_pane.restore_button.text() == "Restaurar propuesta"
-    assert {action.text() for action in dialog.proposed_pane.more_menu.actions()} == {
+    assert {
+        action.text() for action in dialog.proposed_pane.more_menu.actions() if action.isVisible()
+    } == {
         "Ir al inicio",
         "Restaurar propuesta",
     }
@@ -667,8 +694,72 @@ def test_review_pane_displays_binary_page_images(qtbot, tmp_path: Path) -> None:
     assert dialog.original_pane.editor.isHidden()
     assert "idioma final" in dialog.instruction_label.text()
     assert "solo sirve como referencia" in dialog.instruction_label.text()
-    assert not dialog.proposed_pane.selector.isChecked()
+    assert dialog.proposed_pane.selector.isChecked()
     assert dialog.proposed_pane.no_text_button is not None
+
+
+def test_original_page_preview_fits_the_pane_and_keeps_actual_size_available(
+    qtbot,
+    tmp_path: Path,
+) -> None:
+    store = ArtifactStore(tmp_path / "artifacts", protect=reversible, unprotect=reversible)
+    pixmap = QPixmap(1800, 2600)
+    pixmap.fill(QColor("white"))
+    payload = QByteArray()
+    buffer = QBuffer(payload)
+    buffer.open(QIODevice.OpenModeFlag.WriteOnly)
+    assert pixmap.save(buffer, "PNG")
+    image = store.put(job_id="job", payload=bytes(payload), media_type="image/png")
+    text = store.put_text(job_id="job", text="Recognized text")
+    review = ReviewSession.create(
+        job_id="job",
+        stage=StageKind.PREPARE,
+        kind=ReviewKind.OCR,
+        input_artifact_id=text.id,
+        input_version=1,
+        units=(ReviewUnit("page", image.id, text.id, original_selectable=False),),
+    )
+    dialog = PhaseReviewDialog(review, store)
+    qtbot.addWidget(dialog)
+    dialog.resize(1100, 700)
+    dialog.show()
+    qtbot.waitExposed(dialog)
+    qtbot.waitUntil(
+        lambda: (
+            dialog.original_pane.image.pixmap() is not None
+            and dialog.original_pane.image.pixmap().size() != QSize(1800, 2600)
+        )
+    )
+
+    pane = dialog.original_pane
+    viewport = pane.image_scroll.viewport().size()
+    fitted = pane.image.pixmap()
+    assert fitted is not None
+    assert fitted.width() <= viewport.width()
+    assert fitted.height() <= viewport.height()
+    assert pane.image_scroll.horizontalScrollBarPolicy() == Qt.ScrollBarAlwaysOff
+    assert pane.image_scroll.verticalScrollBarPolicy() == Qt.ScrollBarAlwaysOff
+    assert pane.image_size_action.text() == "Ver tamaño real"
+
+    pane.image_size_action.setChecked(True)
+
+    actual = pane.image.pixmap()
+    assert actual is not None
+    assert actual.size() == QSize(1800, 2600)
+    assert pane.image_scroll.horizontalScrollBarPolicy() == Qt.ScrollBarAsNeeded
+    assert pane.image_scroll.verticalScrollBarPolicy() == Qt.ScrollBarAsNeeded
+    assert pane.image_size_action.text() == "Encajar página"
+
+    pane.image_size_action.setChecked(False)
+    dialog.resize(760, 700)
+    qtbot.waitUntil(
+        lambda: (
+            pane.image.pixmap() is not None
+            and pane.image.pixmap().width() <= pane.image_scroll.viewport().width()
+        )
+    )
+    assert pane.image.pixmap() is not None
+    assert pane.image.pixmap().height() <= pane.image_scroll.viewport().height()
 
 
 def test_phase_review_stacks_panes_and_actions_on_compact_width(

@@ -15,7 +15,8 @@ Al añadir un documento, **Salida** abre una página breve dentro de la aplicaci
 **EPUB** se eligen con dos tarjetas visuales; **Revisión automática con IA** usa un interruptor. **Traducir** y,
 para PDF, **Páginas** y **OCR** mantienen el patrón `Etiqueta — Valor actual — ›`. No hay secciones
 avanzadas, pie de botones ni scroll en el tamaño normal. Cuando hay traducción, una única línea tras
-la última opción resume su recorrido y coste aproximado; no se presenta como ayuda de **Glosario**.
+la interfaz mantiene los detalles de funcionamiento en la ayuda contextual, sin añadir un resumen
+técnico permanente bajo las opciones.
 
 **Traducir** parte en **No traducir**. Al elegir un idioma aparecen dos filas idénticas:
 **Traductor** —Argos o IA local— y **Glosario**. La revisión automática con IA parte activada en los
@@ -29,9 +30,9 @@ texto completo y, si el resultado es EPUB, también su estructura. No se pueden 
 y estructura por separado.
 
 En **Flujo**, `→` separa fases y `y` une acciones realizadas en la misma pasada. La IA traduce,
-corrige, verifica u organiza; `Tu revisión` se reserva para una decisión humana. Un EPUB siempre
-muestra `Tu revisión antes de publicar`; otros resultados solo anticipan `Tu revisión si hay cambios`
-cuando la configuración puede producir propuestas.
+corrige, verifica u organiza; `Tu revisión` se reserva para una decisión humana y forma parte de la
+misma secuencia. Un EPUB termina siempre en `Tu revisión final`; otros resultados solo incluyen
+`Tu revisión si hay cambios` cuando la configuración puede producir propuestas.
 
 Cada acción se encuentra en la celda a la que pertenece: configurar el flujo o la salida, revisar,
 ver un error o abrir el archivo. La pantalla principal no añade un inspector lateral ni repite la
@@ -141,6 +142,10 @@ claramente a un tercer idioma y el modelo lo deforma, Parsezen recupera automát
 original sin deshacer su nivel. Si un mismo término aparece traducido de formas parecidas pero
 incompatibles, lo muestra en la revisión en lugar de elegir una por semejanza.
 
+Las descripciones visibles de las imágenes también se traducen. La ruta privada y el papel de cada
+recurso permanecen protegidos, por lo que cambiar `Cover` por `Portada` no puede romper ni sustituir
+la imagen del libro.
+
 Si una corrección parcial deja repetido el complemento de un título, Parsezen revisa de nuevo solo
 esa línea completa y conserva la versión anterior cuando la alternativa no supera todos los
 controles. No amplía esa reparación al autor ni a los párrafos contiguos.
@@ -243,14 +248,17 @@ documento` cuando vuelves a revisarlo.
 En PDFs de 120 páginas o más —o desde 60 cuando el flujo incluye OCR forzado, IA local o EPUB—,
 Parsezen examina hasta nueve candidatos baratos y elige como máximo cinco páginas distintas: inicio,
 final y ejemplos de contenido denso, visual o tabular. La muestra pasa por el mismo flujo real,
-incluidas las transformaciones activadas, y sus salidas temporales se eliminan. Si una señal
+pero evita el trabajo final redundante: convierte las cinco páginas, no construye el EPUB ni ejecuta
+la revisión o reestructuración definitiva y prueba la traducción como máximo en tres posiciones
+distribuidas. Sus salidas temporales se eliminan. Si una señal
 material se repite en varias páginas, el trabajo completo no comienza y la fila explica qué
 configuración conviene revisar. Si la muestra es segura, continúa automáticamente. La extracción y
 el OCR válidos se reutilizan al procesar el documento completo; cambiar el archivo o su
 configuración obliga a comprobarlo otra vez.
 
 La fila activa conserva el documento, la fase y el progreso medible. Tras diez segundos con progreso
-cuantificable, el tiempo restante puede ajustarse al ritmo real de esa fase. Su ayuda explica si solo
+cuantificable, el tiempo restante puede ajustarse al ritmo real de esa fase y se resume como
+`Quedan ~3–12 min` o `Queda <1 min`. Su ayuda explica si solo
 se descontó el tiempo transcurrido o si la observación amplió el intervalo. Si se supera el máximo
 inicial, muestra `Más tiempo del previsto` en lugar de fingir una precisión que ya no existe.
 
@@ -299,7 +307,9 @@ forma inmediata.
 **Ajustes → Actividad reciente** conserva como máximo 20 intentos terminados o fallidos para poder
 volver a abrir su resumen, resultado o carpeta. Es una lista privada y acotada, no una biblioteca:
 guarda rutas, estado, fecha y conteos técnicos, pero no texto documental. `Borrar actividad` elimina
-solo ese historial; nunca elimina originales ni resultados.
+solo ese historial; nunca elimina originales ni resultados. En una ventana amplia, la lista queda a
+la izquierda y el detalle seleccionado a la derecha; en una ventana estrecha ambos paneles se apilan
+sin introducir desplazamiento horizontal.
 
 Una fila fallida se identifica como `Error en preparación`, `Error en comprobación temprana`,
 `Error en traducción`, `Error en corrección`, `Error en personalización` o `Error en publicación`,
@@ -393,7 +403,10 @@ El panel izquierdo contiene la estructura y el derecho el contenido editable.
 `Guardar y salir` conserva metadatos, portada, estructura y el capítulo actual en el borrador cifrado
 para reanudar después. `Descartar cambios` es una acción destructiva secundaria y pide confirmación
 si hay cambios. `Generar EPUB definitivo` valida y publica el archivo antes de mostrarlo como
-completado.
+completado. Cuando editas un EPUB de origen, Parsezen conserva el paquete exacto si no cambias nada;
+si solo modificas el texto de capítulos, mantiene byte por byte su navegación, estilos, fuentes,
+imágenes y demás recursos. Los cambios estructurales o de metadatos usan la reconstrucción EPUB
+normalizada.
 
 El editor no aparece por defecto: solo se abre si lo solicitas desde la confirmación o si una
 condición bloqueante necesita revisión avanzada. El documento solo cambia a `Completado` cuando el
@@ -467,11 +480,22 @@ nativa puede corregir un único término corto introducido por OCR, pero solo si
 inequívoca; si existen variantes, la aplicación mantiene el texto reconocido para revisión.
 
 En los índices, Parsezen reconoce una columna derecha de folios y vuelve a unir cada número con la
-entrada situada en la misma fila. Las entradas se publican como una lista legible y conservan el
-orden de sus columnas, en lugar de agrupar primero todos los títulos y después todos los números.
+entrada situada en la misma fila. Las entradas se publican con título y folio en columnas alineadas,
+conservan sangría, negrita, cursiva y enlaces internos, y mantienen el orden de origen en lugar de
+agrupar primero todos los títulos y después todos los números. También reconoce folios de cuatro
+cifras en libros largos. Si el texto nativo pega dos palabras o confunde un carácter de un folio,
+solo aplica el espacio o la cifra que corroboren la fila visual, sus números vecinos y el OCR local;
+una lectura ambigua permanece visible para revisión.
 Durante la traducción y la corrección, cada folio sigue unido al final de su entrada y una propuesta
 que lo desplace se descarta sin perder las demás correcciones seguras. Los rótulos internos que no
 tienen página propia aparecen separados de la entrada anterior.
+
+Cuando una página con capa de texto también contiene una imagen completa y presenta señales de riesgo
+—por ejemplo, un índice, fórmulas o glifos extraños—, Parsezen puede contrastarla localmente con OCR y
+un segundo extractor. Si una región breve sigue siendo ambigua y tienes instalado un modelo visual
+compatible de tamaño estándar en Ollama, lo usa como árbitro solo para ese pequeño recorte. La capa
+nativa sigue teniendo prioridad y ninguna página ni documento se envía fuera del ordenador. Sin un
+modelo visual compatible, el flujo continúa normalmente y mantiene el caso dudoso para revisión.
 
 ### El EPUB no abre
 

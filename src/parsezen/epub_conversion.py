@@ -8,7 +8,7 @@ import re
 import unicodedata
 from collections import Counter
 from collections.abc import Callable, Iterator
-from copy import copy
+from copy import copy, deepcopy
 from dataclasses import dataclass
 from difflib import SequenceMatcher
 from io import BytesIO
@@ -185,11 +185,30 @@ class EpubPackageMetadata:
 
 
 @dataclass(frozen=True, slots=True)
+class EpubEditableChapter:
+    """One real spine document retained for package-preserving local editing."""
+
+    archive_path: str
+    title: str
+    xhtml: bytes
+
+
+@dataclass(frozen=True, slots=True)
+class EpubEditablePackage:
+    """Bounded editable view plus the exact source package bytes."""
+
+    content: bytes
+    metadata: EpubPackageMetadata
+    chapters: tuple[EpubEditableChapter, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class _EpubTranslationUnit:
     archive_path: str
     element_path: tuple[int, ...]
     source: str
     attribute: str | None = None
+    text_slot: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -296,6 +315,147 @@ def inspect_epub_package(source_path: Path) -> EpubPackageMetadata:
         publisher=metadata.publisher,
         publication_date=metadata.date,
     )
+
+
+def read_editable_epub_package(
+    source_path: Path,
+    *,
+    cancellation: CancellationToken | None = None,
+) -> EpubEditablePackage:
+    """Read exact package bytes and one bounded editable record per real spine document."""
+
+    check_cancelled(cancellation)
+    _validate_epub_container(source_path)
+    try:
+        content = source_path.read_bytes()
+        with ZipFile(BytesIO(content)) as archive:
+            members = _validate_archive_limits(archive, source_path.name)
+            opf_path = _read_rootfile_path(archive, members, source_path.name)
+            opf_root = _parse_xml_member(archive, members, opf_path, "el paquete EPUB")
+            manifest = _read_manifest(opf_root, opf_path)
+            _validate_epub_encryption(archive, members, manifest)
+            spine_ids, toc_id = _read_spine(opf_root)
+            documents = _read_spine_documents(
+                archive,
+                members,
+                manifest,
+                spine_ids,
+                source_path.name,
+                cancellation,
+            )
+            navigation = _read_navigation(
+                archive,
+                members,
+                manifest,
+                toc_id,
+                documents,
+            )
+            labels = {
+                entry.path: entry.label
+                for entry in navigation
+                if entry.path and entry.label and not entry.fragment
+            }
+            chapters = tuple(
+                EpubEditableChapter(
+                    document.path,
+                    labels.get(document.path)
+                    or _document_title(document.root)
+                    or PurePosixPath(document.path).stem,
+                    archive.read(members[document.path]),
+                )
+                for document in documents
+            )
+            metadata = _read_metadata(opf_root)
+            cover = _cover_manifest_item(metadata, manifest)
+    except (BadZipFile, OSError) as exc:
+        raise ConversionError(f"No se pudo abrir el EPUB {source_path.name}.") from exc
+    return EpubEditablePackage(
+        content=content,
+        metadata=EpubPackageMetadata(
+            title=metadata.title,
+            authors=metadata.authors,
+            language=metadata.language,
+            identifier=metadata.identifier,
+            cover_path=PurePosixPath(cover.path) if cover is not None else None,
+            identifiers=metadata.identifiers,
+            publisher=metadata.publisher,
+            publication_date=metadata.date,
+        ),
+        chapters=chapters,
+    )
+
+
+def patch_epub_xhtml_package(
+    content: bytes,
+    replacements: dict[str, bytes],
+    *,
+    cancellation: CancellationToken | None = None,
+) -> bytes:
+    """Replace edited spine bodies while preserving every other package member byte-for-byte."""
+
+    if not replacements:
+        return content
+    check_cancelled(cancellation)
+    try:
+        with ZipFile(BytesIO(content)) as archive:
+            members = _validate_archive_limits(archive, "el EPUB editable")
+            opf_path = _read_rootfile_path(archive, members, "el EPUB editable")
+            opf_root = _parse_xml_member(archive, members, opf_path, "el paquete EPUB")
+            manifest = _read_manifest(opf_root, opf_path)
+            spine_ids, _toc_id = _read_spine(opf_root)
+            editable_paths = {
+                manifest[item_id].path
+                for item_id in spine_ids
+                if item_id in manifest and _is_html_item(manifest[item_id])
+            }
+            normalized_replacements = {
+                _normalize_archive_path(path): payload for path, payload in replacements.items()
+            }
+            if (
+                len(normalized_replacements) != len(replacements)
+                or not normalized_replacements.keys() <= editable_paths
+            ):
+                raise ConversionError("La edición no coincide con capítulos reales del EPUB.")
+            merged = {
+                path: _merge_edited_epub_body(
+                    archive.read(members[path]),
+                    payload,
+                )
+                for path, payload in normalized_replacements.items()
+            }
+            rebuilt, _preserved = _rebuild_epub(
+                archive,
+                members,
+                merged,
+                cancellation,
+            )
+    except (BadZipFile, OSError) as exc:
+        raise ConversionError("No se pudo aplicar la edición al paquete EPUB.") from exc
+    return rebuilt
+
+
+def _merge_edited_epub_body(original: bytes, edited: bytes) -> bytes:
+    try:
+        original_root = _parse_xml_payload(original)
+        edited_root = _parse_xml_payload(edited)
+    except (XmlElementTree.ParseError, DefusedXmlException) as exc:
+        raise ConversionError("La edición produjo XHTML no válido.") from exc
+    original_body = next(
+        (element for element in original_root.iter() if _local_name(element) == "body"),
+        None,
+    )
+    edited_body = next(
+        (element for element in edited_root.iter() if _local_name(element) == "body"),
+        None,
+    )
+    if original_body is None or edited_body is None:
+        raise ConversionError("La edición no contiene un cuerpo XHTML válido.")
+    original_body.text = edited_body.text
+    for child in tuple(original_body):
+        original_body.remove(child)
+    for child in edited_body:
+        original_body.append(deepcopy(child))
+    return _serialize_xml_document(original_root, original)
 
 
 def replace_epub_metadata(
@@ -514,12 +674,28 @@ def _collect_epub_translation_units(
             allowed_elements = frozenset({"text"})
         else:
             allowed_elements = _TRANSLATABLE_BLOCKS
-        for element_path, element in _select_translation_elements(root, allowed_elements):
+        translate_all_safe_text = (
+            archive_path != opf_path
+            and media_types.get(archive_path) not in _NAVIGATION_MEDIA_TYPES
+        )
+        for element_path, element, text_slot in _select_translation_elements(
+            root,
+            allowed_elements,
+            translate_all_safe_text=translate_all_safe_text,
+        ):
+            source = (
+                _translation_text_wrapper(
+                    element.text if text_slot == "text" else element.tail or ""
+                )
+                if text_slot is not None
+                else _serialize_xml_element(element)
+            )
             units.append(
                 _EpubTranslationUnit(
                     archive_path,
                     element_path,
-                    _serialize_xml_element(element),
+                    source,
+                    text_slot=text_slot,
                 )
             )
         if archive_path == opf_path or media_types.get(archive_path) in _NAVIGATION_MEDIA_TYPES:
@@ -608,27 +784,58 @@ def _epub_unit_is_fully_emphasized(value: str) -> bool:
 def _select_translation_elements(
     root: XmlElementTree.Element,
     allowed_elements: frozenset[str],
-) -> Iterator[tuple[tuple[int, ...], XmlElementTree.Element]]:
+    *,
+    translate_all_safe_text: bool = False,
+) -> Iterator[tuple[tuple[int, ...], XmlElementTree.Element, str | None]]:
     def visit(
         element: XmlElementTree.Element,
         path: tuple[int, ...],
-    ) -> Iterator[tuple[tuple[int, ...], XmlElementTree.Element]]:
+        *,
+        translate_direct_text: bool,
+    ) -> Iterator[tuple[tuple[int, ...], XmlElementTree.Element, str | None]]:
+        if not isinstance(element.tag, str):
+            return
         name = _local_name(element).casefold()
+        if name in _UNSAFE_TRANSLATION_CONTENT:
+            return
         contains_unsafe_content = any(
             _local_name(descendant).casefold() in _UNSAFE_TRANSLATION_CONTENT
             for descendant in element.iter()
         )
-        if (
-            (name in allowed_elements or _is_fallback_translation_element(element, name))
-            and any(character.isalpha() for character in _element_text(element))
-            and not contains_unsafe_content
-        ):
-            yield path, element
+        is_translation_container = name in allowed_elements or _is_fallback_translation_element(
+            element,
+            name,
+        )
+        contains_letters = any(character.isalpha() for character in _element_text(element))
+        if is_translation_container and contains_letters and not contains_unsafe_content:
+            yield path, element, None
             return
+        translate_descendant_text = translate_direct_text or (
+            is_translation_container and contains_letters
+        )
+        if translate_descendant_text and _contains_alphabetic_text(element.text):
+            yield path, element, "text"
         for index, child in enumerate(element):
-            yield from visit(child, (*path, index))
+            child_path = (*path, index)
+            yield from visit(
+                child,
+                child_path,
+                translate_direct_text=translate_descendant_text,
+            )
+            if translate_descendant_text and _contains_alphabetic_text(child.tail):
+                yield child_path, child, "tail"
 
-    yield from visit(root, ())
+    yield from visit(root, (), translate_direct_text=translate_all_safe_text)
+
+
+def _contains_alphabetic_text(value: str | None) -> bool:
+    return bool(value) and any(character.isalpha() for character in value)
+
+
+def _translation_text_wrapper(value: str) -> str:
+    wrapper = XmlElementTree.Element("span")
+    wrapper.text = value
+    return XmlElementTree.tostring(wrapper, encoding="unicode")
 
 
 def _is_fallback_translation_element(
@@ -1248,13 +1455,13 @@ def _apply_epub_translations(
 ) -> set[str]:
     changed_paths: set[str] = set()
     element_replacements: list[tuple[_EpubTranslationUnit, XmlElementTree.Element]] = []
-    attribute_replacements: list[tuple[_EpubTranslationUnit, str]] = []
+    text_replacements: list[tuple[_EpubTranslationUnit, str]] = []
     for unit, translated in zip(units, translated_values, strict=True):
         parsed, translated_text = _parse_epub_translation(unit, translated)
         if translated_text is None:
             element_replacements.append((unit, parsed))
         else:
-            attribute_replacements.append((unit, translated_text))
+            text_replacements.append((unit, translated_text))
 
     for unit, replacement in element_replacements:
         root = roots[unit.archive_path]
@@ -1267,12 +1474,19 @@ def _apply_epub_translations(
         parent.remove(original)
         parent.insert(index, replacement)
         changed_paths.add(unit.archive_path)
-    for unit, translated_text in attribute_replacements:
+    for unit, translated_text in text_replacements:
         root = roots[unit.archive_path]
         element = _element_at_path(root, unit.element_path)
-        if unit.attribute is None or unit.attribute not in element.attrib:
-            raise ConversionError("No se pudo restaurar un atributo traducido del EPUB.")
-        element.attrib[unit.attribute] = translated_text
+        if unit.attribute is not None:
+            if unit.attribute not in element.attrib:
+                raise ConversionError("No se pudo restaurar un atributo traducido del EPUB.")
+            element.attrib[unit.attribute] = translated_text
+        elif unit.text_slot == "text":
+            element.text = _restore_text_slot_whitespace(element.text or "", translated_text)
+        elif unit.text_slot == "tail":
+            element.tail = _restore_text_slot_whitespace(element.tail or "", translated_text)
+        else:
+            raise ConversionError("No se pudo restaurar un texto traducido del EPUB.")
         changed_paths.add(unit.archive_path)
     return changed_paths
 
@@ -1285,7 +1499,7 @@ def _parse_epub_translation(
         parsed = _parse_xml_payload(translated.encode("utf-8"))
     except (XmlElementTree.ParseError, DefusedXmlException) as exc:
         raise ConversionError("La traducción produjo XHTML no válido.") from exc
-    if unit.attribute is None:
+    if unit.attribute is None and unit.text_slot is None:
         source_element = _parse_xml_payload(unit.source.encode("utf-8"))
         if _document_structure_signature(parsed) != _document_structure_signature(source_element):
             raise ConversionError("La traducción cambió la estructura interna de una parte.")
@@ -1295,14 +1509,24 @@ def _parse_epub_translation(
         )
         return parsed, None
     if _local_name(parsed) != "span" or len(parsed):
-        raise ConversionError("La traducción cambió un texto alternativo de imagen.")
+        raise ConversionError("La traducción cambió un texto aislado del EPUB.")
     source_element = _parse_xml_payload(unit.source.encode("utf-8"))
     source_text = _element_text(source_element)
     translated_text = _element_text(parsed)
     if not translated_text:
-        raise ConversionError("La traducción dejó vacío un texto alternativo de imagen.")
+        raise ConversionError("La traducción dejó vacío un texto aislado del EPUB.")
     _validate_epub_conserved_text(source_text, translated_text)
     return parsed, translated_text
+
+
+def _restore_text_slot_whitespace(source: str, translated: str) -> str:
+    """Keep exact XHTML boundary whitespace around one independently translated text node."""
+
+    leading_length = len(source) - len(source.lstrip())
+    trailing_length = len(source) - len(source.rstrip())
+    leading = source[:leading_length]
+    trailing = source[len(source) - trailing_length :] if trailing_length else ""
+    return f"{leading}{translated.strip()}{trailing}"
 
 
 def _validate_epub_conserved_text(source: str, translated: str) -> None:

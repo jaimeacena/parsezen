@@ -10,7 +10,7 @@ from hashlib import sha256
 from html import escape
 from io import BytesIO
 from pathlib import Path, PurePosixPath
-from typing import cast
+from typing import Any, cast
 from urllib.parse import quote, unquote, urlsplit
 from uuid import UUID, uuid4
 from zipfile import ZIP_DEFLATED, ZIP_STORED, BadZipFile, ZipFile, ZipInfo
@@ -46,8 +46,8 @@ _RESOURCE_PATTERN = re.compile(
     re.escape(RESOURCE_REFERENCE_PREFIX) + r"([^\s)>'\"]+)",
 )
 _RENDERED_IMAGE_SOURCE_PATTERN = re.compile(r'<img\b[^>]*\bsrc="([^"]+)"', re.IGNORECASE)
-_RENDERED_INTERNAL_LINK_PATTERN = re.compile(
-    r'<a\b(?P<before>[^>]*?)\bhref="#(?P<anchor>[A-Za-z][A-Za-z0-9._:-]{0,127})"'
+_RENDERED_LINK_PATTERN = re.compile(
+    r'<a\b(?P<before>[^>]*?)\bhref="(?P<href>[^"]*)"'
     r"(?P<after>[^>]*)>(?P<label>.*?)</a>",
     re.IGNORECASE | re.DOTALL,
 )
@@ -58,8 +58,13 @@ _NUMERIC_REFERENCE_LIST_PATTERN = re.compile(
     r"(?P<space>[ \t]+)(?P<references>[^\r\n]*)$"
 )
 _NUMERIC_REFERENCE_TOKEN_PATTERN = re.compile(r"\d+(?:[.,:/-]\d+)*")
-_RAW_TABLE_BLOCK_PATTERN = re.compile(r"<table>.*?</table>", re.IGNORECASE | re.DOTALL)
-_SAFE_TABLE_TAGS = frozenset({"table", "thead", "tbody", "tr", "th", "td", "br"})
+_RAW_TABLE_BLOCK_PATTERN = re.compile(
+    r"<table(?:\s+[^>]*)?>.*?</table>",
+    re.IGNORECASE | re.DOTALL,
+)
+_SAFE_TABLE_TAGS = frozenset(
+    {"table", "thead", "tbody", "tr", "th", "td", "br", "strong", "em", "a"}
+)
 _MAX_CHAPTER_CHARACTERS = 120_000
 _MIN_CHAPTER_CHARACTERS = 1_500
 _MIN_STRONG_CHAPTER_CHARACTERS = 240
@@ -415,7 +420,7 @@ def _normalized_resources(
             raise ConversionError("El EPUB contiene un formato de imagen no compatible.")
         key = path.as_posix()
         previous = normalized.get(key)
-        if previous is not None and previous.content != resource.content:
+        if previous is not None and previous.read_content() != resource.read_content():
             raise ConversionError("Dos imágenes del EPUB intentan usar el mismo nombre.")
         normalized[key] = resource
     return normalized
@@ -724,7 +729,7 @@ def _protect_safe_table_blocks(markdown: str) -> tuple[str, tuple[tuple[str, str
 
 
 def _safe_table_xhtml(value: str) -> str | None:
-    """Return normalized XHTML for a strict, attribute-free generated table fragment."""
+    """Return normalized XHTML for a strict generated table fragment."""
 
     normalized = re.sub(r"<br\s*/?>", "<br />", value, flags=re.IGNORECASE)
     try:
@@ -735,7 +740,7 @@ def _safe_table_xhtml(value: str) -> str | None:
     if (
         root.tag.casefold() != "table"
         or any(element.tag.casefold() not in _SAFE_TABLE_TAGS for element in elements)
-        or any(element.attrib for element in elements)
+        or any(not _safe_table_attributes(element) for element in elements)
         or (root.text or "").strip()
     ):
         return None
@@ -765,16 +770,43 @@ def _safe_table_xhtml(value: str) -> str | None:
         for element in (*children, *header_rows, *body_rows, *header_cells, *cells)
     ):
         return None
-    if any(
-        child.tag.casefold() != "br" or child.attrib or len(child)
-        for cell in cells
-        for child in cell
-    ):
+    if any(not _safe_table_cell_content(cell) for cell in cells):
         return None
     return cast(
         str,
         SafeElementTree.tostring(root, encoding="unicode", short_empty_elements=True),
     )
+
+
+def _safe_table_attributes(element: object) -> bool:
+    tag = str(getattr(element, "tag", "")).casefold()
+    attributes = dict(getattr(element, "attrib", {}))
+    if not attributes:
+        return True
+    if tag == "table":
+        return attributes == {"class": "document-toc"}
+    if tag == "th":
+        return attributes.get("class") in {"toc-label", "toc-folio"} and len(attributes) == 1
+    if tag == "td":
+        css_class = attributes.get("class")
+        return (
+            css_class == "toc-folio"
+            or css_class in {f"toc-label toc-level-{level}" for level in range(3)}
+        ) and len(attributes) == 1
+    if tag == "a":
+        href = attributes.get("href", "")
+        return len(attributes) == 1 and re.fullmatch(r"#page-\d{1,6}", href) is not None
+    return False
+
+
+def _safe_table_cell_content(cell: Any) -> bool:
+    for descendant in tuple(cell.iter())[1:]:
+        tag = str(getattr(descendant, "tag", "")).casefold()
+        if tag not in {"br", "strong", "em", "a"} or not _safe_table_attributes(descendant):
+            return False
+        if tag == "br" and ((getattr(descendant, "text", None) or "").strip() or len(descendant)):
+            return False
+    return True
 
 
 def _prepare_markdown(
@@ -835,7 +867,21 @@ def _rewrite_internal_links(
     anchors_by_chapter: dict[str, str],
 ) -> str:
     def replacement(match: re.Match[str]) -> str:
-        anchor = match.group("anchor")
+        href = match.group("href")
+        try:
+            parsed = urlsplit(href)
+        except ValueError:
+            return match.group("label")
+        if parsed.scheme or parsed.netloc:
+            return match.group(0)
+        if parsed.path or parsed.query or not parsed.fragment:
+            # A generated EPUB cannot safely package arbitrary relative files.
+            # Keep the visible label from malformed or out-of-scope PDF links
+            # instead of publishing a dead interactive control.
+            return match.group("label")
+        anchor = unquote(parsed.fragment)
+        if re.fullmatch(r"[A-Za-z][A-Za-z0-9._:-]{0,127}", anchor) is None:
+            return match.group("label")
         destination = anchors_by_chapter.get(anchor)
         if destination is None:
             # A partial document can retain the label of a link whose target
@@ -849,7 +895,7 @@ def _rewrite_internal_links(
             f"{match.group('after')}>{match.group('label')}</a>"
         )
 
-    return _RENDERED_INTERNAL_LINK_PATTERN.sub(replacement, html)
+    return _RENDERED_LINK_PATTERN.sub(replacement, html)
 
 
 def _xhtml_document(title: str, body: str, language: str) -> str:
@@ -925,7 +971,7 @@ def _write_epub_archive(
             archive.writestr(f"EPUB/text/{chapter.filename}", chapter_content)
         for path, resource in resources.items():
             check_cancelled(cancellation)
-            archive.writestr(f"EPUB/images/{path}", resource.content)
+            archive.writestr(f"EPUB/images/{path}", resource.read_content())
     archive_content = buffer.getvalue()
     validate_epub_archive(archive_content)
     return archive_content
@@ -1093,6 +1139,27 @@ img { display: block; height: auto; margin: 1.2em auto; max-width: 100%; }
 .cover img { margin: 0; max-height: 90vh; }
 table { border-collapse: collapse; margin: 1em 0; width: 100%; }
 th, td { border: 1px solid #777; padding: 0.35em 0.5em; text-align: left; }
+table.document-toc { border: 0; table-layout: fixed; }
+.document-toc thead {
+  clip: rect(0 0 0 0);
+  clip-path: inset(50%);
+  height: 1px;
+  overflow: hidden;
+  position: absolute;
+  white-space: nowrap;
+  width: 1px;
+}
+.document-toc tr { break-inside: avoid; page-break-inside: avoid; }
+.document-toc th, .document-toc td { border: 0; padding: 0.16em 0; vertical-align: baseline; }
+.document-toc .toc-label { overflow-wrap: anywhere; padding-right: 0.8em; }
+.document-toc .toc-level-1 { padding-left: 1.25em; }
+.document-toc .toc-level-2 { padding-left: 2.5em; }
+.document-toc .toc-folio {
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+  white-space: nowrap;
+  width: 4.5em;
+}
 blockquote { border-left: 0.2em solid #777; margin-left: 0; padding-left: 1em; }
 pre { overflow-wrap: anywhere; white-space: pre-wrap; }
 code { font-family: monospace; }

@@ -544,6 +544,8 @@ def _book_to_json(book: BookDocument) -> dict[str, Any]:
             "xhtml_artifact_id": section.xhtml_artifact_id,
             "children": [section_json(child) for child in section.children],
             "source_filename": section.source_filename,
+            "source_archive_path": section.source_archive_path,
+            "source_xhtml_artifact_id": section.source_xhtml_artifact_id,
         }
 
     return {
@@ -569,6 +571,10 @@ def _book_to_json(book: BookDocument) -> dict[str, Any]:
         ],
         "stylesheet_artifact_ids": list(book.stylesheet_artifact_ids),
         "cover_resource_id": book.cover_resource_id,
+        "source_fingerprint": book.source_fingerprint,
+        "baseline_fingerprint": book.baseline_fingerprint,
+        "source_package_artifact_id": book.source_package_artifact_id,
+        "package_structure_fingerprint": book.package_structure_fingerprint,
     }
 
 
@@ -581,6 +587,16 @@ def _book_from_json(value: dict[str, Any]) -> BookDocument:
             children=tuple(section_from_json(child) for child in raw.get("children", ())),
             source_filename=(
                 str(raw["source_filename"]) if raw.get("source_filename") is not None else None
+            ),
+            source_archive_path=(
+                str(raw["source_archive_path"])
+                if raw.get("source_archive_path") is not None
+                else None
+            ),
+            source_xhtml_artifact_id=(
+                str(raw["source_xhtml_artifact_id"])
+                if raw.get("source_xhtml_artifact_id") is not None
+                else None
             ),
         )
 
@@ -610,6 +626,10 @@ def _book_from_json(value: dict[str, Any]) -> BookDocument:
             str(identifier) for identifier in value.get("stylesheet_artifact_ids", ())
         ),
         cover_resource_id=value.get("cover_resource_id"),
+        source_fingerprint=value.get("source_fingerprint"),
+        baseline_fingerprint=value.get("baseline_fingerprint"),
+        source_package_artifact_id=value.get("source_package_artifact_id"),
+        package_structure_fingerprint=value.get("package_structure_fingerprint"),
     )
 
 

@@ -13,6 +13,7 @@ from parsezen.domain.reviews import (
     ReviewKind,
     ReviewSession,
     ReviewSeverity,
+    ReviewStatus,
     ReviewUnit,
 )
 from parsezen.domain.stages import StageKind
@@ -26,6 +27,7 @@ _PDF_PAGE_MARKER_PATTERN = re.compile(
     re.IGNORECASE,
 )
 _TRANSLATION_REVIEW_MAX_CHARACTERS = 640
+_TRANSLATION_LENGTH_REVIEW_MAX_CHARACTERS = 4_000
 
 
 def create_translation_review(
@@ -42,6 +44,7 @@ def create_translation_review(
     units: list[ReviewUnit] = []
     occupied: list[tuple[int, int]] = []
     skipped_count = 0
+    skipped_high_severity_count = 0
     for index, issue in enumerate(report.issues, start=1):
         original_context = _readable_translation_context(issue.original_excerpt)
         translated_context = _readable_translation_context(issue.translated_excerpt)
@@ -49,9 +52,21 @@ def create_translation_review(
             document_text,
             translated_context,
             occupied=tuple(occupied),
+            expand_length_issue=issue.kind.value == "length",
         )
         if span is None:
             skipped_count += 1
+            unoccupied_span = _find_translation_span(
+                document_text,
+                translated_context,
+                occupied=(),
+                expand_length_issue=issue.kind.value == "length",
+            )
+            if (
+                unoccupied_span is None
+                and _translation_issue_severity(issue.kind.value) is ReviewSeverity.HIGH
+            ):
+                skipped_high_severity_count += 1
             continue
         occupied.append(span)
         anchored_translation = document_text[slice(*span)]
@@ -80,8 +95,14 @@ def create_translation_review(
         )
     if skipped_count:
         LOGGER.warning(
-            "translation_review_issue_not_materialized count=%d",
+            "translation_review_issue_not_materialized count=%d high=%d",
             skipped_count,
+            skipped_high_severity_count,
+        )
+    if skipped_high_severity_count:
+        raise ValueError(
+            "El informe detectó una incidencia importante, pero su fragmento ya no coincide "
+            "con el texto revisable. Se ha conservado el resultado sin aplicar decisiones."
         )
     if not units:
         return None
@@ -152,6 +173,11 @@ def create_pdf_review(
 def _reviewable_pdf_page(document_text: str, target_marker: str) -> str | None:
     """Return one exact transformed page so review edits match the final document."""
 
+    span = _pdf_page_span(document_text, target_marker)
+    return document_text[slice(*span)] if span is not None else None
+
+
+def _pdf_page_span(document_text: str, target_marker: str) -> tuple[int, int] | None:
     if not target_marker:
         return None
     marker_start = document_text.find(target_marker)
@@ -162,7 +188,7 @@ def _reviewable_pdf_page(document_text: str, target_marker: str) -> str | None:
         return None
     next_marker = _PDF_PAGE_MARKER_PATTERN.search(document_text, marker_match.end())
     page_end = next_marker.start() if next_marker is not None else len(document_text)
-    return document_text[marker_start:page_end]
+    return marker_start, page_end
 
 
 def _translation_issue_severity(kind: str) -> ReviewSeverity:
@@ -233,6 +259,101 @@ def apply_pdf_review(
     return updated
 
 
+def ensure_quality_reviews_applied(
+    text: str,
+    reviews: tuple[ReviewSession, ...],
+    artifacts: ArtifactRepository,
+) -> str:
+    """Reconcile durable human decisions after downstream draft rendering.
+
+    Quality decisions are first applied before refinement and structure review.
+    Those later phases render a new immutable revision snapshot, so a stale or
+    incomplete snapshot must never be allowed to silently discard a decision
+    that the user already confirmed. This pass is deliberately idempotent: it
+    applies a missing decision, accepts one that is already present, and blocks
+    publication when neither the reviewed nor the previous fragment can be
+    anchored safely.
+    """
+
+    reviewed_text = text
+    for review in reviews:
+        if review.status is not ReviewStatus.APPLIED or review.kind not in {
+            ReviewKind.OCR,
+            ReviewKind.TRANSLATION,
+        }:
+            continue
+        reviewed_text = _ensure_review_decisions_applied(
+            reviewed_text,
+            review,
+            artifacts,
+        )
+    return reviewed_text
+
+
+def _ensure_review_decisions_applied(
+    text: str,
+    review: ReviewSession,
+    artifacts: ArtifactRepository,
+) -> str:
+    occupied: list[tuple[int, int]] = []
+    planned: list[tuple[int, int, str]] = []
+    insertions: list[tuple[int, str]] = []
+    for unit in review.units:
+        # Accepting the generated candidate introduces no human-authored delta.
+        # Later refinement or structure choices may legitimately transform it.
+        if unit.choice is ReviewChoice.PROPOSED:
+            continue
+        proposed = (
+            artifacts.read_text(review.job_id, unit.proposed_artifact_id)
+            if unit.proposed_artifact_id is not None
+            else ""
+        )
+        selected = _selected_text(review, unit, artifacts)
+        if proposed == selected:
+            continue
+
+        if selected:
+            selected_span = _find_review_span(text, selected, occupied=tuple(occupied))
+            if selected_span is not None:
+                occupied.append(selected_span)
+                continue
+
+        if review.kind is ReviewKind.OCR and unit.target:
+            page_span = _pdf_page_span(text, unit.target)
+            if page_span is not None and not _overlaps(page_span, tuple(occupied)):
+                occupied.append(page_span)
+                planned.append((*page_span, selected or unit.target))
+                continue
+
+        if proposed:
+            proposed_span = _find_review_span(text, proposed, occupied=tuple(occupied))
+            if proposed_span is not None:
+                occupied.append(proposed_span)
+                planned.append((*proposed_span, selected))
+                continue
+        elif not selected:
+            continue
+
+        if not proposed and unit.target:
+            if not selected:
+                continue
+            target_span = _find_review_span(text, unit.target, occupied=tuple(occupied))
+            if target_span is not None:
+                occupied.append(target_span)
+                insertions.append((target_span[1], f"\n\n{selected}"))
+                continue
+        raise ValueError(
+            "Una decisión de revisión ya no coincide con el documento. "
+            "El resultado no se ha publicado."
+        )
+
+    updated = text
+    operations = [*planned, *((position, position, value) for position, value in insertions)]
+    for start, end, replacement in sorted(operations, reverse=True):
+        updated = f"{updated[:start]}{replacement}{updated[end:]}"
+    return updated
+
+
 def _selected_text(
     review: ReviewSession,
     unit: ReviewUnit,
@@ -268,16 +389,41 @@ def _find_translation_span(
     excerpt: str,
     *,
     occupied: tuple[tuple[int, int], ...] = (),
+    expand_length_issue: bool = False,
 ) -> tuple[int, int] | None:
-    """Anchor one readable fragment without expanding it to a whole page or block."""
+    """Anchor one readable fragment and expose the full suspicious expansion when needed."""
 
     prefix, truncated = _truncated_excerpt_prefix(excerpt)
     match = _find_review_span(text, prefix if truncated else excerpt, occupied=occupied)
     if match is None:
         return None
+    if expand_length_issue:
+        return _complete_translation_length_span(text, match, occupied=occupied)
     if not truncated or prefix.rstrip().endswith((".", "!", "?")):
         return match
     return _complete_translation_span(text, match, occupied=occupied)
+
+
+def _complete_translation_length_span(
+    text: str,
+    span: tuple[int, int],
+    *,
+    occupied: tuple[tuple[int, int], ...],
+) -> tuple[int, int]:
+    """Keep an excessive translation editable through its local block or PDF page."""
+
+    limit = min(len(text), span[0] + _TRANSLATION_LENGTH_REVIEW_MAX_CHARACTERS)
+    marker = _PDF_PAGE_MARKER_PATTERN.search(text, span[1], limit)
+    if marker is not None:
+        limit = marker.start()
+    elif "<!-- PZDOC PDF PAGE " not in text:
+        paragraph_end = text.find("\n\n", span[1], limit)
+        if paragraph_end >= 0:
+            limit = paragraph_end
+    while limit > span[1] and text[limit - 1].isspace():
+        limit -= 1
+    completed = (span[0], limit)
+    return span if _overlaps(completed, occupied) else completed
 
 
 def _truncated_excerpt_prefix(excerpt: str) -> tuple[str, bool]:
@@ -358,14 +504,46 @@ def _apply_review_replacements(
             continue
         span = _find_review_span(text, original, occupied=tuple(occupied))
         if span is None:
+            # An earlier review phase can legitimately replace the same source
+            # fragment (for example, OCR before translation). Treat the later
+            # decision as already applied when its exact selected text is now
+            # present, while reserving that occurrence for this unit.
+            existing = _find_review_span(
+                text,
+                replacement,
+                occupied=tuple(occupied),
+            )
+            if replacement and existing is not None:
+                occupied.append(existing)
+                continue
             raise ValueError("El fragmento revisado ya no coincide con el documento.")
         occupied.append(span)
-        planned.append((span[0], span[1], replacement))
+        planned.append(
+            (
+                span[0],
+                span[1],
+                _preserve_review_boundary_whitespace(text[slice(*span)], replacement),
+            )
+        )
 
     updated = text
     for start, end, replacement in sorted(planned, reverse=True):
         updated = f"{updated[:start]}{replacement}{updated[end:]}"
     return updated
+
+
+def _preserve_review_boundary_whitespace(original: str, replacement: str) -> str:
+    """Retain structural separators that are outside the editable natural text."""
+
+    if not replacement:
+        return replacement
+    leading = original[: len(original) - len(original.lstrip())]
+    trailing = original[len(original.rstrip()) :]
+    if leading and not replacement[0].isspace():
+        replacement = f"{leading}{replacement}"
+    if trailing and not replacement[-1].isspace():
+        replacement = f"{replacement}{trailing}"
+    return replacement
 
 
 def _find_review_span(

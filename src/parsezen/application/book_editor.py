@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+import hashlib
 import re
 from collections.abc import Callable
 from dataclasses import replace
 from html import escape
 from io import BytesIO
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 from typing import cast
 from urllib.parse import quote, unquote, urlsplit
 from uuid import UUID, uuid4
@@ -27,6 +28,7 @@ from parsezen.epub_builder import (
     chapter_filename,
     plan_epub,
 )
+from parsezen.epub_conversion import read_editable_epub_package
 from parsezen.errors import ConversionError
 
 _FORBIDDEN_ELEMENTS = frozenset({"applet", "embed", "form", "iframe", "object", "script"})
@@ -126,6 +128,12 @@ class BookEditor:
             _sanitize_html_fragment(body_html),
             self.book.metadata.language,
         )
+        current_xhtml = self.artifacts.read_text(
+            self.job_id,
+            section.xhtml_artifact_id,
+        )
+        if _xhtml_semantic_signature(normalized) == _xhtml_semantic_signature(current_xhtml):
+            return self.book
         record = self.artifacts.put_text(
             job_id=self.job_id,
             text=normalized,
@@ -287,7 +295,7 @@ def create_book_from_markdown(
     for index, resource in enumerate(resources, start=1):
         record = artifacts.put(
             job_id=job_id,
-            payload=resource.content,
+            payload=resource.read_content(),
             media_type=resource.media_type,
         )
         book_resources.append(
@@ -302,7 +310,7 @@ def create_book_from_markdown(
         tuple(sections),
         tuple(chapter.role for chapter in plan.chapters),
     )
-    return BookDocument(
+    book = BookDocument(
         metadata=BookMetadata(
             _clean_title(metadata.title),
             _clean_language(metadata.language),
@@ -324,7 +332,217 @@ def create_book_from_markdown(
             ),
             None,
         ),
+        source_fingerprint=book_source_fingerprint(markdown),
     )
+    return replace(
+        book,
+        baseline_fingerprint=book_content_fingerprint(
+            book,
+            artifacts,
+            job_id=job_id,
+        ),
+    )
+
+
+def create_book_from_epub_package(
+    source_path: Path,
+    reviewed_markdown: str,
+    resources: tuple[ConvertedResource, ...],
+    metadata: EpubBookMetadata,
+    artifacts: ArtifactRepository,
+    *,
+    job_id: str,
+) -> BookDocument:
+    """Create an editor model bound to real spine files and the exact local EPUB package."""
+
+    package = read_editable_epub_package(source_path)
+    package_record = artifacts.put(
+        job_id=job_id,
+        payload=package.content,
+        media_type="application/epub+zip",
+    )
+    sections: list[BookSection] = []
+    for index, chapter in enumerate(package.chapters, start=1):
+        parser = etree.XMLParser(resolve_entities=False, no_network=True, recover=False)
+        try:
+            root = etree.fromstring(chapter.xhtml, parser)
+        except etree.XMLSyntaxError as exc:
+            raise ConversionError("Un capítulo EPUB contiene XHTML no válido.") from exc
+        bodies = root.xpath("//*[local-name()='body']")
+        if not bodies:
+            raise ConversionError("Un capítulo EPUB no contiene cuerpo editable.")
+        body = bodies[0]
+        body_html = (body.text or "") + "".join(
+            etree.tostring(child, encoding="unicode", method="html") for child in body
+        )
+        editable_xhtml = _xhtml_document(
+            _clean_title(chapter.title),
+            _sanitize_html_fragment(body_html),
+            _clean_language(metadata.language),
+        )
+        record = artifacts.put_text(
+            job_id=job_id,
+            text=editable_xhtml,
+            media_type="application/xhtml+xml",
+        )
+        sections.append(
+            BookSection(
+                f"section-{index:04d}",
+                _clean_title(chapter.title),
+                record.id,
+                source_filename=chapter_filename(index),
+                source_archive_path=chapter.archive_path,
+                source_xhtml_artifact_id=record.id,
+            )
+        )
+    book_resources: list[BookResource] = []
+    for index, resource in enumerate(resources, start=1):
+        record = artifacts.put(
+            job_id=job_id,
+            payload=resource.read_content(),
+            media_type=resource.media_type,
+        )
+        book_resources.append(
+            BookResource(
+                f"resource-{index:04d}",
+                resource.relative_path.as_posix(),
+                resource.media_type,
+                record.id,
+            )
+        )
+    book = BookDocument(
+        metadata=BookMetadata(
+            _clean_title(metadata.title),
+            _clean_language(metadata.language),
+            _clean_optional_text(metadata.author),
+            str(uuid4()),
+            tuple(dict.fromkeys(metadata.identifiers)),
+            _clean_optional_text(metadata.publisher),
+            _clean_optional_text(metadata.publication_date),
+        ),
+        sections=tuple(sections),
+        spine=tuple(section.id for section in sections),
+        resources=tuple(book_resources),
+        cover_resource_id=next(
+            (
+                resource.id
+                for resource in book_resources
+                if metadata.cover_resource is not None
+                and resource.href == metadata.cover_resource.as_posix()
+            ),
+            None,
+        ),
+        source_fingerprint=book_source_fingerprint(reviewed_markdown),
+        source_package_artifact_id=package_record.id,
+    )
+    structure_fingerprint = book_package_structure_fingerprint(
+        book,
+        artifacts,
+        job_id=job_id,
+    )
+    return replace(
+        book,
+        baseline_fingerprint=book_content_fingerprint(book, artifacts, job_id=job_id),
+        package_structure_fingerprint=structure_fingerprint,
+    )
+
+
+def book_source_fingerprint(markdown: str) -> str:
+    """Bind a durable editor draft to the reviewed text it was built from."""
+
+    return hashlib.sha256(markdown.encode("utf-8")).hexdigest()
+
+
+def book_content_fingerprint(
+    book: BookDocument,
+    artifacts: ArtifactRepository,
+    *,
+    job_id: str,
+) -> str:
+    """Hash the complete editable book state without retaining or logging its contents."""
+
+    return _book_state_fingerprint(
+        book,
+        artifacts,
+        job_id=job_id,
+        include_section_content=True,
+    )
+
+
+def book_package_structure_fingerprint(
+    book: BookDocument,
+    artifacts: ArtifactRepository,
+    *,
+    job_id: str,
+) -> str:
+    """Hash every package-relevant edit except replaceable XHTML body content."""
+
+    return _book_state_fingerprint(
+        book,
+        artifacts,
+        job_id=job_id,
+        include_section_content=False,
+    )
+
+
+def _book_state_fingerprint(
+    book: BookDocument,
+    artifacts: ArtifactRepository,
+    *,
+    job_id: str,
+    include_section_content: bool,
+) -> str:
+
+    digest = hashlib.sha256()
+
+    def add(value: str | None) -> None:
+        payload = ("<none>" if value is None else value).encode("utf-8")
+        digest.update(len(payload).to_bytes(8, "big"))
+        digest.update(payload)
+
+    def add_artifact(identifier: str) -> None:
+        payload = artifacts.read(job_id, identifier)
+        add(hashlib.sha256(payload).hexdigest())
+
+    metadata = book.metadata
+    for value in (
+        metadata.title,
+        metadata.language,
+        metadata.author,
+        metadata.identifier,
+        *metadata.identifiers,
+        metadata.publisher,
+        metadata.publication_date,
+    ):
+        add(value)
+
+    def add_section(section: BookSection) -> None:
+        add("section")
+        add(section.id)
+        add(section.title)
+        add(section.source_filename)
+        add(section.source_archive_path)
+        add(section.source_xhtml_artifact_id)
+        if include_section_content:
+            add_artifact(section.xhtml_artifact_id)
+        for child in section.children:
+            add_section(child)
+        add("end-section")
+
+    for section in book.sections:
+        add_section(section)
+    for section_id in book.spine:
+        add(section_id)
+    for resource in book.resources:
+        add(resource.id)
+        add(resource.href)
+        add(resource.media_type)
+        add_artifact(resource.payload_artifact_id)
+    for stylesheet_id in book.stylesheet_artifact_ids:
+        add_artifact(stylesheet_id)
+    add(book.cover_resource_id)
+    add(book.source_fingerprint)
+    return digest.hexdigest()
 
 
 def publish_book(
@@ -447,6 +665,52 @@ def _body_inner_html(xhtml: str) -> str:
     return (body.text or "") + "".join(
         etree.tostring(child, encoding="unicode", method="html") for child in body
     )
+
+
+def _xhtml_semantic_signature(xhtml: str) -> tuple[object, ...]:
+    """Compare sanitized XHTML semantics without treating namespace prefixes as edits."""
+
+    parser = etree.XMLParser(resolve_entities=False, no_network=True, recover=False)
+    try:
+        root = etree.fromstring(xhtml.encode("utf-8"), parser)
+    except etree.XMLSyntaxError as exc:
+        raise ConversionError("Un capítulo editable contiene XHTML no válido.") from exc
+
+    def insignificant_layout(value: str | None, container: str) -> str | None:
+        return (
+            None
+            if value is not None
+            and not value.strip()
+            and container
+            in {
+                "html",
+                "head",
+                "body",
+            }
+            else value
+        )
+
+    def signature(
+        element: etree._Element,
+        *,
+        parent_name: str = "",
+    ) -> tuple[object, ...]:
+        tag = etree.QName(element).text if isinstance(element.tag, str) else "#comment"
+        local_name = (
+            etree.QName(element).localname.casefold() if isinstance(element.tag, str) else ""
+        )
+        attributes = tuple(
+            sorted((etree.QName(name).text, value) for name, value in element.attrib.items())
+        )
+        return (
+            tag,
+            attributes,
+            insignificant_layout(element.text, local_name),
+            tuple(signature(child, parent_name=local_name) for child in element),
+            insignificant_layout(element.tail, parent_name),
+        )
+
+    return signature(root)
 
 
 def _sanitize_html_fragment(fragment: str) -> str:

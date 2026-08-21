@@ -9,6 +9,7 @@ from parsezen.application.quality_review_adapter import (
     apply_translation_review,
     create_pdf_review,
     create_translation_review,
+    ensure_quality_reviews_applied,
 )
 from parsezen.domain.reviews import ReviewChoice, ReviewKind, ReviewSession, ReviewUnit
 from parsezen.domain.stages import StageKind
@@ -225,6 +226,75 @@ def test_translation_review_materializes_multiple_non_overlapping_long_blocks(
     } == {"first": first, "second": second}
 
 
+def test_length_review_exposes_the_suspicious_pdf_tail_without_the_next_page(
+    tmp_path: Path,
+) -> None:
+    store = ArtifactStore(tmp_path / "artifacts", protect=reversible, unprotect=reversible)
+    suspicious = (
+        "Inicio traducido fielmente.\n\n"
+        "Contenido ajeno añadido por el modelo.\n\n"
+        "Otra continuación ajena que también debe quedar visible."
+    )
+    document = (
+        "<!-- PZDOC PDF PAGE 16 -->\n\n"
+        f"{suspicious}\n\n"
+        "<!-- PZDOC PDF PAGE 17 -->\n\n"
+        "Contenido correcto de la página siguiente."
+    )
+    input_record = store.put_text(job_id="job", text=document)
+    report = TranslationQualityReport(
+        "en",
+        "Español",
+        "es",
+        2,
+        20,
+        45,
+        1,
+        (
+            TranslationQualityIssue(
+                1,
+                TranslationIssueKind.LENGTH,
+                "La traducción añadió demasiado contenido",
+                "Faithful source beginning…",
+                "Inicio traducido fielmente.…",
+                "length-tail",
+            ),
+        ),
+    )
+
+    review = create_translation_review(
+        report,
+        job_id="job",
+        configuration_revision=1,
+        input_artifact_id=input_record.id,
+        artifacts=store,
+    )
+
+    assert review is not None
+    proposal = store.read_text("job", review.units[0].proposed_artifact_id or "")
+    assert proposal == suspicious
+    assert "página siguiente" not in proposal
+
+
+def test_review_replacement_preserves_structural_boundary_whitespace(tmp_path: Path) -> None:
+    store = ArtifactStore(tmp_path / "artifacts", protect=reversible, unprotect=reversible)
+    original = store.put_text(job_id="job", text="\n\nOld text\n\n")
+    proposal = store.put_text(job_id="job", text="\n\nOld text\n\n")
+    edited = store.put_text(job_id="job", text="New text")
+    review = ReviewSession.create(
+        job_id="job",
+        stage=StageKind.TRANSLATE,
+        kind=ReviewKind.TRANSLATION,
+        input_artifact_id="input",
+        input_version=1,
+        units=(ReviewUnit("unit", original.id, proposal.id),),
+    ).decide("unit", ReviewChoice.EDITED, edited_artifact_id=edited.id)
+
+    assert apply_translation_review("Before\n\nOld text\n\nAfter", review, store) == (
+        "Before\n\nNew text\n\nAfter"
+    )
+
+
 def test_translation_review_shows_a_readable_context_and_changes_identity_with_scope(
     tmp_path: Path,
 ) -> None:
@@ -378,9 +448,50 @@ def test_unanchored_translation_issue_logs_only_a_sanitized_count(
     )
 
     assert review is None
-    assert "translation_review_issue_not_materialized count=1" in caplog.text
+    assert "translation_review_issue_not_materialized count=1 high=0" in caplog.text
     assert private_text not in caplog.text
     assert "Fuente privada" not in caplog.text
+
+
+def test_unanchored_high_severity_translation_issue_blocks_review_materialization(
+    tmp_path: Path,
+    caplog,
+) -> None:
+    store = ArtifactStore(tmp_path / "artifacts", protect=reversible, unprotect=reversible)
+    input_record = store.put_text(job_id="job", text="Texto candidato distinto.")
+    report = TranslationQualityReport(
+        "en",
+        "Español",
+        "es",
+        1,
+        10,
+        9,
+        1,
+        (
+            TranslationQualityIssue(
+                1,
+                TranslationIssueKind.FIDELITY,
+                "Incidencia importante sin anclaje",
+                "Private source",
+                "Missing candidate…",
+                "missing-high",
+            ),
+        ),
+    )
+    caplog.set_level(logging.WARNING, logger="parsezen.application.quality_review_adapter")
+
+    with pytest.raises(ValueError, match="incidencia importante"):
+        create_translation_review(
+            report,
+            job_id="job",
+            configuration_revision=1,
+            input_artifact_id=input_record.id,
+            artifacts=store,
+        )
+
+    assert "translation_review_issue_not_materialized count=1 high=1" in caplog.text
+    assert "Private source" not in caplog.text
+    assert "Missing candidate" not in caplog.text
 
 
 def test_saved_review_tolerates_line_ending_normalization_when_applied(
@@ -456,6 +567,104 @@ def test_pdf_review_uses_page_image_and_applies_edited_text(
     assert apply_pdf_review("<!-- page -->\nOld OCR", decided, store) == (
         "<!-- page -->\nCorrected OCR"
     )
+
+
+def test_applied_quality_decision_is_restored_after_downstream_rendering(
+    tmp_path: Path,
+) -> None:
+    store = ArtifactStore(tmp_path / "artifacts", protect=reversible, unprotect=reversible)
+    original = store.put_text(job_id="job", text="Source")
+    proposal = store.put_text(job_id="job", text="Crea tu visión")
+    edited = store.put_text(job_id="job", text="CREA TU VISIÓN")
+    review = (
+        ReviewSession.create(
+            job_id="job",
+            stage=StageKind.TRANSLATE,
+            kind=ReviewKind.TRANSLATION,
+            input_artifact_id="input",
+            input_version=1,
+            units=(ReviewUnit("heading", original.id, proposal.id),),
+        )
+        .decide(
+            "heading",
+            ReviewChoice.EDITED,
+            edited_artifact_id=edited.id,
+        )
+        .apply()
+    )
+
+    restored = ensure_quality_reviews_applied("# Crea tu visión\n", (review,), store)
+
+    assert restored == "# CREA TU VISIÓN\n"
+    assert ensure_quality_reviews_applied(restored, (review,), store) == restored
+
+
+def test_missing_applied_quality_decision_blocks_publication(tmp_path: Path) -> None:
+    store = ArtifactStore(tmp_path / "artifacts", protect=reversible, unprotect=reversible)
+    original = store.put_text(job_id="job", text="Source")
+    proposal = store.put_text(job_id="job", text="Old proposal")
+    edited = store.put_text(job_id="job", text="Human decision")
+    review = (
+        ReviewSession.create(
+            job_id="job",
+            stage=StageKind.TRANSLATE,
+            kind=ReviewKind.TRANSLATION,
+            input_artifact_id="input",
+            input_version=1,
+            units=(ReviewUnit("segment", original.id, proposal.id),),
+        )
+        .decide(
+            "segment",
+            ReviewChoice.EDITED,
+            edited_artifact_id=edited.id,
+        )
+        .apply()
+    )
+
+    with pytest.raises(ValueError, match="no coincide"):
+        ensure_quality_reviews_applied("Unrelated final text", (review,), store)
+
+
+def test_edited_ocr_page_overrides_a_later_revision_of_the_same_page(
+    tmp_path: Path,
+) -> None:
+    store = ArtifactStore(tmp_path / "artifacts", protect=reversible, unprotect=reversible)
+    target = "<!-- PZDOC PDF PAGE 1 -->"
+    proposal_text = f"{target}\n\n# Crea tu visión\n\n"
+    edited_text = f"{target}\n\n# CREA TU VISIÓN\n\n"
+    original = store.put_text(job_id="job", text="page image")
+    proposal = store.put_text(job_id="job", text=proposal_text)
+    edited = store.put_text(job_id="job", text=edited_text)
+    review = (
+        ReviewSession.create(
+            job_id="job",
+            stage=StageKind.PREPARE,
+            kind=ReviewKind.OCR,
+            input_artifact_id="input",
+            input_version=1,
+            units=(
+                ReviewUnit(
+                    "page-one",
+                    original.id,
+                    proposal.id,
+                    original_selectable=False,
+                    target=target,
+                ),
+            ),
+        )
+        .decide(
+            "page-one",
+            ReviewChoice.EDITED,
+            edited_artifact_id=edited.id,
+        )
+        .apply()
+    )
+    rendered = f"{target}\n\n# Crear una visión\n\n<!-- PZDOC PDF PAGE 2 -->\n\nTexto estable.\n"
+
+    reconciled = ensure_quality_reviews_applied(rendered, (review,), store)
+
+    assert reconciled.startswith(edited_text)
+    assert "<!-- PZDOC PDF PAGE 2 -->\n\nTexto estable." in reconciled
 
 
 def test_pdf_review_anchors_multiple_issues_to_the_transformed_pages(
@@ -630,3 +839,22 @@ def test_quality_review_supports_original_proposed_and_defensive_failures(
     )
     with pytest.raises(ValueError, match="está vacío"):
         apply_translation_review("Proposal", empty_review, store)
+
+
+def test_translation_review_accepts_a_choice_already_applied_by_ocr(
+    tmp_path: Path,
+) -> None:
+    store = ArtifactStore(tmp_path / "artifacts", protect=reversible, unprotect=reversible)
+    original = store.put_text(job_id="job", text="YO' MONEY")
+    proposal = store.put_text(job_id="job", text="YO' MONEY")
+    edited = store.put_text(job_id="job", text="TU DINERO")
+    review = ReviewSession.create(
+        job_id="job",
+        stage=StageKind.TRANSLATE,
+        kind=ReviewKind.TRANSLATION,
+        input_artifact_id="input",
+        input_version=1,
+        units=(ReviewUnit("unit", original.id, proposal.id),),
+    ).decide("unit", ReviewChoice.EDITED, edited_artifact_id=edited.id)
+
+    assert apply_translation_review("## TU DINERO\n", review, store) == "## TU DINERO\n"

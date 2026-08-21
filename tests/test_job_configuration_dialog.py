@@ -119,21 +119,13 @@ def test_translation_choice_reveals_only_translator_and_glossary(
     assert dialog.translator_row.value.text() == "Argos · ligero"
     assert not dialog.glossary_row.isHidden()
     assert dialog.glossary_row.value.text() == "Ninguno"
-    assert "Coste aproximado bajo" in dialog.translation_route.text()
-    assert "no revisión semántica" in dialog.translation_route.text()
-    assert "1 pasada" in dialog.translation_route.text()
-    assert dialog.options_layout.indexOf(dialog.translation_route) > dialog.options_layout.indexOf(
-        dialog.ocr_row
-    )
-    assert dialog.options_layout.indexOf(dialog.translation_route) < dialog.options_layout.indexOf(
-        dialog.validation_label
-    )
+    assert not hasattr(dialog, "translation_route")
+    assert "verifica la traducción" in dialog.plan_reviewed.accessibleDescription()
+    assert dialog.plan_reviewed.toolTip() == dialog.plan_reviewed.accessibleDescription()
 
     dialog._set_review_enabled(True)  # noqa: SLF001
 
-    assert "Coste aproximado alto" in dialog.translation_route.text()
-    assert "verificación bilingüe independiente" in dialog.translation_route.text()
-    assert "2 pasadas" in dialog.translation_route.text()
+    assert "verifica la traducción" in dialog.plan_reviewed.accessibleDescription()
 
 
 def test_translation_menu_contains_no_translation_and_every_supported_language(
@@ -270,16 +262,14 @@ def test_translation_can_use_the_global_local_ai_model(qtbot, tmp_path: Path) ->
         target_language="es",
     )
     assert dialog.translator_row.value.text() == "IA local · contextual"
-    assert "Coste aproximado medio" in dialog.translation_route.text()
-    assert "no una revisión semántica posterior" in dialog.translation_route.text()
+    assert "corrección se integra" in dialog.plan_reviewed.accessibleDescription()
     assert request.target_language == "es"
     assert request.offline_translation_language is None
     assert request.improvement_mode is not None
 
     dialog._set_review_enabled(True)  # noqa: SLF001
 
-    assert "corrige en una sola pasada" in dialog.translation_route.text()
-    assert "no es una verificación bilingüe independiente" in dialog.translation_route.text()
+    assert "corrección se integra" in dialog.plan_reviewed.accessibleDescription()
 
 
 def test_ai_translation_requires_the_global_model(qtbot, tmp_path: Path) -> None:

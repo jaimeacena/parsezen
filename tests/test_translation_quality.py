@@ -202,6 +202,57 @@ def test_reports_an_untranslated_title_below_the_general_language_threshold() ->
     assert report.total_issues > 0
 
 
+def test_reports_short_spanish_index_residue_inside_an_otherwise_english_page() -> None:
+    source = (
+        "<!-- PZDOC PDF PAGE 8 -->\n\n"
+        "- EXPOSICIÓN 307\n"
+        "- APÉNDICE 5: EDICIONES DE LUJO 427\n"
+        "- CENTRO DE TRANSURFING 437\n\n"
+        "Este párrafo suficientemente largo establece con claridad el idioma de origen."
+    )
+    translated = (
+        "<!-- PZDOC PDF PAGE 8 -->\n\n"
+        "- EXPOSICION 307\n"
+        "- APPENDIX 5:EDITIONSOFLUJO 427\n"
+        "- CENTRO OF TRANSURFING 437\n\n"
+        "This sufficiently long paragraph clearly establishes the target language."
+    )
+
+    report = build_translation_quality_report(
+        source,
+        translated,
+        source_language="es",
+        target_language="en",
+    )
+
+    assert report.issues_by_kind[TranslationIssueKind.SOURCE_TEXT] >= 3
+
+
+def test_repairs_aligned_short_index_residue_independently() -> None:
+    source = "<!-- PZDOC PDF PAGE 8 -->\n\n- EXPOSICIÓN 307\n- APÉNDICE 5: EDICIONES DE LUJO 427\n"
+    translated = "<!-- PZDOC PDF PAGE 8 -->\n\n- EXPOSICION 307\n- APPENDIX 5:EDICIONESDELUJO 427\n"
+    replacements = {
+        "- EXPOSICIÓN 307": "- EXHIBITION 307",
+        "- APÉNDICE 5: EDICIONES DE LUJO 427": ("- APPENDIX 5: LUXURY EDITIONS 427"),
+    }
+
+    repair = repair_untranslated_source_text(
+        source,
+        translated,
+        source_language="es",
+        target_language="en",
+        translate_segment=lambda source_segment, _current: replacements.get(
+            source_segment.strip(),
+            _current,
+        ),
+    )
+
+    assert repair.attempted_segments == 2
+    assert repair.repaired_segments == 2
+    assert "- EXHIBITION 307" in repair.translated
+    assert "- APPENDIX 5: LUXURY EDITIONS 427" in repair.translated
+
+
 def test_accepts_a_changed_short_work_title_despite_unreliable_language_detection() -> None:
     validate_translation_quality(
         "WHOLE LOTTA MONEY (feat. N.",
@@ -315,6 +366,67 @@ def test_reports_partially_untranslated_short_titles_in_a_dense_index() -> None:
     assert report.total_issues > 0
 
 
+def test_report_accepts_an_established_title_term_unchanged_in_the_target_language() -> None:
+    report = build_translation_quality_report(
+        "ARIES I 244\nARIES II 251\nARIES III 258",
+        "ARIES I 244\nARIES II 251\nARIES III 258",
+        source_language="en",
+        target_language="es",
+    )
+
+    assert report.total_issues == 0
+
+
+def test_report_still_requires_a_localized_classification_term() -> None:
+    report = build_translation_quality_report(
+        "TAURUS I 69\nTAURUS II 74\nTAURUS III 80",
+        "TAURUS I 69\nTAURUS II 74\nTAURUS III 80",
+        source_language="en",
+        target_language="es",
+    )
+
+    assert report.issues_by_kind[TranslationIssueKind.SOURCE_TEXT] >= 3
+
+
+def test_report_flags_an_english_word_copied_inside_a_spanish_paragraph() -> None:
+    source = "The author tried to combine narrative and scholarship while preserving every detail."
+    translated = (
+        "El autor intentó combinar narrativa y scholarship mientras conservaba cada detalle."
+    )
+
+    report = build_translation_quality_report(
+        source,
+        translated,
+        source_language="en",
+        target_language="es",
+    )
+
+    assert report.issues_by_kind[TranslationIssueKind.SOURCE_TEXT] == 1
+
+
+def test_repair_retries_an_aligned_paragraph_with_a_copied_source_word_once() -> None:
+    source = "The author tried to combine narrative and scholarship while preserving every detail."
+    translated = (
+        "El autor intentó combinar narrativa y scholarship mientras conservaba cada detalle."
+    )
+    calls: list[tuple[str, str]] = []
+
+    result = repair_untranslated_source_text(
+        source,
+        translated,
+        source_language="en",
+        target_language="es",
+        translate_segment=lambda original, current: (
+            calls.append((original, current))
+            or "El autor intentó combinar narrativa y erudición mientras conservaba cada detalle."
+        ),
+    )
+
+    assert result.repaired_segments == 1
+    assert result.translated.endswith("mientras conservaba cada detalle.")
+    assert len(calls) == 1
+
+
 def test_rejects_a_translation_that_omits_most_content() -> None:
     shortened = """# Contrato
 
@@ -356,6 +468,10 @@ def test_does_not_treat_a_prefixed_translation_as_an_unchanged_sentence() -> Non
 
 def test_accepts_a_written_number_converted_to_digits_without_duplication() -> None:
     assert numeric_tokens_are_conserved("ten and ten", "diez y 10")
+    assert numeric_tokens_are_conserved(
+        "50. Elevenfold Division of the Lunar Cycle",
+        "50. División del ciclo lunar en 11 partes",
+    )
 
 
 def test_rejects_an_ungrounded_or_duplicated_new_digit() -> None:
@@ -368,6 +484,27 @@ def test_rejects_a_changed_roman_numeral_in_an_index_reference() -> None:
         validate_translation_quality(
             "LIBRA III 168",
             "LIBRA TERCERA 168",
+            source_language="en",
+            target_language="es",
+            preserve_paragraphs=True,
+        )
+
+
+def test_accepts_a_written_ordinal_rendered_as_a_roman_century() -> None:
+    validate_translation_quality(
+        "- Seventeenth-Century England 17",
+        "- Inglaterra del siglo XVII 17",
+        source_language="en",
+        target_language="es",
+        preserve_paragraphs=True,
+    )
+
+
+def test_rejects_an_ungrounded_roman_century_on_the_same_index_line() -> None:
+    with pytest.raises(TranslationQualityError, match="números romanos"):
+        validate_translation_quality(
+            "- Twentieth-Century England 17",
+            "- Inglaterra del siglo XVII 17",
             source_language="en",
             target_language="es",
             preserve_paragraphs=True,
@@ -1217,6 +1354,34 @@ def test_translation_report_flags_an_extreme_segment_length_without_blocking() -
     assert any(issue.kind is TranslationIssueKind.LENGTH for issue in report.issues)
 
 
+def test_rejects_a_short_cover_title_expanded_with_invented_paragraphs() -> None:
+    source = "36 FACES The History, Astrology and Magic of the Decans Austin Coppock"
+    hallucinated = (
+        "36 CARAS. La historia, la astrología y la magia de los decanos. Austin Coppock. "
+        "Esta introducción inventada desarrolla una explicación extensa que no aparece en "
+        "la portada original y añade datos, conclusiones y contexto completamente nuevos. "
+        "También incorpora otro párrafo artificial para superar con claridad el límite seguro."
+    )
+
+    with pytest.raises(TranslationQualityError, match="duplicado o añadido contenido"):
+        validate_translation_quality(
+            source,
+            hallucinated,
+            source_language="en",
+            target_language="es",
+            preserve_paragraphs=True,
+        )
+
+    report = build_translation_quality_report(
+        source,
+        hallucinated,
+        source_language="en",
+        target_language="es",
+    )
+
+    assert any(issue.kind is TranslationIssueKind.LENGTH for issue in report.issues)
+
+
 def test_translation_report_bounds_excerpts_and_visible_issue_count() -> None:
     source = "\n\n".join(f"The unchanged source sentence number {index}." for index in range(30))
 
@@ -1337,6 +1502,39 @@ def test_pdf_report_and_repair_align_by_page_when_paragraph_counts_change() -> N
     assert repair.attempted_segments == 1
     assert repair.repaired_segments == 1
     assert "The second complete" not in repair.translated
+
+
+def test_pdf_report_keeps_empty_pages_so_later_review_pairs_do_not_shift() -> None:
+    source = (
+        "<!-- PZDOC PDF PAGE 1 -->\n\n"
+        "<!-- PZDOC PDF PAGE 2 -->\n\n"
+        "DEDICATION TO MY FAMILY AND FRIENDS\n\n"
+        "<!-- PZDOC PDF PAGE 3 -->\n\n"
+        "This acknowledgements paragraph remains completely in English and needs review."
+    )
+    translated = (
+        "<!-- PZDOC PDF PAGE 1 -->\n\n"
+        "SÍMBOLOS Y GLIFOS\n\n"
+        "<!-- PZDOC PDF PAGE 2 -->\n\n"
+        "DEDICATORIA A MI FAMILIA Y AMIGOS\n\n"
+        "<!-- PZDOC PDF PAGE 3 -->\n\n"
+        "This acknowledgements paragraph remains completely in English and needs review."
+    )
+
+    report = build_translation_quality_report(
+        source,
+        translated,
+        source_language="en",
+        target_language="es",
+    )
+
+    assert report.checked_segments == 3
+    assert not any(issue.kind is TranslationIssueKind.ALIGNMENT for issue in report.issues)
+    residual = next(
+        issue for issue in report.issues if issue.kind is TranslationIssueKind.SOURCE_TEXT
+    )
+    assert "acknowledgements paragraph" in residual.original_excerpt
+    assert "acknowledgements paragraph" in residual.translated_excerpt
 
 
 def test_pdf_repair_targets_one_residual_paragraph_instead_of_the_whole_page() -> None:
@@ -1470,6 +1668,27 @@ def test_pdf_repair_keeps_a_safe_sentence_fix_when_another_page_still_needs_revi
     assert second in repair.translated
 
 
+def test_repair_keeps_a_safe_title_fix_when_another_title_still_needs_review() -> None:
+    first = "CONTENTS"
+    second = "EXPOSITION OF REALITY"
+    source = f"{first}\n\n{second}"
+
+    repair = repair_untranslated_source_text(
+        source,
+        source,
+        source_language="en",
+        target_language="es",
+        translate_segment=lambda source_fragment, current_fragment: (
+            "CONTENIDO" if source_fragment == first else current_fragment
+        ),
+    )
+
+    assert repair.attempted_segments == 2
+    assert repair.repaired_segments == 1
+    assert first not in repair.translated
+    assert second in repair.translated
+
+
 def test_pdf_repair_can_target_one_residual_sentence_inside_a_mixed_page() -> None:
     residual = "This sentence was preserved in English after a failed chunk."
     source = (
@@ -1516,6 +1735,28 @@ def test_repairs_a_short_unchanged_source_sentence() -> None:
     assert repair.translated == "Contenido EPUB moderno."
     assert repair.attempted_segments == 1
     assert repair.repaired_segments == 1
+
+
+def test_repairs_source_residue_when_ocr_collapses_word_spacing() -> None:
+    source = "YO' MONEY YO' MONEY YO' MONEY LEVEL UP"
+    collapsed = "YO' MONEYYO' MONEYYO' MONEYLEVELUP"
+    calls: list[tuple[str, str]] = []
+
+    repair = repair_untranslated_source_text(
+        source,
+        collapsed,
+        source_language="en",
+        target_language="es",
+        translate_segment=lambda source_fragment, current_fragment: (
+            calls.append((source_fragment, current_fragment))
+            or "TU DINERO, TU DINERO, TU DINERO: SUBE DE NIVEL"
+        ),
+    )
+
+    assert calls == [(source, collapsed)]
+    assert repair.attempted_segments == 1
+    assert repair.repaired_segments == 1
+    assert collapsed not in repair.translated
 
 
 def test_repairs_one_residual_sentence_inside_a_non_pdf_paragraph() -> None:
@@ -1656,3 +1897,145 @@ def test_does_not_automatically_repair_ambiguous_length_warnings() -> None:
     assert repair.attempted_segments == 0
     assert repair.repaired_segments == 0
     assert repair.translated == translated
+
+
+def test_finds_high_confidence_source_words_before_translation() -> None:
+    source = "Although his scholarship brought recognition, Coppock remained independent."
+
+    assert translation_quality_module.source_words_requiring_translation(source, "en") == (
+        "although",
+        "scholarship",
+    )
+    assert translation_quality_module.source_words_requiring_focused_translation(source, "en") == (
+        "scholarship",
+    )
+
+
+def test_source_word_preflight_does_not_classify_capitalized_names_by_suffix() -> None:
+    source = "A note from Fellowship Press accompanies the chart."
+
+    assert translation_quality_module.source_words_requiring_translation(source, "en") == ()
+
+
+def test_established_term_translation_is_available_before_document_generation() -> None:
+    assert translation_quality_module.established_term_translation("rulership", "en", "es") == (
+        "regencia"
+    )
+    assert translation_quality_module.established_term_translation("unknown", "en", "es") is None
+    assert (
+        translation_quality_module.established_term_translation(
+            "Triplicity Rulerships",
+            "en",
+            "es",
+        )
+        == "regencias por triplicidad"
+    )
+    assert (
+        translation_quality_module.established_term_translation(
+            "Triplicity Lords",
+            "en",
+            "es",
+        )
+        == "señores de la triplicidad"
+    )
+    assert (
+        translation_quality_module.established_term_translation(
+            "Science of Judgment",
+            "en",
+            "es",
+        )
+        == "ciencia del juicio"
+    )
+    assert (
+        translation_quality_module.established_term_translation(
+            "The Science of Judgment",
+            "en",
+            "es",
+        )
+        == "la ciencia del juicio"
+    )
+    assert (
+        translation_quality_module.established_term_translation(
+            "The Art of Judgment",
+            "en",
+            "es",
+        )
+        == "el arte del juicio"
+    )
+    assert (
+        translation_quality_module.established_term_translation(
+            "Part Six: The Art of Judgment",
+            "en",
+            "es",
+        )
+        == "parte seis: el arte del juicio"
+    )
+    assert (
+        translation_quality_module.established_term_translation(
+            "Primary Source Readings",
+            "en",
+            "es",
+        )
+        == "lecturas de fuentes primarias"
+    )
+    assert (
+        translation_quality_module.established_term_translation(
+            "Delineating a Planet in a House",
+            "en",
+            "es",
+        )
+        == "delineación de un planeta en una casa"
+    )
+    assert (
+        translation_quality_module.established_term_translation(
+            "Benefic and Malefic Planets, Conditions, and Houses",
+            "en",
+            "es",
+        )
+        == "planetas benéficos y maléficos, condiciones y casas"
+    )
+    assert (
+        translation_quality_module.established_term_translation(
+            "The Tenth House",
+            "en",
+            "es",
+        )
+        == "la décima casa"
+    )
+    assert (
+        translation_quality_module.established_term_translation(
+            "Zodiacal Sign Rulerships",
+            "en",
+            "es",
+        )
+        == "regencias de los signos zodiacales"
+    )
+    assert translation_quality_module.established_terms_requiring_translation(
+        "Planetary Rulership and Virgo",
+        "en",
+        "es",
+    ) == ("rulership",)
+    assert translation_quality_module.established_terms_requiring_translation(
+        "15. TRIPLICITY RULERSHIPS 199",
+        "en",
+        "es",
+    )[:1] == ("triplicity rulerships",)
+    assert translation_quality_module.established_terms_requiring_translation(
+        "Other Uses of the Triplicity Lords 202",
+        "en",
+        "es",
+    )[:1] == ("the triplicity lords",)
+    assert translation_quality_module.contains_established_translation_candidate(
+        "Planetary Rulership"
+    )
+
+
+def test_title_residue_detection_does_not_reject_a_target_language_derivative() -> None:
+    assert (
+        translation_quality_module.find_titles_with_source_language_residue(
+            "- 13. PLANETARY RECEPTION 177",
+            "- 13. RECEPCIÓN PLANETARIA 177",
+            "en",
+        )
+        == ()
+    )

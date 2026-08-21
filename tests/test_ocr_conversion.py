@@ -15,6 +15,7 @@ from parsezen.ocr_conversion import (
     _clean_ocr_markdown,
     _convert_pdf_pages_in_process,
     _page_ranges,
+    _worker_page_batches,
     convert_pdf_pages_with_ocr,
 )
 
@@ -37,6 +38,13 @@ def test_limits_ocr_ranges_to_safe_cancellation_batches() -> None:
     ]
 
 
+def test_groups_sparse_ranges_into_bounded_worker_lifetimes() -> None:
+    assert _worker_page_batches({1, 3, 5, 7, 9, 11, 13, 15, 17}) == [
+        {1, 3, 5, 7, 9, 11, 13, 15},
+        {17},
+    ]
+
+
 def test_cleans_placeholders_page_numbers_and_shadowed_headings() -> None:
     markdown = """1
 
@@ -48,6 +56,20 @@ Useful text.
 """
 
     assert _clean_ocr_markdown(markdown) == "## CREATE YO' VISION\n\nUseful text."
+
+
+@pytest.mark.parametrize(
+    ("source", "expected"),
+    [
+        ("# # CREATE YO' VISION", "## CREATE YO' VISION"),
+        ("# # # LEVEL UP", "### LEVEL UP"),
+    ],
+)
+def test_ocr_cleaning_repairs_spaced_atx_heading_markers(
+    source: str,
+    expected: str,
+) -> None:
+    assert _clean_ocr_markdown(source) == expected
 
 
 def test_ocr_cleaning_replaces_xml_forbidden_controls_without_joining_words() -> None:
@@ -196,6 +218,7 @@ def test_public_ocr_boundary_delegates_to_the_private_worker(
         *,
         force_full_page_numbers: set[int] | None,
         on_progress,
+        on_page_result,
     ) -> dict[int, str]:
         received.append(
             (
@@ -208,6 +231,7 @@ def test_public_ocr_boundary_delegates_to_the_private_worker(
         )
         if on_progress is not None:
             on_progress(1, 1)
+        on_page_result(2, "Texto local.")
         return {2: "Texto local."}
 
     monkeypatch.setattr(executor_module, "run_ocr_worker", run_worker)
@@ -222,6 +246,57 @@ def test_public_ocr_boundary_delegates_to_the_private_worker(
     assert callable(received[0][4])
     assert received[0][:4] == (source, {2}, cancellation, {2})
     assert progress == [(1, 1)]
+
+
+def test_public_ocr_restarts_failed_batches_and_degrades_to_single_pages(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "scan.pdf"
+    failures = {"batch": 2, 1: 0, 2: 2}
+    calls: list[set[int]] = []
+
+    def run_worker(_source, pages, _cancellation, **_kwargs):
+        calls.append(set(pages))
+        if len(pages) == 2:
+            failures["batch"] -= 1
+            raise ConversionError("batch failed")
+        page = next(iter(pages))
+        if failures[page]:
+            failures[page] -= 1
+            raise ConversionError("page failed")
+        return {page: f"OCR {page}"}
+
+    monkeypatch.setattr(executor_module, "run_ocr_worker", run_worker)
+
+    result = convert_pdf_pages_with_ocr(source, {1, 2})
+
+    assert result == {1: "OCR 1"}
+    assert calls == [{1, 2}, {1, 2}, {1}, {2}, {2}]
+
+
+def test_public_ocr_retries_only_unfinished_pages_after_a_partial_worker_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "scan.pdf"
+    calls: list[set[int]] = []
+
+    def run_worker(_source, pages, _cancellation, *, on_page_result, **_kwargs):
+        calls.append(set(pages))
+        if pages == {1, 3, 5}:
+            on_page_result(1, "OCR 1")
+            raise ConversionError("worker failed after one page")
+        return {page: f"OCR {page}" for page in pages}
+
+    monkeypatch.setattr(executor_module, "run_ocr_worker", run_worker)
+
+    assert convert_pdf_pages_with_ocr(source, {1, 3, 5}) == {
+        1: "OCR 1",
+        3: "OCR 3",
+        5: "OCR 5",
+    }
+    assert calls == [{1, 3, 5}, {3, 5}]
 
 
 def test_translates_ocr_dependency_failures_to_an_application_error(

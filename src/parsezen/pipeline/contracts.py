@@ -87,6 +87,7 @@ class ProcessResult:
     epub_resumed_parts: int = 0
     epub_checkpoint_degraded: bool = False
     translation_quality_report: TranslationQualityReport | None = None
+    review_translation_quality_report: TranslationQualityReport | None = None
     linguistic_review_coverage: LinguisticReviewCoverage | None = None
     preserved_translation_chunks: tuple[int, ...] = ()
     preserved_images: int = 0
@@ -97,6 +98,7 @@ class ProcessResult:
     review_markdown: str | None = None
     review_required: bool = False
     revision_approved: bool = False
+    preserve_epub_package_on_unchanged_review: bool = False
     final_integrity_report: FinalIntegrityReport | None = None
     telemetry: ProcessTelemetry | None = None
     front_matter_blocks: int = 0
@@ -106,6 +108,12 @@ class ProcessResult:
     markdown_include_metadata: bool = False
     markdown_include_page_references: bool = False
     markdown_source_name: str | None = None
+
+    @property
+    def translation_quality_for_review(self) -> TranslationQualityReport | None:
+        """Return quality evidence aligned with ``review_markdown`` when available."""
+
+        return self.review_translation_quality_report or self.translation_quality_report
 
 
 @dataclass(frozen=True, slots=True)
@@ -130,6 +138,7 @@ class TransformedDocument:
 
     transformed_markdown: str
     translation_quality_report: TranslationQualityReport | None
+    review_translation_quality_report: TranslationQualityReport | None
     linguistic_review_coverage: LinguisticReviewCoverage | None
     preserved_translation_chunks: tuple[int, ...]
     revision_draft: RevisionDraft | None

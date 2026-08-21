@@ -92,7 +92,23 @@ def test_workspace_header_prioritizes_real_reviews(qtbot) -> None:
     workspace.set_jobs((make_review_job("one"),))
 
     assert workspace.primary_button.text() == "Revisar 1 pendiente"
-    assert "1 requiere atención" in workspace.queue_summary.text()
+    assert "1 por revisar" in workspace.queue_summary.text()
+
+
+def test_wide_queue_summary_uses_one_line_across_the_available_toolbar_space(qtbot) -> None:
+    workspace = ParsezenWorkspace()
+    qtbot.addWidget(workspace)
+    workspace.resize(1440, 800)
+    workspace.set_jobs(tuple(make_review_job(f"review-{index}", index) for index in range(5)))
+    workspace.show()
+    qtbot.waitExposed(workspace)
+
+    position = workspace.queue_toolbar_layout.getItemPosition(
+        workspace.queue_toolbar_layout.indexOf(workspace.queue_summary)
+    )
+    assert workspace.queue_summary.wordWrap() is False
+    assert position == (0, 0, 1, 2)
+    assert workspace.queue_summary.text() == "5 documentos · 5 por revisar"
 
 
 def test_workspace_emits_current_primary_mode(qtbot) -> None:
@@ -122,7 +138,7 @@ def test_workspace_summarizes_the_predicted_automatic_time(qtbot) -> None:
     workspace.set_jobs((job,))
     workspace.set_preflight({job.id: forecast}, combine_preflights((forecast,)))
 
-    assert workspace.queue_summary.text() == "1 documento · aprox. 2 min–5 min"
+    assert workspace.queue_summary.text() == "1 documento · ~2 min–5 min"
     assert "Tiempo automático" in (
         workspace.job_table.job_model.index(0, 4).data(Qt.ItemDataRole.AccessibleTextRole)
     )

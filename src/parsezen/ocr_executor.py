@@ -44,6 +44,9 @@ _STARTUP_TIMEOUT_SECONDS = 30.0
 _CANCEL_GRACE_SECONDS = 3.0
 _PROCESS_EXIT_TIMEOUT_SECONDS = 3.0
 _POLL_SECONDS = 0.05
+_MIN_EXECUTION_TIMEOUT_SECONDS = 180.0
+_EXECUTION_TIMEOUT_SECONDS_PER_PAGE = 180.0
+_MAX_EXECUTION_TIMEOUT_SECONDS = 1_800.0
 _VALID_ERROR_CODES = {"conversion_failed", "unexpected"}
 _SAFE_DIAGNOSTIC_VALUE = re.compile(r"[A-Za-z0-9_.<>-]{1,160}\Z")
 
@@ -124,6 +127,9 @@ def _run_ocr_worker(
                     "ocr_worker_stage stage=%s elapsed_ms=%d",
                     stage,
                     _elapsed_milliseconds(started_at),
+                ),
+                execution_deadline=(
+                    started_at + _ocr_execution_timeout_seconds(len(selected_pages))
                 ),
             )
             _wait_for_clean_exit(process)
@@ -281,6 +287,7 @@ def _receive_worker_result(
     on_progress: Callable[[int, int], None] | None = None,
     on_stage: Callable[[str], None] | None = None,
     on_page_result: Callable[[int, str], None] | None = None,
+    execution_deadline: float | None = None,
 ) -> dict[int, str]:
     results: dict[int, str] = {}
     total_result_bytes = 0
@@ -288,6 +295,16 @@ def _receive_worker_result(
     progress_current = 0
     cancellation_sent_at: float | None = None
     while True:
+        if execution_deadline is not None and time.monotonic() > execution_deadline:
+            LOGGER.warning(
+                "ocr_worker_execution_timeout pages=%d completed=%d",
+                len(selected_pages),
+                len(results),
+            )
+            _stop_worker(process)
+            raise ConversionError(
+                "El OCR local superó el tiempo máximo de ejecución y se detuvo de forma segura."
+            )
         if cancellation is not None and cancellation.is_cancelled:
             if cancellation_sent_at is None:
                 send_message(connection, {"type": "cancel", "job_id": job_id})
@@ -422,3 +439,13 @@ def _stop_worker(process: subprocess.Popen[bytes]) -> None:
 
 def _elapsed_milliseconds(started_at: float) -> int:
     return max(0, round((time.monotonic() - started_at) * 1000))
+
+
+def _ocr_execution_timeout_seconds(page_count: int) -> float:
+    return min(
+        max(
+            page_count * _EXECUTION_TIMEOUT_SECONDS_PER_PAGE,
+            _MIN_EXECUTION_TIMEOUT_SECONDS,
+        ),
+        _MAX_EXECUTION_TIMEOUT_SECONDS,
+    )

@@ -49,6 +49,63 @@ def test_preserves_a_meaningful_pdf_image_as_a_portable_resource(tmp_path: Path)
     assert (PdfProgressPhase.IMAGES, 1, 1) in progress
 
 
+def test_preserves_a_full_page_table_image_beside_its_ocr_text(tmp_path: Path) -> None:
+    source = tmp_path / "scanned-form.pdf"
+    _write_image_pdf(source)
+    ocr_table = (
+        "| Date | Income source | Amount | Expense category | Spending |\n"
+        "| --- | --- | --- | --- | --- |\n"
+        "|  |  |  |  |  |\n"
+        "| Total income |  |  | Total expenses |  |"
+    )
+
+    converted = convert_pdf_document(
+        source,
+        include_images=True,
+        load_ocr_checkpoint=lambda _page: ocr_table,
+    )
+
+    assert len(converted.resources) == 1
+    assert ocr_table in converted.markdown
+    assert "__parsezen_resources__/pdf/page-0001-image-01.jpg" in converted.markdown
+
+
+def test_omits_a_full_page_contents_scan_when_ocr_recovers_its_entries(tmp_path: Path) -> None:
+    source = tmp_path / "scanned-contents.pdf"
+    _write_image_pdf(source)
+    ocr_toc = (
+        "| Section | Page |\n"
+        "| --- | --- |\n"
+        "| Introduction | 9 |\n"
+        "| First chapter | 16 |\n"
+        "| Second chapter | 28 |\n"
+        "| Third chapter | 37 |"
+    )
+
+    converted = convert_pdf_document(
+        source,
+        include_images=True,
+        load_ocr_checkpoint=lambda _page: ocr_toc,
+    )
+
+    assert converted.resources == ()
+    assert ocr_toc in converted.markdown
+
+
+def test_omits_a_nearly_blank_full_page_background(tmp_path: Path) -> None:
+    source = tmp_path / "blank-background.pdf"
+    _write_image_pdf(source, native_text="Front matter")
+
+    converted = convert_pdf_document(
+        source,
+        include_images=True,
+        load_ocr_checkpoint=lambda _page: "",
+    )
+
+    assert converted.resources == ()
+    assert "Front matter" in converted.markdown
+
+
 def test_preserves_a_curve_based_pdf_illustration_as_a_portable_resource(
     tmp_path: Path,
 ) -> None:
@@ -80,6 +137,59 @@ def test_extracts_pdf_headings_text_and_links(tmp_path: Path) -> None:
     assert '<a id="page-1"></a>' not in markdown
     assert '<a id="page-2"></a>' in markdown
     assert reports[0].low_confidence_pages == ()
+
+
+def test_does_not_promote_a_long_body_sized_small_caps_sentence_to_heading() -> None:
+    sentence = pdf_conversion_module._PdfLine(
+        page_number=1,
+        page_width=600,
+        page_height=800,
+        text="IT IS AN HONOR FOR ME TO WELCOME AND INTRODUCE THE PUBLICATION",
+        chars=(),
+        x0=50,
+        x1=550,
+        top=100,
+        bottom=112,
+        font_size=10,
+        bold=True,
+        links=(),
+        soft_hyphen_end=False,
+        hard_hyphen_end=False,
+        rotated=False,
+    )
+    concise_heading = replace(sentence, text="ANCIENT ASTROLOGY")
+    oversized_title = replace(sentence, font_size=14)
+
+    assert (
+        pdf_conversion_module._heading_level(
+            sentence,
+            body_size=10,
+            heading_sizes={},
+            gap_before=12,
+            toc_page=False,
+        )
+        is None
+    )
+    assert (
+        pdf_conversion_module._heading_level(
+            concise_heading,
+            body_size=10,
+            heading_sizes={},
+            gap_before=12,
+            toc_page=False,
+        )
+        == 2
+    )
+    assert (
+        pdf_conversion_module._heading_level(
+            oversized_title,
+            body_size=10,
+            heading_sizes={14: 1},
+            gap_before=12,
+            toc_page=False,
+        )
+        == 1
+    )
 
 
 def test_extracts_only_the_selected_pdf_pages_and_keeps_original_page_numbers(
@@ -379,6 +489,35 @@ def test_selective_ocr_reuses_an_empty_page_checkpoint(
     assert "Native content remains available." in markdown
 
 
+def test_ocr_failure_preserves_cached_pages_and_reports_only_pending_pages(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan = pdf_conversion_module._PdfOcrPlan(
+        page_numbers={1, 2},
+        force_full_page_numbers=set(),
+        required_page_numbers=set(),
+    )
+    monkeypatch.setattr(
+        pdf_conversion_module,
+        "convert_pdf_pages_with_ocr",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(ConversionError("OCR unavailable")),
+    )
+
+    pages, failed, required_failed = pdf_conversion_module._run_planned_ocr(
+        Path("book.pdf"),
+        plan,
+        None,
+        None,
+        None,
+        lambda page: "cached page" if page == 1 else None,
+        None,
+    )
+
+    assert pages == {1: "cached page"}
+    assert failed == {2}
+    assert required_failed == set()
+
+
 def test_forced_ocr_analyzes_all_selected_pages_as_full_images(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -589,6 +728,83 @@ def test_repairs_uppercase_glyph_accent_markers() -> None:
         == "PRÁCTICA, ATENCIÓN, MÚSCULOS"
     )
     assert pdf_conversion_module._normalize_text("mayoría$ esta$") == "mayoría está"
+
+
+def test_keeps_a_suspicious_numeric_glyph_until_ocr_can_arbitrate_it() -> None:
+    assert pdf_conversion_module._normalize_text("1$. TRIPLICITY RULERSHIPS") == (
+        "1$. TRIPLICITY RULERSHIPS"
+    )
+
+
+def test_reconciles_only_uniquely_confirmed_toc_numeric_glyphs() -> None:
+    lines = [
+        _pdf_model_line(1, "1$. TRIPLICITY RULERSHIPS 199"),
+        _pdf_model_line(1, "SUMMARY AND SOURCE LEGENDS 5^5"),
+        _pdf_model_line(1, "PRICE 1$"),
+        _pdf_model_line(1, "6S. THE FIFTH HOUSE 697"),
+    ]
+    ocr = (
+        "15. TRIPLICITY RULERSHIPS 199\n"
+        "SUMMARY AND SOURCE LEGENDS 525\n"
+        "PRICE 19\n"
+        "68. THE FIFTH HOUSE 697"
+    )
+
+    reconciled = pdf_conversion_module._reconcile_suspicious_toc_numbers(lines, ocr)
+
+    assert [line.text for line in reconciled] == [
+        "15. TRIPLICITY RULERSHIPS 199",
+        "SUMMARY AND SOURCE LEGENDS 525",
+        # Both 15 and 19 appear in OCR, so this token remains explicitly uncertain.
+        "PRICE 1$",
+        "68. THE FIFTH HOUSE 697",
+    ]
+
+
+def test_reconciles_detached_toc_folio_from_unique_native_corroboration() -> None:
+    lines = [
+        replace(_pdf_model_line(1, "522"), x0=370, top=170),
+        replace(_pdf_model_line(1, "54. SUMMARY AND SOURCE READINGS"), top=195),
+        replace(_pdf_model_line(1, "5^5"), x0=370, top=195),
+        replace(_pdf_model_line(1, "Main Points of the Aspect Doctrine"), top=220),
+        replace(_pdf_model_line(1, "525"), x0=370, top=220),
+    ]
+
+    reconciled = pdf_conversion_module._reconcile_suspicious_toc_numbers(
+        lines,
+        "Exercise 38 515\nSummary 525\nFinal synthesis 535",
+    )
+
+    assert [line.text for line in reconciled] == [
+        "522",
+        "54. SUMMARY AND SOURCE READINGS",
+        "525",
+        "Main Points of the Aspect Doctrine",
+        "525",
+    ]
+
+
+def test_reconciles_alpha_shaped_detached_toc_folio_from_ocr_and_sequence() -> None:
+    lines = [
+        replace(_pdf_model_line(1, "625"), x0=370, top=170),
+        replace(_pdf_model_line(1, "Joys of the Houses"), top=195),
+        replace(_pdf_model_line(1, "62S"), x0=370, top=195),
+        replace(_pdf_model_line(1, "Derived Houses"), top=220),
+        replace(_pdf_model_line(1, "635"), x0=370, top=220),
+    ]
+
+    reconciled = pdf_conversion_module._reconcile_suspicious_toc_numbers(
+        lines,
+        "The Houses and Chronological Ages 625\nJoys of the Houses 628\nDerived Houses 635",
+    )
+
+    assert [line.text for line in reconciled] == [
+        "625",
+        "Joys of the Houses",
+        "628",
+        "Derived Houses",
+        "635",
+    ]
 
 
 def test_adaptive_ocr_quality_score_distinguishes_readable_and_garbled_text() -> None:
@@ -1054,6 +1270,62 @@ def test_pairs_a_detached_toc_page_number_column_by_visual_row() -> None:
     assert (normalized[1].links[0].x0, normalized[1].links[0].x1) == (70, 510)
 
 
+def test_pairs_four_digit_folios_in_a_long_book_toc() -> None:
+    def line(text: str, x0: float, x1: float, top: float) -> pdf_conversion_module._PdfLine:
+        return replace(
+            _pdf_model_line(1, text),
+            x0=x0,
+            x1=x1,
+            top=top,
+            bottom=top + 10,
+            font_size=10,
+        )
+
+    source_order = [
+        line("List of Figures", 50, 180, 50),
+        line("First figure", 55, 220, 100),
+        line("Second figure", 55, 230, 120),
+        line("Third figure", 55, 220, 140),
+        line("1023", 335, 350, 100),
+        line("1125", 335, 350, 120),
+        line("1155", 335, 350, 140),
+    ]
+
+    normalized = pdf_conversion_module._normalize_toc_entry_rows(source_order)
+
+    assert [item.text for item in normalized] == [
+        "List of Figures",
+        "First figure 1023",
+        "Second figure 1125",
+        "Third figure 1155",
+    ]
+    assert pdf_conversion_module._split_toc_entry_text("Final figure 1155") == (
+        "Final figure",
+        "1155",
+    )
+
+
+def test_restores_only_toc_word_boundaries_confirmed_by_ocr() -> None:
+    lines = [
+        _pdf_model_line(1, "92. Names and Topics ofthe Twelve Houses 600"),
+        _pdf_model_line(1, "121. Example Chart One: Horoscope ofJacqueline Onassis 1154"),
+        _pdf_model_line(1, "Native wording stays authoritative 1200"),
+    ]
+    ocr = (
+        "| 92. Names and Topics of thc Twelve Houses | 600 |\n"
+        "| 121. Example Chart Onc: Horoscope of Jacqueline Onassis | 1154 |\n"
+        "| Different OCR wording must not replace native text | 1200 |"
+    )
+
+    reconciled = pdf_conversion_module._reconcile_toc_spacing_from_ocr(lines, ocr)
+
+    assert [line.text for line in reconciled] == [
+        "92. Names and Topics of the Twelve Houses 600",
+        "121. Example Chart One: Horoscope of Jacqueline Onassis 1154",
+        "Native wording stays authoritative 1200",
+    ]
+
+
 def test_leaves_an_uncertain_small_page_number_column_untouched() -> None:
     lines = [
         _pdf_model_line(1, "Contents"),
@@ -1205,7 +1477,7 @@ def test_repairs_toc_spacing_and_roman_glyphs_only_with_native_heading_consensus
     ]
 
 
-def test_renders_toc_entries_as_distinct_markdown_list_rows() -> None:
+def test_renders_toc_entries_as_a_reflowable_aligned_table() -> None:
     def line(
         text: str,
         x0: float,
@@ -1260,7 +1532,66 @@ def test_renders_toc_entries_as_distinct_markdown_list_rows() -> None:
     )
 
     assert "## Table of Contents" in markdown
-    assert "- Opening 9\n- First chapter 17\n- Second chapter 31" in markdown
+    assert '<table class="document-toc">' in markdown
+    assert '<td class="toc-label toc-level-0">Opening</td><td class="toc-folio">9</td>' in markdown
+    assert '<td class="toc-folio">17</td>' in markdown
+    assert '<td class="toc-folio">31</td>' in markdown
+
+
+def test_renders_dotted_toc_entries_as_reflowable_aligned_rows() -> None:
+    def line(
+        text: str,
+        top: float,
+        *,
+        size: float = 10,
+        links: tuple[pdf_conversion_module._PdfLink, ...] = (),
+    ) -> pdf_conversion_module._PdfLine:
+        return replace(
+            _pdf_model_line(1, text),
+            x0=70,
+            x1=520,
+            top=top,
+            bottom=top + size,
+            font_size=size,
+            links=links,
+        )
+
+    target = pdf_conversion_module._PdfLink("#page-9", 70, 520, 100, 110)
+    page = pdf_conversion_module._PdfPage(
+        number=1,
+        lines=(
+            line("Índice", 50, size=18),
+            line("Introducción................................9", 100, links=(target,)),
+            line("Primer capítulo..........................1 2", 120),
+            line("Segundo capítulo..........................31", 140),
+            line("Apéndice..................................iv", 160),
+        ),
+        has_images=False,
+        image_area_ratios=(),
+        has_table=False,
+        image_orientation_mismatch=False,
+    )
+
+    markdown, _issues = pdf_conversion_module._render_document(
+        [page],
+        body_size=10,
+        heading_sizes={18.0: 2},
+        repeated_margins=set(),
+        referenced_pages=set(),
+        ocr_pages={},
+        ocr_failed_pages=set(),
+    )
+
+    assert "## Índice" in markdown
+    assert '<a href="#page-9">Introducción</a>' in markdown
+    assert '<td class="toc-folio">9</td>' in markdown
+    assert '<td class="toc-label toc-level-0">Primer capítulo</td>' in markdown
+    assert '<td class="toc-folio">12</td>' in markdown
+    assert '<td class="toc-label toc-level-0">Segundo capítulo</td>' in markdown
+    assert '<td class="toc-folio">31</td>' in markdown
+    assert '<td class="toc-label toc-level-0">Apéndice</td>' in markdown
+    assert '<td class="toc-folio">iv</td>' in markdown
+    assert "..." not in markdown
 
 
 def test_separates_unnumbered_toc_sections_from_adjacent_list_entries() -> None:
@@ -1587,6 +1918,32 @@ def test_recovers_a_clustered_vector_illustration_as_an_image_box() -> None:
     assert bottom >= 390
 
 
+@pytest.mark.parametrize(("letters", "expected"), [(150, 1), (400, 0)])
+def test_preserves_only_sparse_hybrid_full_page_illustrations(
+    letters: int,
+    expected: int,
+) -> None:
+    page = SimpleNamespace(
+        width=600,
+        height=800,
+        bbox=(0, 0, 600, 800),
+        images=[{"x0": 0, "x1": 600, "top": 0, "bottom": 800}],
+        curves=[],
+    )
+    model = pdf_conversion_module._PdfPage(
+        number=1,
+        lines=(_pdf_model_line(1, "A" * letters),),
+        has_images=True,
+        image_area_ratios=(1.0,),
+        has_table=False,
+        image_orientation_mismatch=False,
+    )
+
+    boxes = pdf_conversion_module._exportable_image_boxes(page, model, None)
+
+    assert len(boxes) == expected
+
+
 def test_spatial_character_deduplication_preserves_the_original_choice() -> None:
     characters: list[dict[str, object]] = []
     for index in range(200):
@@ -1753,6 +2110,39 @@ def test_pdf_link_without_visible_text_is_kept_outside_the_paragraph() -> None:
     )
     assert "[enlace]" not in restored_ocr.casefold()
     assert "[Abrir example.com](<https://example.com/vector-destination>)" in restored_ocr
+
+
+def test_invisible_internal_page_link_does_not_create_artificial_prose() -> None:
+    target = "#page-20"
+    line = replace(
+        _pdf_model_line(4, "Index entry without a usable annotation label"),
+        links=(pdf_conversion_module._PdfLink(target, 300, 340, 200, 214),),
+    )
+    page = pdf_conversion_module._PdfPage(
+        number=4,
+        lines=(line,),
+        has_images=False,
+        image_area_ratios=(),
+        has_table=False,
+        image_orientation_mismatch=False,
+    )
+
+    markdown, _issues = pdf_conversion_module._render_document(
+        [page],
+        body_size=12,
+        heading_sizes={},
+        repeated_margins=set(),
+        referenced_pages={20},
+        ocr_pages={},
+        ocr_failed_pages=set(),
+    )
+
+    assert "Destinos conservados" not in markdown
+    assert "Página 20" not in markdown
+    assert "Destinos conservados" not in pdf_conversion_module._restore_page_links(
+        "Recognized index entry.",
+        page,
+    )
 
 
 def test_removes_a_native_margin_number_merged_into_ocr_cover_text() -> None:
@@ -2003,6 +2393,455 @@ def test_does_not_merge_toc_blocks_from_different_pages() -> None:
     ]
 
     assert pdf_conversion_module._blocks_to_markdown(blocks) == "First 1\n\nSecond 2"
+
+
+def test_renders_toc_entries_with_aligned_folios_and_source_emphasis() -> None:
+    line = pdf_conversion_module._PdfLine(
+        page_number=1,
+        page_width=600,
+        page_height=800,
+        text="Chapter One 12",
+        chars=(),
+        x0=72,
+        x1=520,
+        top=100,
+        bottom=114,
+        font_size=12,
+        bold=True,
+        links=(),
+        soft_hyphen_end=False,
+        hard_hyphen_end=False,
+        rotated=False,
+        italic=True,
+    )
+    blocks = [
+        pdf_conversion_module._MarkdownBlock(
+            "toc-entry",
+            "Chapter One",
+            1,
+            source_line=line,
+            toc_folio="12",
+            toc_level=1,
+        )
+    ]
+
+    markdown = pdf_conversion_module._blocks_to_markdown(blocks)
+
+    assert '<table class="document-toc">' in markdown
+    assert (
+        '<td class="toc-label toc-level-1"><strong><em>Chapter One</em></strong></td>' in markdown
+    )
+    assert '<td class="toc-folio">12</td>' in markdown
+    assert "- Chapter One" not in markdown
+
+
+def test_groups_toc_subtitles_into_one_continuous_table() -> None:
+    lines: list[pdf_conversion_module._PdfLine] = []
+    for index in range(4):
+        top = 80 + index * 50
+        lines.extend(
+            (
+                pdf_conversion_module._PdfLine(
+                    page_number=1,
+                    page_width=600,
+                    page_height=800,
+                    text=f"{index + 1}. MAIN ENTRY {100 + index}",
+                    chars=(),
+                    x0=60,
+                    x1=520,
+                    top=top,
+                    bottom=top + 12,
+                    font_size=10,
+                    bold=True,
+                    links=(),
+                    soft_hyphen_end=False,
+                    hard_hyphen_end=False,
+                    rotated=False,
+                ),
+                pdf_conversion_module._PdfLine(
+                    page_number=1,
+                    page_width=600,
+                    page_height=800,
+                    text=f"Indented detail {('alpha', 'beta', 'gamma', 'delta')[index]}",
+                    chars=(),
+                    x0=82,
+                    x1=420,
+                    top=top + 15,
+                    bottom=top + 27,
+                    font_size=10,
+                    bold=False,
+                    links=(),
+                    soft_hyphen_end=False,
+                    hard_hyphen_end=False,
+                    rotated=False,
+                    italic=True,
+                ),
+            )
+        )
+    page = pdf_conversion_module._PdfPage(
+        1,
+        tuple(lines),
+        has_images=False,
+        image_area_ratios=(),
+        has_table=False,
+        image_orientation_mismatch=False,
+    )
+
+    markdown, _issues = pdf_conversion_module._render_document(
+        [page],
+        body_size=10,
+        heading_sizes={},
+        repeated_margins=set(),
+        referenced_pages=set(),
+        ocr_pages={},
+        ocr_failed_pages=set(),
+    )
+
+    assert markdown.count('<table class="document-toc">') == 1
+    assert markdown.count("<tr>") == 9
+    assert '<td class="toc-label toc-level-1"><em>Indented detail alpha</em></td>' in markdown
+    assert '<td class="toc-folio"></td>' in markdown
+
+
+def test_visual_reading_accepts_only_the_disputed_glyph_span() -> None:
+    accepted = pdf_conversion_module._validated_visual_reading(
+        "The Horimiea 1135",
+        "The Horim\ufffda 1135",
+        "The Horimæa 1135",
+    )
+    rejected = pdf_conversion_module._validated_visual_reading(
+        "The Horimiea 1135",
+        "The Horim\ufffda 1135",
+        "A different invention 1135",
+    )
+
+    assert accepted == "The Horimæa 1135"
+    assert rejected is None
+
+
+def test_visual_disagreement_aligns_a_detached_toc_folio() -> None:
+    line = pdf_conversion_module._PdfLine(
+        page_number=12,
+        page_width=600,
+        page_height=800,
+        text="The Horimiea",
+        chars=(),
+        x0=72,
+        x1=300,
+        top=120,
+        bottom=134,
+        font_size=12,
+        bold=False,
+        links=(),
+        soft_hyphen_end=False,
+        hard_hyphen_end=False,
+        rotated=False,
+    )
+    page = pdf_conversion_module._PdfPage(
+        12,
+        (line,),
+        has_images=True,
+        image_area_ratios=(1.0,),
+        has_table=False,
+        image_orientation_mismatch=False,
+    )
+
+    disagreements = pdf_conversion_module._visual_text_disagreements(
+        [page],
+        {12: "|     | The Horim\ufffda |   1135 |"},
+    )
+
+    assert len(disagreements) == 1
+    assert disagreements[0].ocr_text == "The Horim\ufffda"
+
+
+def test_visual_disagreement_prioritizes_a_rare_ligature() -> None:
+    similarity = pdf_conversion_module.SequenceMatcher(
+        None,
+        "The Horimiea".casefold(),
+        "The Horimæa".casefold(),
+        autojunk=False,
+    ).ratio()
+
+    priority = pdf_conversion_module._visual_disagreement_priority(
+        "The Horimiea",
+        "The Horimæa",
+        similarity,
+    )
+
+    assert priority is not None
+    assert priority >= 115
+
+
+def test_visual_disagreement_prioritizes_an_alphanumeric_toc_number() -> None:
+    similarity = pdf_conversion_module.SequenceMatcher(
+        None,
+        "6S. THE FIFTH HOUSE".casefold(),
+        "68. THE FIFTH HOUSE".casefold(),
+        autojunk=False,
+    ).ratio()
+
+    priority = pdf_conversion_module._visual_disagreement_priority(
+        "6S. THE FIFTH HOUSE",
+        "68. THE FIFTH HOUSE",
+        similarity,
+    )
+    accepted = pdf_conversion_module._validated_visual_reading(
+        "6S. THE FIFTH HOUSE",
+        "68. THE FIFTH HOUSE",
+        "68. THE FIFTH HOUSE",
+    )
+
+    assert priority is not None
+    assert priority >= 112
+    assert accepted == "68. THE FIFTH HOUSE"
+
+
+def test_visual_arbiter_can_override_a_self_suspicious_mixed_glyph() -> None:
+    priority = pdf_conversion_module._visual_disagreement_priority(
+        "6S. THE FIFTH HOUSE",
+        "6S. THE FIFTH HOUSE",
+        1.0,
+    )
+    accepted_number = pdf_conversion_module._validated_visual_reading(
+        "6S. THE FIFTH HOUSE",
+        "6S. THE FIFTH HOUSE",
+        "68. THE FIFTH HOUSE",
+    )
+    accepted_third_numeric_reading = pdf_conversion_module._validated_visual_reading(
+        "6S. THE FIFTH HOUSE",
+        "65. THE FIFTH HOUSE",
+        "68. THE FIFTH HOUSE",
+    )
+    accepted_word = pdf_conversion_module._validated_visual_reading(
+        "77ie Subterranean Place",
+        "77ie Subterranean Place",
+        "The Subterranean Place",
+    )
+
+    assert priority is not None
+    assert priority >= 118
+    assert accepted_number == "68. THE FIFTH HOUSE"
+    assert accepted_third_numeric_reading == "68. THE FIFTH HOUSE"
+    assert accepted_word == "The Subterranean Place"
+
+
+def test_visual_arbiter_can_resolve_a_replacement_glyph_without_trusting_bad_ocr() -> None:
+    priority = pdf_conversion_module._visual_disagreement_priority(
+        "Primary Directions and the 90� Arc",
+        "Primary Directions and the 90� Arc",
+        1.0,
+    )
+    accepted = pdf_conversion_module._validated_visual_reading(
+        "Primary Directions and the 90� Arc",
+        "Primary Directions and the 90� Arc",
+        "Primary Directions and the 90° Arc",
+    )
+
+    assert priority is not None
+    assert priority >= 125
+    assert accepted == "Primary Directions and the 90° Arc"
+
+
+def test_visual_disagreements_include_a_self_suspicious_line_when_ocr_agrees() -> None:
+    line = pdf_conversion_module._PdfLine(
+        page_number=8,
+        page_width=600,
+        page_height=800,
+        text="6S. THE FIFTH HOUSE",
+        chars=(),
+        x0=72,
+        x1=300,
+        top=120,
+        bottom=134,
+        font_size=12,
+        bold=True,
+        links=(
+            pdf_conversion_module._PdfLink(
+                target="#page-68",
+                x0=72,
+                x1=300,
+                top=120,
+                bottom=134,
+            ),
+        ),
+        soft_hyphen_end=False,
+        hard_hyphen_end=False,
+        rotated=False,
+    )
+    page = pdf_conversion_module._PdfPage(
+        8,
+        (line,),
+        has_images=True,
+        image_area_ratios=(1.0,),
+        has_table=False,
+        image_orientation_mismatch=False,
+    )
+
+    disagreements = pdf_conversion_module._visual_text_disagreements(
+        [page],
+        {8: "6S. THE FIFTH HOUSE"},
+    )
+
+    assert len(disagreements) == 1
+    assert disagreements[0].priority >= 118
+    assert pdf_conversion_module._has_suspicious_numeric_glyph_encoding(page)
+
+
+def test_visual_disagreement_keeps_a_number_from_an_ocr_table_cell() -> None:
+    line = pdf_conversion_module._PdfLine(
+        page_number=8,
+        page_width=600,
+        page_height=800,
+        text="6S. THE FIFTH HOUSE",
+        chars=(),
+        x0=72,
+        x1=300,
+        top=120,
+        bottom=134,
+        font_size=12,
+        bold=True,
+        links=(),
+        soft_hyphen_end=False,
+        hard_hyphen_end=False,
+        rotated=False,
+    )
+    page = pdf_conversion_module._PdfPage(
+        8,
+        (line,),
+        has_images=True,
+        image_area_ratios=(1.0,),
+        has_table=False,
+        image_orientation_mismatch=False,
+    )
+
+    disagreements = pdf_conversion_module._visual_text_disagreements(
+        [page],
+        {8: "| 68. | THE FIFTH HOUSE | 697 |"},
+    )
+
+    assert len(disagreements) == 1
+    assert disagreements[0].ocr_text == "68. THE FIFTH HOUSE"
+
+
+def test_hidden_text_budget_selects_scanned_contents_but_not_ordinary_prose() -> None:
+    def page(number: int, lines: tuple[pdf_conversion_module._PdfLine, ...]):
+        return pdf_conversion_module._PdfPage(
+            number,
+            lines,
+            has_images=True,
+            image_area_ratios=(1.0,),
+            has_table=False,
+            image_orientation_mismatch=False,
+        )
+
+    toc_lines = tuple(
+        pdf_conversion_module._PdfLine(
+            page_number=1,
+            page_width=600,
+            page_height=800,
+            text=f"Chapter {index} {index * 10}",
+            chars=(),
+            x0=72,
+            x1=520,
+            top=100 + index * 20,
+            bottom=114 + index * 20,
+            font_size=12,
+            bold=False,
+            links=(),
+            soft_hyphen_end=False,
+            hard_hyphen_end=False,
+            rotated=False,
+        )
+        for index in range(1, 7)
+    )
+    prose_line = replace(
+        toc_lines[0],
+        page_number=2,
+        text="This ordinary scanned paragraph has a useful selectable text layer.",
+    )
+
+    selected = pdf_conversion_module._hidden_text_audit_pages(
+        [page(1, toc_lines), page(2, (prose_line,))]
+    )
+
+    assert selected == {1}
+
+
+def test_hidden_text_audit_budget_scales_with_the_selected_interval() -> None:
+    pages = []
+    for page_number in range(1, 21):
+        lines = tuple(
+            pdf_conversion_module._PdfLine(
+                page_number=page_number,
+                page_width=600,
+                page_height=800,
+                text=f"Chapter {index} {index * 10}",
+                chars=(),
+                x0=72,
+                x1=520,
+                top=100 + index * 20,
+                bottom=114 + index * 20,
+                font_size=12,
+                bold=False,
+                links=(),
+                soft_hyphen_end=False,
+                hard_hyphen_end=False,
+                rotated=False,
+            )
+            for index in range(1, 7)
+        )
+        pages.append(
+            pdf_conversion_module._PdfPage(
+                page_number,
+                lines,
+                has_images=True,
+                image_area_ratios=(1.0,),
+                has_table=False,
+                image_orientation_mismatch=False,
+            )
+        )
+
+    selected = pdf_conversion_module._hidden_text_audit_pages(pages)
+
+    assert selected == {1, 2, 3, 4, 5}
+
+
+def test_secondary_native_engine_can_confirm_one_ocr_spelling() -> None:
+    line = pdf_conversion_module._PdfLine(
+        page_number=1,
+        page_width=600,
+        page_height=800,
+        text="The Horimiea 1135",
+        chars=(),
+        x0=72,
+        x1=520,
+        top=100,
+        bottom=114,
+        font_size=12,
+        bold=False,
+        links=(),
+        soft_hyphen_end=False,
+        hard_hyphen_end=False,
+        rotated=False,
+    )
+    page = pdf_conversion_module._PdfPage(
+        1,
+        (line,),
+        has_images=True,
+        image_area_ratios=(1.0,),
+        has_table=False,
+        image_orientation_mismatch=False,
+    )
+
+    reconciled, changes = pdf_conversion_module._reconcile_secondary_native_text(
+        [page],
+        {1: "The Horimaea 1135"},
+        {1: "The Horimaea 1135"},
+    )
+
+    assert changes == 1
+    assert reconciled[0].lines[0].text == "The Horimaea 1135"
 
 
 def test_pdf_nests_explicit_chapters_under_a_container_only_with_two_siblings() -> None:

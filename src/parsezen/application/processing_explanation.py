@@ -11,6 +11,7 @@ from parsezen.domain.jobs import (
     ProcessingPlan,
     TranslationMethod,
 )
+from parsezen.domain.stages import StageKind
 from parsezen.translation_quality import (
     TARGET_LANGUAGE_CODES,
     LinguisticReviewCoverage,
@@ -40,35 +41,61 @@ class ProcessingFlow:
 
     compact_steps: tuple[str, ...]
     detailed_steps: tuple[str, ...]
+    step_stages: tuple[tuple[StageKind, ...], ...]
     human_review: HumanReviewPolicy
 
     @property
-    def human_review_note(self) -> str | None:
+    def human_review_step(self) -> str | None:
         return {
             HumanReviewPolicy.NONE: None,
             HumanReviewPolicy.IF_CHANGES: "Tu revisión si hay cambios",
-            HumanReviewPolicy.BEFORE_PUBLISHING: "Tu revisión antes de publicar",
+            HumanReviewPolicy.BEFORE_PUBLISHING: "Tu revisión final",
         }[self.human_review]
+
+    @property
+    def compact_sequence(self) -> tuple[str, ...]:
+        """Return the complete route, including the user's decision when required."""
+
+        return self.compact_steps + ((self.human_review_step,) if self.human_review_step else ())
+
+    @property
+    def detailed_sequence(self) -> tuple[str, ...]:
+        """Return the accessible route with the same semantics as the compact one."""
+
+        return self.detailed_steps + ((self.human_review_step,) if self.human_review_step else ())
+
+    @property
+    def sequence_stages(self) -> tuple[tuple[StageKind, ...], ...]:
+        """Map every visible step to its real execution phases."""
+
+        return self.step_stages + (((),) if self.human_review_step else ())
 
 
 def processing_flow(
     source_format: DocumentFormat,
     configuration: JobConfiguration,
 ) -> ProcessingFlow:
-    """Describe automatic actions separately from the later human decision."""
+    """Describe the automatic route and any final human decision."""
 
     reviewed = configuration.plan is ProcessingPlan.LOCAL_AI_REVIEWED
     translation = configuration.translation
     output_format = configuration.output.format
     compact_steps: list[str] = []
     detailed_steps: list[str] = []
+    step_stages: list[tuple[StageKind, ...]] = []
 
-    def add_step(compact: str, detailed: str | None = None) -> None:
+    def add_step(
+        compact: str,
+        detailed: str | None = None,
+        *,
+        stages: tuple[StageKind, ...],
+    ) -> None:
         compact_steps.append(compact)
         detailed_steps.append(detailed or compact)
+        step_stages.append(stages)
 
     if source_format is DocumentFormat.PDF and configuration.force_pdf_ocr:
-        add_step("OCR")
+        add_step("OCR", stages=(StageKind.PREPARE,))
 
     automatic_transformations = 0
     if translation.enabled:
@@ -78,43 +105,60 @@ def processing_flow(
             add_step(
                 f"Traducir{suffix}",
                 f"Traducir con Argos{suffix}",
+                stages=(StageKind.TRANSLATE,),
             )
             automatic_transformations += 1
             if reviewed:
                 add_step(
                     "Verificar traducción",
                     "Verificar traducción con IA local",
+                    stages=(StageKind.REFINE,),
                 )
                 automatic_transformations += 1
         elif reviewed:
             add_step(
                 f"Traducir y corregir{suffix}",
                 f"Traducir y corregir con IA local{suffix}",
+                stages=(StageKind.TRANSLATE, StageKind.REFINE),
             )
             automatic_transformations += 1
         else:
             add_step(
                 f"Traducir{suffix}",
                 f"Traducir con IA local{suffix}",
+                stages=(StageKind.TRANSLATE,),
             )
             automatic_transformations += 1
     elif reviewed:
-        add_step("Corregir contenido", "Corregir contenido con IA local")
+        add_step(
+            "Corregir contenido",
+            "Corregir contenido con IA local",
+            stages=(StageKind.REFINE,),
+        )
         automatic_transformations += 1
 
     if reviewed and output_format is DocumentFormat.EPUB:
-        add_step("Organizar EPUB", "Organizar EPUB con IA local")
+        add_step(
+            "Organizar EPUB",
+            "Organizar EPUB con IA local",
+            stages=(StageKind.STRUCTURE,),
+        )
         automatic_transformations += 1
     elif (
         source_format is DocumentFormat.EPUB
         and output_format is DocumentFormat.EPUB
         and automatic_transformations == 0
     ):
-        add_step("Personalizar EPUB")
+        add_step("Personalizar EPUB", stages=(StageKind.STRUCTURE,))
         automatic_transformations += 1
 
     if automatic_transformations == 0:
-        add_step("Convertir")
+        convert_stages = (
+            (StageKind.PUBLISH,)
+            if compact_steps and compact_steps[-1] == "OCR"
+            else (StageKind.PREPARE, StageKind.PUBLISH)
+        )
+        add_step("Convertir", stages=convert_stages)
 
     human_review = (
         HumanReviewPolicy.BEFORE_PUBLISHING
@@ -126,6 +170,7 @@ def processing_flow(
     return ProcessingFlow(
         tuple(compact_steps),
         tuple(detailed_steps),
+        tuple(step_stages),
         human_review,
     )
 
@@ -195,45 +240,6 @@ def processing_pass_summary(configuration: JobConfiguration) -> str:
     return (
         "1 pasada principal de IA que combina traducción y corrección. "
         "La corrección queda integrada en la traducción."
-    )
-
-
-def translation_route_summary(
-    method: TranslationMethod,
-    *,
-    reviewed: bool,
-    epub: bool,
-) -> str:
-    """Give configuration UI a short, truthful route and qualitative cost preview."""
-
-    if method is TranslationMethod.OFFLINE:
-        if reviewed and epub:
-            return (
-                "Coste aproximado alto · Argos traduce; la IA hace una verificación bilingüe "
-                "independiente y después planifica la estructura (3 pasadas)."
-            )
-        if reviewed:
-            return (
-                "Coste aproximado alto · Argos traduce y la IA realiza después una verificación "
-                "bilingüe independiente (2 pasadas)."
-            )
-        return (
-            "Coste aproximado bajo · Argos traduce sin Ollama (1 pasada); hay comprobaciones "
-            "automáticas, pero no revisión semántica."
-        )
-    if reviewed and epub:
-        return (
-            "Coste aproximado alto · la IA traduce y corrige en la misma pasada; después planifica "
-            "la estructura. No hay una segunda verificación bilingüe (2 pasadas)."
-        )
-    if reviewed:
-        return (
-            "Coste aproximado alto · la IA traduce y corrige en una sola pasada. La corrección "
-            "no es una verificación bilingüe independiente."
-        )
-    return (
-        "Coste aproximado medio · la IA traduce en una pasada; hay comprobaciones automáticas, "
-        "pero no una revisión semántica posterior."
     )
 
 

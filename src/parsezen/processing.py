@@ -50,6 +50,7 @@ from parsezen.epub_conversion import (
 )
 from parsezen.errors import (
     ImprovementError,
+    OutputWriteError,
     ParsezenError,
     ProcessingCancelledError,
     RequestValidationError,
@@ -86,6 +87,7 @@ from parsezen.pdf_conversion import (
     PdfPageRange,
     PdfProgressCallback,
     PdfQualityReport,
+    PdfVisualArbiterFactory,
     render_pdf_page_cover,
     resolve_pdf_page_range,
     strip_pdf_page_markers,
@@ -152,6 +154,7 @@ from parsezen.translation_quality import (
     detect_language_code,
     resolve_language_code,
 )
+from parsezen.visual_ocr import build_local_visual_text_arbiter
 from parsezen.work_checkpoints import (
     WorkCheckpoints,
     open_work_checkpoints,
@@ -220,6 +223,8 @@ class _PreparedEpubReview:
     revision_draft: RevisionDraft | None
     linguistic_review_mode: LinguisticReviewMode
     translation_quality_report: TranslationQualityReport
+    review_translation_quality_report: TranslationQualityReport
+    normalized_output: bool
 
 
 class _ConversionArguments(TypedDict, total=False):
@@ -427,28 +432,55 @@ def apply_reviewed_revision(result: ProcessResult, reviewed_text: str) -> Proces
         metadata = result.revision_epub_metadata
         if metadata is None:
             raise RequestValidationError("Falta la información necesaria para reconstruir el EPUB.")
-        built = build_epub(published_text, result.revision_resources, metadata)
-        integrity = binary_integrity_capture(
-            built.content,
-            format_label="EPUB",
-            validate_container=_validate_epub_path,
-            ledger=(
-                built.integrity_report.ledger
-                if built.integrity_report is not None
-                else IntegrityLedger()
-            ),
+        preserve_existing_package = bool(
+            result.preserve_epub_package_on_unchanged_review
+            and draft is None
+            and result.review_markdown is not None
+            and published_text == strip_pdf_page_markers(result.review_markdown)
         )
-        replace_binary_output(
-            result.final_path,
-            built.content,
-            validate_staged=integrity,
-        )
-        integrity_report = merge_integrity_reports(
-            built.integrity_report,
-            integrity.report,
-        )
-        epub_chapters = built.chapter_count
-        preserved_images = built.resource_count
+        if preserve_existing_package:
+            try:
+                existing_content = result.final_path.read_bytes()
+            except OSError as exc:
+                raise OutputWriteError("No se pudo volver a leer el EPUB revisado.") from exc
+            integrity = binary_integrity_capture(
+                existing_content,
+                format_label="EPUB",
+                validate_container=_validate_preserved_epub_path,
+                ledger=(
+                    result.final_integrity_report.ledger
+                    if result.final_integrity_report is not None
+                    else IntegrityLedger()
+                ),
+            )
+            integrity(result.final_path)
+            integrity_report = merge_integrity_reports(
+                result.final_integrity_report,
+                integrity.report,
+            )
+        else:
+            built = build_epub(published_text, result.revision_resources, metadata)
+            integrity = binary_integrity_capture(
+                built.content,
+                format_label="EPUB",
+                validate_container=_validate_epub_path,
+                ledger=(
+                    built.integrity_report.ledger
+                    if built.integrity_report is not None
+                    else IntegrityLedger()
+                ),
+            )
+            replace_binary_output(
+                result.final_path,
+                built.content,
+                validate_staged=integrity,
+            )
+            integrity_report = merge_integrity_reports(
+                built.integrity_report,
+                integrity.report,
+            )
+            epub_chapters = built.chapter_count
+            preserved_images = built.resource_count
     else:
         raise RequestValidationError(
             "Este formato todavía no admite aplicar una revisión editable."
@@ -457,6 +489,8 @@ def apply_reviewed_revision(result: ProcessResult, reviewed_text: str) -> Proces
         result,
         epub_chapters=epub_chapters,
         preserved_images=preserved_images,
+        translation_quality_report=result.translation_quality_for_review,
+        review_translation_quality_report=result.translation_quality_for_review,
         review_markdown=published_text,
         review_required=False,
         revision_approved=True,
@@ -562,10 +596,10 @@ def review_completed_result(
         protected_translation_terms=tuple(entry.target for entry in request.glossary),
     )
     draft = candidate if candidate.changes else None
-    translation_quality_report = base_result.translation_quality_report
+    review_translation_quality_report = base_result.translation_quality_for_review
     linguistic_review_coverage = base_result.linguistic_review_coverage
     if bilingual and source_markdown is not None:
-        translation_quality_report = _translation_quality_report(
+        review_translation_quality_report = _translation_quality_report(
             request,
             source_markdown,
             proposed_markdown,
@@ -581,7 +615,7 @@ def review_completed_result(
             else 0
         )
         linguistic_review_coverage = _linguistic_review_coverage(
-            translation_quality_report,
+            review_translation_quality_report,
             mode=LinguisticReviewMode.TARGETED_BILINGUAL,
             reviewed_blocks=previous_reviewed + len(selected),
             independently_verified_blocks=previous_independent + len(selected),
@@ -594,7 +628,7 @@ def review_completed_result(
     )
     return replace(
         base_result,
-        translation_quality_report=translation_quality_report,
+        review_translation_quality_report=review_translation_quality_report,
         linguistic_review_coverage=linguistic_review_coverage,
         revision_draft=draft,
         review_markdown=proposed_markdown if draft is not None else current,
@@ -664,6 +698,7 @@ def _process_document(
         pdf_checkpoints,
         converter=convert_document,
         page_range_resolver=resolve_pdf_page_range,
+        pdf_visual_arbiter_factory=_pdf_visual_arbiter_factory(request, settings),
     )
     generated_epub = request.output_format is OutputFormat.EPUB
 
@@ -694,7 +729,7 @@ def _process_document(
 
 def _prepare_translated_epub_review(
     request: ProcessRequest,
-    final_path: Path,
+    staged_path: Path,
     translated_language_code: str,
     converted_source: ConvertedDocument,
     initial_translation_quality_report: TranslationQualityReport,
@@ -717,8 +752,8 @@ def _prepare_translated_epub_review(
     )
     # Every translated EPUB reaches the same confirmation/editor contract. The
     # exact package stays published unless an option requires normalization.
-    converted_document = convert_epub(final_path, cancellation=cancellation)
-    package_metadata = inspect_epub_package(final_path)
+    converted_document = convert_epub(staged_path, cancellation=cancellation)
+    package_metadata = inspect_epub_package(staged_path)
     normalized_markdown = (
         converted_document.markdown
         if request.include_images
@@ -780,6 +815,14 @@ def _prepare_translated_epub_review(
     )
     revision_source = normalized_document.markdown
     reviewed_markdown = revision_source
+    review_base_quality_report = (
+        _translation_quality_report(
+            request,
+            converted_source.markdown,
+            revision_source,
+        )
+        or initial_translation_quality_report
+    )
     revision_kinds: set[RevisionKind] = set()
     translation_review_source: str | None = None
     content_review_fused = bool(
@@ -806,6 +849,7 @@ def _prepare_translated_epub_review(
             on_progress,
             cancellation,
             work_checkpoints,
+            quality_report=review_base_quality_report,
         )
         if reviewed_markdown != revision_source:
             revision_kinds.add(RevisionKind.CONTENT)
@@ -840,16 +884,14 @@ def _prepare_translated_epub_review(
         if revision_candidate is not None and revision_candidate.changes
         else None
     )
-    translation_quality_report = initial_translation_quality_report
-    if reviewed_markdown != revision_source:
-        updated_report = _translation_quality_report(
+    review_translation_quality_report = (
+        _translation_quality_report(
             request,
             converted_source.markdown,
             reviewed_markdown,
         )
-        if updated_report is None:
-            raise AssertionError("A translated EPUB always has a translation quality report.")
-        translation_quality_report = updated_report
+        or initial_translation_quality_report
+    )
     normalized_document = replace(
         normalized_document,
         markdown=(revision_source if revision_draft is not None else reviewed_markdown),
@@ -875,7 +917,7 @@ def _prepare_translated_epub_review(
             ),
         )
         replace_binary_output(
-            final_path,
+            staged_path,
             built.content,
             validate_staged=normalized_capture,
         )
@@ -893,7 +935,9 @@ def _prepare_translated_epub_review(
         integrity_report=integrity_report,
         revision_draft=revision_draft,
         linguistic_review_mode=linguistic_review_mode,
-        translation_quality_report=translation_quality_report,
+        translation_quality_report=initial_translation_quality_report,
+        review_translation_quality_report=review_translation_quality_report,
+        normalized_output=normalize_output,
     )
 
 
@@ -1050,33 +1094,61 @@ def _process_epub_translation(
     )
     announce_translation_stage()
     check_cancelled(cancellation)
-    _notify(on_stage, ProcessStage.WRITING)
     translated_integrity = binary_integrity_capture(
         translated_content,
         format_label="EPUB",
         validate_container=_validate_preserved_epub_path,
     )
+    staging_directory = request.output_directory or request.source_path.parent
+    with _staged_epub_payload(translated_content, staging_directory) as staged_path:
+        translated_integrity(staged_path)
+        prepared_review = _prepare_translated_epub_review(
+            request,
+            staged_path,
+            translated_epub.language_code,
+            converted_source,
+            translated_epub.quality_report,
+            translation_glossary,
+            target_language,
+            effective_ai_mode,
+            on_stage,
+            on_progress,
+            settings,
+            cancellation,
+            work_checkpoints,
+        )
+        check_cancelled(cancellation)
+        try:
+            publication_content = staged_path.read_bytes()
+        except OSError as exc:
+            raise OutputWriteError(
+                "No se pudo preparar el EPUB validado para su publicación."
+            ) from exc
+    publication_integrity = binary_integrity_capture(
+        publication_content,
+        format_label="EPUB",
+        validate_container=(
+            _validate_epub_path
+            if prepared_review.normalized_output
+            else _validate_preserved_epub_path
+        ),
+        ledger=(
+            prepared_review.integrity_report.ledger
+            if prepared_review.integrity_report is not None
+            else (
+                translated_integrity.report.ledger
+                if translated_integrity.report is not None
+                else IntegrityLedger()
+            )
+        ),
+    )
+    _notify(on_stage, ProcessStage.WRITING)
     final_path = write_epub_translation_output(
         request.source_path,
-        translated_content,
+        publication_content,
         translated_epub.language_code,
         request.output_directory,
-        validate_staged=translated_integrity,
-    )
-    prepared_review = _prepare_translated_epub_review(
-        request,
-        final_path,
-        translated_epub.language_code,
-        converted_source,
-        translated_epub.quality_report,
-        translation_glossary,
-        target_language,
-        effective_ai_mode,
-        on_stage,
-        on_progress,
-        settings,
-        cancellation,
-        work_checkpoints,
+        validate_staged=publication_integrity,
     )
     _finish_epub_checkpoints(
         checkpoints,
@@ -1097,8 +1169,9 @@ def _process_epub_translation(
         epub_resumed_parts=translated_epub.resumed_parts,
         epub_checkpoint_degraded=translated_epub.checkpoint_degraded,
         translation_quality_report=prepared_review.translation_quality_report,
+        review_translation_quality_report=(prepared_review.review_translation_quality_report),
         linguistic_review_coverage=_linguistic_review_coverage(
-            prepared_review.translation_quality_report,
+            prepared_review.review_translation_quality_report,
             mode=prepared_review.linguistic_review_mode,
         ),
         preserved_images=prepared_review.resource_count,
@@ -1112,10 +1185,11 @@ def _process_epub_translation(
             else prepared_review.document.markdown
         ),
         review_required=True,
-        final_integrity_report=(
-            prepared_review.integrity_report
-            if prepared_review.integrity_report is not None
-            else translated_integrity.report
+        preserve_epub_package_on_unchanged_review=True,
+        final_integrity_report=merge_integrity_reports(
+            translated_integrity.report,
+            prepared_review.integrity_report,
+            publication_integrity.report,
         ),
         front_matter_blocks=source_semantic.front_matter_blocks,
         toc_blocks=source_semantic.toc_blocks,
@@ -1187,6 +1261,7 @@ def _process_epub_personalization(
         revision_epub_metadata=metadata,
         review_markdown=markdown,
         review_required=True,
+        preserve_epub_package_on_unchanged_review=True,
         final_integrity_report=integrity.report,
         front_matter_blocks=semantic_document.front_matter_blocks,
         toc_blocks=semantic_document.toc_blocks,
@@ -1236,6 +1311,31 @@ def _uses_general_work_checkpoints(request: ProcessRequest) -> bool:
 
 def _uses_pdf_conversion_checkpoints(request: ProcessRequest) -> bool:
     return request.source_path.suffix.lower() == ".pdf" and request.convert_to_markdown
+
+
+def _pdf_visual_arbiter_factory(
+    request: ProcessRequest,
+    settings: AppSettings | None,
+) -> PdfVisualArbiterFactory | None:
+    """Create the optional vision arbiter lazily only for an AI-backed PDF workflow."""
+
+    if (
+        request.source_path.suffix.lower() != ".pdf"
+        or settings is None
+        or not (
+            request.improvement_mode is not None
+            or request.review_content
+            or request.review_structure
+        )
+    ):
+        return None
+    normalized = validate_settings(settings)
+    if normalized.model is None:
+        return None
+    return lambda: build_local_visual_text_arbiter(
+        normalized.model,
+        normalized.timeout_seconds,
+    )
 
 
 def _checkpoint_source_digest(request: ProcessRequest) -> str:
@@ -1828,6 +1928,35 @@ def _validate_epub_path(path: Path) -> None:
 
 def _validate_preserved_epub_path(path: Path) -> None:
     inspect_epub_package(path)
+
+
+@contextmanager
+def _staged_epub_payload(content: bytes, directory: Path) -> Iterator[Path]:
+    """Expose unpublished EPUB bytes to local readers and remove them on every exit path."""
+
+    staged_path: Path | None = None
+    try:
+        descriptor, temporary_name = mkstemp(
+            dir=directory,
+            prefix=".parsezen-epub-prepare-",
+            suffix=".epub",
+        )
+        staged_path = Path(temporary_name)
+        with os.fdopen(descriptor, "wb") as output_file:
+            output_file.write(content)
+            output_file.flush()
+            os.fsync(output_file.fileno())
+    except OSError as exc:
+        if staged_path is not None:
+            staged_path.unlink(missing_ok=True)
+        raise OutputWriteError("No se pudo preparar temporalmente el EPUB traducido.") from exc
+    try:
+        yield staged_path
+    finally:
+        try:
+            staged_path.unlink(missing_ok=True)
+        except OSError:
+            LOGGER.warning("epub_staging_cleanup_failed")
 
 
 @contextmanager

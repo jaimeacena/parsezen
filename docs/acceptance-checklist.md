@@ -55,8 +55,17 @@ python scripts/sync_version.py --check
   `Organizar EPUB` y `Personalizar EPUB`; no usa `Revisar con IA` para describir trabajo automático.
 - `→` separa fases y `y` une acciones integradas. El idioma de destino siempre aparece al traducir y
   el motor queda en la ayuda contextual.
-- La segunda línea de Flujo se omite cuando no aporta una decisión. Muestra `Tu revisión si hay
-  cambios` en recorridos revisados no EPUB y `Tu revisión antes de publicar` en toda salida EPUB.
+- Flujo presenta una única secuencia semántica. Termina en `Tu revisión si hay cambios` en recorridos
+  revisados no EPUB y en `Tu revisión final` en toda salida EPUB; si se parte en dos líneas, todos los
+  pasos mantienen el mismo estilo y cada paso salvo el último conserva su flecha de continuación.
+- En la tabla amplia, Flujo dispone de más ancho que Documento, Salida o Estado; la redistribución no
+  provoca scroll horizontal ni impide mostrar acciones como `Revisar y publicar`.
+- Antes de procesar, todos los pasos de Flujo mantienen el mismo peso. Durante la ejecución, el paso
+  actual usa el acento, los completados muestran `✓`, los futuros se atenúan y `Tu revisión` solo usa
+  el tono de aviso cuando requiere una acción. Un fallo afecta únicamente a su paso.
+- La progresión visual deriva de fases semánticas, no de comparar etiquetas. Una acción combinada como
+  `Traducir y corregir` permanece unida durante todas sus fases internas y cada fila progresa de forma
+  independiente.
 - Varias filas calculan su flujo de manera independiente; añadir documentos no mezcla idiomas,
   motores, OCR ni políticas de revisión.
 - La IA local muestra un estado breve y deja el modelo general heredado en la ayuda contextual, sin
@@ -138,8 +147,8 @@ python scripts/sync_version.py --check
 - El preanálisis no guarda nombres, rutas ni contenido, proyecta la estimación en la cola y no añade
   una confirmación informativa entre `Procesar` y la preparación real.
 - Tras diez segundos de progreso medible, la fila puede actualizar el tiempo restante y explica si
-  descontó tiempo o lo recalculó con el ritmo real; al superar el máximo inicial deja de mostrar una
-  cuenta atrás precisa.
+  descontó tiempo o lo recalculó con el ritmo real; el texto visible usa `Quedan ~X–Y min` y, al
+  superar el máximo inicial, deja de mostrar una cuenta atrás precisa.
 - Al terminar un documento, `Ver resumen` distingue integridad técnica, incidencias detectadas y
   revisión manual, sin presentar la ausencia de señales como equivalencia semántica.
 - El cierre del lote cuenta documentos listos, pendientes de revisión, fallidos, pausados y
@@ -149,7 +158,8 @@ python scripts/sync_version.py --check
 - Las notificaciones de Windows aparecen al terminar o requerir atención solo con Parsezen
   minimizado o inactivo.
 - Actividad reciente conserva como máximo 20 intentos, no contiene texto documental, puede abrir
-  resultado o carpeta y se borra sin eliminar ningún documento.
+  resultado o carpeta y se borra sin eliminar ningún documento. En escritorio distribuye lista y
+  detalle en dos paneles; en compacto los apila sin scroll horizontal.
 
 ## PDF y OCR
 
@@ -181,9 +191,15 @@ python scripts/sync_version.py --check
 - Una página de dos a cuatro columnas conserva cada columna completa de izquierda a derecha, sin
   desplazar títulos o separadores de ancho completo.
 - Un índice con al menos tres folios separados a la derecha vuelve a asociar cada número con la
-  entrada de su misma fila, conserva el orden multicolumna y genera elementos de lista independientes;
-  una columna numérica ambigua o una tabla ordinaria permanece intacta.
-- Un encabezado de sección sin folio queda fuera de la lista anterior y no se fusiona con su última
+  entrada de su misma fila, conserva el orden multicolumna y genera una tabla de índice con folios
+  alineados, sangría, énfasis y enlaces internos; una columna numérica ambigua o una tabla ordinaria
+  permanece intacta.
+- Un índice de un libro largo conserva folios de cuatro cifras como `1023` en la celda derecha sin
+  convertirlos en párrafos sueltos ni ampliar a cuatro cifras la detección general de márgenes.
+- Un folio mixto como `62S` solo se convierte en `628` cuando la etiqueta de su fila, la secuencia
+  numérica vecina y el OCR local dejan un único candidato. El OCR puede reponer un espacio ausente
+  entre palabras de esa fila, pero no sustituye las letras nativas aunque su propia grafía difiera.
+- Un encabezado de sección sin folio queda fuera de la tabla anterior y no se fusiona con su última
   entrada durante la conversión CommonMark→XHTML.
 - Argos no recibe el folio final de una entrada de índice y tanto la traducción como la corrección
   conservan ese mismo folio al final de la entrada; desplazarlo se rechaza aunque la cifra siga
@@ -218,6 +234,14 @@ python scripts/sync_version.py --check
 - Los grupos de curvas que forman ilustraciones se conservan como imágenes y no duplican recursos
   incrustados solapados.
 - Una página dudosa abre la imagen a la izquierda y el texto editable a la derecha.
+- Una página con imagen completa y texto útil puede entrar en la auditoría OCR acotada sin que el OCR
+  sustituya automáticamente la capa nativa. El presupuesto no supera el 25 % del intervalo ni seis
+  páginas; PDFium solo se ejecuta en esas páginas inciertas.
+- Una discrepancia breve entre capa nativa y OCR usa como máximo dos arbitrajes visuales locales por
+  página y ocho por documento. Una ligadura rara se prioriza; la propuesta no puede cambiar átomos
+  coincidentes ni inventar cifras, y la ausencia o fallo del modelo visual no bloquea la conversión.
+- Los canarios sintéticos conservan índice, columnas, negrita, cursiva y fórmulas. El Markdown es
+  idéntico al repetir la conversión con checkpoints de página y sin ellos.
 - Los marcadores técnicos no aparecen en el Markdown o EPUB final.
 - La publicación EPUB sustituye caracteres prohibidos por XML 1.0 antes de construir el paquete y
   mantiene intactos, byte por byte, todos los recursos binarios.
@@ -229,7 +253,8 @@ python scripts/sync_version.py --check
   del documento`; la cola continúa con otros documentos mientras uno espera decisiones.
 - Solo aparecen las opciones de la fase actual.
 - Original y propuesta son selecciones excluyentes.
-- Una unidad nueva no marca ninguna elección: la recomendación se muestra como provisional.
+- Una unidad nueva preselecciona la recomendación segura sin resolverla: `Siguiente` la confirma,
+  mientras cerrar sin interacción la mantiene pendiente.
 - El caso común no repite posición, prioridad media ni la necesidad obvia de confirmar; solo una
   prioridad alta o crítica, un aviso, una etiqueta o una sugerencia concreta añaden contexto.
 - La elección confirmada se ve en el botón y en el tintado del panel, sin borde turquesa alrededor
@@ -246,6 +271,11 @@ python scripts/sync_version.py --check
   caso o una fase previa; el pie mantiene `Guardar y salir` y una única acción primaria.
 - Las propuestas que cambian cifras, fechas, nombres, párrafos o demasiado contenido seleccionan el
   original por defecto y la aprobación masiva no las acepta.
+- Un tramo OCR íntegramente en mayúsculas continúa en mayúsculas después de traducirse; texto mixto
+  y letras aisladas conservan el comportamiento normal del idioma de destino.
+- Una decisión OCR o de traducción confirmada aparece en el texto enviado al editor y en el EPUB
+  publicado. Cambiarla invalida cualquier borrador EPUB anterior; una decisión que no pueda anclarse
+  bloquea la publicación en vez de mostrar un éxito falso.
 - La pre-organización no convierte un párrafo largo en encabezado aunque conserve todas sus palabras
   en una sola línea.
 - Un fallo de validación del reensamblado conserva los fragmentos seguros y restaura solamente los

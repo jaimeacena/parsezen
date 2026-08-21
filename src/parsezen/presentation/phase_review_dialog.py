@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
 
-from PySide6.QtCore import QRectF, Qt, QTimer
+from PySide6.QtCore import QEvent, QRectF, Qt, QTimer
 from PySide6.QtGui import (
     QAction,
     QColor,
@@ -555,6 +555,12 @@ class PhaseReviewDialog(QDialog):
             self.proposed_pane.selector.setChecked(True)
         elif unit.choice is ReviewChoice.NO_TEXT and self.proposed_pane.no_text_button is not None:
             self.proposed_pane.no_text_button.setChecked(True)
+        elif unit.recommended_choice is ReviewChoice.ORIGINAL and unit.original_selectable:
+            self.original_pane.selector.setChecked(True)
+        elif unit.proposed_selectable:
+            self.proposed_pane.selector.setChecked(True)
+        elif unit.original_selectable:
+            self.original_pane.selector.setChecked(True)
         self._refresh_pane_selection()
         self._loading_unit = False
         self._focus_pending_decision()
@@ -839,7 +845,10 @@ class _ReviewPane(QFrame):
         self.image.setVisible(False)
         self.image_scroll = QScrollArea(self)
         self.image_scroll.setWidgetResizable(True)
+        self.image_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.image_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.image_scroll.setWidget(self.image)
+        self.image_scroll.viewport().installEventFilter(self)
         self.image_scroll.setVisible(False)
         layout.addWidget(self.editor, 1)
         layout.addWidget(self.image_scroll, 1)
@@ -852,6 +861,10 @@ class _ReviewPane(QFrame):
         self.locate_button.hide()
         self.locate_action = self.more_menu.addAction("Ir al inicio")
         self.locate_action.triggered.connect(self._locate)
+        self.image_size_action = self.more_menu.addAction("Ver tamaño real")
+        self.image_size_action.setCheckable(True)
+        self.image_size_action.setVisible(False)
+        self.image_size_action.toggled.connect(self._set_image_actual_size)
         self.restore_button: QPushButton | None
         self.restore_action: QAction | None
         if editable:
@@ -882,6 +895,7 @@ class _ReviewPane(QFrame):
             self.actions_layout.addWidget(self.no_text_button, 0, 0)
             layout.addLayout(self.actions_layout)
         self._payload = b""
+        self._image_pixmap = QPixmap()
         self._initial_text = ""
         self._projection: ReviewProjection | None = None
         self.set_selected(False)
@@ -917,10 +931,19 @@ class _ReviewPane(QFrame):
             if pixmap.loadFromData(payload):
                 self.editor.setVisible(False)
                 self.image_scroll.setVisible(True)
-                self.image.setPixmap(pixmap)
+                self._image_pixmap = pixmap
+                self.image_size_action.blockSignals(True)
+                self.image_size_action.setChecked(False)
+                self.image_size_action.setText("Ver tamaño real")
+                self.image_size_action.blockSignals(False)
+                self.image_size_action.setVisible(True)
+                self._set_image_actual_size(False)
                 self._initial_text = ""
                 return
             text = "Este elemento no puede mostrarse, pero se conservará sin cambios."
+        self._image_pixmap = QPixmap()
+        self.image.clear()
+        self.image_size_action.setVisible(False)
         if project_private:
             self._projection = project_review_text(text)
             text = self._projection.visible_text
@@ -953,6 +976,46 @@ class _ReviewPane(QFrame):
         else:
             self.image_scroll.verticalScrollBar().setValue(0)
             self.image_scroll.horizontalScrollBar().setValue(0)
+
+    def eventFilter(self, watched: object, event: QEvent) -> bool:  # noqa: N802
+        if (
+            watched is self.image_scroll.viewport()
+            and event.type() is QEvent.Type.Resize
+            and self.image_scroll.isVisible()
+            and not self.image_size_action.isChecked()
+        ):
+            self._fit_image_to_viewport()
+        return super().eventFilter(watched, event)
+
+    def _set_image_actual_size(self, actual_size: bool) -> None:
+        if self._image_pixmap.isNull():
+            return
+        self.image_size_action.setText("Encajar página" if actual_size else "Ver tamaño real")
+        if actual_size:
+            self.image_scroll.setWidgetResizable(False)
+            self.image_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+            self.image_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+            self.image.setPixmap(self._image_pixmap)
+            self.image.adjustSize()
+            return
+        self.image_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.image_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.image_scroll.setWidgetResizable(True)
+        self._fit_image_to_viewport()
+
+    def _fit_image_to_viewport(self) -> None:
+        if self._image_pixmap.isNull():
+            return
+        available = self.image_scroll.viewport().size()
+        if available.width() <= 1 or available.height() <= 1:
+            QTimer.singleShot(0, self._fit_image_to_viewport)
+            return
+        fitted = self._image_pixmap.scaled(
+            available,
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+        self.image.setPixmap(fitted)
 
     def _restore(self) -> None:
         self.editor.setPlainText(self._initial_text)

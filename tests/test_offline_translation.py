@@ -525,6 +525,34 @@ def test_retries_with_identity_markers_when_argos_reorders_numbers(
     assert len(requests) == 2
 
 
+def test_accepts_a_grounded_digit_from_a_written_number_compound() -> None:
+    requests: list[str] = []
+
+    def translate(text: str) -> str:
+        requests.append(text)
+        return "50. División del ciclo lunar en 11 partes"
+
+    result = translation_module._translate_value_once(
+        translate,
+        "50. Elevenfold Division of the Lunar Cycle",
+    )
+
+    assert result == "50. División del ciclo lunar en 11 partes"
+    assert len(requests) == 1
+
+
+def test_rejects_an_ungrounded_digit_after_protecting_existing_numbers() -> None:
+    placeholder = translation_module._number_placeholder(0)
+
+    def translate(text: str) -> str:
+        if placeholder in text:
+            return f"Entrada {placeholder} con valor inventado 11"
+        return "Entrada 50 con valor inventado 11"
+
+    with pytest.raises(TranslationError, match="números o fechas"):
+        translation_module._translate_value_once(translate, "Entry 50")
+
+
 def test_rejects_an_offline_result_left_in_the_source_language(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -566,6 +594,43 @@ def test_retries_unchanged_titles_with_normalized_case(
 
     assert result == expected
     assert requests == [source.lstrip("# ").casefold()]
+
+
+def test_preserves_an_all_caps_title_after_a_successful_initial_translation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = "## PROMISE TO YO' SELF\n"
+
+    monkeypatch.setattr(
+        translation_module,
+        "_get_or_install_translator",
+        lambda _source, _target: (
+            lambda text: "prometerte a ti mismo" if text == "PROMISE TO YO' SELF" else text
+        ),
+    )
+
+    result = translation_module._translate_markdown_offline_in_process(
+        source,
+        "es",
+        source_language_code="en",
+    )
+
+    assert result == "## PROMETERTE A TI MISMO\n"
+
+
+@pytest.mark.parametrize(
+    ("source", "translated", "expected"),
+    [
+        ("I", "Yo", "Yo"),
+        ("NASA launches", "La NASA lanza", "La NASA lanza"),
+    ],
+)
+def test_uppercase_preservation_does_not_invent_case_for_mixed_or_single_letter_text(
+    source: str,
+    translated: str,
+    expected: str,
+) -> None:
+    assert translation_module._preserve_source_uppercase(source, translated) == expected
 
 
 def test_preserves_an_unchanged_title_after_the_single_local_retry() -> None:

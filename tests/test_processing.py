@@ -44,10 +44,16 @@ from parsezen.processing import (
     validate_process_request,
 )
 from parsezen.revision import RevisionDecision
-from parsezen.semantic_blocks import DocumentTerm
+from parsezen.semantic_blocks import (
+    DocumentTerm,
+    SemanticBlock,
+    SemanticDocument,
+    SemanticRole,
+)
 from parsezen.settings import AppSettings
 from parsezen.translation_quality import (
     LinguisticReviewMode,
+    TranslationIssueKind,
     TranslationQualityReport,
 )
 
@@ -296,7 +302,7 @@ def test_targeted_translation_review_keeps_source_alignment_for_both_routes(
     assert final_path.read_text(encoding="utf-8") == translated
 
 
-def test_epub_translation_checkpoint_key_includes_fused_content_review() -> None:
+def test_epub_translation_checkpoint_key_includes_independent_content_review() -> None:
     source = Path("book.epub")
     translation = ProcessRequest(
         source,
@@ -508,6 +514,30 @@ def test_reviewed_epub_uses_the_exact_chapter_split_chosen_by_the_user(
     assert "PZDOC EPUB CHAPTER" not in navigation
 
 
+def test_unchanged_headless_epub_review_preserves_existing_package_bytes(
+    tmp_path: Path,
+) -> None:
+    destination = tmp_path / "book.epub"
+    original = build_epub(
+        "# One\n\nFirst.\n",
+        (),
+        EpubBookMetadata("Book", "en"),
+    ).content
+    destination.write_bytes(original)
+    result = ProcessResult(
+        destination,
+        review_markdown="# One\n\nFirst.\n",
+        revision_epub_metadata=EpubBookMetadata("Book", "en"),
+        review_required=True,
+        preserve_epub_package_on_unchanged_review=True,
+    )
+
+    updated = apply_reviewed_revision(result, result.review_markdown or "")
+
+    assert destination.read_bytes() == original
+    assert updated.revision_approved is True
+
+
 def test_preflight_resolves_a_selected_pdf_range(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -591,7 +621,7 @@ def test_processes_txt_and_reports_real_stages(tmp_path: Path) -> None:
     ]
 
 
-def test_chained_ai_translation_and_correction_are_fused_in_the_target_language(
+def test_chained_ai_translation_and_correction_keep_an_independent_bilingual_pass(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -602,11 +632,16 @@ def test_chained_ai_translation_and_correction_are_fused_in_the_target_language(
 
     def improve(text: str, mode: ImprovementMode, *_args: object, **_kwargs: object) -> str:
         calls.append(mode)
-        assert mode is ImprovementMode.CLEAN_AND_TRANSLATE
+        assert mode is ImprovementMode.TRANSLATE
         assert text == "# Title\n\nOriginal text.\n"
         return "# Título\n\nTexto traducido y corregido.\n"
 
     _patch_transform_dependency(monkeypatch, "improve_markdown", improve)
+    _patch_transform_dependency(
+        monkeypatch,
+        "review_translation_markdown",
+        lambda _source, current, *_args, **_kwargs: current,
+    )
     _patch_transform_dependency(
         monkeypatch,
         "_repair_translation_warnings",
@@ -626,7 +661,7 @@ def test_chained_ai_translation_and_correction_are_fused_in_the_target_language(
         on_stage=stages.append,
     )
 
-    assert calls == [ImprovementMode.CLEAN_AND_TRANSLATE]
+    assert calls == [ImprovementMode.TRANSLATE]
     assert stages.index(ProcessStage.TRANSLATING) < stages.index(ProcessStage.REVIEWING_CONTENT)
     assert result.final_path.read_text(encoding="utf-8") == (
         "# Título\n\nTexto traducido y corregido.\n"
@@ -644,7 +679,7 @@ def test_translation_quality_is_measured_before_review_changes_block_layout(
     quality_calls: list[tuple[str | None, str]] = []
 
     def improve(text: str, mode: ImprovementMode, *_args: object, **_kwargs: object) -> str:
-        assert mode is ImprovementMode.CLEAN_AND_TRANSLATE
+        assert mode is ImprovementMode.TRANSLATE
         return translated
 
     def quality_report(
@@ -655,6 +690,11 @@ def test_translation_quality_is_measured_before_review_changes_block_layout(
         quality_calls.append((translation_source, translated_markdown))
 
     _patch_transform_dependency(monkeypatch, "improve_markdown", improve)
+    _patch_transform_dependency(
+        monkeypatch,
+        "review_translation_markdown",
+        lambda _source, current, *_args, **_kwargs: current,
+    )
     _patch_transform_dependency(
         monkeypatch,
         "_repair_translation_warnings",
@@ -676,7 +716,7 @@ def test_translation_quality_is_measured_before_review_changes_block_layout(
     assert quality_calls == [("# Title\n\nOriginal text.\n", translated)]
 
 
-def test_fused_translation_corrects_only_pdf_pages_with_quality_signals(
+def test_aligned_translation_corrects_only_pdf_pages_with_quality_signals(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -707,6 +747,7 @@ def test_fused_translation_corrects_only_pdf_pages_with_quality_signals(
         ),
     )
     reviewed_payloads: list[str] = []
+    bilingual_review_calls: list[tuple[str, str]] = []
 
     def convert(*_args: object, **kwargs: object) -> ConvertedDocument:
         callback = kwargs.get("on_pdf_quality_report")
@@ -720,7 +761,7 @@ def test_fused_translation_corrects_only_pdf_pages_with_quality_signals(
         *_args: object,
         **_kwargs: object,
     ) -> str:
-        if mode is ImprovementMode.CLEAN_AND_TRANSLATE:
+        if mode is ImprovementMode.TRANSLATE:
             return translated
         assert mode is ImprovementMode.REVIEW_CONTENT
         reviewed_payloads.append(text)
@@ -728,6 +769,13 @@ def test_fused_translation_corrects_only_pdf_pages_with_quality_signals(
 
     monkeypatch.setattr(processing_module, "convert_document", convert)
     _patch_transform_dependency(monkeypatch, "improve_markdown", improve)
+    _patch_transform_dependency(
+        monkeypatch,
+        "review_translation_markdown",
+        lambda original, current, *_args, **_kwargs: (
+            bilingual_review_calls.append((original, current)) or current
+        ),
+    )
     _patch_transform_dependency(
         monkeypatch,
         "_repair_translation_warnings",
@@ -755,15 +803,70 @@ def test_fused_translation_corrects_only_pdf_pages_with_quality_signals(
     assert reviewed_payloads
     assert all("Primera página correcta" not in payload for payload in reviewed_payloads)
     assert any("Segunda página dañada" in payload for payload in reviewed_payloads)
+    assert bilingual_review_calls == [(extracted, translated)]
     assert result.revision_draft is not None
     assert "Segunda página corregida" in result.revision_draft.proposed_markdown
     assert result.linguistic_review_coverage is not None
-    assert (
-        result.linguistic_review_coverage.mode is LinguisticReviewMode.CORRECTED_DURING_TRANSLATION
-    )
+    assert result.linguistic_review_coverage.mode is LinguisticReviewMode.INDEPENDENT_BILINGUAL
     assert result.linguistic_review_coverage.semantically_reviewed_blocks == 2
-    assert result.linguistic_review_coverage.independently_verified_blocks == 0
+    assert result.linguistic_review_coverage.independently_verified_blocks == 2
     assert result.linguistic_review_coverage.remaining_issues == 1
+
+
+def test_fused_translation_skips_visual_blocks_without_reviewable_text(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    visual = SemanticBlock(
+        identifier="visual",
+        markdown='<div class="page-art"></div>\n\n',
+        position=0,
+        role=SemanticRole.BODY,
+        page_number=2,
+        confidence=0.7,
+    )
+    text = SemanticBlock(
+        identifier="text",
+        markdown="Texto dañado.\n",
+        position=1,
+        role=SemanticRole.BODY,
+        page_number=2,
+        confidence=0.9,
+    )
+    document = SemanticDocument((visual, text), ())
+    report = PdfQualityReport(
+        processed_pages=(2,),
+        ocr_pages=(2,),
+        issues=(
+            PdfReviewIssue(
+                2,
+                "La página necesita revisión.",
+                "Texto dudoso.",
+                blocking=True,
+            ),
+        ),
+    )
+    reviewed_payloads: list[str] = []
+
+    def improve(value: str, *_args: object, **_kwargs: object) -> str:
+        reviewed_payloads.append(value)
+        return value.replace("dañado", "corregido")
+
+    monkeypatch.setattr(transform_module, "improve_with_checkpoints", improve)
+
+    result = transform_module.improve_selected_content(
+        visual.markdown + text.markdown,
+        LOCAL_SETTINGS,
+        ProcessRequest(tmp_path / "book.pdf", convert_to_markdown=True),
+        None,
+        None,
+        None,
+        semantic_document=document,
+        pdf_quality_report=report,
+    )
+
+    assert reviewed_payloads == [text.markdown]
+    assert result == visual.markdown + "Texto corregido.\n"
 
 
 def test_offline_translation_applies_and_restores_the_glossary(
@@ -860,6 +963,8 @@ def test_offline_translation_content_review_compares_source_and_target(
         (source_markdown, translated),
         (source_markdown, corrected),
     ]
+    assert result.translation_quality_report is quality_report
+    assert result.review_translation_quality_report is quality_report
     assert result.revision_draft is not None
     assert result.revision_draft.render() == corrected
     assert all(
@@ -934,6 +1039,7 @@ def test_ai_translation_repair_reuses_encrypted_work_checkpoints(
         save=lambda _key, _payload: True,
     )
     callbacks: list[tuple[object, object]] = []
+    repair_results: list[tuple[int, int]] = []
 
     def improve(_text: str, *_args: object, **kwargs: object) -> str:
         callbacks.append((kwargs.get("load_checkpoint"), kwargs.get("save_checkpoint")))
@@ -965,10 +1071,12 @@ def test_ai_translation_repair_reuses_encrypted_work_checkpoints(
         cancellation=None,
         source_language_code="en",
         work_checkpoints=checkpoint,
+        on_result=lambda attempted, accepted: repair_results.append((attempted, accepted)),
     )
 
     assert result == "Texto reparado."
     assert callbacks == [(checkpoint.load, checkpoint.save)]
+    assert repair_results == [(1, 1)]
 
 
 def test_translation_repair_rejects_numeric_damage_from_heading_restoration(
@@ -1004,6 +1112,49 @@ def test_translation_repair_rejects_numeric_damage_from_heading_restoration(
     )
 
     assert result == "Referencia 202.\n"
+
+
+def test_preserved_translation_is_resolved_only_by_complete_verified_repair() -> None:
+    clean_report = TranslationQualityReport(
+        "es",
+        "en",
+        "en",
+        2,
+        120,
+        130,
+        0,
+        (),
+    )
+    residual_report = TranslationQualityReport(
+        "es",
+        "en",
+        "en",
+        2,
+        120,
+        130,
+        1,
+        (),
+        ((TranslationIssueKind.SOURCE_TEXT, 1),),
+    )
+
+    assert transform_module._preserved_translation_was_fully_repaired(
+        2,
+        attempted=2,
+        accepted=2,
+        report=clean_report,
+    )
+    assert not transform_module._preserved_translation_was_fully_repaired(
+        2,
+        attempted=2,
+        accepted=1,
+        report=clean_report,
+    )
+    assert not transform_module._preserved_translation_was_fully_repaired(
+        2,
+        attempted=2,
+        accepted=2,
+        report=residual_report,
+    )
 
 
 def test_avoids_overwriting_and_keeps_existing_output(tmp_path: Path) -> None:
@@ -2137,7 +2288,7 @@ def test_direct_epub_translation_propagates_checkpoint_degradation(
     monkeypatch.setattr(processing_module, "validate_epub_file", lambda _path: None)
 
     def write_output(*_args, **_kwargs) -> Path:
-        output.write_bytes(translated.content)
+        output.write_bytes(_args[1])
         return output
 
     monkeypatch.setattr(processing_module, "write_epub_translation_output", write_output)
@@ -2177,6 +2328,77 @@ def test_direct_epub_translation_propagates_checkpoint_degradation(
     assert cleared == [True]
 
 
+def test_direct_epub_translation_does_not_publish_before_review_preparation_succeeds(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "book.epub"
+    source.write_bytes(b"synthetic epub handled by orchestration doubles")
+    translated = SimpleNamespace(
+        content=b"translated epub",
+        language_code="es",
+        translation_parts=1,
+        resumed_parts=0,
+        checkpoint_degraded=False,
+        quality_report=None,
+    )
+    writer_calls = 0
+
+    monkeypatch.setattr(
+        processing_module,
+        "open_epub_translation_checkpoints",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            load=lambda _key: None,
+            save=lambda _key, _payload: True,
+            clear=lambda: None,
+        ),
+    )
+    monkeypatch.setattr(processing_module, "translate_epub", lambda *_args, **_kwargs: translated)
+    monkeypatch.setattr(
+        processing_module,
+        "inspect_epub_package",
+        lambda path, **_kwargs: SimpleNamespace(
+            title="Book",
+            language="en" if Path(path) == source else "es",
+            authors=(),
+            cover_path=None,
+            identifiers=(),
+            publisher=None,
+            publication_date=None,
+        ),
+    )
+
+    def convert(path: Path, **_kwargs) -> ConvertedDocument:
+        if Path(path) != source:
+            raise ConversionError("staged review failed")
+        return ConvertedDocument(
+            "This sufficiently long English source paragraph establishes the source language "
+            "before the direct package translation begins."
+        )
+
+    def write_output(*_args, **_kwargs) -> Path:
+        nonlocal writer_calls
+        writer_calls += 1
+        return tmp_path / "book.es.epub"
+
+    monkeypatch.setattr(processing_module, "convert_epub", convert)
+    monkeypatch.setattr(processing_module, "write_epub_translation_output", write_output)
+
+    with pytest.raises(ConversionError, match="staged review failed"):
+        process_document(
+            ProcessRequest(
+                source,
+                convert_to_markdown=False,
+                offline_translation_language="Español",
+                output_format=OutputFormat.EPUB,
+            )
+        )
+
+    assert writer_calls == 0
+    assert not (tmp_path / "book.es.epub").exists()
+    assert not tuple(tmp_path.glob(".parsezen-epub-prepare-*.epub"))
+
+
 def test_direct_epub_translation_can_remove_content_images_but_keep_the_cover(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2212,7 +2434,7 @@ def test_direct_epub_translation_can_remove_content_images_but_keep_the_cover(
     monkeypatch.setattr(processing_module, "validate_epub_file", lambda _path: None)
 
     def write_output(*_args, **_kwargs) -> Path:
-        output.write_bytes(translated.content)
+        output.write_bytes(_args[1])
         return output
 
     monkeypatch.setattr(processing_module, "write_epub_translation_output", write_output)
@@ -2298,7 +2520,7 @@ def test_direct_epub_translation_can_normalize_styles_while_retaining_images(
     monkeypatch.setattr(processing_module, "validate_epub_file", lambda _path: None)
 
     def write_output(*_args, **_kwargs) -> Path:
-        output.write_bytes(translated.content)
+        output.write_bytes(_args[1])
         return output
 
     monkeypatch.setattr(processing_module, "write_epub_translation_output", write_output)

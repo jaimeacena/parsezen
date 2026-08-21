@@ -57,6 +57,30 @@ class PdfMetrics:
         return self.elapsed_seconds / self.processed_pages
 
 
+def measure_pdf_matrix(
+    source_path: Path,
+    page_counts: tuple[int, ...] = (100, 500, 1000),
+    *,
+    force_ocr: bool = False,
+    include_images: bool = False,
+) -> dict[int, PdfMetrics]:
+    """Measure bounded page prefixes for long-document scaling comparisons."""
+    if not page_counts or any(
+        isinstance(count, bool) or not isinstance(count, int) or count < 1 for count in page_counts
+    ):
+        raise ValueError("La matriz necesita cantidades de páginas positivas.")
+    unique_counts = tuple(dict.fromkeys(page_counts))
+    return {
+        count: measure_pdf(
+            source_path,
+            page_range=PdfPageRange(1, count),
+            force_ocr=force_ocr,
+            include_images=include_images,
+        )
+        for count in unique_counts
+    }
+
+
 @dataclass(frozen=True, slots=True)
 class PdfBaseline:
     source_path: Path
@@ -576,6 +600,13 @@ def _parser() -> argparse.ArgumentParser:
     profile.add_argument("--pages", nargs=2, type=int, metavar=("INICIO", "FIN"))
     profile.add_argument("--force-ocr", action="store_true")
     profile.add_argument("--include-images", action="store_true")
+    profile.add_argument(
+        "--matrix-pages",
+        nargs="+",
+        type=int,
+        metavar="N",
+        help="Mide prefijos de N páginas; por defecto se recomienda 100 500 1000.",
+    )
     return parser
 
 
@@ -599,6 +630,34 @@ def main(argv: list[str] | None = None) -> int:
                 )
             return 0
         if arguments.command == "profile":
+            if arguments.matrix_pages is not None:
+                metrics_by_pages = measure_pdf_matrix(
+                    arguments.source,
+                    tuple(arguments.matrix_pages),
+                    force_ocr=arguments.force_ocr,
+                    include_images=arguments.include_images,
+                )
+                print(
+                    json.dumps(
+                        {
+                            str(page_count): {
+                                "elapsed_seconds": metrics.elapsed_seconds,
+                                "elapsed_per_page_seconds": metrics.elapsed_per_page_seconds,
+                                "peak_incremental_mib": metrics.peak_incremental_mib,
+                                "processed_pages": metrics.processed_pages,
+                                "ocr_pages": metrics.ocr_pages,
+                                "ocr_elapsed_seconds": metrics.ocr_elapsed_seconds,
+                                "resources": metrics.resources,
+                                "resource_bytes": metrics.resource_bytes,
+                                "memory_scope": "process-tree",
+                            }
+                            for page_count, metrics in metrics_by_pages.items()
+                        },
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    )
+                )
+                return 0
             page_range = PdfPageRange(*arguments.pages) if arguments.pages is not None else None
             metrics = measure_pdf(
                 arguments.source,
@@ -617,6 +676,7 @@ def main(argv: list[str] | None = None) -> int:
                         "ocr_elapsed_seconds": metrics.ocr_elapsed_seconds,
                         "resources": metrics.resources,
                         "resource_bytes": metrics.resource_bytes,
+                        "memory_scope": "process-tree",
                     },
                     ensure_ascii=False,
                     sort_keys=True,

@@ -46,6 +46,8 @@ de Ollama y nunca envía el documento fuera del equipo. Es open source, privado 
   editor EPUB se adaptan al ancho disponible y agrupan herramientas secundarias sin recortar
   funciones. Durante una revisión solo permanecen visibles la comparación, las dos decisiones y el
   avance; localizar, restaurar y aprobar en lote aparecen únicamente cuando son útiles.
+  La alternativa segura aparece ya seleccionada, de modo que `Siguiente` basta cuando no quieres
+  cambiarla; las decisiones anteriores siguen intactas al reanudar.
 
 - **Pensado para trabajos largos.** Puedes procesar varios documentos, consultar el tiempo
   aproximado, pausar, continuar más tarde y reintentar únicamente la fase que haya fallado. En EPUB,
@@ -53,7 +55,9 @@ de Ollama y nunca envía el documento fuera del equipo. Es open source, privado 
   mantener la traducción dentro de un capítulo.
 
 - **EPUB sin pasos innecesarios.** Antes de publicar confirmas título, autor, idioma, portada y
-  capítulos. El editor completo sigue disponible cuando quieres ajustar estructura o contenido.
+  capítulos. El editor completo sigue disponible cuando quieres ajustar estructura o contenido. En
+  un EPUB de origen, guardar sin cambios conserva el archivo exacto y una edición solo textual
+  mantiene byte por byte navegación, estilos, fuentes, imágenes y demás recursos.
 
 - **Jerarquía conservadora.** Solo anida un contenedor explícito cuando encuentra al menos dos
   capítulos inequívocos contiguos; los casos ambiguos permanecen planos y conservan su orden.
@@ -61,6 +65,15 @@ de Ollama y nunca envía el documento fuera del equipo. Es open source, privado 
 - **Esquema global verificable.** La revisión estructural combina índice, páginas, geometría,
   encabezados y roles semánticos, pero solo aplica directivas de nivel sobre palabras ya existentes.
   Antes de decidir, muestra los árboles actual y propuesto.
+
+- **Contraste local selectivo.** En regiones realmente ambiguas de un PDF, Parsezen puede comparar
+  la capa de texto, un segundo extractor nativo y el OCR. Si todavía discrepan, usa un modelo visual
+  local instalado solo sobre un recorte pequeño y acepta su lectura bajo guardas estrictas.
+
+- **Índices EPUB fieles.** Las entradas conservan jerarquía, negrita, cursiva, enlaces internos y
+  una columna de folios alineada —también en libros de más de mil páginas—, sin convertir el índice
+  en una lista irregular. Un folio con un glifo dudoso solo se corrige cuando coinciden su fila, la
+  secuencia vecina y una lectura OCR local.
 
 - **IA local sin complicaciones.** Parsezen te ayuda a instalar Ollama, comprobar tu equipo y elegir
   un modelo adecuado sin que tengas que utilizar comandos.
@@ -73,11 +86,12 @@ de Ollama y nunca envía el documento fuera del equipo. Es open source, privado 
 3. **Configura el resultado.** Dentro de Parsezen, dos tarjetas claras permiten elegir Markdown o
    EPUB; traducción, páginas y OCR usan filas breves `Etiqueta — Valor — ›`, y la revisión automática con IA un
    único interruptor. Al elegir un idioma aparecen traductor y glosario; un intervalo se resume como
-   `25–140`. Bajo el traductor se explica el recorrido efectivo, el número de pasadas y un coste
-   cualitativo que cambia con el formato y la revisión elegidos. Cada elección válida se guarda al
-   instante, sin pie de acciones ni scroll en el tamaño normal.
+   `25–140`. Cada elección válida se guarda al instante, sin texto técnico permanente, pie de acciones
+   ni scroll en el tamaño normal.
 4. **Procesa y revisa.** Parsezen extrae y organiza el contenido, conserva las imágenes y tablas
-   compatibles y te muestra cualquier decisión pendiente antes de publicar.
+   compatibles y mantiene también la lámina original cuando una página completa contiene una tabla
+   OCR o una imagen girada que no puede reconstruirse con fidelidad. Cualquier decisión pendiente se
+   muestra antes de publicar.
 
 > Windows puede mostrar «Editor desconocido» porque Parsezen todavía no utiliza una firma comercial. Asegúrate de descargarlo desde este repositorio.
 

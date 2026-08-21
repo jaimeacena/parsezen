@@ -48,6 +48,19 @@ def test_book_editor_preserves_content_when_divisions_change(tmp_path: Path) -> 
     assert "Second body." in html
 
 
+def test_book_editor_does_not_create_a_new_artifact_for_an_unchanged_body(
+    tmp_path: Path,
+) -> None:
+    store = ArtifactStore(tmp_path / "artifacts", protect=reversible, unprotect=reversible)
+    book = make_book(store)
+    editor = BookEditor(book, store, job_id="job")
+    section_id = book.spine[0]
+
+    unchanged = editor.update_content(section_id, editor.editable_html(section_id))
+
+    assert unchanged is book
+
+
 def test_book_editor_sanitizes_active_content_and_publishes_epub(tmp_path: Path) -> None:
     store = ArtifactStore(tmp_path / "artifacts", protect=reversible, unprotect=reversible)
     book = make_book(store)

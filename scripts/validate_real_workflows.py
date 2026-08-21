@@ -577,10 +577,7 @@ def _workflow_cases(
 
 def _planned_passes(case: LiveWorkflowCase, translation_engine: str) -> tuple[int, int]:
     translated = int(case.translate)
-    content_review_fused = bool(
-        case.translate and case.review_content and translation_engine == "local_ai"
-    )
-    content_review = int(case.review_content and not content_review_fused)
+    content_review = int(case.review_content)
     structure_review = int(case.review_structure)
     text_passes = translated + content_review + structure_review
     ai_translation = int(case.translate and translation_engine == "local_ai")

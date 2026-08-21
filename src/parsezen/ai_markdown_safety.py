@@ -52,12 +52,38 @@ MAX_TRANSLATION_PROTECTED_VALUES_PER_CHUNK = 8
 LOGGER = logging.getLogger(__name__)
 
 RAW_URL_PATTERN = re.compile(r"(?:https?://|mailto:)[^\s<>)\]]+")
+FORMULA_PATTERN = re.compile(
+    r"(?<!\\)\$(?=[^\r\n$]{1,200}\$)[^\r\n$]+\$"
+    r"|\\\([^\r\n]{1,200}\\\)"
+    r"|\\\[[^\r\n]{1,500}\\\]"
+    r"|(?<!\w)(?:[A-Za-zΑ-ω]\w*|\d+(?:[.,]\d+)?)"
+    r"(?:[ \t]*(?:[=±×÷∑√^]|<=|>=|!=|≈|≠|≤|≥)[ \t]*"
+    r"(?:[A-Za-zΑ-ω]\w*|\d+(?:[.,]\d+)?)){1,6}(?!\w)",
+)
+REFERENCE_IDENTIFIER_PATTERN = re.compile(
+    r"(?<!\w)\[(?:\d{1,5}(?:[ \t]*[-–,;][ \t]*\d{1,5})*)\]"
+    r"|\bdoi:[ \t]*10\.\d{4,9}/[-._;()/:A-Z0-9]+"
+    r"|\bISBN(?:-1[03])?:?[ \t]*(?:97[89][ -]?)?[0-9X](?:[ -]?[0-9X]){8,12}\b",
+    re.IGNORECASE,
+)
+_SAFE_TRANSLATION_TABLE_OUTER_PATTERN = re.compile(
+    r'\A\s*<table(?: class="document-toc")?>[\s\S]*</table>\s*\Z',
+    re.IGNORECASE,
+)
+_SAFE_TRANSLATION_TABLE_TAG_PATTERN = re.compile(
+    r"</?(?:table|thead|tbody|tr|strong|em)>"
+    r'|<table class="document-toc">'
+    r'|<th class="(?:toc-label|toc-folio)">|</th>|<th>'
+    r'|<td class="(?:toc-folio|toc-label toc-level-[0-2])">|</td>|<td>'
+    r'|<a href="#page-\d{1,6}">|</a>|<br\s*/?>',
+    re.IGNORECASE,
+)
 TITLE_ROMAN_REFERENCE_PATTERN = re.compile(
     r"(?<![A-Za-z])([IVXLCDM]+)(?=[ \t]+[+-]?\d)",
 )
 _PRIVATE_IMAGE_PATTERN = re.compile(
     r"!\[(?P<alt>(?:\\.|[^\]\\])*)\]"
-    r"\(\s*(?:<)?__parsezen_resources__/[^\s)>\"']+(?:>)?[^)]*\)",
+    r"\(\s*(?:<)?(?P<resource>__parsezen_resources__/[^\s)>\"']+)(?:>)?[^)]*\)",
 )
 _PRIVATE_MARKER_TOKEN_PATTERN = re.compile(r"\bPZDOC[^\s<>()\]`]*", re.IGNORECASE)
 _PRIVATE_COMMENT_TEXT_PATTERN = re.compile(r"comentario\s+interno", re.IGNORECASE)
@@ -279,6 +305,13 @@ def _protect_translation_values(
     spans.extend(
         (match.start(), match.end(), False) for match in INLINE_CODE_PATTERN.finditer(markdown)
     )
+    spans.extend(
+        (match.start(), match.end(), False) for match in FORMULA_PATTERN.finditer(markdown)
+    )
+    spans.extend(
+        (match.start(), match.end(), False)
+        for match in REFERENCE_IDENTIFIER_PATTERN.finditer(markdown)
+    )
     spans.extend((start, end, False) for start, end in _title_roman_reference_spans(markdown))
     spans.extend((start, end, False) for start, end, _value in link_destination_spans(markdown))
     spans.extend(
@@ -477,6 +510,13 @@ def _plan_markdown_parts(
             flush_pending()
             parts.append(_MarkdownPart(block, False, "\n\n" if parts else ""))
             continue
+        if protect_paragraphs and _is_safe_translation_html_table(block):
+            # A complete generated table is one resumable unit. Splitting it on
+            # newlines creates invalid HTML fragments and multiplies retries; the
+            # translation layer handles only its text nodes in bounded batches.
+            flush_pending()
+            parts.append(_MarkdownPart(block, True, "\n\n" if parts else ""))
+            continue
         if (
             protect_paragraphs
             and uppercase_person_name_base(block, source_language) in uppercase_person_names
@@ -539,7 +579,74 @@ def _plan_markdown_parts(
         pending_conserved_values = candidate_conserved_values
 
     flush_pending()
+    if protect_paragraphs:
+        return _coalesce_translation_title_runs(
+            parts,
+            max_characters=max_characters,
+        )
     return parts
+
+
+def _coalesce_translation_title_runs(
+    parts: list[_MarkdownPart],
+    *,
+    max_characters: int,
+) -> list[_MarkdownPart]:
+    """Batch long title/index runs while keeping isolated headings focused."""
+
+    planned: list[_MarkdownPart] = []
+    run: list[_MarkdownPart] = []
+
+    def is_title(part: _MarkdownPart) -> bool:
+        text = part.text.strip()
+        return part.should_improve and bool(
+            is_unmarked_title_line(text) or ATX_HEADING_PATTERN.match(text)
+        )
+
+    def flush_run() -> None:
+        if len(run) < 3:
+            planned.extend(run)
+            run.clear()
+            return
+        group: list[_MarkdownPart] = []
+        group_length = 0
+        group_values = 0
+
+        def flush_group() -> None:
+            nonlocal group_length, group_values
+            if not group:
+                return
+            first, *remaining = group
+            text = first.text + "".join(f"{part.separator_before}{part.text}" for part in remaining)
+            planned.append(_MarkdownPart(text, True, first.separator_before))
+            group.clear()
+            group_length = 0
+            group_values = 0
+
+        for part in run:
+            separator_length = len(part.separator_before) if group else 0
+            value_count = _conserved_value_count(part.text) + (1 if group else 0)
+            if group and (
+                group_length + separator_length + len(part.text) > max_characters
+                or group_values + value_count > MAX_TRANSLATION_PROTECTED_VALUES_PER_CHUNK
+            ):
+                flush_group()
+                separator_length = 0
+                value_count = _conserved_value_count(part.text)
+            group.append(part)
+            group_length += separator_length + len(part.text)
+            group_values += value_count
+        flush_group()
+        run.clear()
+
+    for part in parts:
+        if is_title(part):
+            run.append(part)
+        else:
+            flush_run()
+            planned.append(part)
+    flush_run()
+    return planned
 
 
 def _split_dense_block(
@@ -664,6 +771,22 @@ def _markdown_blocks(markdown: str) -> list[str]:
 def _is_fenced_code_block(block: str) -> bool:
     first_line = block.splitlines()[0] if block else ""
     return FENCE_PATTERN.match(first_line) is not None
+
+
+def _is_safe_translation_html_table(block: str) -> bool:
+    """Recognize only generated table markup eligible for text-node translation."""
+
+    if _SAFE_TRANSLATION_TABLE_OUTER_PATTERN.fullmatch(block) is None:
+        return False
+    cursor = 0
+    for match in re.finditer(r"<[^<>]*>", block):
+        between = block[cursor : match.start()]
+        if "<" in between or ">" in between:
+            return False
+        if _SAFE_TRANSLATION_TABLE_TAG_PATTERN.fullmatch(match.group(0)) is None:
+            return False
+        cursor = match.end()
+    return "<" not in block[cursor:] and ">" not in block[cursor:]
 
 
 def _repair_common_markdown_spacing(markdown: str) -> str:
@@ -808,8 +931,16 @@ def _validate_internal_markers(source: str, improved: str) -> None:
     )
     if source_resources != improved_resources:
         raise ImprovementError("El modelo cambió u omitió recursos privados del documento.")
-    source_images = Counter(match.group(0) for match in _PRIVATE_IMAGE_PATTERN.finditer(source))
-    improved_images = Counter(match.group(0) for match in _PRIVATE_IMAGE_PATTERN.finditer(improved))
+    # The resource and its image role are private structure; the alternative
+    # text is user-visible prose and should be translated. Comparing the whole
+    # Markdown image used to reject a faithful ``Cover`` -> ``Portada`` change
+    # even though the protected destination remained byte-for-byte identical.
+    source_images = Counter(
+        match.group("resource") for match in _PRIVATE_IMAGE_PATTERN.finditer(source)
+    )
+    improved_images = Counter(
+        match.group("resource") for match in _PRIVATE_IMAGE_PATTERN.finditer(improved)
+    )
     if source_images != improved_images:
         raise ImprovementError("El modelo cambió la sintaxis de una imagen privada.")
     if Counter(_INSTRUCTION_PLACEHOLDER_TAG_PATTERN.findall(source)) != Counter(

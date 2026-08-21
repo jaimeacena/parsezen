@@ -332,9 +332,13 @@ def test_state_store_round_trips_normalized_book(tmp_path: Path) -> None:
                 "Chapter",
                 "xhtml",
                 source_filename="chapter-0001.xhtml",
+                source_archive_path="EPUB/text/chapter.xhtml",
+                source_xhtml_artifact_id="source-xhtml",
             ),
         ),
         ("chapter",),
+        source_package_artifact_id="source-package",
+        package_structure_fingerprint="a" * 64,
     )
 
     store.save_book(job.id, book)

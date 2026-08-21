@@ -12,6 +12,7 @@ import pdfplumber
 
 from parsezen.cancellation import CancellationToken, check_cancelled
 from parsezen.domain.outcomes import EarlyCheckReport
+from parsezen.improvement import ImprovementMode
 from parsezen.pdf_conversion import PdfPageRange, resolve_pdf_page_range
 from parsezen.pipeline.contracts import ProcessRequest, ProcessResult
 from parsezen.processing import clear_general_work_checkpoints, process_document
@@ -141,13 +142,17 @@ def run_early_check(
         settings,
         checkpoint_retention_days=max(1, settings.checkpoint_retention_days),
     )
+    translation_probe_pages = _translation_probe_pages(request, sampled_pages)
 
     with TemporaryDirectory(prefix="parsezen-early-check-") as temporary_name:
         temporary_root = Path(temporary_name)
         for index, page_number in enumerate(sampled_pages, start=1):
             check_cancelled(cancellation)
+            probe_translation = page_number in translation_probe_pages
             sample_request = replace(
                 request,
+                convert_to_markdown=True,
+                output_format=OutputFormat.MARKDOWN,
                 output_directory=temporary_root,
                 image_output_directory=(
                     temporary_root / "assets"
@@ -155,6 +160,18 @@ def run_early_check(
                     else None
                 ),
                 pdf_page_range=PdfPageRange(page_number, page_number),
+                improvement_mode=(request.improvement_mode if probe_translation else None),
+                target_language=(request.target_language if probe_translation else None),
+                offline_translation_language=(
+                    request.offline_translation_language if probe_translation else None
+                ),
+                review_content=False,
+                review_structure=False,
+                epub_title=None,
+                epub_author=None,
+                epub_cover_path=None,
+                epub_first_page_cover=False,
+                epub_remove_cover=False,
             )
             sample_settings = replace(
                 retained_settings,
@@ -262,4 +279,23 @@ def run_early_check(
         warning_pages=warning_pages,
         blocking_reasons=tuple(blocking_reasons),
         duration_seconds=max(1, round(monotonic() - started_at)),
+    )
+
+
+def _translation_probe_pages(
+    request: ProcessRequest,
+    sampled_pages: tuple[int, ...],
+) -> frozenset[int]:
+    translates = request.offline_translation_language is not None or request.improvement_mode in {
+        ImprovementMode.TRANSLATE,
+        ImprovementMode.CLEAN_AND_TRANSLATE,
+    }
+    if not translates or len(sampled_pages) <= 3:
+        return frozenset(sampled_pages if translates else ())
+    return frozenset(
+        (
+            sampled_pages[0],
+            sampled_pages[len(sampled_pages) // 2],
+            sampled_pages[-1],
+        )
     )

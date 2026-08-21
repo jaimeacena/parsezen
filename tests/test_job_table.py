@@ -2,7 +2,7 @@ from dataclasses import replace
 from pathlib import Path
 
 from PySide6.QtCore import QMimeData, QPointF, QRect, Qt
-from PySide6.QtGui import QDropEvent
+from PySide6.QtGui import QDropEvent, QFont, QFontMetrics
 from PySide6.QtWidgets import QStyleOptionViewItem
 
 import parsezen.presentation.job_table as job_table_module
@@ -22,6 +22,7 @@ from parsezen.domain.jobs import (
     TranslationMethod,
 )
 from parsezen.domain.stages import StageKind, StageStatus
+from parsezen.final_integrity import FinalIntegrityReport, IntegrityLedger
 from parsezen.presentation.job_table import (
     CELL_PRESENTATION_ROLE,
     COLUMNS,
@@ -35,6 +36,7 @@ from parsezen.presentation.job_table import (
     JobHeaderView,
     JobTableModel,
     JobTableView,
+    cell_presentation,
 )
 
 
@@ -150,14 +152,14 @@ def test_running_progress_explains_the_remaining_time() -> None:
     model.set_runtime_estimates(
         {
             "manual": RuntimeEstimate(
-                "Quedan aprox. 12 min–20 min",
+                "Quedan ~12–20 min",
                 "Actualizada con el avance real de la etapa actual.",
             )
         }
     )
     status = model.index(0, COLUMNS.index(JobColumn.NEXT_STEP))
 
-    assert status.data(CELL_PRESENTATION_ROLE).subtitle == "Quedan aprox. 12 min–20 min"
+    assert status.data(CELL_PRESENTATION_ROLE).subtitle == "Quedan ~12–20 min"
     assert "avance real" in status.data(Qt.ItemDataRole.ToolTipRole)
 
 
@@ -166,7 +168,7 @@ def test_running_progress_track_sits_below_remaining_time_inside_the_row() -> No
     option.rect = QRect(0, 0, 260, JobCellDelegate.ROW_HEIGHT)
     presentation = job_table_module.CellPresentation(
         "Traduciendo · 25 %",
-        "Quedan aprox. 12 min–20 min",
+        "Quedan ~12–20 min",
         tone="running",
         progress=0.25,
     )
@@ -188,8 +190,10 @@ def test_configuration_summary_remains_visible_and_accessible() -> None:
         "Traducir a español",
         "Verificar traducción",
         "Organizar EPUB",
+        "Tu revisión final",
     )
-    assert presentation.subtitle == "Tu revisión antes de publicar"
+    assert presentation.subtitle is None
+    assert presentation.operation_tones == ("default",) * 4
     assert index.data(Qt.ItemDataRole.AccessibleTextRole).startswith("Flujo")
 
 
@@ -228,14 +232,47 @@ def test_multiple_documents_keep_independent_clear_flows() -> None:
     assert presentations[1].operations == (
         "Traducir a español",
         "Verificar traducción",
+        "Tu revisión si hay cambios",
     )
-    assert presentations[1].subtitle == "Tu revisión si hay cambios"
+    assert presentations[1].subtitle is None
     assert presentations[2].operations == (
         "Traducir a español",
         "Verificar traducción",
         "Organizar EPUB",
+        "Tu revisión final",
     )
-    assert presentations[2].subtitle == "Tu revisión antes de publicar"
+    assert presentations[2].subtitle is None
+
+
+def test_flow_distinguishes_current_completed_future_and_human_review() -> None:
+    running = make_job()
+    stages = []
+    for stage in running.stages:
+        if stage.kind in {StageKind.PREPARE, StageKind.TRANSLATE}:
+            stages.append(replace(stage, status=StageStatus.COMPLETED))
+        elif stage.kind is StageKind.REFINE:
+            stages.append(replace(stage, status=StageStatus.RUNNING))
+        else:
+            stages.append(stage)
+    running = replace(running, stages=tuple(stages))
+
+    running_flow = cell_presentation(running, JobColumn.FLOW)
+    review_flow = cell_presentation(make_review_job(), JobColumn.FLOW)
+    completed_flow = cell_presentation(make_completed_job(), JobColumn.FLOW)
+
+    assert running_flow.operation_tones == ("completed", "current", "future", "future")
+    assert review_flow.operation_tones == (
+        "completed",
+        "completed",
+        "future",
+        "current_review",
+    )
+    assert completed_flow.operation_tones == (
+        "completed",
+        "completed",
+        "completed",
+        "completed",
+    )
 
 
 def test_execution_preflight_is_presented_as_preparing() -> None:
@@ -276,7 +313,7 @@ def test_ready_job_exposes_automatic_time_without_hiding_its_next_step() -> None
 
     presentation = status.data(CELL_PRESENTATION_ROLE)
     assert presentation.title == "En cola"
-    assert presentation.subtitle == "Tiempo automático aprox. 2 min–5 min"
+    assert presentation.subtitle == "~2 min–5 min"
     assert "Basada en trabajos similares" in status.data(Qt.ItemDataRole.ToolTipRole)
     assert "Tiempo automático" in status.data(Qt.ItemDataRole.AccessibleTextRole)
 
@@ -289,6 +326,26 @@ def test_completed_result_exposes_open_action() -> None:
     assert presentation.action == "Abrir resultado"
     assert presentation.title == "Listo"
     assert "Estado · Listo" in index.data(Qt.ItemDataRole.AccessibleTextRole)
+
+
+def test_completed_result_keeps_integrity_detail_out_of_the_action_layout() -> None:
+    model = JobTableModel((make_completed_job(),))
+    model.set_integrity_reports(
+        {
+            "manual": FinalIntegrityReport(
+                "EPUB",
+                checks=("Paquete EPUB válido",),
+                ledger=IntegrityLedger(blocks=1, headings=2, images=3, resources=4),
+            )
+        }
+    )
+    index = model.index(0, COLUMNS.index(JobColumn.NEXT_STEP))
+
+    presentation = index.data(CELL_PRESENTATION_ROLE)
+    assert presentation.subtitle is None
+    assert presentation.status == "Integridad final comprobada"
+    assert "Integridad final comprobada" in index.data(Qt.ItemDataRole.AccessibleTextRole)
+    assert "Paquete EPUB válido" in index.data(Qt.ItemDataRole.ToolTipRole)
 
 
 def test_completed_result_with_evidence_offers_targeted_ai_review(qtbot) -> None:
@@ -454,7 +511,7 @@ def test_review_context_menu_routes_the_blocking_phase(qtbot, monkeypatch) -> No
     captured: list[tuple[str, object]] = []
     table.review_requested.connect(lambda job_id, stage: captured.append((job_id, stage)))
 
-    FakeMenu.selected_text = "Revisar"
+    FakeMenu.selected_text = "Revisar y publicar"
     monkeypatch.setattr(job_table_module, "QMenu", FakeMenu)
     table._show_context_menu(table.visualRect(index).center())
 
@@ -593,7 +650,22 @@ def test_compact_table_preserves_flow_and_actions_without_scrolling(qtbot) -> No
     assert table.horizontalScrollBarPolicy() == Qt.ScrollBarPolicy.ScrollBarAlwaysOff
 
 
-def test_wide_table_prioritizes_document_and_names_the_live_state(qtbot) -> None:
+def test_wrapped_flow_preserves_the_connector_between_every_stage() -> None:
+    operations = (
+        "Traducir y corregir a español",
+        "Organizar EPUB",
+        "Tu revisión final",
+    )
+
+    lines = JobCellDelegate._flow_lines(operations, QFontMetrics(QFont()), 280)
+
+    assert len(lines) == 2
+    assert lines[0].endswith("→")
+    assert "\n".join(lines).count("→") == len(operations) - 1
+    assert all(operation in "\n".join(lines) for operation in operations)
+
+
+def test_wide_table_prioritizes_flow_and_names_the_live_state(qtbot) -> None:
     table = JobTableView()
     qtbot.addWidget(table)
     table.resize(1280, 300)
@@ -617,9 +689,9 @@ def test_wide_table_prioritizes_document_and_names_the_live_state(qtbot) -> None
         )
         == "Estado"
     )
-    assert abs(widths[JobColumn.DOCUMENT] / semantic_width - 0.33) < 0.02
-    assert abs(widths[JobColumn.FLOW] / semantic_width - 0.29) < 0.02
-    assert abs(widths[JobColumn.RESULT] / semantic_width - 0.16) < 0.02
-    assert abs(widths[JobColumn.NEXT_STEP] / semantic_width - 0.22) < 0.02
+    assert abs(widths[JobColumn.DOCUMENT] / semantic_width - 0.31) < 0.02
+    assert abs(widths[JobColumn.FLOW] / semantic_width - 0.36) < 0.02
+    assert abs(widths[JobColumn.RESULT] / semantic_width - 0.14) < 0.02
+    assert abs(widths[JobColumn.NEXT_STEP] / semantic_width - 0.19) < 0.02
     assert table.horizontalHeader().height() == 44
     assert table.rowHeight(0) == 80

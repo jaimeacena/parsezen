@@ -100,7 +100,8 @@ def test_activity_view_exposes_result_actions_and_reflows(qtbot, tmp_path: Path)
     opened: list[Path] = []
     view.open_requested.connect(opened.append)
 
-    assert "Integridad técnica: comprobada" in view.details_summary.text()
+    assert "Integridad técnica" in view.details_summary.text()
+    assert "comprobada" in view.details_summary.text()
     assert "Incidencias detectadas" in view.details_summary.text()
     assert "Revisión manual" in view.details_summary.text()
     assert "Revisión con IA sugerida" in view.details_summary.text()
@@ -115,7 +116,10 @@ def test_activity_view_exposes_result_actions_and_reflows(qtbot, tmp_path: Path)
     assert opened == [result]
 
     view.set_compact_mode(True)
-    assert view.actions_layout.itemAtPosition(1, 0).widget() is view.folder_button
+    assert view.panels.orientation() is Qt.Orientation.Vertical
+    assert view.actions_layout.itemAtPosition(0, 1).widget() is view.folder_button
+    view.set_compact_mode(False)
+    assert view.panels.orientation() is Qt.Orientation.Horizontal
 
 
 def test_summary_never_presents_technical_integrity_as_semantic_quality() -> None:
@@ -263,5 +267,6 @@ def test_activity_rows_keep_cancelled_truthful_and_reflow_without_overflow(
 
     assert "Cancelado" in view.jobs_list.item(0).text()
     assert view._compact is True  # noqa: SLF001
+    assert view.panels.orientation() is Qt.Orientation.Vertical
     assert view.jobs_list.horizontalScrollBar().maximum() == 0
-    assert view.actions_layout.itemAtPosition(1, 0).widget() is view.folder_button
+    assert view.actions_layout.itemAtPosition(0, 1).widget() is view.folder_button

@@ -45,6 +45,7 @@ from parsezen.application.processing_explanation import linguistic_review_summar
 from parsezen.application.quality_review_adapter import (
     apply_pdf_review,
     apply_translation_review,
+    ensure_quality_reviews_applied,
 )
 from parsezen.application.queue_configuration import QueueConfigurationService
 from parsezen.application.queue_persistence import (
@@ -1445,10 +1446,10 @@ class ParsezenMainWindow(QMainWindow):
                 kinds=frozenset({RevisionKind.STRUCTURE}),
             )
         if draft is not None:
-            if reviewed_source != draft.original_markdown:
+            if reviewed_source != draft.proposed_markdown:
                 draft = build_revision_draft(
+                    draft.original_markdown,
                     reviewed_source,
-                    draft.proposed_markdown,
                     kinds=draft.kinds,
                 )
             self._review_revision_by_phase(
@@ -1578,11 +1579,11 @@ class ParsezenMainWindow(QMainWindow):
         result = entry.result
         if result is None:
             return None
-        text = (
-            result.revision_draft.original_markdown
-            if result.revision_draft is not None
-            else result.review_markdown
-        )
+        # Quality reports describe the publishable candidate, which is the
+        # proposed side of a revision draft. Materializing them against the
+        # pre-correction original creates a phantom review step whose excerpt
+        # cannot be anchored.
+        text = result.review_markdown
         if text is None:
             return ("", ())
         try:
@@ -1706,8 +1707,8 @@ class ParsezenMainWindow(QMainWindow):
         if draft is None:
             return None
         return build_revision_draft(
+            draft.original_markdown,
             reviewed_text,
-            draft.proposed_markdown,
             kinds=draft.kinds,
         )
 
@@ -1831,7 +1832,13 @@ class ParsezenMainWindow(QMainWindow):
                 tuple(reviews),
                 self._artifact_store,
             )
+            reviewed_text = ensure_quality_reviews_applied(
+                reviewed_text,
+                preceding_reviews,
+                self._artifact_store,
+            )
         except ValueError as exc:
+            self._keep_review_pending(entry, result)
             QMessageBox.warning(self, "Revisión incompleta", str(exc))
             return
 
@@ -2458,7 +2465,12 @@ class ParsezenMainWindow(QMainWindow):
             for job_id in plan.job_ids:
                 job = self._job_queue.get(job_id)
                 if job is not None:
-                    self._job_queue.refresh_source(job.id, _source_from_path(job.source.path))
+                    current_source = _source_from_path(job.source.path)
+                    if (
+                        current_source.size_bytes != job.source.size_bytes
+                        or current_source.modified_ns != job.source.modified_ns
+                    ):
+                        self._job_queue.refresh_source(job.id, current_source)
         except (OSError, ValueError) as exc:
             self._preparation_failed(str(exc))
             return

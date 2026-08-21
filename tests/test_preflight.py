@@ -150,10 +150,28 @@ def test_remaining_time_explains_when_real_progress_changes_the_range() -> None:
         progress_total=10,
     )
 
-    assert estimate.label.startswith("Quedan aprox.")
+    assert estimate.label.startswith("Quedan ~")
     assert "avance real" in estimate.explanation
     assert estimate.estimate is not None
     assert estimate.estimate.upper_seconds >= 1_200 - 300
+
+
+def test_remaining_time_uses_a_compact_minute_range() -> None:
+    estimate = estimate_remaining_time(
+        DurationEstimate(30, 360, 1_200),
+        elapsed_seconds=0,
+    )
+
+    assert estimate.label == "Quedan ~1–20 min"
+
+
+def test_remaining_time_uses_singular_below_one_minute() -> None:
+    estimate = estimate_remaining_time(
+        DurationEstimate(10, 20, 40),
+        elapsed_seconds=0,
+    )
+
+    assert estimate.label == "Queda <1 min"
 
 
 def test_remaining_time_reports_an_overrun_without_fake_precision() -> None:

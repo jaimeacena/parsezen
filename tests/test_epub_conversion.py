@@ -14,6 +14,8 @@ from parsezen.conversion import RESOURCE_REFERENCE_PREFIX, convert_document, con
 from parsezen.epub_builder import EpubBookMetadata, build_epub
 from parsezen.epub_conversion import (
     inspect_epub_package,
+    patch_epub_xhtml_package,
+    read_editable_epub_package,
     replace_epub_metadata,
     translate_epub,
 )
@@ -103,6 +105,54 @@ def test_epub_package_inspection_retains_all_publication_metadata(tmp_path: Path
     assert metadata.identifiers == ("small-book-id", "secondary-id")
     assert metadata.publisher == "Local Publisher"
     assert metadata.publication_date == "2024-03-14"
+
+
+def test_editable_epub_package_uses_real_spine_files_and_preserves_source_bytes(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "editable.epub"
+    _write_epub3(source)
+
+    package = read_editable_epub_package(source)
+
+    assert package.content == source.read_bytes()
+    assert tuple(chapter.archive_path for chapter in package.chapters) == ("EPUB/opening.xhtml",)
+    assert package.chapters[0].title == "Opening"
+    assert b"Modern EPUB content." in package.chapters[0].xhtml
+
+
+def test_epub_body_patch_preserves_all_non_edited_members_byte_for_byte(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "editable.epub"
+    _write_epub3(source)
+    original = source.read_bytes()
+    edited = b"""<?xml version="1.0" encoding="utf-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml"><head><title>Editor</title></head>
+<body><h1>Opening</h1><p>Edited locally.</p></body></html>"""
+
+    patched = patch_epub_xhtml_package(
+        original,
+        {"EPUB/opening.xhtml": edited},
+    )
+
+    with ZipFile(BytesIO(original)) as before, ZipFile(BytesIO(patched)) as after:
+        assert b"Edited locally." in after.read("EPUB/opening.xhtml")
+        assert b"<title>Opening</title>" in after.read("EPUB/opening.xhtml")
+        assert {
+            name: before.read(name) for name in before.namelist() if name != "EPUB/opening.xhtml"
+        } == {name: after.read(name) for name in after.namelist() if name != "EPUB/opening.xhtml"}
+
+
+def test_epub_body_patch_rejects_files_outside_the_real_spine(tmp_path: Path) -> None:
+    source = tmp_path / "editable.epub"
+    _write_epub3(source)
+
+    with pytest.raises(ConversionError, match="capítulos reales"):
+        patch_epub_xhtml_package(
+            source.read_bytes(),
+            {"EPUB/nav.xhtml": b"<html><body>Unsafe target</body></html>"},
+        )
 
 
 def test_epub_translation_prefers_detected_text_language_over_incorrect_metadata(
@@ -430,6 +480,68 @@ def test_epub_translation_does_not_expose_internal_references_to_translator(
         navigation = archive.read("EPUB/nav.xhtml").decode("utf-8")
     assert 'href="opening.xhtml#start"' in navigation
     assert "missing.xhtml#start" not in navigation
+
+
+def test_epub_translation_preserves_unsafe_inline_markup_without_skipping_surrounding_text(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "inline-unsafe.epub"
+    _write_epub3(source)
+    with ZipFile(source) as archive:
+        opening = archive.read("EPUB/opening.xhtml")
+    opening = opening.replace(
+        b"<p>Modern EPUB content.</p>",
+        (
+            b"<p>This explanatory sentence before the formula must be translated "
+            b"<code>sum(x)</code> and this complete sentence after the formula must also "
+            b"be translated.</p>"
+            b"<p>This introduction before MathML must be translated "
+            b'<math xmlns="http://www.w3.org/1998/Math/MathML">'
+            b"<mi>x</mi><mo>+</mo><mn>1</mn></math> and this conclusion after MathML must "
+            b"be translated too.</p>"
+        ),
+    )
+    _rewrite_epub_members(source, {"EPUB/opening.xhtml": opening})
+
+    def translate(text: str, _progress, _cancellation) -> str:
+        return (
+            text.replace(
+                "This explanatory sentence before the formula must be translated",
+                "Esta frase explicativa anterior a la fórmula debe traducirse",
+            )
+            .replace(
+                "and this complete sentence after the formula must also be translated.",
+                "y esta frase completa posterior a la fórmula también debe traducirse.",
+            )
+            .replace(
+                "This introduction before MathML must be translated",
+                "Esta introducción anterior a MathML debe traducirse",
+            )
+            .replace(
+                "and this conclusion after MathML must be translated too.",
+                "y esta conclusión posterior a MathML también debe traducirse.",
+            )
+            .replace("Modern Book", "Libro moderno")
+            .replace("Opening", "Apertura")
+            .replace("Contents", "Contenido")
+        )
+
+    result = translate_epub(source, "es", translate)
+
+    with ZipFile(BytesIO(result.content)) as archive:
+        translated = archive.read("EPUB/opening.xhtml").decode("utf-8")
+    assert "Esta frase explicativa anterior a la fórmula debe traducirse" in translated
+    assert "y esta frase completa posterior a la fórmula también debe traducirse." in translated
+    assert "Esta introducción anterior a MathML debe traducirse" in translated
+    assert "y esta conclusión posterior a MathML también debe traducirse." in translated
+    assert "<code>sum(x)</code>" in translated
+    assert re.search(
+        r"<(?:\w+:)?mi>x</(?:\w+:)?mi><(?:\w+:)?mo>\+</(?:\w+:)?mo>"
+        r"<(?:\w+:)?mn>1</(?:\w+:)?mn>",
+        translated,
+    )
+    assert "This explanatory sentence" not in translated
+    assert "this conclusion after MathML" not in translated
 
 
 def test_epub2_translation_preserves_prefixed_opf_attributes(tmp_path: Path) -> None:
@@ -1035,6 +1147,8 @@ def test_processes_an_epub_translation_directly_and_avoids_collisions(
     assert first.review_original_path == source
     assert first.translation_quality_report is not None
     assert first.translation_quality_report.target_language == "es"
+    assert first.review_translation_quality_report is not None
+    assert first.translation_quality_for_review is first.review_translation_quality_report
     assert source.read_bytes() == source_bytes
     assert stages == [
         ProcessStage.VALIDATING,
@@ -1160,7 +1274,7 @@ def test_epub_review_route_can_remove_the_original_cover(
     ("review_content", "expected_mode"),
     [
         (False, ImprovementMode.TRANSLATE),
-        (True, ImprovementMode.CLEAN_AND_TRANSLATE),
+        (True, ImprovementMode.TRANSLATE),
     ],
 )
 def test_processes_an_epub_translation_with_the_selected_ollama_model(
@@ -1190,6 +1304,11 @@ def test_processes_an_epub_translation_with_the_selected_ollama_model(
         )
 
     _patch_transformation_dependency(monkeypatch, "improve_markdown", improve)
+    _patch_transformation_dependency(
+        monkeypatch,
+        "review_translation_markdown",
+        lambda _source, current, *_args, **_kwargs: current,
+    )
     result = process_document(
         ProcessRequest(
             source,

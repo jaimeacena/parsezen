@@ -45,6 +45,7 @@ class _PdfLine:
     soft_hyphen_end: bool
     hard_hyphen_end: bool
     rotated: bool
+    italic: bool = False
 
     @property
     def centered(self) -> bool:
@@ -90,3 +91,11 @@ class _MarkdownBlock:
     page_number: int
     level: int | None = None
     source_line: _PdfLine | None = None
+    source_pages: tuple[int, ...] = ()
+    toc_folio: str | None = None
+    toc_level: int = 0
+
+    def __post_init__(self) -> None:
+        """Keep a compact, non-user-visible page provenance for every block."""
+        if not self.source_pages:
+            self.source_pages = (self.page_number,)

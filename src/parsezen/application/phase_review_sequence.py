@@ -165,11 +165,11 @@ class PhaseReviewSequenceCoordinator:
             None,
         )
         if target_index is None:
-            raise ValueError("This review phase is not part of the current result.")
+            raise ValueError("Esta fase de revisión no forma parte del resultado actual.")
         saved = self._saved_by_kind(job)
         target = saved.get(kind)
         if target is None or target.status is not ReviewStatus.APPLIED:
-            raise ValueError("Only an applied review can be reopened.")
+            raise ValueError("Solo se puede volver a abrir una revisión ya aplicada.")
 
         for later_step in steps[target_index + 1 :]:
             later = saved.get(later_step.kind)
@@ -192,7 +192,7 @@ class PhaseReviewSequenceCoordinator:
         progress = self.reconcile(job.id, result)
         step = progress.next_step
         if step is None or step.kind is not kind:
-            raise ValueError("This is not the next pending review.")
+            raise ValueError("La revisión seleccionada ya no es la siguiente fase pendiente.")
         return step
 
     def _saved_by_kind(self, job: DocumentJob) -> dict[ReviewKind, ReviewSession]:

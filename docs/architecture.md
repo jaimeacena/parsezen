@@ -139,9 +139,9 @@ fila de etiqueta, valor y chevron. Los documentos nuevos presentan
 son valores iniciales. Traductor y glosario dependen del idioma; Páginas y OCR aparecen solo para
 PDF. El intervalo se edita en un diálogo efímero y la fila conserva únicamente su valor resumido.
 Solo Markdown y EPUB son resultados de producto. La página no incorpora scroll ni vuelve a
-proyectar destino. Al activar traducción, `translation_route_summary` deriva del motor, el plan y el
-formato una explicación breve del recorrido efectivo, sus pasadas y su coste cualitativo; la
-presentación no duplica reglas del procesador.
+proyectar destino. Tampoco añade un resumen técnico permanente del recorrido: el interruptor conserva
+una descripción accesible y contextual sobre la corrección o verificación efectiva. La presentación
+no duplica reglas del procesador.
 
 `STANDARD` se resume como procesamiento directo; `LOCAL_AI_REVIEWED`, como revisión completa con IA
 local, activa la revisión de texto y, únicamente para EPUB, la revisión de estructura. No existen
@@ -158,10 +158,18 @@ tiempo; una propuesta aceptable no se interpreta por sí sola como evidencia de 
 
 `application.processing_explanation.processing_flow` es la única proyección del recorrido visible.
 Deriva pasos compactos, pasos detallados y una política humana (`NONE`, `IF_CHANGES` o
-`BEFORE_PUBLISHING`) sin depender de Qt. La cola muestra solo verbos automáticos en orden y reserva
-`Tu revisión` para la segunda línea; preflight reutiliza la misma ruta con motor y formato. La salida
-EPUB exige revisión antes de publicar, mientras Markdown solo la anticipa cuando el plan puede
-producir propuestas. Las incidencias excepcionales siguen apareciendo dinámicamente en Estado.
+`BEFORE_PUBLISHING`) sin depender de Qt. La cola integra la decisión humana como último paso de la
+misma secuencia y solo la distribuye en dos líneas cuando el ancho lo exige, sin convertirla en una
+nota secundaria ni perder el conector entre pasos. La tabla asigna a Flujo la mayor proporción del
+ancho semántico y conserva anchos específicos para las acciones. Preflight reutiliza la misma ruta
+con motor y formato. La salida EPUB exige una
+revisión final, mientras Markdown solo la anticipa cuando el plan puede producir propuestas. Las
+incidencias excepcionales siguen apareciendo dinámicamente en Estado.
+
+Cada paso automático declara además las `StageKind` que representa. La presentación deriva de esas
+referencias los tonos `default`, `current`, `completed`, `future` y `failed`; la revisión humana usa
+un estado actual específico cuando el trabajo queda bloqueado para decidir. Así, una etiqueta
+combinada puede abarcar varias fases internas sin comparar textos ni duplicar el planificador.
 
 Al completar `STANDARD` sin otra revisión bloqueante, `review_recommendation` deriva una
 `ReviewRecommendation` determinista de los informes ya calculados. Sus señales son daño de
@@ -251,7 +259,10 @@ pueden justificarla: al menos 120 unidades, o 60 con OCR forzado, IA local o sal
 `run_early_check` inspecciona un máximo de nueve posiciones del intervalo y elige hasta cinco que
 cubren extremos, densidad textual, contenido visual y tablas; cuando las características se
 concentran en los extremos, completa la muestra con las posiciones restantes más distribuidas.
-Ejecuta cada una mediante el mismo `process_document`, con salidas en un directorio temporal. Una
+Ejecuta cada una mediante el mismo `process_document`, con salidas en un directorio temporal, pero
+usa una solicitud de sondeo: convierte y valida todas las páginas elegidas, omite construcción EPUB,
+revisión final y reestructuración, y solo prueba la traducción en la primera, central y última de la
+muestra. De este modo se comprueba el motor sin multiplicar hasta cinco veces las pasadas caras. Una
 página inicial o final sin texto nativo que conserva imágenes se mantiene como advertencia y cuenta
 en el informe, pero no como incidencia material de extracción; los fallos repetidos en páginas
 interiores sí bloquean. Las incidencias de traducción conservan su umbral independiente.
@@ -377,6 +388,12 @@ intento como `processing_attempt_*`. El dominio no escribe logs y Diagnóstico s
 tokens seguros. Los nombres distintos evitan que inicio, cierre o fallo parezcan el mismo evento
 emitido dos veces por capas diferentes.
 
+`ProcessTelemetry` mide duración y visitas de cada etapa y el transporte de Ollama agrega, solo en
+memoria, tiempo de pared, tokens de entrada/salida, carga declarada por Ollama y tokens por segundo.
+Las generaciones tienen tanto timeout de inactividad como un deadline total acotado; OCR aplica un
+deadline total por página y termina el proceso privado si lo supera. Ninguna de estas métricas incluye
+texto, prompts, respuestas o rutas y las métricas de Ollama no entran en las instantáneas.
+
 La pausa entra siempre por `ProcessingRunner.pause()`: marca al trabajador antes de activar su token
 de cancelación cooperativa y cierra la fase activa como `paused` en la traza del intento. La ventana
 proyecta ese mismo motivo en el dominio, conserva los checkpoints, no crea una fila de actividad
@@ -400,8 +417,10 @@ más tarde. `RecentJob` recibe esa misma instantánea y el esquema 3 de activida
 límite total de 20 filas. No existe una segunda fuente de eventos ni una caché histórica sin límite.
 
 La vista de Actividad deduplica transiciones repetidas solo al presentarlas, muestra horas locales y
-solo ofrece `Volver al documento` cuando el origen coincide con un trabajo fallido todavía presente
-en la cola. Los intentos históricos no se convierten en una biblioteca ni en una acción de reintento.
+separa la lista de intentos y el detalle formateado en dos paneles de un `QSplitter`; cambia a eje
+vertical en anchos compactos. Solo ofrece `Volver al documento` cuando el origen coincide con un
+trabajo fallido todavía presente en la cola. Los intentos históricos no se convierten en una
+biblioteca ni en una acción de reintento.
 El diagnóstico copiable tiene una frontera más estricta que la explicación de la interfaz: contiene
 la versión, fase, código, instante de finalización, tokens opacos y fase/estado/hora de cada evento.
 Excluye nombres, rutas, mensajes, contenido, prompts, respuestas, trazas y secretos; la interfaz no
@@ -426,6 +445,14 @@ siguiente arranque. La ventana solo presenta el resultado y los avisos de estos 
 normalizado, valida y construye el resultado, reemplaza el archivo de forma atómica y delega
 entonces la finalización del trabajo. Si la persistencia final falla, el borrador y la puerta de
 revisión permanecen recuperables y la interfaz no presenta el documento como completado.
+
+Para un EPUB directo, el borrador conserva también el paquete original cifrado, la ruta real de cada
+documento del spine y una huella de toda la estructura no editable en sitio. Si no cambia nada, la
+publicación reutiliza exactamente los bytes ya validados. Si solo cambia el cuerpo de uno o varios
+capítulos, fusiona esos cuerpos sobre su XHTML original y reconstruye el ZIP copiando byte por byte
+todos los demás miembros. Cambios de metadatos, portada, recursos, orden, jerarquía o títulos invalidan
+esa huella y vuelven de forma segura al constructor EPUB normalizado. El archivo definitivo se toca
+una sola vez, después de preparar y validar el candidato completo.
 
 `final_integrity` añade una última barrera determinista entre el serializador y la publicación.
 TXT y Markdown se vuelven a leer en UTF-8 y se comparan con el contenido aprobado; DOCX y EPUB
@@ -470,9 +497,11 @@ de libro. La presentación muestra el progreso de la sesión activa como decisio
 las unidades realmente materializadas de esa fase; no usa como denominador el plan ponderado global,
 los cambios estructurales futuros ni incidencias de un informe que no llegaron a ser decisiones.
 
-La recomendación inicial es provisional y nunca marca un botón como elegido al abrir una unidad.
-La persona debe pulsar un botón de elección o editar la propuesta; el botón confirmado muestra su
-estado y el panel elegido se tiñe sin dibujar un borde de selección alrededor de todo el panel. La
+La recomendación inicial sigue siendo provisional, pero aparece preseleccionada al abrir una unidad:
+se conserva el original cuando las guardas lo recomiendan y se usa la propuesta en el resto de casos
+seleccionables. La persona puede avanzar directamente con `Siguiente`, cambiar la elección o editar
+la propuesta; el botón confirmado muestra su estado y el panel elegido se tiñe sin dibujar un borde
+de selección alrededor de todo el panel. La
 salida por guardar, volver o cerrar conserva una edición o una elección cambiada del caso visible;
 abrir y salir sin interacción no marca la recomendación como resuelta. `Guardar y salir` cifra el
 estado y permite reanudar en la primera unidad pendiente. La presentación omite el resumen del caso
@@ -487,6 +516,62 @@ edita el texto final y la decisión se aplica sobre la misma instantánea que se
 intenta insertar texto fuente obsoleto dentro del resultado traducido. El contenido de ese tramo
 forma parte del identificador estable de la unidad. Una revisión OCR anterior cuyo candidato ya no
 coincida se reemplaza una sola vez por la versión actual y descarta sus elecciones incompatibles.
+La traducción conserva además las mayúsculas completas de cada tramo reconocido que ya estaba
+íntegramente en mayúsculas; no infiere mayúsculas nuevas para texto mixto ni para una sola letra.
+Al materializar de nuevo un candidato con la misma identidad, todos sus artefactos de contexto se
+renuevan. Una elección automática compatible puede continuar, pero una edición humana cuyo artefacto
+ya fue limpiado vuelve a quedar pendiente en vez de abrir una referencia inexistente.
+
+Antes de preparar el editor EPUB, el ensamblado vuelve a reconciliar todas las decisiones OCR y de
+traducción ya aplicadas. Si no puede demostrar que una decisión está presente ni volver a anclarla,
+bloquea la publicación. Cada borrador de libro persiste además la huella SHA-256 del Markdown revisado
+que lo originó: solo se reutiliza mientras esa huella coincida y se reconstruye cuando una decisión
+humana modifica el texto.
+
+La aplicación de una secuencia de revisiones también es idempotente dentro de la sesión activa. Si
+una decisión anterior —por ejemplo, OCR— ya dejó exactamente el texto elegido por una decisión
+posterior —por ejemplo, traducción—, esa segunda decisión se reconoce como aplicada y reserva el
+fragmento correspondiente. Solo se considera desincronización cuando no se puede anclar ni el texto
+anterior ni el resultado elegido.
+
+Las incidencias por crecimiento anómalo muestran para revisar el resto completo de la página PDF
+sospechosa —con un límite defensivo— en vez del extracto truncado del informe. La sustitución conserva
+los separadores estructurales que rodean el tramo editable, por lo que una decisión no puede pegar dos
+títulos o párrafos contiguos. El detector de texto fuente compara también letras sin espacios ni
+puntuación para reconocer residuos en los que un OCR defectuoso haya unido palabras.
+
+La traducción local agrupa las tiradas de tres o más títulos de un índice y admite fragmentos de
+prosa de hasta un límite conservador de 2.400 caracteres. Los títulos aislados siguen recibiendo su
+tratamiento enfocado. Las guardas protegen párrafos, encabezados, tablas, enlaces, cifras y
+marcadores; si una respuesta agrupada no las supera, el mismo intento se degrada automáticamente a
+segmentos más pequeños. Así se evita una petición distinta por cada entrada breve de un índice sin
+debilitar la recuperación segura.
+
+Antes de fragmentar, `semantic_blocks.reconcile_document_evidence` contrasta el propio documento.
+Solo corrige una variante rara cuando otra grafía casi idéntica domina de forma clara, o cuando una
+entrada del índice y un encabezado único del cuerpo coinciden con distancia acotada. Código, enlaces,
+comentarios y referencias quedan fuera. Esta reconciliación corrige el dato canónico antes de
+traducir, no una traducción ya generada, y el registro conserva exclusivamente el número de cambios.
+La capa de valores opacos protege además fórmulas, DOI, ISBN y citas numéricas, junto con cifras,
+enlaces y términos; Ollama nunca puede reescribir esos identificadores.
+
+La cobertura también protege portadas y títulos breves: una respuesta con una expansión relativa
+extrema y al menos 80 letras nuevas se considera contenido añadido aunque el original no alcance el
+umbral de un párrafo largo. Tras un reintento fallido, una tirada de títulos se divide y cada título
+se traduce de forma enfocada; si una unidad sigue sin superar las guardas, se conserva su original en
+vez de publicar texto inventado. La prosa no se recompone con traducciones parciales tras fallar por
+cobertura: puede degradarse a oraciones independientes, pero el bloque completo solo se acepta si
+todas superan las guardas. Un único fallo conserva el bloque original entero para evitar resultados
+mixtos difíciles de detectar.
+
+La organización estructural usa el índice únicamente como mapa de referencia. Las filas que el
+análisis semántico clasifica como índice no se ofrecen como candidatas editables al modelo; solo una
+coincidencia posterior en el cuerpo puede convertirse en encabezado. De este modo un índice extenso
+no termina publicado como cientos de capítulos.
+
+La extracción PDF tampoco interpreta una frase larga en versalitas como título únicamente por sus
+mayúsculas, negrita o centrado cuando usa el tamaño del cuerpo. Ese atajo se limita a rótulos breves;
+los títulos largos siguen siendo válidos cuando su tamaño tipográfico aporta evidencia independiente.
 
 `PhaseReviewSequenceCoordinator` deriva un plan ordenado exclusivamente de los informes y cambios
 reales del resultado: OCR, traducción, corrección y estructura. Cada aceptación se guarda como
@@ -618,6 +703,9 @@ El informe de traducción se vuelve a calcular sobre la propuesta completa despu
 de contenido y estructura. Sigue siendo una orientación local no bloqueante, separada de las guardas
 críticas, pero deja de mostrar incidencias que la corrección ya resolvió o de ocultar residuos que una
 propuesta estructural hubiese introducido.
+En documentos PDF, el informe conserva todos los tramos delimitados por marcador de página, también
+los que no contienen texto natural en uno de los dos lados. Así una portada gráfica, una página vacía
+o una adición anómala no desplazan el emparejamiento de las incidencias posteriores.
 
 Cuando dos respuestas bilingües consecutivas no superan las guardas, el checkpoint guarda como
 decisión explícita únicamente la traducción ya validada que se conserva; nunca persiste la respuesta
@@ -646,6 +734,24 @@ sobre la propuesta completa después del plan Revisado. La evidencia admite una 
 que la contiene sí se ha traducido; las variantes incompatibles de un mismo término se señalan para
 revisión y no se sustituyen por semejanza.
 
+Los dos informes no son intercambiables: `translation_quality_report` describe exactamente la salida
+publicada o la base todavía protegida por la puerta de revisión;
+`review_translation_quality_report` describe el candidato que la persona está comparando. Las
+recomendaciones y la materialización consultan el segundo, pero un candidato rechazado nunca
+reescribe retrospectivamente la evidencia de la base. Ambos se recuperan por separado.
+
+La verificación bilingüe es adaptativa. Revisa todos los bloques con señales deterministas de riesgo,
+añade sus vecinos para recuperar contexto y distribuye una muestra de bloques limpios por el resto del
+libro. Una incidencia devuelta por el modelo que no pueda anclarse a esa selección activa una pasada
+completa en vez de silenciarse. Cada fragmento de traducción recibe además la ruta acotada de
+encabezados que lo contiene; esta ruta forma parte de la clave del checkpoint y se usa solo como
+contexto, nunca como texto que el modelo pueda publicar.
+
+En una imagen Markdown interna, la traducción puede cambiar únicamente el texto alternativo visible
+y el título opcional. La ruta privada, el número de apariciones y su rol de imagen se comparan por
+separado y deben permanecer idénticos; así una descripción traducida no invalida un fragmento seguro
+ni puede convertir el recurso en un enlace ordinario.
+
 `runtime_mapping` proyecta `LOCAL_AI_REVIEWED` como `review_content=True` y añade
 `review_structure=True` solo para EPUB. Si también hay traducción, la revisión actúa después del
 motor elegido como editor bilingüe local y cada diferencia material se materializa para revisión.
@@ -658,6 +764,11 @@ traducido con frases conservadas, solo esas frases. Una reparación local que su
 cobertura y estructura se conserva aunque otra página siga necesitando revisión; las guardas finales
 verifican que el ensamblado no altere cifras, enlaces, jerarquía o distribución. OCR y estructura
 conservan sus recuperaciones específicas.
+
+Si todos los fragmentos traducidos son válidos por separado pero su ensamblado completo incumple una
+guarda estructural, Parsezen localiza de forma incremental la combinación incompatible. Conserva el
+original únicamente en esos fragmentos, mantiene las traducciones que siguen siendo demostrablemente
+seguras y obliga a revisar el residuo, en vez de perder todo el trabajo o publicar una estructura rota.
 
 Antes de renderizar XHTML, `epub_builder` escapa solo el marcador de las continuaciones densas y
 puramente numéricas de un índice. Así CommonMark no las convierte en una lista ordenada ni sustituye
@@ -722,12 +833,19 @@ canal entre ellas es moderado y ordena de dos a cuatro bandas contiguas sin move
 separadores de ancho completo. En una página de índice, una columna de folios separada se vuelve a
 asociar por fila con sus entradas antes de retirar márgenes o ruido: exige al menos tres pares, una
 alineación vertical inequívoca y suficiente cobertura de la columna numérica. La reparación conserva
-el orden multicolumna ya validado y publica cada entrada como un elemento de lista, por lo que los
-folios no se confunden con decoración vertical ni todo el índice termina fusionado en un párrafo.
+el orden multicolumna ya validado y publica las entradas como una tabla semántica restringida con
+etiqueta y folio en celdas independientes. Conserva negrita, cursiva, sangría jerárquica y enlaces
+internos de página; los folios quedan alineados a la derecha y no se confunden con decoración vertical
+ni todo el índice termina fusionado en un párrafo. El contexto de índice admite folios decimales de
+cuatro cifras sin ampliar la detección general de números de margen, que seguiría confundiendo años.
+Si un folio contiene una única letra o símbolo opaco, solo se sustituye cuando la geometría aporta su
+etiqueta, la secuencia de la columna acota el valor y la fila OCR local confirma un candidato único.
+Después de asociar la fila, el OCR puede restaurar fronteras entre palabras aunque contenga hasta dos
+glifos distintos, pero nunca aporta ni reemplaza letras: la secuencia nativa permanece intacta.
 Antes de traducir, el texto de cada entrada queda separado de su folio para impedir que el traductor
 o la revisión posterior cambien su función o su posición. Un rótulo de sección sin folio se serializa
-como un bloque independiente: nunca se convierte en una continuación perezosa del elemento de lista
-anterior al interpretarse como CommonMark.
+como un bloque independiente: nunca se convierte en una continuación perezosa de la entrada anterior
+al interpretarse como CommonMark.
 Los marcadores de
 página se conservan durante todo el procesamiento y solo se retiran al publicar un resultado que no
 necesita revisión. Cuando una palabra termina con guion al final de una página y continúa en
@@ -761,10 +879,12 @@ dentro de la caja de la tabla no se publican por duplicado y el resto de leyenda
 su posición.
 
 Al construir un EPUB, ese HTML tabular pasa por un analizador XML local que exige exactamente
-`table/thead/tbody/tr/th/td/br`, sin atributos, con filas rectangulares y texto escapado. Los bloques
-que cumplen el contrato se insertan como XHTML semántico después de CommonMark; todo el demás HTML
-permanece desactivado. Así las celdas multilínea no aparecen como etiquetas visibles y la excepción
-no abre una vía para scripts, eventos o marcado documental arbitrario.
+`table/thead/tbody/tr/th/td/br`. Las tablas documentales ordinarias no admiten atributos; el índice
+solo admite las clases exactas generadas por Parsezen, `strong`/`em` y enlaces locales `#page-N`.
+Las filas deben ser rectangulares y el texto estar escapado. Los bloques que cumplen el contrato se
+insertan como XHTML semántico después de CommonMark; todo el demás HTML permanece desactivado. Así las
+celdas multilínea no aparecen como etiquetas visibles y la excepción no abre una vía para scripts,
+eventos o marcado documental arbitrario.
 
 La guarda compartida de traducción conserva en orden `table/thead/tbody/tr/th/td/br`, incluidos los
 pares que representan celdas vacías. Esta comprobación es local a la estructura y se aplica también
@@ -807,13 +927,51 @@ deriva después el archivo único o el índice con capítulos, metadatos y refer
 volver a invocar OCR, Argos u Ollama. `output.py` publica conjuntamente índice, carpeta de capítulos
 y recursos y vuelve a generar el conjunto cuando se acepta una revisión.
 
+La extracción PDF recorre el rango en shards de 32 páginas y libera los objetos transitorios de
+`pdfplumber` entre shards; cada modelo nativo se guarda además como checkpoint independiente antes
+de continuar. La reconstrucción conserva el modelo compacto necesario, mientras que las imágenes
+que cruzan la frontera hacia la preparación se derraman a un directorio temporal privado y se leen
+solo al materializar la salida. Los checkpoints generales comprimen el payload antes de la
+protección, pero siguen aceptando entradas históricas sin compresión.
+
 El plan OCR añade una puntuación de legibilidad basada en densidad alfabética, fragmentación,
 glifos sospechosos, texto espaciado y líneas rotadas. Una página de confianza baja se rasteriza con
 la estrategia completa; al terminar, el texto OCR sustituye al nativo solo si supera umbrales
 absolutos y mejora suficientemente su puntuación. Tablas y páginas sin texto tienen reglas
 específicas. Un análisis correcto que no obtiene texto se guarda como checkpoint vacío para evitar
 repetir OCR costoso al reanudar; una excepción del motor no se guarda como ausencia de texto. El
-informe conserva las páginas analizadas, sustituidas y todavía dudosas.
+informe conserva las páginas analizadas, sustituidas y todavía dudosas. Las respuestas parciales
+mantienen las páginas cacheadas. Un worker reutiliza su modelo para hasta ocho páginas solicitadas,
+pero Docling sigue recibiendo rangos internos de una o dos páginas y libera cada resultado antes del
+siguiente. Si el proceso falla, las páginas ya transmitidas no se repiten y las pendientes se
+reintentan con un proceso nuevo; un grupo todavía problemático se degrada a páginas individuales y
+las páginas opcionales que siguen fallando se marcan como poison pages. Las páginas requeridas
+pendientes continúan bloqueando la conversión; ambas clases quedan separadas en el informe sin
+introducir texto documental en el historial.
+
+Una muestra proporcional de hasta el 25 % del intervalo y un máximo de seis páginas con imagen
+completa y capa textual útil también pasa por OCR cuando contiene índices, tablas, fórmulas, muchas
+cifras o codificaciones sospechosas. El OCR no
+sustituye por ello la capa nativa: actúa como evidencia de auditoría. Solo esas páginas inciertas se
+leen además con PDFium como segunda implementación nativa; una grafía OCR se acepta directamente
+cuando PDFium coincide exactamente y supera las mismas guardas conservadoras.
+
+Si las dos capas siguen discrepando, un presupuesto de incertidumbre elige como máximo ocho recortes
+por documento y dos por página, priorizando glifos corruptos, fórmulas y ligaduras tipográficas. El
+árbitro se descubre en Ollama local mediante `/api/tags` y `/api/show`, excluye modelos cloud y los
+que exceden 6 GiB, y recibe solo el recorte y las dos lecturas candidatas. Nunca ve una página ni un
+documento completos. Su propuesta se acepta únicamente si conserva todos los átomos no disputados,
+no inventa cifras y queda a distancia mínima de al menos una evidencia. Si no existe un modelo visual
+estándar o falla, la conversión continúa con la capa nativa y la revisión habitual.
+
+Los canarios PDF sintéticos cubren índices con folios, columnas, énfasis y fórmulas. Una prueba
+metamórfica exige que ejecutar la misma conversión con y sin checkpoints produzca Markdown idéntico,
+lo que detecta divergencias de reanudación sin guardar contenido real de usuario.
+
+Cada bloque Markdown conserva una provenance interna con sus páginas de origen. La unión de un
+párrafo entre páginas solo se permite cuando la primera línea termina cerca del margen inferior,
+la siguiente empieza cerca del margen superior en minúscula, mantiene columna y tamaño tipográfico
+y no hay una frontera de frase; encabezados, listas y tablas no se reconcilian por esta vía.
 
 En páginas gráficas completas, el reconocimiento puede incluir letras decorativas o marcas diminutas
 aisladas. Antes de limpiar el Markdown se descartan solo las líneas de una a cuatro letras cuya altura
@@ -823,6 +981,13 @@ forma parte de su cabecera para que una regla nueva no reutilice texto ruidoso a
 etiquetada de otra versión invalida la entrada y fuerza el reconocimiento: nunca se interpreta como
 texto heredado del documento. Solo se mantiene compatibilidad con checkpoints antiguos sin cabecera,
 anteriores al versionado explícito.
+
+Una imagen que ocupa la página completa suele ser un escaneo y no se duplica si la capa OCR ofrece
+una representación textual suficiente. Hay dos excepciones verificables: si la imagen está colocada
+con una orientación distinta de su bitmap o si el OCR reconoce una tabla, se conserva además la
+lámina completa. La capa textual sigue siendo accesible y traducible, mientras que formularios,
+rejillas, campos vacíos y relaciones espaciales que el Markdown no puede expresar permanecen en la
+salida como referencia fiel.
 
 La reconstrucción PDF conserva aparte el OCR crudo y puede contrastar los primeros cuatro folios con
 títulos nativos repetidos entre los doce primeros. Solo sustituye una línea cuando la página depende
@@ -888,8 +1053,9 @@ La publicación genera EPUB 3 con:
   recursos, XML y anclas antes de exponer el resultado;
 - escritura atómica del archivo final.
 
-La traducción directa conserva inicialmente el paquete y además prepara siempre su representación
-editable. EPUB→EPUB sin otra operación también crea este resultado pendiente de personalización.
+La traducción directa conserva inicialmente el paquete y además prepara una representación editable
+ligada a sus documentos reales del spine. EPUB→EPUB sin otra operación también crea este resultado
+pendiente de personalización.
 Las unidades semánticas pueden viajar agrupadas para reducir llamadas, pero la detección y
 reparación de texto residual se ejecuta sobre cada unidad antes de guardar el checkpoint; así una
 frase breve sin traducir no queda diluida entre metadatos, navegación y atributos ya traducidos.
@@ -900,8 +1066,10 @@ Cada subfragmento de Ollama validado se cifra además en el espacio general de t
 completar la unidad semántica; una pausa dentro de un capítulo grande reutiliza esas respuestas sin
 esperar a que termine el lote exterior. La intención del plan forma parte de ambas claves para
 impedir que un resultado estándar se reutilice como resultado revisado.
-La publicación tras la confirmación —directa o después del editor— reconstruye el libro normalizado
-para garantizar un EPUB válido, editable y coherente con los metadatos y la portada elegidos.
+La publicación tras la confirmación valida siempre el paquete completo. Conserva el original cuando
+no hay cambios, aplica parches de cuerpo cuando esa es la única diferencia y reconstruye el libro
+normalizado cuando cualquier cambio afecta a la estructura del paquete, los metadatos, la portada o
+los recursos.
 
 Tanto la confirmación como el editor ofrecen `Guardar y salir`. La primera conserva los metadatos;
 el segundo guarda además portada, estructura y sección visible. Escape, volver y el rechazo externo
@@ -1065,7 +1233,9 @@ funcional. Los manifiestos y resultados viven en `local-benchmarks/`, fuera de G
 
 El subcomando `profile` añade observación sin crear una referencia: tiempo total y por página, pico
 RSS incremental del árbol de procesos, páginas y tiempo OCR, y cantidad/tamaño de recursos cuando se
-activa `--include-images`. `scripts/benchmark_runtime.py PERFIL INSTALACIÓN` completa la matriz con un
+activa `--include-images`. `profile --matrix-pages 100 500 1000` mide prefijos de documentos largos
+con el mismo alcance de memoria `process-tree`; si el PDF tiene menos páginas, el rango se rechaza.
+`scripts/benchmark_runtime.py PERFIL INSTALACIÓN` completa la matriz con un
 payload sintético: tiempos DPAPI, escritura y recuperación de snapshot v2, disco privado/temporal,
 arranque en frío de una ventana offscreen y tamaño de la instalación; `--installer` añade el tamaño
 del instalador construido. El perfil resultante contiene solo números, no rutas ni payloads. Para que

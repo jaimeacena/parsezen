@@ -227,6 +227,32 @@ def test_epub_renders_restricted_multiline_pdf_table_html() -> None:
     assert "Primera lÃ­nea<br />Segunda lÃ­nea" in chapter
 
 
+def test_epub_renders_a_source_faithful_document_contents_table() -> None:
+    markdown = """# Contenidos
+
+<table class="document-toc">
+<thead><tr><th class="toc-label">Entrada</th><th class="toc-folio">Página</th></tr></thead>
+<tbody>
+<tr><td class="toc-label toc-level-0"><strong>Parte uno</strong></td>
+<td class="toc-folio">12</td></tr>
+<tr><td class="toc-label toc-level-1"><em>Primera sección</em></td>
+<td class="toc-folio">14</td></tr>
+</tbody>
+</table>
+"""
+
+    built = _build(markdown)
+    chapter = next(iter_epub_text_documents(built.content))[1]
+
+    assert '<table class="document-toc">' in chapter
+    assert '<td class="toc-label toc-level-1"><em>Primera sección</em></td>' in chapter
+    assert '<td class="toc-folio">14</td>' in chapter
+    with ZipFile(BytesIO(built.content)) as archive:
+        stylesheet = archive.read("EPUB/styles/book.css").decode("utf-8")
+    assert ".document-toc .toc-level-1" in stylesheet
+    assert "font-variant-numeric: tabular-nums" in stylesheet
+
+
 def test_epub_keeps_untrusted_raw_table_html_disabled() -> None:
     markdown = """# Datos
 
@@ -269,6 +295,22 @@ def test_epub_keeps_the_label_when_an_internal_target_is_outside_the_selection()
     assert "Chapter outside the selected pages" in chapter
     assert 'href="#page-99"' not in chapter
     assert "<a" not in chapter
+
+
+def test_epub_keeps_text_but_drops_relative_links_that_cannot_be_packaged() -> None:
+    chapter = next(
+        iter_epub_text_documents(
+            _build(
+                "# Imported PDF\n\n"
+                "[Malformed website](<./zeland%C2%ADs.com>) and "
+                "[external website](https://example.com)."
+            ).content
+        )
+    )[1]
+
+    assert "Malformed website" in chapter
+    assert "zeland" not in chapter
+    assert '<a href="https://example.com">external website</a>' in chapter
 
 
 def test_long_book_splits_at_headings_and_rewrites_cross_chapter_links() -> None:

@@ -39,7 +39,7 @@ TRANSLATION_RETRY_PART_CHARACTER_LIMITS = (700, 350, 175, 90, 45, 24)
 MAX_OFFLINE_TRANSLATION_WORK_ITEM_CHARACTERS = 60_000
 MAX_OUTPUT_CHARACTERS = 2_000_000
 TRANSLATION_SEGMENT_MARKER = "PZTRANSLATIONSEGMENTV1"
-_OFFLINE_TRANSLATION_CHECKPOINT_REVISION = "offline-translation-work-v5"
+_OFFLINE_TRANSLATION_CHECKPOINT_REVISION = "offline-translation-work-v6"
 
 LOGGER = logging.getLogger(__name__)
 
@@ -330,7 +330,10 @@ def _translate_markdown_offline_in_process(
             translated_values,
             strict=True,
         ):
-            translated_parts[part_index] = translated
+            translated_parts[part_index] = _preserve_source_uppercase(
+                parts[part_index].text,
+                translated,
+            )
 
     check_cancelled(cancellation)
     result_parts: list[str] = []
@@ -532,6 +535,15 @@ def _translate_title_case_normalized(
     else:
         translated = _capitalize_first_translatable_part(translated)
     return f"{prefix}{translated}"
+
+
+def _preserve_source_uppercase(source: str, translated: str) -> str:
+    """Keep an all-caps source span all-caps after a successful translation."""
+
+    letters = [character for character in natural_language_text(source) if character.isalpha()]
+    if len(letters) < 2 or not all(character.isupper() for character in letters):
+        return translated
+    return translated.upper()
 
 
 def _translate_sentence_case_normalized(
@@ -866,9 +878,19 @@ def _translate_value_once(
     text: str,
 ) -> str:
     translated = _translate_nonempty(translate_text, text)
-    if NUMBER_PATTERN.findall(text) == NUMBER_PATTERN.findall(translated):
+    source_numbers = NUMBER_PATTERN.findall(text)
+    translated_numbers = NUMBER_PATTERN.findall(translated)
+    if source_numbers == translated_numbers or (
+        numeric_tokens_are_conserved(text, translated)
+        and _is_subsequence(source_numbers, translated_numbers)
+    ):
         return translated
     return _translate_with_protected_numbers(translate_text, text)
+
+
+def _is_subsequence(expected: list[str], values: list[str]) -> bool:
+    pending = iter(values)
+    return all(any(candidate == value for candidate in pending) for value in expected)
 
 
 def _split_translation_retry_parts(
@@ -918,7 +940,7 @@ def _translate_with_protected_numbers(
         if translated.count(placeholder) != 1:
             raise TranslationError("El motor gratuito cambió un valor numérico protegido.")
         translated = translated.replace(placeholder, number)
-    return translated
+    return _validate_preserved_numbers(text, translated)
 
 
 def _number_placeholder(index: int) -> str:

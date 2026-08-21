@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import gc
 import inspect
 import logging
 import math
@@ -22,10 +23,11 @@ from urllib.parse import quote, unquote, urlsplit
 
 import pdfplumber
 from pdfplumber.utils.exceptions import MalformedPDFException, PdfminerException
+from PIL import Image, ImageStat
 
 from parsezen.cancellation import CancellationToken, check_cancelled
 from parsezen.document_model import RESOURCE_REFERENCE_PREFIX
-from parsezen.errors import ConversionError
+from parsezen.errors import ConversionError, ImprovementError, LocalModelUnavailableError
 from parsezen.ocr_conversion import convert_pdf_pages_with_ocr
 from parsezen.pdf_checkpoints import (
     _MAX_PDF_TABLE_CELL_CHARACTERS,
@@ -45,6 +47,7 @@ from parsezen.pdf_layout import (
     _TableRendering,
 )
 from parsezen.translation_quality import markdown_table_shapes
+from parsezen.visual_ocr import VisualTextArbiter
 
 LOGGER = logging.getLogger(__name__)
 
@@ -83,6 +86,7 @@ _SPACED_WORD_PATTERN = re.compile(
 )
 _ADJACENT_LINK_PATTERN = re.compile(r"\[([^\]]+)\]\(<([^>]+)>\)\s+\[([^\]]+)\]\(<\2>\)")
 _MAX_HEADING_LENGTH = 120
+_MAX_BODY_SIZE_UPPERCASE_HEADING_WORDS = 10
 _DUPLICATE_OVERLAP_RATIO = 0.55
 _DEDUPLICATION_GRID_SIZE = 16.0
 _MAX_CHARACTER_GRID_CELLS = 1_024
@@ -143,6 +147,16 @@ _TOC_REFERENCE_PREFIX_PATTERN = re.compile(
     r"^(?P<prefix>(?:(?:table|tabla|cuadro)\s+)?\d+\s*[.\-:)]\s*)(?P<label>.+)$",
     re.IGNORECASE,
 )
+_TOC_HEADING_PATTERN = re.compile(
+    r"^(?:table of contents|contents|content|index|índice|indice|sumario|contenido)$",
+    re.IGNORECASE,
+)
+_TOC_DOTTED_FOLIO_PATTERN = re.compile(
+    r"(?P<label>.*[^\W\d_].*?)\s*\.{2,}\s*"
+    r"(?P<folio>(?:\d[ \t]*){1,3}|[ivxlcdm]{1,8})\s*$",
+    re.IGNORECASE,
+)
+_MARKDOWN_LINK_DESTINATION_SPLIT_PATTERN = re.compile(r"(\]\(<[^>]*>\))")
 _TABLE_CAPTION_LINE_PATTERN = re.compile(
     r"^(?:table|tabla|cuadro)\s+(?:\d+|[ivxlcdm]+)\s*[.\-:]",
     re.IGNORECASE,
@@ -150,7 +164,7 @@ _TABLE_CAPTION_LINE_PATTERN = re.compile(
 _ROMAN_HEADING_REFERENCE_PATTERN = re.compile(
     r"^(?P<prefix>.+?)\s+(?P<roman>[IVXLCDM]{1,6})(?=\s*(?::|[-–—]|$))"
 )
-_FULL_PAGE_EXPORT_LETTER_LIMIT = 100
+_FULL_PAGE_EXPORT_LETTER_LIMIT = 300
 _MIN_COLUMN_LINES = 3
 _MIN_VECTOR_CURVES = 3
 _MAX_CLUSTERED_VECTOR_CURVES = 500
@@ -164,6 +178,25 @@ _PDF_WARNING_MESSAGE_PATTERN = re.compile(
     r"^>\s*\*\*Aviso(?: OCR| de conversión) \(página \d+\):\*\*\s*"
 )
 _PDF_PAGE_MARKER_PATTERN = re.compile(r"<!--\s*PZDOC PDF PAGE \d+\s*-->", re.IGNORECASE)
+_PDF_EXTRACTION_SHARD_SIZE = 32
+_SUSPICIOUS_NUMERIC_GLYPH_PATTERN = re.compile(
+    r"(?<!\w)(?:"
+    r"(?=[\d$^]{2,6}(?!\w))(?=[\d$^]*[$^])[\d$^]{2,6}"
+    r"|(?=[\dA-Za-z]{2,7}(?!\w))(?=[\dA-Za-z]*\d)(?=[\dA-Za-z]*[A-Za-z])"
+    r"[\dA-Za-z]{2,7}"
+    r")(?!\w)"
+)
+_VISUAL_ATOM_PATTERN = re.compile(
+    r"[\d$^][\d$^A-Za-z]{1,6}(?=(?:[.)](?:\s|$)|\s|$))"
+    r"|[\d$^\ufffd°]+(?:[.,][\d$^\ufffd°]+)*"
+    r"|(?:[^\W\d_]|\ufffd)+(?:[’'\-](?:[^\W\d_]|\ufffd)+)*"
+    r"|[^\w\s]",
+    re.UNICODE,
+)
+_MAX_VISUAL_ARBITRATION_REGIONS = 8
+_MAX_VISUAL_ARBITRATION_REGIONS_PER_PAGE = 2
+_MAX_HIDDEN_TEXT_AUDIT_PAGES = 6
+_MAX_VISUAL_CROP_BYTES = 4 * 1024 * 1024
 
 
 def strip_pdf_page_markers(markdown: str) -> str:
@@ -189,6 +222,7 @@ class PdfProgressPhase(StrEnum):
 
 
 PdfProgressCallback = Callable[[PdfProgressPhase, int, int], None]
+PdfVisualArbiterFactory = Callable[[], VisualTextArbiter | None]
 
 
 @dataclass(frozen=True, slots=True)
@@ -212,6 +246,12 @@ class PdfQualityReport:
     issues: tuple[PdfReviewIssue, ...]
     ocr_replaced_pages: tuple[int, ...] = ()
     low_confidence_pages: tuple[int, ...] = ()
+    ocr_failed_pages: tuple[int, ...] = ()
+    required_ocr_failed_pages: tuple[int, ...] = ()
+    secondary_native_pages: tuple[int, ...] = ()
+    secondary_native_arbitrated_regions: int = 0
+    visual_reviewed_regions: int = 0
+    visual_arbitrated_regions: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -238,6 +278,14 @@ class _PdfOcrPlan:
     page_numbers: set[int]
     force_full_page_numbers: set[int]
     required_page_numbers: set[int]
+
+
+@dataclass(frozen=True, slots=True)
+class _PdfVisualDisagreement:
+    page_number: int
+    line: _PdfLine
+    ocr_text: str
+    priority: int
 
 
 def extract_pdf_warning_pages(markdown: str) -> tuple[int, ...]:
@@ -308,6 +356,7 @@ def convert_pdf(
     save_ocr_checkpoint: Callable[[int, str], bool] | None = None,
     load_page_checkpoint: Callable[[int], str | None] | None = None,
     save_page_checkpoint: Callable[[int, str], bool] | None = None,
+    visual_arbiter_factory: PdfVisualArbiterFactory | None = None,
 ) -> str:
     """Return structured Markdown from a local PDF, using selective OCR when needed."""
     return convert_pdf_document(
@@ -322,6 +371,7 @@ def convert_pdf(
         save_ocr_checkpoint=save_ocr_checkpoint,
         load_page_checkpoint=load_page_checkpoint,
         save_page_checkpoint=save_page_checkpoint,
+        visual_arbiter_factory=visual_arbiter_factory,
     ).markdown
 
 
@@ -339,6 +389,7 @@ def convert_pdf_document(
     save_page_checkpoint: Callable[[int, str], bool] | None = None,
     *,
     include_images: bool = False,
+    visual_arbiter_factory: PdfVisualArbiterFactory | None = None,
 ) -> PdfConversionResult:
     """Return PDF Markdown with optional, meaningful raster resources."""
     check_cancelled(cancellation)
@@ -357,7 +408,7 @@ def convert_pdf_document(
 
     lines = [line for page in pages for line in page.lines]
     ocr_plan = _build_ocr_plan(pages, force_ocr)
-    ocr_pages, ocr_failed_pages = _run_planned_ocr(
+    ocr_pages, ocr_failed_pages, required_ocr_failed_pages = _run_planned_ocr(
         source_path,
         ocr_plan,
         on_ocr_start,
@@ -399,6 +450,33 @@ def convert_pdf_document(
         ocr_pages,
         body_size,
     )
+    secondary_native_text = _extract_secondary_native_text(
+        source_path,
+        {
+            page.number
+            for page in pages
+            if page.number in rendered_ocr_pages
+            and not _should_replace_with_ocr(page, rendered_ocr_pages[page.number])
+        },
+        cancellation,
+    )
+    pages, secondary_native_arbitrated_regions = _reconcile_secondary_native_text(
+        pages,
+        rendered_ocr_pages,
+        secondary_native_text,
+    )
+    visual_reviewed_regions = 0
+    visual_arbitrated_regions = 0
+    if visual_arbiter_factory is not None:
+        pages, visual_reviewed_regions, visual_arbitrated_regions = (
+            _arbitrate_visual_text_disagreements(
+                source_path,
+                pages,
+                rendered_ocr_pages,
+                visual_arbiter_factory,
+                cancellation,
+            )
+        )
     markdown, review_issues = _render_document(
         pages,
         body_size,
@@ -420,6 +498,12 @@ def convert_pdf_document(
         ocr_plan.page_numbers,
         review_issues,
         rendered_ocr_pages,
+        ocr_failed_pages=ocr_failed_pages,
+        required_ocr_failed_pages=required_ocr_failed_pages,
+        secondary_native_pages=set(secondary_native_text),
+        secondary_native_arbitrated_regions=secondary_native_arbitrated_regions,
+        visual_reviewed_regions=visual_reviewed_regions,
+        visual_arbitrated_regions=visual_arbitrated_regions,
     )
     return PdfConversionResult(
         f"{markdown}\n",
@@ -429,14 +513,18 @@ def convert_pdf_document(
 
 
 def _build_ocr_plan(pages: list[_PdfPage], force_ocr: bool) -> _PdfOcrPlan:
+    hidden_text_audit_pages = _hidden_text_audit_pages(pages)
     page_numbers = {page.number for page in pages} if force_ocr else _pages_requiring_ocr(pages)
+    page_numbers.update(hidden_text_audit_pages)
     force_full_page_numbers = {
         page.number
         for page in pages
         if (
             _has_suspicious_glyph_encoding(page)
+            or _has_suspicious_numeric_glyph_encoding(page)
             or page.image_orientation_mismatch
             or _native_page_quality(page) < _VERY_LOW_NATIVE_QUALITY_THRESHOLD
+            or page.number in hidden_text_audit_pages
         )
     }
     if force_ocr:
@@ -458,9 +546,9 @@ def _run_planned_ocr(
     on_progress: PdfProgressCallback | None,
     load_checkpoint: Callable[[int], str | None] | None,
     save_checkpoint: Callable[[int, str], bool] | None,
-) -> tuple[dict[int, str], set[int]]:
+) -> tuple[dict[int, str], set[int], set[int]]:
     if not plan.page_numbers:
-        return {}, set()
+        return {}, set(), set()
     check_cancelled(cancellation)
     cached_pages: dict[int, str] = {}
     if load_checkpoint is not None:
@@ -472,7 +560,7 @@ def _run_planned_ocr(
     if not pending_pages:
         if on_progress is not None:
             on_progress(PdfProgressPhase.OCR, len(cached_pages), len(plan.page_numbers))
-        return cached_pages, set()
+        return cached_pages, set(), set()
     if on_ocr_start is not None:
         on_ocr_start()
     progress = (
@@ -522,11 +610,18 @@ def _run_planned_ocr(
                 **ocr_arguments,
             )
     except ConversionError:
-        if plan.required_page_numbers:
+        # A worker can fail after returning valid cached pages. Keep those
+        # pages and only classify the unresolved subset as failed. Required
+        # pages still preserve the historic blocking behaviour.
+        failed_pages = set(plan.page_numbers) - set(cached_pages)
+        required_failed_pages = failed_pages & plan.required_page_numbers
+        if required_failed_pages:
             raise
-        return {}, set(plan.page_numbers)
+        return cached_pages, failed_pages, required_failed_pages
     ocr_pages = {**cached_pages, **ocr_pages}
-    return ocr_pages, set(plan.page_numbers) - set(ocr_pages)
+    failed_pages = set(plan.page_numbers) - set(ocr_pages)
+    required_failed_pages = failed_pages & plan.required_page_numbers
+    return ocr_pages, failed_pages, required_failed_pages
 
 
 def _empty_pdf_result(
@@ -580,6 +675,13 @@ def _notify_pdf_quality(
     ocr_page_numbers: set[int],
     issues: tuple[PdfReviewIssue, ...],
     ocr_markdown: dict[int, str] | None = None,
+    *,
+    ocr_failed_pages: set[int] | None = None,
+    required_ocr_failed_pages: set[int] | None = None,
+    secondary_native_pages: set[int] | None = None,
+    secondary_native_arbitrated_regions: int = 0,
+    visual_reviewed_regions: int = 0,
+    visual_arbitrated_regions: int = 0,
 ) -> None:
     if on_quality_report is None:
         return
@@ -600,6 +702,12 @@ def _notify_pdf_quality(
                 for page in pages
                 if _native_page_quality(page) < _LOW_NATIVE_QUALITY_THRESHOLD
             ),
+            ocr_failed_pages=tuple(sorted(ocr_failed_pages or set())),
+            required_ocr_failed_pages=tuple(sorted(required_ocr_failed_pages or set())),
+            secondary_native_pages=tuple(sorted(secondary_native_pages or set())),
+            secondary_native_arbitrated_regions=secondary_native_arbitrated_regions,
+            visual_reviewed_regions=visual_reviewed_regions,
+            visual_arbitrated_regions=visual_arbitrated_regions,
         )
     )
 
@@ -628,74 +736,72 @@ def _extract_pages(
             if page_range is not None
             else PdfPageRange(1, len(pdf.pages))
         )
-        selected_pages = pdf.pages[resolved_range.first_page - 1 : resolved_range.last_page]
         page_ids = {
             page_id: page_number
-            for page_number, page in enumerate(
-                selected_pages,
-                start=resolved_range.first_page,
-            )
+            for page_number in range(resolved_range.first_page, resolved_range.last_page + 1)
+            for page in (pdf.pages[page_number - 1],)
             if isinstance((page_id := page.page_obj.pageid), int)
         }
         pages: list[_PdfPage] = []
-        total_pages = len(selected_pages)
-        for current, (page_number, page) in enumerate(
-            zip(
-                range(resolved_range.first_page, resolved_range.last_page + 1),
-                selected_pages,
-                strict=True,
-            ),
-            start=1,
-        ):
-            check_cancelled(cancellation)
-            if load_checkpoint is not None:
-                cached_page = _deserialize_page_checkpoint(
-                    load_checkpoint(page_number),
-                    page_number,
+        total_pages = resolved_range.last_page - resolved_range.first_page + 1
+        for shard_start in range(0, total_pages, _PDF_EXTRACTION_SHARD_SIZE):
+            shard_end = min(total_pages, shard_start + _PDF_EXTRACTION_SHARD_SIZE)
+            for offset in range(shard_start, shard_end):
+                current = offset + 1
+                page_number = resolved_range.first_page + offset
+                page = pdf.pages[page_number - 1]
+                check_cancelled(cancellation)
+                if load_checkpoint is not None:
+                    cached_page = _deserialize_page_checkpoint(
+                        load_checkpoint(page_number),
+                        page_number,
+                    )
+                    if cached_page is not None:
+                        pages.append(cached_page)
+                        page.close()
+                        if on_progress is not None:
+                            on_progress(PdfProgressPhase.EXTRACTING, current, total_pages)
+                        continue
+                links = _extract_links(page.annots, page_ids)
+                filtered_page = _deduplicated_page(page)
+                raw_lines = filtered_page.extract_text_lines(
+                    strip=True,
+                    return_chars=True,
                 )
-                if cached_page is not None:
-                    pages.append(cached_page)
-                    page.close()
-                    if on_progress is not None:
-                        on_progress(PdfProgressPhase.EXTRACTING, current, total_pages)
-                    continue
-            links = _extract_links(page.annots, page_ids)
-            filtered_page = _deduplicated_page(page)
-            raw_lines = filtered_page.extract_text_lines(
-                strip=True,
-                return_chars=True,
-            )
-            built_lines: list[_PdfLine] = []
-            for raw_line in raw_lines:
-                line = _build_line(
-                    page_number,
-                    page.width,
-                    page.height,
-                    raw_line,
-                    links,
+                built_lines: list[_PdfLine] = []
+                for raw_line in raw_lines:
+                    line = _build_line(
+                        page_number,
+                        page.width,
+                        page.height,
+                        raw_line,
+                        links,
+                    )
+                    if line is not None:
+                        built_lines.extend(_split_wide_line(line))
+                lines = tuple(_reading_order_lines(built_lines))
+                tables = _extract_tables(page)
+                if not tables and _has_spatial_table_candidate(lines):
+                    tables = _extract_spatial_tables(page, lines)
+                extracted_page = _PdfPage(
+                    number=page_number,
+                    lines=lines,
+                    has_images=bool(page.images),
+                    image_area_ratios=_image_area_ratios(page),
+                    has_table=bool(tables),
+                    image_orientation_mismatch=_image_orientation_mismatch(page),
+                    tables=tables,
                 )
-                if line is not None:
-                    built_lines.extend(_split_wide_line(line))
-            lines = tuple(_reading_order_lines(built_lines))
-            tables = _extract_tables(page)
-            if not tables and _has_spatial_table_candidate(lines):
-                tables = _extract_spatial_tables(page, lines)
-            extracted_page = _PdfPage(
-                number=page_number,
-                lines=lines,
-                has_images=bool(page.images),
-                image_area_ratios=_image_area_ratios(page),
-                has_table=bool(tables),
-                image_orientation_mismatch=_image_orientation_mismatch(page),
-                tables=tables,
-            )
-            pages.append(extracted_page)
-            filtered_page.close()
-            page.close()
-            if save_checkpoint is not None:
-                save_checkpoint(page_number, _serialize_page_checkpoint(extracted_page))
-            if on_progress is not None:
-                on_progress(PdfProgressPhase.EXTRACTING, current, total_pages)
+                pages.append(extracted_page)
+                filtered_page.close()
+                page.close()
+                if save_checkpoint is not None:
+                    save_checkpoint(page_number, _serialize_page_checkpoint(extracted_page))
+                if on_progress is not None:
+                    on_progress(PdfProgressPhase.EXTRACTING, current, total_pages)
+            # pdfplumber's transient character/table objects can be sizeable;
+            # release them between shards while retaining only compact models.
+            gc.collect()
         check_cancelled(cancellation)
         return pages
 
@@ -782,16 +888,12 @@ def _extract_embedded_images(
                 if page_range is not None
                 else PdfPageRange(1, len(pdf.pages))
             )
-            pdf_pages = pdf.pages[resolved_range.first_page - 1 : resolved_range.last_page]
-            total = len(pdf_pages)
-            for current, (page_number, page) in enumerate(
-                zip(
-                    range(resolved_range.first_page, resolved_range.last_page + 1),
-                    pdf_pages,
-                    strict=True,
-                ),
+            total = resolved_range.last_page - resolved_range.first_page + 1
+            for current, page_number in enumerate(
+                range(resolved_range.first_page, resolved_range.last_page + 1),
                 start=1,
             ):
+                page = pdf.pages[page_number - 1]
                 check_cancelled(cancellation)
                 model = page_models[page_number]
                 candidates = _exportable_image_boxes(page, model, ocr_pages.get(page_number))
@@ -805,6 +907,18 @@ def _extract_embedded_images(
                     except (OSError, TypeError, ValueError):
                         omitted += 1
                         LOGGER.warning("pdf_image_export_failed page=%d", page_number)
+                        continue
+                    bbox_area_ratio = (
+                        (bbox[2] - bbox[0])
+                        * (bbox[3] - bbox[1])
+                        / max(float(page.width) * float(page.height), 1.0)
+                    )
+                    if (
+                        bbox_area_ratio >= _MAX_EXPORTED_IMAGE_AREA_RATIO
+                        and not _MARKDOWN_TABLE_PATTERN.search(ocr_pages.get(page_number, ""))
+                        and _is_nearly_blank_image(content)
+                    ):
+                        omitted += 1
                         continue
                     if len(content) > _MAX_EXPORTED_IMAGE_BYTES:
                         omitted += 1
@@ -875,10 +989,25 @@ def _exportable_image_boxes(
             candidates.append((ratio, table.bbox))
 
     # A page-sized image is normally a scan or decorative background. Keep at most one only
-    # when the page contains almost no readable content (for example, a cover or plate).
+    # when text remains sparse enough for the raster to carry substantial visual information
+    # (for example, a cover, illustrated plate or hybrid notice), or when another fidelity
+    # signal makes the raster necessary. Dense text-layer scans remain reflowable-only.
     recognized_letters = _heading_letter_count(ocr_markdown or "")
     useful_letters = max(_page_letter_count(model), recognized_letters)
-    if not candidates and full_page and useful_letters < _FULL_PAGE_EXPORT_LETTER_LIMIT:
+    ocr_contains_table = bool(_MARKDOWN_TABLE_PATTERN.search(ocr_markdown or ""))
+    ocr_is_toc = _is_toc_markdown(ocr_markdown or "")
+    native_is_toc = _is_toc_page(list(model.lines))
+    if (
+        not candidates
+        and full_page
+        and not native_is_toc
+        and not ocr_is_toc
+        and (
+            useful_letters < _FULL_PAGE_EXPORT_LETTER_LIMIT
+            or model.image_orientation_mismatch
+            or ocr_contains_table
+        )
+    ):
         candidates.append(max(full_page, key=lambda item: item[0]))
     candidates.sort(key=lambda item: (item[1][1], item[1][0], -item[0]))
     retained: list[tuple[float, float, float, float]] = []
@@ -1040,6 +1169,22 @@ def _render_pdf_image(
     output = BytesIO()
     image.save(output, format="JPEG", quality=74, optimize=True, progressive=True)
     return output.getvalue()
+
+
+def _is_nearly_blank_image(content: bytes) -> bool:
+    """Reject page backgrounds with no meaningful dark or contrasting visual content."""
+
+    try:
+        with Image.open(BytesIO(content)) as image:
+            grayscale = image.convert("L")
+            grayscale.thumbnail((256, 256))
+            histogram = grayscale.histogram()
+            total = max(sum(histogram), 1)
+            dark_ratio = sum(histogram[:210]) / total
+            deviation = ImageStat.Stat(grayscale).stddev[0]
+    except (OSError, TypeError, ValueError):
+        return False
+    return deviation < 10.0 and dark_ratio < 0.002
 
 
 def _has_table_candidate(page: Any) -> bool:
@@ -1354,10 +1499,16 @@ def _build_line(
         for char in raw_chars
         if _is_bold_font(str(char.get("fontname", "")))
     )
+    italic_characters = sum(
+        max(len(str(char.get("text", ""))), 1)
+        for char in raw_chars
+        if _is_italic_font(str(char.get("fontname", "")))
+    )
     rotated_characters = sum(
         max(len(str(char.get("text", ""))), 1) for char in raw_chars if char.get("upright") is False
     )
     bold = weighted_characters > 0 and bold_characters / weighted_characters >= 0.55
+    italic = weighted_characters > 0 and italic_characters / weighted_characters >= 0.55
     rotated = weighted_characters > 0 and rotated_characters / weighted_characters >= 0.55
     top = float(raw_line["top"])
     bottom = float(raw_line["bottom"])
@@ -1384,6 +1535,7 @@ def _build_line(
         soft_hyphen_end=soft_hyphen_end,
         hard_hyphen_end=hard_hyphen_end,
         rotated=rotated,
+        italic=italic,
     )
 
 
@@ -1597,6 +1749,147 @@ def _order_column_band(lines: list[_PdfLine], page_width: float) -> list[_PdfLin
     ]
 
 
+def _reconcile_suspicious_toc_numbers(
+    lines: list[_PdfLine],
+    ocr_markdown: str | None,
+) -> list[_PdfLine]:
+    """Use OCR only to decode a broken native numeric glyph on a contents page.
+
+    The selectable layer remains authoritative for every letter and for layout.  A suspicious
+    token is changed only when replacing its one opaque glyph with a digit yields exactly one
+    number that the independent OCR pass also saw on the same page.
+    """
+
+    ocr_numbers = set(re.findall(r"(?<!\d)\d{1,6}(?!\d)", ocr_markdown or ""))
+    native_folios = tuple(
+        (line, int(compact))
+        for line in lines
+        for compact in (re.sub(r"\s+", "", line.text),)
+        if re.fullmatch(r"\d{1,6}", compact)
+    )
+    if not ocr_numbers and not native_folios:
+        return lines
+
+    ocr_lines = tuple(line for line in (ocr_markdown or "").splitlines() if line.strip())
+
+    def lexical_key(value: str) -> str:
+        words = re.findall(r"[^\W\d_]{2,}", value.casefold(), re.UNICODE)
+        return " ".join(words)
+
+    def line_ocr_numbers(source_line: str) -> set[str]:
+        source_key = lexical_key(source_line)
+        if not source_key:
+            return ocr_numbers
+        ranked = sorted(
+            (
+                SequenceMatcher(None, source_key, lexical_key(candidate), autojunk=False).ratio(),
+                candidate,
+            )
+            for candidate in ocr_lines
+            if lexical_key(candidate)
+        )
+        if not ranked or ranked[-1][0] < 0.72:
+            return ocr_numbers
+        best_score = ranked[-1][0]
+        best_lines = [candidate for score, candidate in ranked if score >= best_score - 0.02]
+        return set(re.findall(r"(?<!\d)\d{1,6}(?!\d)", "\n".join(best_lines))) or ocr_numbers
+
+    def ocr_evidence_text(source_line: _PdfLine) -> str:
+        """Attach a detached folio to its visual label before matching OCR text."""
+
+        if lexical_key(source_line.text):
+            return source_line.text
+        row_labels = [
+            candidate
+            for candidate in lines
+            if candidate is not source_line
+            and candidate.x0 < source_line.x0
+            and _heading_letter_count(candidate.text) >= 2
+            and _toc_lines_share_row(candidate, source_line)
+        ]
+        if not row_labels:
+            return source_line.text
+        label = min(
+            row_labels,
+            key=lambda candidate: (
+                abs((candidate.top + candidate.bottom) - (source_line.top + source_line.bottom)),
+                -candidate.x1,
+            ),
+        )
+        return f"{label.text} {source_line.text}"
+
+    def native_sequence_numbers(source_line: _PdfLine) -> set[str]:
+        """Constrain one detached broken folio by its neighbours in the same column."""
+
+        token = re.sub(r"\s+", "", source_line.text)
+        if _SUSPICIOUS_NUMERIC_GLYPH_PATTERN.fullmatch(token) is None:
+            return set()
+        column_tolerance = source_line.page_width * 0.08
+        preceding = [
+            (line, value)
+            for line, value in native_folios
+            if line.top < source_line.top - 0.5
+            and abs(line.x0 - source_line.x0) <= column_tolerance
+        ]
+        following = [
+            (line, value)
+            for line, value in native_folios
+            if line.top > source_line.top + 0.5
+            and abs(line.x0 - source_line.x0) <= column_tolerance
+        ]
+        if not preceding or not following:
+            return set()
+        lower = max(preceding, key=lambda item: item[0].top)[1]
+        upper = min(following, key=lambda item: item[0].top)[1]
+        if lower > upper:
+            return set()
+        opaque_positions = [
+            index
+            for index, value in enumerate(token)
+            if value in "$^" or (value.isalpha() and any(char.isdigit() for char in token))
+        ]
+        if len(opaque_positions) != 1:
+            return set()
+        position = opaque_positions[0]
+        return {
+            candidate
+            for digit in "0123456789"
+            for candidate in (f"{token[:position]}{digit}{token[position + 1 :]}",)
+            if lower <= int(candidate) <= upper
+        }
+
+    def reconcile_token(match: re.Match[str], confirmed_numbers: set[str]) -> str:
+        token = match.group(0)
+        opaque_positions = [
+            index
+            for index, value in enumerate(token)
+            if value in "$^" or (value.isalpha() and any(char.isdigit() for char in token))
+        ]
+        if len(opaque_positions) != 1 or not any(value.isdigit() for value in token):
+            return token
+        # A trailing dollar sign can be a real currency marker.  Without a following ordinal
+        # separator or another digit it remains visible and is reported for review.
+        if "$" in token and match.end() == len(match.string):
+            return token
+        position = opaque_positions[0]
+        candidates = {f"{token[:position]}{digit}{token[position + 1 :]}" for digit in "0123456789"}
+        confirmed = candidates & confirmed_numbers
+        return next(iter(confirmed)) if len(confirmed) == 1 else token
+
+    reconciled: list[_PdfLine] = []
+    for line in lines:
+        native_sequence = native_sequence_numbers(line)
+        ocr_confirmed_numbers = line_ocr_numbers(ocr_evidence_text(line))
+        native_ocr_consensus = native_sequence & ocr_confirmed_numbers
+        confirmed_numbers = native_ocr_consensus or native_sequence or ocr_confirmed_numbers
+        text = _SUSPICIOUS_NUMERIC_GLYPH_PATTERN.sub(
+            lambda match, confirmed=confirmed_numbers: reconcile_token(match, confirmed),
+            line.text,
+        )
+        reconciled.append(replace(line, text=text) if text != line.text else line)
+    return reconciled
+
+
 def _normalize_toc_entry_rows(lines: list[_PdfLine]) -> list[_PdfLine]:
     """Pair a detached page-number column with its TOC entries by geometry."""
 
@@ -1610,7 +1903,7 @@ def _normalize_toc_entry_rows(lines: list[_PdfLine]) -> list[_PdfLine]:
         for index, line in enumerate(lines)
         if not line.rotated
         and line.x0 >= page_width * 0.35
-        and _is_page_number(re.sub(r"\s+", "", line.text))
+        and _is_toc_folio(re.sub(r"\s+", "", line.text))
     ]
     if len(number_indices) < 3:
         return lines
@@ -1661,6 +1954,64 @@ def _normalize_toc_entry_rows(lines: list[_PdfLine]) -> list[_PdfLine]:
     # detached folio column; sorting by row here would interleave a genuine
     # two-column contents page.
     return normalized
+
+
+def _reconcile_toc_spacing_from_ocr(
+    lines: list[_PdfLine],
+    ocr_markdown: str | None,
+) -> list[_PdfLine]:
+    """Restore only missing word boundaries corroborated by the local OCR layer."""
+
+    ocr_lines = _visible_ocr_lines(ocr_markdown or "")
+    if not ocr_lines:
+        return lines
+
+    def compact_with_boundaries(text: str) -> tuple[str, set[int]]:
+        compact: list[str] = []
+        boundaries: set[int] = set()
+        pending_space = False
+        for character in text.strip():
+            if character.isspace():
+                pending_space = bool(compact)
+                continue
+            if pending_space:
+                boundaries.add(len(compact))
+            compact.append(character)
+            pending_space = False
+        return "".join(compact), boundaries
+
+    reconciled: list[_PdfLine] = []
+    for line in lines:
+        match = _best_matching_text_line(line.text, ocr_lines)
+        if match is None or match[0] < 0.86:
+            reconciled.append(line)
+            continue
+        candidate = _aligned_visual_candidate(line.text, match[1])
+        native_compact, native_boundaries = compact_with_boundaries(line.text)
+        ocr_compact, ocr_boundaries = compact_with_boundaries(candidate)
+        if (
+            len(native_compact) != len(ocr_compact)
+            or _levenshtein_distance(native_compact.casefold(), ocr_compact.casefold()) > 2
+        ):
+            reconciled.append(line)
+            continue
+        added_boundaries = {
+            position
+            for position in ocr_boundaries - native_boundaries
+            if 0 < position < len(native_compact)
+            and native_compact[position - 1].isalpha()
+            and native_compact[position].isalpha()
+        }
+        if not added_boundaries:
+            reconciled.append(line)
+            continue
+        all_boundaries = native_boundaries | added_boundaries
+        text = "".join(
+            f" {character}" if index in all_boundaries else character
+            for index, character in enumerate(native_compact)
+        )
+        reconciled.append(replace(line, text=text))
+    return reconciled
 
 
 def _toc_lines_share_row(entry: _PdfLine, number: _PdfLine) -> bool:
@@ -1777,11 +2128,11 @@ def _repair_toc_entries_from_native_headings(
 
     repaired: list[_PdfLine] = []
     for line in lines:
-        folio = _toc_entry_page_number(line.text)
-        if folio is None:
+        entry_parts = _split_toc_entry_text(line.text)
+        if entry_parts is None:
             repaired.append(line)
             continue
-        entry, _folio = line.text.strip().rsplit(maxsplit=1)
+        entry, folio = entry_parts
         enumeration, label = _split_toc_reference_label(entry)
         candidates = exact_references.get(_toc_reference_key(label), frozenset())
         if len(candidates) == 1:
@@ -1794,7 +2145,8 @@ def _repair_toc_entries_from_native_headings(
             if roman in roman_references.get(_toc_reference_key(prefix), frozenset()):
                 label = f"{prefix} {roman}"
 
-        text = f"{enumeration}{label} {folio}"
+        separator = " ........ " if _TOC_DOTTED_FOLIO_PATTERN.fullmatch(line.text.strip()) else " "
+        text = f"{enumeration}{label}{separator}{folio}"
         repaired.append(replace(line, text=text) if text != line.text else line)
     return repaired
 
@@ -1833,6 +2185,11 @@ def _compact_character(raw: dict[str, Any]) -> _PdfCharacter | None:
 def _is_bold_font(font_name: str) -> bool:
     normalized = font_name.casefold()
     return any(marker in normalized for marker in ("bold", "black", "demi", "semibold"))
+
+
+def _is_italic_font(font_name: str) -> bool:
+    normalized = font_name.casefold()
+    return any(marker in normalized for marker in ("italic", "oblique", "slanted"))
 
 
 def _dominant_body_size(lines: list[_PdfLine]) -> float:
@@ -1885,10 +2242,544 @@ def _pages_requiring_ocr(pages: list[_PdfPage]) -> set[int]:
             or has_discrete_image
             or (has_full_page_image and lacks_text)
             or _has_suspicious_glyph_encoding(page)
+            or _has_suspicious_numeric_glyph_encoding(page)
             or _native_page_quality(page) < _LOW_NATIVE_QUALITY_THRESHOLD
         ):
             selected.add(page.number)
     return selected
+
+
+def _hidden_text_audit_pages(pages: list[_PdfPage]) -> set[int]:
+    """Spend a bounded OCR budget on risky scanned pages with a useful hidden text layer.
+
+    A full-page raster plus selectable text commonly means that an earlier OCR engine created the
+    PDF. The selectable layer remains authoritative, but contents pages, tables and glyph-heavy
+    reference pages receive one independent full-page reading so later reconciliation has actual
+    evidence instead of trusting a plausible-looking hidden typo.
+    """
+
+    ranked: list[tuple[int, int]] = []
+    for page in pages:
+        if not any(ratio >= _FULL_PAGE_IMAGE_AREA_RATIO for ratio in page.image_area_ratios):
+            continue
+        if _page_letter_count(page) < _GRAPHIC_WARNING_LETTER_LIMIT:
+            continue
+        lines = [line for line in page.lines if not line.rotated]
+        toc_page = _is_toc_page(lines)
+        trailing_numbers = sum(bool(re.search(r"\b\d{1,6}\s*$", line.text)) for line in lines)
+        formula_signals = sum(bool(re.search(r"[=±×÷∑√^]|\d[$^]\d", line.text)) for line in lines)
+        score = (
+            (120 if toc_page else 0)
+            + (90 if page.has_table else 0)
+            + min(30, trailing_numbers * 2)
+            + min(30, formula_signals * 5)
+            + (50 if _has_suspicious_glyph_encoding(page) else 0)
+            + (50 if _has_suspicious_numeric_glyph_encoding(page) else 0)
+        )
+        if score >= 20:
+            ranked.append((score, page.number))
+    ranked.sort(key=lambda item: (-item[0], item[1]))
+    budget = min(
+        _MAX_HIDDEN_TEXT_AUDIT_PAGES,
+        max(1, math.ceil(len(pages) * 0.25)),
+    )
+    return {page_number for _score, page_number in ranked[:budget]}
+
+
+def _extract_secondary_native_text(
+    source_path: Path,
+    page_numbers: set[int],
+    cancellation: CancellationToken | None,
+) -> dict[int, str]:
+    """Read only uncertain pages through PDFium as a second native-text implementation."""
+
+    if not page_numbers:
+        return {}
+    try:
+        import pypdfium2
+
+        document = pypdfium2.PdfDocument(source_path)
+    except (ImportError, OSError, RuntimeError, ValueError):
+        LOGGER.warning("pdf_secondary_native_unavailable pages=%d", len(page_numbers))
+        return {}
+    extracted: dict[int, str] = {}
+    try:
+        for page_number in sorted(page_numbers):
+            check_cancelled(cancellation)
+            if page_number < 1 or page_number > len(document):
+                continue
+            page = document[page_number - 1]
+            text_page = None
+            try:
+                text_page = page.get_textpage()
+                text = text_page.get_text_bounded()
+                if isinstance(text, str) and text.strip() and "\0" not in text:
+                    extracted[page_number] = unicodedata.normalize("NFC", text)
+            except (OSError, RuntimeError, TypeError, ValueError):
+                continue
+            finally:
+                if text_page is not None:
+                    text_page.close()
+                page.close()
+    finally:
+        document.close()
+    LOGGER.info("pdf_secondary_native_completed pages=%d", len(extracted))
+    return extracted
+
+
+def _reconcile_secondary_native_text(
+    pages: list[_PdfPage],
+    ocr_pages: dict[int, str],
+    secondary_pages: dict[int, str],
+) -> tuple[list[_PdfPage], int]:
+    """Accept an OCR spelling only when independent PDFium text gives the same reading."""
+
+    replacements: dict[tuple[int, float, float, str], str] = {}
+    for page in pages:
+        secondary = secondary_pages.get(page.number)
+        ocr = ocr_pages.get(page.number)
+        if secondary is None or ocr is None:
+            continue
+        ocr_lines = _visible_ocr_lines(ocr)
+        secondary_lines = _visible_ocr_lines(secondary)
+        for line in page.lines:
+            if line.rotated:
+                continue
+            ocr_match = _best_matching_text_line(line.text, ocr_lines)
+            if ocr_match is None:
+                continue
+            _ocr_similarity, ocr_text = ocr_match
+            ocr_text = _aligned_visual_candidate(line.text, ocr_text)
+            _ocr_similarity = SequenceMatcher(
+                None,
+                line.text.casefold(),
+                ocr_text.casefold(),
+                autojunk=False,
+            ).ratio()
+            if _visual_disagreement_priority(line.text, ocr_text, _ocr_similarity) is None:
+                continue
+            secondary_match = _best_matching_text_line(ocr_text, secondary_lines)
+            if secondary_match is None or secondary_match[0] < 0.92:
+                continue
+            secondary_text = secondary_match[1]
+            if _comparison_line_key(secondary_text) != _comparison_line_key(ocr_text):
+                continue
+            accepted = _validated_visual_reading(line.text, ocr_text, ocr_text)
+            if accepted is not None and accepted != line.text:
+                replacements[_visual_line_key(line)] = accepted
+    if not replacements:
+        return pages, 0
+    reconciled = [
+        replace(
+            page,
+            lines=tuple(
+                replace(line, text=replacements[_visual_line_key(line)])
+                if _visual_line_key(line) in replacements
+                else line
+                for line in page.lines
+            ),
+        )
+        for page in pages
+    ]
+    LOGGER.info("pdf_secondary_native_arbitration_completed accepted=%d", len(replacements))
+    return reconciled, len(replacements)
+
+
+def _arbitrate_visual_text_disagreements(
+    source_path: Path,
+    pages: list[_PdfPage],
+    ocr_pages: dict[int, str],
+    arbiter_factory: PdfVisualArbiterFactory,
+    cancellation: CancellationToken | None,
+) -> tuple[list[_PdfPage], int, int]:
+    disagreements = _visual_text_disagreements(pages, ocr_pages)
+    if not disagreements:
+        return pages, 0, 0
+    arbiter = arbiter_factory()
+    if arbiter is None:
+        return pages, 0, 0
+
+    selected: list[_PdfVisualDisagreement] = []
+    per_page: Counter[int] = Counter()
+    for disagreement in sorted(
+        disagreements,
+        key=lambda item: (-item.priority, item.page_number, item.line.top, item.line.x0),
+    ):
+        if per_page[disagreement.page_number] >= _MAX_VISUAL_ARBITRATION_REGIONS_PER_PAGE:
+            continue
+        selected.append(disagreement)
+        per_page[disagreement.page_number] += 1
+        if len(selected) >= _MAX_VISUAL_ARBITRATION_REGIONS:
+            break
+    if not selected:
+        return pages, 0, 0
+
+    replacements: dict[tuple[int, float, float, str], str] = {}
+    reviewed = 0
+    try:
+        with pdfplumber.open(source_path, unicode_norm="NFC") as pdf:
+            for disagreement in selected:
+                check_cancelled(cancellation)
+                page = pdf.pages[disagreement.page_number - 1]
+                try:
+                    crop = _render_visual_text_crop(page, disagreement.line)
+                    proposed = arbiter(
+                        crop,
+                        disagreement.line.text,
+                        disagreement.ocr_text,
+                        cancellation,
+                    )
+                    reviewed += 1
+                except LocalModelUnavailableError:
+                    LOGGER.warning("pdf_visual_arbiter_unavailable reviewed=%d", reviewed)
+                    break
+                except (ImprovementError, OSError, ValueError):
+                    LOGGER.warning("pdf_visual_region_skipped reviewed=%d", reviewed)
+                    continue
+                finally:
+                    page.close()
+                if proposed is None:
+                    continue
+                accepted = _validated_visual_reading(
+                    disagreement.line.text,
+                    disagreement.ocr_text,
+                    proposed,
+                )
+                if accepted is None or accepted == disagreement.line.text:
+                    continue
+                replacements[_visual_line_key(disagreement.line)] = accepted
+    except (MalformedPDFException, PdfminerException, OSError, ValueError):
+        LOGGER.warning("pdf_visual_arbiter_render_failed reviewed=%d", reviewed)
+        return pages, reviewed, 0
+
+    if not replacements:
+        return pages, reviewed, 0
+    reconciled: list[_PdfPage] = []
+    for page in pages:
+        page_lines = tuple(
+            replace(line, text=replacements[_visual_line_key(line)])
+            if _visual_line_key(line) in replacements
+            else line
+            for line in page.lines
+        )
+        reconciled.append(replace(page, lines=page_lines) if page_lines != page.lines else page)
+    LOGGER.info(
+        "pdf_visual_arbitration_completed reviewed=%d accepted=%d",
+        reviewed,
+        len(replacements),
+    )
+    return reconciled, reviewed, len(replacements)
+
+
+def _visual_text_disagreements(
+    pages: list[_PdfPage],
+    ocr_pages: dict[int, str],
+) -> tuple[_PdfVisualDisagreement, ...]:
+    disagreements: list[_PdfVisualDisagreement] = []
+    for page in pages:
+        ocr_markdown = ocr_pages.get(page.number)
+        if ocr_markdown is None or _should_replace_with_ocr(page, ocr_markdown):
+            continue
+        ocr_lines = _visible_ocr_lines(ocr_markdown)
+        if not ocr_lines:
+            continue
+        for line in page.lines:
+            if line.rotated or not (3 <= len(line.text) <= 300):
+                continue
+            native_self_suspicion = bool(
+                "\ufffd" in line.text or _SUSPICIOUS_NUMERIC_GLYPH_PATTERN.search(line.text)
+            )
+            match = _best_matching_text_line(line.text, ocr_lines)
+            # A contents folio is often a detached native line but part of the OCR row.
+            # Keep a deliberately low preliminary threshold, then validate the aligned
+            # candidate with the strict same-atom guard below.
+            if match is None or match[0] < 0.60:
+                if not native_self_suspicion:
+                    continue
+                similarity, candidate = 1.0, line.text
+            else:
+                similarity, candidate = match
+            candidate = _aligned_visual_candidate(line.text, candidate)
+            similarity = SequenceMatcher(
+                None,
+                line.text.casefold(),
+                candidate.casefold(),
+                autojunk=False,
+            ).ratio()
+            if similarity < 0.74:
+                if not native_self_suspicion:
+                    continue
+                similarity, candidate = 1.0, line.text
+            priority = _visual_disagreement_priority(line.text, candidate, similarity)
+            if priority is None and native_self_suspicion:
+                similarity, candidate = 1.0, line.text
+                priority = _visual_disagreement_priority(line.text, candidate, similarity)
+            if priority is None:
+                continue
+            disagreements.append(_PdfVisualDisagreement(page.number, line, candidate, priority))
+    return tuple(disagreements)
+
+
+def _best_matching_text_line(
+    source: str,
+    candidates: tuple[str, ...],
+) -> tuple[float, str] | None:
+    ranked = sorted(
+        (
+            (
+                SequenceMatcher(
+                    None,
+                    source.casefold(),
+                    candidate.casefold(),
+                    autojunk=False,
+                ).ratio(),
+                candidate,
+            )
+            for candidate in candidates
+        ),
+        reverse=True,
+    )
+    return ranked[0] if ranked else None
+
+
+def _comparison_line_key(text: str) -> str:
+    return " ".join(unicodedata.normalize("NFC", text).casefold().split())
+
+
+def _aligned_visual_candidate(native: str, candidate: str) -> str:
+    native_atoms = _visual_atoms(native)
+    candidate_atoms = _visual_atoms(candidate)
+    if (
+        len(candidate_atoms) == len(native_atoms) + 1
+        and candidate_atoms[-1].isdigit()
+        and not any(atom.isdigit() for atom in native_atoms)
+    ):
+        return re.sub(r"\s+\d{1,6}\s*$", "", candidate).strip()
+    return candidate
+
+
+def _visible_ocr_lines(markdown: str) -> tuple[str, ...]:
+    lines: list[str] = []
+    for raw_line in markdown.splitlines():
+        stripped = raw_line.strip()
+        if not stripped or re.fullmatch(r"\|?[\s:|-]+\|?", stripped):
+            continue
+        from_table = "|" in stripped and stripped.startswith("|")
+        if from_table:
+            stripped = " ".join(
+                cell.strip() for cell in stripped.strip("|").split("|") if cell.strip()
+            )
+        stripped = re.sub(r"^[#>*+\-]+\s*", "", stripped)
+        if not from_table:
+            stripped = re.sub(r"^\d+[.)]\s+", "", stripped)
+        stripped = re.sub(r"[*_`]+", "", stripped)
+        stripped = re.sub(r"!?\[([^\]]*)\]\((?:<[^>]+>|[^)]+)\)", r"\1", stripped)
+        stripped = re.sub(r"<[^>]+>", " ", stripped)
+        stripped = " ".join(stripped.split())
+        if stripped:
+            lines.append(stripped)
+    return tuple(dict.fromkeys(lines))
+
+
+def _visual_atoms(text: str) -> tuple[str, ...]:
+    return tuple(_VISUAL_ATOM_PATTERN.findall(unicodedata.normalize("NFC", text)))
+
+
+def _visual_disagreement_priority(
+    native: str,
+    ocr: str,
+    similarity: float,
+) -> int | None:
+    native_atoms = _visual_atoms(native)
+    ocr_atoms = _visual_atoms(ocr)
+    if not native_atoms or len(native_atoms) != len(ocr_atoms):
+        return None
+    different = [
+        index
+        for index, (native_atom, ocr_atom) in enumerate(zip(native_atoms, ocr_atoms, strict=True))
+        if native_atom != ocr_atom
+    ]
+    if not different:
+        if native == ocr and "\ufffd" in native:
+            return 125 + round(similarity * 10)
+        if native == ocr and any(_is_mixed_visual_glyph(atom) for atom in native_atoms):
+            return 118 + round(similarity * 10)
+        return None
+    if len(different) > 2:
+        return None
+    if any("\ufffd" in atom for atom in (*native_atoms, *ocr_atoms)):
+        return 120 + round(similarity * 10)
+    if any(
+        character in "æÆœŒﬁﬂ"
+        for index in different
+        for character in native_atoms[index] + ocr_atoms[index]
+    ):
+        # Rare printed ligatures are a high-value visual question: text layers often
+        # map them to a visually similar ASCII sequence while OCR may preserve them.
+        return 115 + round(similarity * 10)
+    if any(
+        re.search(r"[\d$^]*[$^][\d$^]*", native_atoms[index] + ocr_atoms[index])
+        for index in different
+    ):
+        return 110 + round(similarity * 10)
+    changed_pairs = [(native_atoms[index], ocr_atoms[index]) for index in different]
+    if all(
+        (_is_mixed_visual_glyph(left) and (right.isalpha() or right.isdigit()))
+        or (_is_mixed_visual_glyph(right) and (left.isalpha() or left.isdigit()))
+        for left, right in changed_pairs
+    ):
+        return 116 + round(similarity * 10)
+    if all(
+        2 <= max(len(left), len(right)) <= 6
+        and any(character.isdigit() for character in left)
+        and any(character.isdigit() for character in right)
+        and (left.isdigit() or right.isdigit())
+        and _levenshtein_distance(left.casefold(), right.casefold()) <= 2
+        for left, right in changed_pairs
+    ):
+        return 112 + round(similarity * 10)
+    if all(
+        max(len(left), len(right)) >= 5
+        and _levenshtein_distance(left.casefold(), right.casefold()) <= 2
+        for left, right in changed_pairs
+    ):
+        title_case = any(left[:1].isupper() or right[:1].isupper() for left, right in changed_pairs)
+        return (70 if title_case else 50) + round(similarity * 10)
+    return None
+
+
+def _validated_visual_reading(native: str, ocr: str, proposed: str) -> str | None:
+    if any(character in proposed for character in "\r\n\0") or len(proposed) > 300:
+        return None
+    native_atoms = _visual_atoms(native)
+    ocr_atoms = _visual_atoms(ocr)
+    proposed_atoms = _visual_atoms(proposed)
+    if (
+        not native_atoms
+        or len(native_atoms) != len(ocr_atoms)
+        or len(native_atoms) != len(proposed_atoms)
+    ):
+        return None
+    disagreement = False
+    for native_atom, ocr_atom, proposed_atom in zip(
+        native_atoms,
+        ocr_atoms,
+        proposed_atoms,
+        strict=True,
+    ):
+        if native_atom == ocr_atom:
+            if proposed_atom != native_atom:
+                replacement_resolution = (
+                    "\ufffd" in native_atom
+                    and _levenshtein_distance(native_atom, proposed_atom) <= 2
+                )
+                if not replacement_resolution and not _plausible_mixed_visual_resolution(
+                    native_atom,
+                    proposed_atom,
+                ):
+                    return None
+                disagreement = True
+            continue
+        disagreement = True
+        numeric = any(character.isdigit() for character in native_atom + ocr_atom)
+        if numeric:
+            if proposed_atom not in {
+                native_atom,
+                ocr_atom,
+            } and not _plausible_mixed_visual_resolution(native_atom, proposed_atom):
+                return None
+            continue
+        if (
+            min(
+                _levenshtein_distance(proposed_atom.casefold(), native_atom.casefold()),
+                _levenshtein_distance(proposed_atom.casefold(), ocr_atom.casefold()),
+            )
+            > 2
+        ):
+            return None
+        if (
+            proposed_atom not in {native_atom, ocr_atom}
+            and "\ufffd" not in native_atom + ocr_atom
+            and not any(character in proposed_atom for character in "æÆœŒﬁﬂ")
+        ):
+            return None
+    if not disagreement:
+        return None
+    if SequenceMatcher(None, native.casefold(), proposed.casefold(), autojunk=False).ratio() < 0.80:
+        return None
+    return proposed
+
+
+def _is_mixed_visual_glyph(atom: str) -> bool:
+    return (
+        2 <= len(atom) <= 7
+        and any(character.isdigit() for character in atom)
+        and any(character.isalpha() for character in atom)
+    )
+
+
+def _plausible_mixed_visual_resolution(source: str, proposed: str) -> bool:
+    if not _is_mixed_visual_glyph(source) or not (proposed.isalpha() or proposed.isdigit()):
+        return False
+    return (
+        abs(len(source) - len(proposed)) <= 1
+        and _levenshtein_distance(
+            source.casefold(),
+            proposed.casefold(),
+        )
+        <= 3
+    )
+
+
+def _render_visual_text_crop(page: Any, line: _PdfLine) -> bytes:
+    page_x0, page_top, page_x1, page_bottom = (float(value) for value in page.bbox)
+    line_height = max(line.bottom - line.top, 2.0)
+    bbox = (
+        max(page_x0, line.x0 - max(8.0, line_height * 1.4)),
+        max(page_top, line.top - max(4.0, line_height * 0.8)),
+        min(page_x1, line.x1 + max(8.0, line_height * 1.4)),
+        min(page_bottom, line.bottom + max(4.0, line_height * 0.8)),
+    )
+    if bbox[2] <= bbox[0] or bbox[3] <= bbox[1]:
+        raise ValueError("invalid visual crop")
+    image = page.crop(bbox, strict=True).to_image(resolution=288, antialias=True).original
+    image = image.convert("RGB")
+    if image.width * image.height > 4_000_000:
+        image.thumbnail((2_800, 1_400))
+    output = BytesIO()
+    image.save(output, format="PNG", optimize=True)
+    content = output.getvalue()
+    if len(content) > _MAX_VISUAL_CROP_BYTES:
+        output = BytesIO()
+        image.save(output, format="JPEG", quality=88, optimize=True, progressive=True)
+        content = output.getvalue()
+    if len(content) > _MAX_VISUAL_CROP_BYTES:
+        raise ValueError("visual crop too large")
+    return content
+
+
+def _visual_line_key(line: _PdfLine) -> tuple[int, float, float, str]:
+    return (line.page_number, line.top, line.x0, line.text)
+
+
+def _levenshtein_distance(left: str, right: str) -> int:
+    if left == right:
+        return 0
+    if len(left) < len(right):
+        left, right = right, left
+    previous = list(range(len(right) + 1))
+    for left_index, left_character in enumerate(left, start=1):
+        current = [left_index]
+        for right_index, right_character in enumerate(right, start=1):
+            current.append(
+                min(
+                    current[-1] + 1,
+                    previous[right_index] + 1,
+                    previous[right_index - 1] + (left_character != right_character),
+                )
+            )
+        previous = current
+    return previous[-1]
 
 
 def _has_spatial_table_candidate(lines: tuple[_PdfLine, ...]) -> bool:
@@ -2590,7 +3481,15 @@ def _render_document(
 
         toc_page = _is_toc_page(candidate_lines)
         if toc_page and not page.has_table:
+            candidate_lines = _reconcile_suspicious_toc_numbers(
+                candidate_lines,
+                ocr_markdown,
+            )
             candidate_lines = _normalize_toc_entry_rows(candidate_lines)
+            candidate_lines = _reconcile_toc_spacing_from_ocr(
+                candidate_lines,
+                ocr_markdown,
+            )
             candidate_lines = _repair_toc_entries_from_native_headings(
                 candidate_lines,
                 toc_heading_references,
@@ -2632,6 +3531,10 @@ def _render_document(
 
         previous_in_page: _PdfLine | None = None
         pending_tables = list(sorted(page.tables, key=lambda table: table.bbox[1]))
+        toc_entry_lines = [
+            line for line in visible_lines if _split_toc_entry_text(line.text) is not None
+        ]
+        toc_left = min((line.x0 for line in toc_entry_lines), default=0.0)
         for line in visible_lines:
             while pending_tables and pending_tables[0].bbox[1] <= line.top:
                 _append_pdf_table(blocks, page.number, pending_tables.pop(0))
@@ -2647,6 +3550,7 @@ def _render_document(
                 previous_body_line = None
             elif _BULLET_PATTERN.match(line.text):
                 item_text = _BULLET_PATTERN.sub("", _apply_links(line), count=1).strip()
+                item_text = _apply_source_emphasis(line, item_text)
                 blocks.append(
                     _MarkdownBlock(
                         kind="list",
@@ -2657,24 +3561,53 @@ def _render_document(
                 )
                 previous_body_line = None
             elif toc_page:
-                rendered = _apply_links(line)
-                if line.bold and _heading_letter_count(line.text) >= 4:
-                    rendered = f"**{rendered}**"
-                if _toc_entry_page_number(line.text) is not None:
-                    rendered = f"- {rendered}"
-                blocks.append(
-                    _MarkdownBlock(
-                        kind="toc",
-                        text=rendered,
-                        page_number=page.number,
-                        source_line=line,
+                entry = _split_toc_entry_text(line.text)
+                if entry is not None:
+                    label, folio = entry
+                    if line.links:
+                        label = _apply_links(replace(line, text=label))
+                    blocks.append(
+                        _MarkdownBlock(
+                            kind="toc-entry",
+                            text=label,
+                            page_number=page.number,
+                            source_line=line,
+                            toc_folio=folio,
+                            toc_level=_toc_indent_level(line, toc_left, body_size),
+                        )
                     )
-                )
+                else:
+                    rendered = _apply_source_emphasis(line, _apply_links(line))
+                    indent_level = _toc_indent_level(line, toc_left, body_size)
+                    previous_block = blocks[-1] if blocks else None
+                    if (
+                        previous_block is not None
+                        and previous_block.kind == "toc-entry"
+                        and previous_block.page_number == page.number
+                        and (line.italic or indent_level > previous_block.toc_level)
+                    ):
+                        blocks.append(
+                            _MarkdownBlock(
+                                kind="toc-entry",
+                                text=_apply_links(line),
+                                page_number=page.number,
+                                source_line=line,
+                                toc_folio=None,
+                                toc_level=max(1, indent_level),
+                            )
+                        )
+                    else:
+                        blocks.append(
+                            _MarkdownBlock(
+                                kind="toc",
+                                text=rendered,
+                                page_number=page.number,
+                                source_line=line,
+                            )
+                        )
                 previous_body_line = None
             else:
-                rendered = _apply_links(line)
-                if line.bold and _heading_letter_count(line.text) >= 4:
-                    rendered = f"**{rendered}**"
+                rendered = _apply_source_emphasis(line, _apply_links(line))
                 if (
                     blocks
                     and blocks[-1].kind == "paragraph"
@@ -2939,6 +3872,20 @@ def _has_suspicious_glyph_encoding(page: _PdfPage) -> bool:
     return _suspicious_glyph_count(text) >= 3
 
 
+def _has_suspicious_numeric_glyph_encoding(page: _PdfPage) -> bool:
+    """Find broken font mappings inside numeric TOC tokens without distrusting prose."""
+
+    return any(
+        _SUSPICIOUS_NUMERIC_GLYPH_PATTERN.search(line.text)
+        and (
+            re.search(r"\d[$^]|[$^]\d", line.text)
+            or any(_is_mixed_visual_glyph(atom) for atom in _visual_atoms(line.text))
+        )
+        for line in page.lines
+        if not line.rotated
+    )
+
+
 def _suspicious_glyph_count(text: str) -> int:
     return len(re.findall(r"(?<=[^\W\d_])[$\"]|[$\"](?=[^\W\d_])", text))
 
@@ -2974,6 +3921,7 @@ def _text_quality_score(text: str) -> float:
     suspicious = (
         visible.count("\ufffd")
         + visible.count("$")
+        + len(_SUSPICIOUS_NUMERIC_GLYPH_PATTERN.findall(visible))
         + _suspicious_glyph_count(visible)
         + len(_SPACED_WORD_PATTERN.findall(visible))
     )
@@ -3041,6 +3989,8 @@ def _strip_native_margin_numbers_from_ocr(
 
 
 def _ocr_additions(page: _PdfPage, ocr_markdown: str) -> str:
+    if _is_toc_page(list(page.lines)) and _is_toc_markdown(ocr_markdown):
+        return ""
     native_tokens = _comparison_tokens(" ".join(line.text for line in page.lines))
     additions: list[str] = []
     seen_additions: set[tuple[str, ...]] = set()
@@ -3088,7 +4038,7 @@ def _restore_page_links(markdown: str, page: _PdfPage) -> str:
             replacement = f"[{_escape_link_label(label)}](<{_safe_target(link.target)}>)"
             if label and label in restored:
                 restored = restored.replace(label, replacement, 1)
-            else:
+            elif not _is_internal_page_target(link.target):
                 missing_links.append((label or _descriptive_link_label(link.target), link.target))
     if missing_links:
         restored = (
@@ -3110,7 +4060,7 @@ def _append_unplaced_page_links(
     seen_targets = set(placed_targets)
     for line in lines:
         for link in line.links:
-            if link.target in seen_targets:
+            if link.target in seen_targets or _is_internal_page_target(link.target):
                 continue
             seen_targets.add(link.target)
             missing.append((_descriptive_link_label(link.target), link.target))
@@ -3155,6 +4105,10 @@ def _descriptive_link_label(target: str) -> str:
         return f"Destino: {fragment[:100]}"
     cleaned = " ".join(unquote(target).split()).strip()
     return f"Destino: {cleaned[:100]}" if cleaned else "Destino conservado"
+
+
+def _is_internal_page_target(target: str) -> bool:
+    return re.fullmatch(r"#page-\d+", target, re.IGNORECASE) is not None
 
 
 def _merge_drop_caps(lines: list[_PdfLine], body_size: float) -> list[_PdfLine]:
@@ -3272,7 +4226,8 @@ def _append_heading(
     level: int,
     gap_before: float,
 ) -> None:
-    text = _display_heading_text(line) if not line.links else _apply_links(line)
+    visible = _display_heading_text(line) if not line.links else _apply_links(line)
+    text = f"*{visible}*" if line.italic else visible
     if (
         blocks
         and blocks[-1].kind == "heading"
@@ -3295,6 +4250,18 @@ def _append_heading(
             source_line=line,
         )
     )
+
+
+def _apply_source_emphasis(line: _PdfLine, rendered: str) -> str:
+    if _heading_letter_count(line.text) < 4:
+        return rendered
+    if line.bold and line.italic:
+        return f"***{rendered}***"
+    if line.bold:
+        return f"**{rendered}**"
+    if line.italic:
+        return f"*{rendered}*"
+    return rendered
 
 
 def _display_heading_text(line: _PdfLine) -> str:
@@ -3353,7 +4320,17 @@ def _should_join_lines(
 
     same_page = previous.page_number == current.page_number
     if not same_page:
-        return False
+        # Reconcile only an unmistakable paragraph continuation at a page
+        # boundary. Headings, lists, tables and sentence boundaries remain
+        # separate, so a bad guess cannot restructure the document broadly.
+        return (
+            current.text[:1].islower()
+            and previous.text.rstrip()[-1:] not in ".!?;:"
+            and previous.bottom >= previous.page_height * 0.70
+            and current.top <= current.page_height * 0.25
+            and abs(previous.font_size - current.font_size) <= body_size * 0.20
+            and abs(current.x0 - previous.x0) <= current.page_width * 0.08
+        )
 
     if gap_before > max(body_size * 1.15, previous.font_size * 0.95):
         return False
@@ -3426,6 +4403,8 @@ def _heading_level(
         or text.startswith(("-", "–", "—", "―"))
     ):
         return None
+    if _TOC_HEADING_PATTERN.fullmatch(text):
+        return 2
     if toc_page and _toc_entry_page_number(text) is not None:
         return None
     if _SECTION_HEADING_PATTERN.match(text):
@@ -3437,7 +4416,15 @@ def _heading_level(
 
     uppercase = _is_uppercase_text(text)
     separated = gap_before >= max(body_size * 0.55, 3)
-    if uppercase and separated and (line.bold or line.centered):
+    uppercase_word_count = len(re.findall(r"[^\W\d_]+", text, re.UNICODE))
+    if uppercase and uppercase_word_count > _MAX_BODY_SIZE_UPPERCASE_HEADING_WORDS:
+        return None
+    if (
+        uppercase
+        and uppercase_word_count <= _MAX_BODY_SIZE_UPPERCASE_HEADING_WORDS
+        and separated
+        and (line.bold or line.centered)
+    ):
         return 2 if line.centered else 3
     if line.bold and separated and len(text) <= 80:
         return 3
@@ -3526,6 +4513,11 @@ def _page_conversion_warning(
 ) -> str | None:
     if ocr_markdown == "" and not skipped_rotated:
         return None
+    if any(_SUSPICIOUS_NUMERIC_GLYPH_PATTERN.search(line.text) for line in visible_lines):
+        return (
+            f"> **Aviso de conversión (página {page.number}):** la capa de texto contiene "
+            "un glifo numérico ambiguo que el OCR local no pudo confirmar. Revisa el PDF original."
+        )
     letter_count = sum(_heading_letter_count(line.text) for line in visible_lines)
     mostly_graphical = page.has_images and letter_count < _GRAPHIC_WARNING_LETTER_LIMIT
     if not (mostly_graphical or skipped_rotated):
@@ -3548,8 +4540,20 @@ def _normalized_blocks_to_markdown(blocks: list[_MarkdownBlock]) -> str:
     parts: list[str] = []
     previous_compact_group: str | None = None
     previous_page_number: int | None = None
-    for block in blocks:
+    block_index = 0
+    while block_index < len(blocks):
+        block = blocks[block_index]
         if block.kind == "warning":
+            block_index += 1
+            continue
+        if block.kind == "toc-entry":
+            end = block_index + 1
+            while end < len(blocks) and blocks[end].kind == "toc-entry":
+                end += 1
+            parts.append(_toc_entries_html(blocks[block_index:end]))
+            previous_compact_group = None
+            previous_page_number = block.page_number
+            block_index = end
             continue
         if block.kind == "heading":
             rendered = f"{'#' * (block.level or 1)} {block.text}"
@@ -3572,8 +4576,46 @@ def _normalized_blocks_to_markdown(blocks: list[_MarkdownBlock]) -> str:
             parts.append(rendered)
         previous_compact_group = compact_group
         previous_page_number = block.page_number
+        block_index += 1
     markdown = "\n\n".join(part for part in parts if part).strip()
     return _join_page_boundary_hyphenations(markdown)
+
+
+def _toc_indent_level(line: _PdfLine, left: float, body_size: float) -> int:
+    indentation = max(0.0, line.x0 - left)
+    unit = max(body_size * 1.8, 10.0)
+    return min(2, max(0, round(indentation / unit)))
+
+
+def _toc_entries_html(blocks: list[_MarkdownBlock]) -> str:
+    rows: list[str] = []
+    for block in blocks:
+        label = _toc_label_xhtml(block.text)
+        source_line = block.source_line
+        if source_line is not None and source_line.italic:
+            label = f"<em>{label}</em>"
+        if source_line is not None and source_line.bold:
+            label = f"<strong>{label}</strong>"
+        rows.append(
+            "<tr>"
+            f'<td class="toc-label toc-level-{block.toc_level}">{label}</td>'
+            f'<td class="toc-folio">{escape(block.toc_folio or "")}</td>'
+            "</tr>"
+        )
+    return (
+        '<table class="document-toc">\n'
+        '<thead><tr><th class="toc-label">Entrada</th>'
+        '<th class="toc-folio">Página</th></tr></thead>\n'
+        f"<tbody>{''.join(rows)}</tbody>\n"
+        "</table>"
+    )
+
+
+def _toc_label_xhtml(markdown: str) -> str:
+    link = re.fullmatch(r"\[([^\]]+)]\(<?(#page-\d{1,6})>?\)", markdown)
+    if link is None:
+        return escape(markdown)
+    return f'<a href="{escape(link.group(2), quote=True)}">{escape(link.group(1))}</a>'
 
 
 def _join_page_boundary_hyphenations(markdown: str) -> str:
@@ -3652,6 +4694,9 @@ def _join_hyphenated_block_continuations(
                 block.source_line,
             )
             previous.source_line = block.source_line
+            previous.source_pages = tuple(
+                dict.fromkeys((*previous.source_pages, *block.source_pages))
+            )
             continue
         repaired.append(block)
     return repaired
@@ -3681,6 +4726,12 @@ def _is_page_number(text: str) -> bool:
     if not _PAGE_NUMBER_PATTERN.fullmatch(text):
         return False
     return not text.isdecimal() or len(text) <= 3
+
+
+def _is_toc_folio(text: str) -> bool:
+    """Accept long-book folios without treating four-digit years as page margins."""
+
+    return _is_page_number(text) or bool(text.isdecimal() and len(text) <= 4)
 
 
 def _apply_links(line: _PdfLine) -> str:
@@ -3770,7 +4821,11 @@ def _repair_suspicious_glyph_encoding(text: str) -> str:
         repaired,
     )
     repaired = re.sub(r"([AEIOU])K(?=[A-ZÑ]|$)", accent_vowel, repaired)
-    return repaired.replace("$", "")
+    # Some embedded fonts map a digit to ``$``.  Removing every remaining
+    # dollar sign used to turn a native TOC label such as ``1$.`` into ``1.``
+    # before OCR had a chance to arbitrate it.  Only discard a residue still
+    # attached to a natural-language word; keep numeric/currency uses visible.
+    return re.sub(r"(?<=[^\W\d_])\$", "", repaired)
 
 
 def _margin_key(text: str) -> str:
@@ -3790,7 +4845,7 @@ def _is_toc_page(lines: list[_PdfLine]) -> bool:
     if not lines:
         return False
     normalized_lines = {_margin_key(line.text) for line in lines}
-    if normalized_lines.intersection({"contents", "contenido", "table of contents"}):
+    if any(_TOC_HEADING_PATTERN.fullmatch(line) for line in normalized_lines):
         return True
     entry_count = sum(
         bool(re.search(r"\b\d+\s*$", line.text))
@@ -3800,12 +4855,51 @@ def _is_toc_page(lines: list[_PdfLine]) -> bool:
     return entry_count >= 4 and entry_count / len(lines) >= 0.3
 
 
+def _is_toc_markdown(markdown: str) -> bool:
+    """Recognize OCR-rendered contents pages without retaining their full-page scan."""
+
+    lines = [
+        re.sub(r"^[#>*+\-\s|]+|[|\s]+$", "", line).strip()
+        for line in markdown.splitlines()
+        if line.strip() and not re.match(r"^\s*\|?\s*:?-{3,}", line)
+    ]
+    if not lines:
+        return False
+    if any(_TOC_HEADING_PATTERN.fullmatch(_margin_key(line)) for line in lines):
+        return True
+    entries = sum(
+        bool(re.search(r"\b\d{1,4}\s*\|?\s*$", line))
+        for line in markdown.splitlines()
+        if line.strip()
+    )
+    return entries >= 4 and entries / len(lines) >= 0.3
+
+
 def _toc_entry_page_number(text: str) -> str | None:
+    entry = _split_toc_entry_text(text)
+    return entry[1] if entry is not None else None
+
+
+def _split_toc_entry_text(text: str) -> tuple[str, str] | None:
+    dotted = _TOC_DOTTED_FOLIO_PATTERN.fullmatch(text.strip())
+    if dotted is not None:
+        candidate = re.sub(r"\s+", "", dotted.group("folio"))
+        if _is_toc_folio(candidate):
+            return dotted.group("label").strip(), candidate
+        return None
     parts = text.strip().rsplit(maxsplit=1)
     if len(parts) != 2 or _heading_letter_count(parts[0]) < 2:
         return None
     candidate = re.sub(r"\s+", "", parts[1])
-    return candidate if _is_page_number(candidate) else None
+    return (parts[0], candidate) if _is_toc_folio(candidate) else None
+
+
+def _normalize_toc_leaders(markdown: str) -> str:
+    parts = _MARKDOWN_LINK_DESTINATION_SPLIT_PATTERN.split(markdown)
+    return "".join(
+        part if index % 2 else re.sub(r"\s*\.{2,}\s*", " — ", part)
+        for index, part in enumerate(parts)
+    )
 
 
 def _escape_link_label(label: str) -> str:

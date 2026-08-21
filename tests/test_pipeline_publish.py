@@ -29,14 +29,15 @@ def test_publication_writes_a_prepared_transformation_without_transforming_it(
         (),
     )
     transformed = TransformedDocument(
-        markdown,
-        None,
-        None,
-        (),
-        None,
-        markdown,
-        False,
-        markdown,
+        transformed_markdown=markdown,
+        translation_quality_report=None,
+        review_translation_quality_report=None,
+        linguistic_review_coverage=None,
+        preserved_translation_chunks=(),
+        revision_draft=None,
+        published_markdown=markdown,
+        review_required=False,
+        public_markdown=markdown,
     )
     stages: list[ProcessStage] = []
 

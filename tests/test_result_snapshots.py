@@ -92,6 +92,18 @@ def test_round_trips_a_sensitive_pending_result_encrypted(tmp_path: Path) -> Non
             source_blocks=5,
             translated_blocks=5,
         ),
+        review_translation_quality_report=TranslationQualityReport(
+            "en",
+            "es",
+            "es",
+            1,
+            5,
+            5,
+            1,
+            (),
+            source_blocks=5,
+            translated_blocks=5,
+        ),
         linguistic_review_coverage=LinguisticReviewCoverage(
             LinguisticReviewMode.INDEPENDENT_BILINGUAL,
             translated_blocks=5,
@@ -113,6 +125,7 @@ def test_round_trips_a_sensitive_pending_result_encrypted(tmp_path: Path) -> Non
         ),
         review_markdown="# Propuesta\n\nTexto corregido.\n",
         review_required=True,
+        preserve_epub_package_on_unchanged_review=True,
         final_integrity_report=FinalIntegrityReport(
             "EPUB",
             ("Contenedor EPUB válido", "Contenido aprobado conservado"),

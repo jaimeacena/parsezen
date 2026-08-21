@@ -164,6 +164,36 @@ def test_private_pdf_benchmark_counts_descendant_working_sets(
     assert benchmark_module._working_set_bytes() == 600
 
 
+def test_pdf_profile_matrix_measures_requested_long_document_prefixes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "book.pdf"
+    source.write_bytes(b"%PDF")
+    calls: list[object] = []
+
+    def measure(_source: Path, *, page_range, **_kwargs):
+        calls.append(page_range)
+        return benchmark_module.PdfMetrics(
+            "a" * 64,
+            page_range.last_page,
+            0,
+            0,
+            0,
+            page_range.last_page,
+            0,
+            1.0,
+            2.0,
+        )
+
+    monkeypatch.setattr(benchmark_module, "measure_pdf", measure)
+
+    matrix = benchmark_module.measure_pdf_matrix(source, (100, 500, 1000, 500))
+
+    assert tuple(matrix) == (100, 500, 1000)
+    assert [item.last_page for item in calls] == [100, 500, 1000]
+
+
 def test_pdf_profile_measures_page_rate_ocr_time_and_resources(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

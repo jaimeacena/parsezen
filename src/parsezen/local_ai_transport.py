@@ -3,6 +3,10 @@
 from __future__ import annotations
 
 import json
+import logging
+from base64 import b64encode
+from collections.abc import Callable
+from dataclasses import dataclass
 from time import monotonic
 
 import httpx
@@ -11,6 +15,23 @@ from parsezen.cancellation import CancellationToken, check_cancelled
 from parsezen.errors import ImprovementError
 from parsezen.improvement_contracts import MAX_LOCAL_AI_OUTPUT_CHARACTERS
 from parsezen.local_models import OLLAMA_BASE_URL
+
+LOGGER = logging.getLogger(__name__)
+_DEFAULT_MAX_GENERATION_SECONDS = 600.0
+_MIN_MAX_GENERATION_SECONDS = 60.0
+_MAX_MAX_GENERATION_SECONDS = 1_800.0
+
+
+@dataclass(frozen=True, slots=True)
+class LocalAiMetrics:
+    """Privacy-safe timing and token counters reported by one local inference."""
+
+    wall_duration_ms: int
+    prompt_tokens: int
+    output_tokens: int
+    ollama_total_duration_ms: int
+    ollama_load_duration_ms: int
+    output_tokens_per_second: float
 
 
 def request_local_ai(
@@ -23,14 +44,20 @@ def request_local_ai(
     *,
     prediction_characters: int | None = None,
     max_generation_seconds: float | None = None,
+    image: bytes | None = None,
+    json_response: bool = False,
+    on_metrics: Callable[[LocalAiMetrics], None] | None = None,
 ) -> str:
     """Return one deterministic local transformation with independent stream bounds."""
 
+    user_message: dict[str, object] = {"role": "user", "content": document_fragment}
+    if image is not None:
+        user_message["images"] = [b64encode(image).decode("ascii")]
     request_payload = {
         "model": model,
         "messages": [
             {"role": "system", "content": instructions},
-            {"role": "user", "content": document_fragment},
+            user_message,
         ],
         "stream": True,
         "think": False,
@@ -46,12 +73,17 @@ def request_local_ai(
             "seed": 0,
         },
     }
+    if json_response:
+        request_payload["format"] = "json"
     check_cancelled(cancellation)
-    deadline = (
-        monotonic() + max_generation_seconds
-        if max_generation_seconds is not None and max_generation_seconds > 0
-        else None
-    )
+    started_at = monotonic()
+    generation_timeout = _generation_timeout_seconds(client, max_generation_seconds)
+    deadline = started_at + generation_timeout
+    prompt_tokens = 0
+    output_tokens = 0
+    ollama_total_duration_ns = 0
+    ollama_load_duration_ns = 0
+    ollama_eval_duration_ns = 0
     with client.stream(
         "POST",
         f"{OLLAMA_BASE_URL}/api/chat",
@@ -71,7 +103,7 @@ def request_local_ai(
         saw_message = False
         for line in response.iter_lines():
             check_cancelled(cancellation)
-            if deadline is not None and monotonic() > deadline:
+            if monotonic() > deadline:
                 raise ImprovementError(
                     "El modelo local superó el tiempo máximo total de generación."
                 )
@@ -86,6 +118,12 @@ def request_local_ai(
             if not isinstance(content, str):
                 raise ImprovementError("Ollama devolvió una respuesta incompatible.")
             saw_message = True
+            if payload.get("done") is True:
+                prompt_tokens = _safe_nonnegative_int(payload.get("prompt_eval_count"))
+                output_tokens = _safe_nonnegative_int(payload.get("eval_count"))
+                ollama_total_duration_ns = _safe_nonnegative_int(payload.get("total_duration"))
+                ollama_load_duration_ns = _safe_nonnegative_int(payload.get("load_duration"))
+                ollama_eval_duration_ns = _safe_nonnegative_int(payload.get("eval_duration"))
             content_length += len(content)
             if content_length > MAX_LOCAL_AI_OUTPUT_CHARACTERS:
                 raise ImprovementError("La respuesta del modelo supera el tamaño permitido.")
@@ -93,7 +131,52 @@ def request_local_ai(
         check_cancelled(cancellation)
     if not saw_message:
         raise ImprovementError("Ollama devolvió una respuesta incompatible.")
+    wall_duration_ms = max(0, round((monotonic() - started_at) * 1_000))
+    tokens_per_second = (
+        output_tokens / (ollama_eval_duration_ns / 1_000_000_000)
+        if output_tokens and ollama_eval_duration_ns
+        else 0.0
+    )
+    metrics = LocalAiMetrics(
+        wall_duration_ms=wall_duration_ms,
+        prompt_tokens=prompt_tokens,
+        output_tokens=output_tokens,
+        ollama_total_duration_ms=ollama_total_duration_ns // 1_000_000,
+        ollama_load_duration_ms=ollama_load_duration_ns // 1_000_000,
+        output_tokens_per_second=round(tokens_per_second, 2),
+    )
+    LOGGER.info(
+        "local_ai_completed wall_ms=%d prompt_tokens=%d output_tokens=%d "
+        "ollama_total_ms=%d load_ms=%d output_tokens_per_second=%.2f",
+        metrics.wall_duration_ms,
+        metrics.prompt_tokens,
+        metrics.output_tokens,
+        metrics.ollama_total_duration_ms,
+        metrics.ollama_load_duration_ms,
+        metrics.output_tokens_per_second,
+    )
+    if on_metrics is not None:
+        on_metrics(metrics)
     return "".join(content_parts)
+
+
+def _generation_timeout_seconds(
+    client: httpx.Client,
+    requested: float | None,
+) -> float:
+    if requested is not None and requested > 0:
+        return min(max(float(requested), 1.0), _MAX_MAX_GENERATION_SECONDS)
+    read_timeout = client.timeout.read
+    if isinstance(read_timeout, (int, float)) and read_timeout > 0:
+        return min(
+            max(float(read_timeout) * 5, _MIN_MAX_GENERATION_SECONDS),
+            _MAX_MAX_GENERATION_SECONDS,
+        )
+    return _DEFAULT_MAX_GENERATION_SECONDS
+
+
+def _safe_nonnegative_int(value: object) -> int:
+    return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else 0
 
 
 def prediction_token_limit(source_characters: int, context_window: int) -> int:
