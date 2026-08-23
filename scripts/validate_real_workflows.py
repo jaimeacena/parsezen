@@ -9,7 +9,7 @@ import logging
 import re
 import sys
 from collections import Counter
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import asdict, dataclass, field
 from itertools import product
 from pathlib import Path
@@ -35,7 +35,7 @@ from parsezen.processing import (
 from parsezen.revision import RevisionDecision
 from parsezen.settings import AppSettings, load_settings
 
-REPORT_SCHEMA_VERSION = 10
+REPORT_SCHEMA_VERSION = 13
 DEFAULT_REPORT_PATH = Path("local-benchmarks") / "real-workflows" / "latest.json"
 SYNTHETIC_PAGE_COUNT = 20
 MAX_EPUB_HEADING_CHARACTERS = 320
@@ -80,6 +80,7 @@ class LiveWorkflowResult:
     translation_issues: int = 0
     translation_issue_kinds: dict[str, int] = field(default_factory=dict)
     preserved_translation_chunks: int = 0
+    preserved_translation_chunk_numbers: tuple[int, ...] = ()
     preserved_images: int = 0
     epub_chapters: int = 0
     epub_structure_issues: int = 0
@@ -93,6 +94,16 @@ class LiveWorkflowResult:
     stage_duration_ms: dict[str, int] = field(default_factory=dict)
     planned_text_passes: int = 0
     planned_ai_passes: int = 0
+    local_ai_requests: int = 0
+    checkpoint_hits: int = 0
+    checkpoint_misses: int = 0
+    retries: int = 0
+    validation_rejections: int = 0
+    prompt_tokens: int = 0
+    output_tokens: int = 0
+    local_ai_wall_duration_ms: int = 0
+    output_tokens_per_second: float = 0.0
+    ai_operations: dict[str, dict[str, int]] = field(default_factory=dict)
     error_type: str | None = None
     failed_stage: str | None = None
 
@@ -228,8 +239,9 @@ def run_live_workflows(
     full_matrix: bool = False,
     page_range: PdfPageRange | None = None,
     glossary: tuple[GlossaryEntry, ...] = (),
-    translation_engine: str = "argos",
+    translation_engine: str = "local_ai",
     workflow_profile: str = "critical",
+    on_results: Callable[[tuple[LiveWorkflowResult, ...]], None] | None = None,
 ) -> tuple[LiveWorkflowResult, ...]:
     """Run real workflows while collecting no document text, names or paths."""
     if not sources:
@@ -273,6 +285,7 @@ def run_live_workflows(
             translation_issues = 0
             translation_issue_kinds: dict[str, int] = {}
             preserved_translation_chunks = 0
+            preserved_translation_chunk_numbers: tuple[int, ...] = ()
             preserved_images = 0
             epub_chapters = 0
             epub_structure_issues = 0
@@ -283,6 +296,16 @@ def run_live_workflows(
             toc_blocks = 0
             terminology_terms = 0
             stage_duration_ms: dict[str, int] = {}
+            local_ai_requests = 0
+            checkpoint_hits = 0
+            checkpoint_misses = 0
+            retries = 0
+            validation_rejections = 0
+            prompt_tokens = 0
+            output_tokens = 0
+            local_ai_wall_duration_ms = 0
+            output_tokens_per_second = 0.0
+            ai_operations: dict[str, dict[str, int]] = {}
             planned_text_passes, planned_ai_passes = _planned_passes(
                 case,
                 translation_engine,
@@ -313,6 +336,9 @@ def run_live_workflows(
                     review_content=case.review_content,
                     review_structure=case.review_structure,
                     include_images=True,
+                    epub_first_page_cover=(
+                        extension == ".pdf" and case.output_format is OutputFormat.EPUB
+                    ),
                     glossary=glossary,
                 )
                 processed = process_document(
@@ -353,6 +379,7 @@ def run_live_workflows(
                         for kind, count in translation_report.issues_by_kind.items()
                     }
                 preserved_translation_chunks = len(processed.preserved_translation_chunks)
+                preserved_translation_chunk_numbers = processed.preserved_translation_chunks
                 preserved_images = processed.preserved_images
                 epub_chapters = processed.epub_chapters
                 front_matter_blocks = processed.front_matter_blocks
@@ -361,6 +388,25 @@ def run_live_workflows(
                 if processed.telemetry is not None:
                     stage_duration_ms = {
                         stage.stage.value: stage.duration_ms for stage in processed.telemetry.stages
+                    }
+                    batches = processed.telemetry.batches
+                    local_ai_requests = batches.local_ai_requests
+                    checkpoint_hits = batches.checkpoint_hits
+                    checkpoint_misses = batches.checkpoint_misses
+                    retries = batches.retries
+                    validation_rejections = batches.validation_rejections
+                    prompt_tokens = batches.prompt_tokens
+                    output_tokens = batches.output_tokens
+                    local_ai_wall_duration_ms = batches.wall_duration_ms
+                    output_tokens_per_second = round(batches.output_tokens_per_second, 2)
+                    ai_operations = {
+                        operation.operation: {
+                            "requests": operation.requests,
+                            "prompt_tokens": operation.prompt_tokens,
+                            "output_tokens": operation.output_tokens,
+                            "wall_duration_ms": operation.wall_duration_ms,
+                        }
+                        for operation in batches.operations
                     }
                 if processed.revision_draft is not None:
                     revision_changes = len(processed.revision_draft.changes)
@@ -436,6 +482,7 @@ def run_live_workflows(
                     translation_issues=translation_issues,
                     translation_issue_kinds=translation_issue_kinds,
                     preserved_translation_chunks=preserved_translation_chunks,
+                    preserved_translation_chunk_numbers=preserved_translation_chunk_numbers,
                     preserved_images=preserved_images,
                     epub_chapters=epub_chapters,
                     epub_structure_issues=epub_structure_issues,
@@ -449,10 +496,22 @@ def run_live_workflows(
                     stage_duration_ms=stage_duration_ms,
                     planned_text_passes=planned_text_passes,
                     planned_ai_passes=planned_ai_passes,
+                    local_ai_requests=local_ai_requests,
+                    checkpoint_hits=checkpoint_hits,
+                    checkpoint_misses=checkpoint_misses,
+                    retries=retries,
+                    validation_rejections=validation_rejections,
+                    prompt_tokens=prompt_tokens,
+                    output_tokens=output_tokens,
+                    local_ai_wall_duration_ms=local_ai_wall_duration_ms,
+                    output_tokens_per_second=output_tokens_per_second,
+                    ai_operations=ai_operations,
                     error_type=error_type,
                     failed_stage=stages[-1].value if error_type is not None and stages else None,
                 )
             )
+            if on_results is not None:
+                on_results(tuple(results))
         if _file_sha256(source) != source_hash:
             raise RuntimeError("La comprobación modificó un documento de origen.")
     return tuple(results)
@@ -472,10 +531,12 @@ def write_report(
         "privacy": "No contiene rutas, nombres, prompts, respuestas ni texto documental.",
     }
     destination.parent.mkdir(parents=True, exist_ok=True)
-    destination.write_text(
+    temporary = destination.with_name(f".{destination.name}.tmp")
+    temporary.write_text(
         json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8",
     )
+    temporary.replace(destination)
 
 
 def write_synthetic_pdf(destination: Path) -> None:
@@ -756,8 +817,11 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--translation-engine",
         choices=("argos", "local_ai"),
-        default="argos",
-        help="Motor usado por los casos que traducen.",
+        default="local_ai",
+        help=(
+            "Motor usado por los casos que traducen; IA local es el valor predeterminado y Argos "
+            "solo se usa al pedirlo explícitamente."
+        ),
     )
     parser.add_argument(
         "--profile",
@@ -801,6 +865,14 @@ def _run_from_arguments(arguments: argparse.Namespace) -> int:
             write_synthetic_pdf(synthetic)
             sources = (synthetic,)
         output_root = arguments.output_directory or (temporary / "outputs")
+
+        def persist_results(partial: tuple[LiveWorkflowResult, ...]) -> None:
+            write_report(
+                arguments.report,
+                partial,
+                model=settings.model or "none",
+            )
+
         results = run_live_workflows(
             sources,
             output_root,
@@ -811,8 +883,8 @@ def _run_from_arguments(arguments: argparse.Namespace) -> int:
             glossary=_parse_glossary_arguments(arguments.glossary),
             translation_engine=arguments.translation_engine,
             workflow_profile=arguments.profile,
+            on_results=persist_results,
         )
-        write_report(arguments.report, results, model=settings.model or "none")
     for result in results:
         state = "OK" if result.quality_gate_passed else ("REVISAR" if result.passed else "FALLO")
         detail = (

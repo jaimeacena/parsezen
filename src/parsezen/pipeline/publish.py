@@ -20,6 +20,7 @@ from parsezen.final_integrity import (
     text_integrity_capture,
 )
 from parsezen.improvement import ImprovementMode
+from parsezen.markdown_resources import without_markdown_resource
 from parsezen.output import (
     write_conversion_output,
     write_epub_output,
@@ -135,6 +136,21 @@ def publish_transformed_document(
             cover_resource_path = cover_resource.relative_path
         elif request.epub_first_page_cover:
             page_number = resolved_page_range.first_page if resolved_page_range is not None else 1
+            published_markdown, epub_resources, cover_page_duplicates = (
+                _remove_pdf_cover_page_duplicates(
+                    published_markdown,
+                    epub_resources,
+                    page_number,
+                )
+            )
+            transformed_markdown = _without_resources(
+                transformed_markdown,
+                cover_page_duplicates,
+            )
+            revision_draft = _without_revision_resources(
+                revision_draft,
+                cover_page_duplicates,
+            )
             cover_resource = ConvertedResource(
                 PurePosixPath("cover/first-page.jpg"),
                 render_cover(source_path, page_number),
@@ -347,6 +363,72 @@ def _finish_both_checkpoints(
         root=root,
         cleanup_allowed=cleanup_allowed,
     )
+
+
+def _remove_pdf_cover_page_duplicates(
+    markdown: str,
+    resources: tuple[ConvertedResource, ...],
+    page_number: int,
+) -> tuple[str, tuple[ConvertedResource, ...], tuple[ConvertedResource, ...]]:
+    """Keep a rendered first-page cover out of the reading order a second time."""
+
+    page_prefix = f"page-{page_number:04d}-image-"
+    duplicates = tuple(
+        resource
+        for resource in resources
+        if resource.relative_path.parent == PurePosixPath("pdf")
+        and resource.relative_path.name.startswith(page_prefix)
+    )
+    markdown = _without_resources(markdown, duplicates)
+    duplicate_paths = {resource.relative_path for resource in duplicates}
+    return (
+        markdown,
+        tuple(resource for resource in resources if resource.relative_path not in duplicate_paths),
+        duplicates,
+    )
+
+
+def _without_resources(
+    markdown: str,
+    resources: tuple[ConvertedResource, ...],
+) -> str:
+    for resource in resources:
+        markdown = without_markdown_resource(markdown, resource.relative_path)
+    return markdown
+
+
+def _without_revision_resources(
+    draft: RevisionDraft | None,
+    resources: tuple[ConvertedResource, ...],
+) -> RevisionDraft | None:
+    """Keep an editable EPUB revision aligned with deliberately omitted resources."""
+
+    if draft is None or not resources:
+        return draft
+    original = _without_resources(draft.original_markdown, resources)
+    proposed = _without_resources(draft.proposed_markdown, resources)
+    rebuilt = build_revision_draft(original, proposed, kinds=draft.kinds)
+    if not rebuilt.changes:
+        return None
+    if len(rebuilt.changes) != len(draft.changes):
+        return rebuilt
+    aligned_changes = []
+    for rebuilt_change, source_change in zip(rebuilt.changes, draft.changes, strict=True):
+        if (
+            rebuilt_change.kind is not source_change.kind
+            or rebuilt_change.original_markdown != source_change.original_markdown
+            or rebuilt_change.proposed_markdown != source_change.proposed_markdown
+        ):
+            return rebuilt
+        aligned_changes.append(
+            replace(
+                rebuilt_change,
+                risk=source_change.risk,
+                risk_reason=source_change.risk_reason,
+                proposal_selectable=source_change.proposal_selectable,
+            )
+        )
+    return replace(rebuilt, changes=tuple(aligned_changes))
 
 
 def _read_epub_cover(path: Path) -> ConvertedResource:

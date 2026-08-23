@@ -22,6 +22,39 @@ from parsezen.pdf_conversion import (
     render_pdf_page_cover,
     resolve_pdf_page_range,
 )
+from parsezen.pdf_layout import _PdfLine
+
+
+def _margin_line(page_number: int, text: str, *, top: float = 20.0) -> _PdfLine:
+    return _PdfLine(
+        page_number=page_number,
+        page_width=600,
+        page_height=800,
+        text=text,
+        chars=(),
+        x0=40,
+        x1=560,
+        top=top,
+        bottom=top + 12,
+        font_size=10,
+        bold=False,
+        links=(),
+        soft_hyphen_end=False,
+        hard_hyphen_end=False,
+        rotated=False,
+    )
+
+
+def test_repeated_margin_lines_detect_local_running_headers_in_a_long_book() -> None:
+    lines = [
+        *(_margin_line(page, "CHAPTER 6") for page in range(20, 25)),
+        _margin_line(30, "ONE-OFF HEADER"),
+        _margin_line(30, "ONE-OFF HEADER", top=32),
+    ]
+
+    repeated = pdf_conversion_module._repeated_margin_lines(lines, page_count=700)
+
+    assert repeated == {pdf_conversion_module._margin_key("CHAPTER 6")}
 
 
 def test_preserves_a_meaningful_pdf_image_as_a_portable_resource(tmp_path: Path) -> None:
@@ -730,10 +763,67 @@ def test_repairs_uppercase_glyph_accent_markers() -> None:
     assert pdf_conversion_module._normalize_text("mayoría$ esta$") == "mayoría está"
 
 
+def test_keeps_legitimate_k_in_uppercase_english_words() -> None:
+    assert pdf_conversion_module._normalize_text("MAKE A PROMISE, TAKE ACTION") == (
+        "MAKE A PROMISE, TAKE ACTION"
+    )
+
+
 def test_keeps_a_suspicious_numeric_glyph_until_ocr_can_arbitrate_it() -> None:
     assert pdf_conversion_module._normalize_text("1$. TRIPLICITY RULERSHIPS") == (
         "1$. TRIPLICITY RULERSHIPS"
     )
+
+
+def test_ordinary_english_ordinals_do_not_trigger_visual_ocr() -> None:
+    assert not pdf_conversion_module._is_mixed_visual_glyph("1st")
+    assert not pdf_conversion_module._is_mixed_visual_glyph("22nd")
+    assert not pdf_conversion_module._is_mixed_visual_glyph("3rd")
+    assert not pdf_conversion_module._is_mixed_visual_glyph("14th")
+    assert pdf_conversion_module._is_mixed_visual_glyph("6S")
+
+
+@pytest.mark.parametrize("include_page_number", [False, True])
+def test_blank_or_page_number_only_vector_page_does_not_trigger_optional_ocr(
+    include_page_number: bool,
+) -> None:
+    lines = (
+        (
+            pdf_conversion_module._PdfLine(
+                page_number=1,
+                page_width=600,
+                page_height=800,
+                text="16",
+                chars=(),
+                x0=290,
+                x1=310,
+                top=760,
+                bottom=775,
+                font_size=10,
+                bold=False,
+                links=(),
+                soft_hyphen_end=False,
+                hard_hyphen_end=False,
+                rotated=False,
+            ),
+        )
+        if include_page_number
+        else ()
+    )
+    page = pdf_conversion_module._PdfPage(
+        1,
+        lines,
+        has_images=False,
+        image_area_ratios=(),
+        has_table=False,
+        image_orientation_mismatch=False,
+    )
+
+    plan = pdf_conversion_module._build_ocr_plan([page], force_ocr=False)
+
+    assert plan.page_numbers == set()
+    assert plan.force_full_page_numbers == set()
+    assert plan.required_page_numbers == set()
 
 
 def test_reconciles_only_uniquely_confirmed_toc_numeric_glyphs() -> None:
@@ -805,6 +895,151 @@ def test_reconciles_alpha_shaped_detached_toc_folio_from_ocr_and_sequence() -> N
         "Derived Houses",
         "635",
     ]
+
+
+def test_reconciles_broken_ligature_folios_from_neighbouring_toc_entries() -> None:
+    lines = [
+        _pdf_model_line(1, "Exercise 49 1030"),
+        _pdf_model_line(1, "90. THE ULTIMATE RULERS OF THE CHART IO35"),
+        _pdf_model_line(1, "91. THE PREDOMINATOR IO39"),
+        _pdf_model_line(1, "Procedure 1040"),
+        _pdf_model_line(1, "The Horimea 1135"),
+        _pdf_model_line(1, "97. LENGTH OF LIFE H37"),
+        _pdf_model_line(1, "The Predominator as Releaser 1137"),
+        _pdf_model_line(1, "98. SOURCE READINGS 1147"),
+        _pdf_model_line(1, "Primary Source Readings n47"),
+    ]
+
+    reconciled = pdf_conversion_module._reconcile_suspicious_toc_numbers(lines, None)
+
+    assert [line.text for line in reconciled] == [
+        "Exercise 49 1030",
+        "90. THE ULTIMATE RULERS OF THE CHART 1035",
+        "91. THE PREDOMINATOR 1039",
+        "Procedure 1040",
+        "The Horimea 1135",
+        "97. LENGTH OF LIFE 1137",
+        "The Predominator as Releaser 1137",
+        "98. SOURCE READINGS 1147",
+        "Primary Source Readings 1147",
+    ]
+
+
+def test_reconciles_broken_toc_folios_when_the_page_also_contains_a_table() -> None:
+    page = pdf_conversion_module._PdfPage(
+        number=8,
+        lines=(
+            _pdf_model_line(8, "Prelude 1029"),
+            _pdf_model_line(8, "Exercise 49 1030"),
+            _pdf_model_line(8, "90. THE ULTIMATE RULERS OF THE CHART IO35"),
+            _pdf_model_line(8, "91. THE PREDOMINATOR IO39"),
+            _pdf_model_line(8, "Procedure 1040"),
+            _pdf_model_line(8, "Summary 1043"),
+        ),
+        has_images=False,
+        image_area_ratios=(),
+        has_table=True,
+        image_orientation_mismatch=False,
+    )
+
+    markdown, _issues = pdf_conversion_module._render_document(
+        [page],
+        body_size=12,
+        heading_sizes={},
+        repeated_margins=set(),
+        referenced_pages=set(),
+        ocr_pages={},
+        ocr_failed_pages=set(),
+    )
+
+    assert "1035" in markdown
+    assert "1039" in markdown
+    assert "IO35" not in markdown
+    assert "IO39" not in markdown
+
+
+def test_reasserts_repaired_toc_folios_after_visual_spacing_reconstruction(
+    monkeypatch,
+) -> None:
+    page = pdf_conversion_module._PdfPage(
+        number=8,
+        lines=(
+            _pdf_model_line(8, "Prelude 1029"),
+            _pdf_model_line(8, "Exercise 49 1030"),
+            _pdf_model_line(8, "90. THE ULTIMATE RULERS OF THE CHART IO35"),
+            _pdf_model_line(8, "91. THE PREDOMINATOR IO39"),
+            _pdf_model_line(8, "Procedure 1040"),
+            _pdf_model_line(8, "Summary 1043"),
+        ),
+        has_images=False,
+        image_area_ratios=(),
+        has_table=False,
+        image_orientation_mismatch=False,
+    )
+    original_display = pdf_conversion_module._display_heading_text
+
+    def reconstruct_from_original_glyphs(line):
+        reconstructed = original_display(line)
+        return reconstructed.replace("1035", "IO35").replace("1039", "IO39")
+
+    monkeypatch.setattr(
+        pdf_conversion_module,
+        "_display_heading_text",
+        reconstruct_from_original_glyphs,
+    )
+
+    markdown, _issues = pdf_conversion_module._render_document(
+        [page],
+        body_size=12,
+        heading_sizes={},
+        repeated_margins=set(),
+        referenced_pages=set(),
+        ocr_pages={},
+        ocr_failed_pages=set(),
+    )
+
+    assert "1035" in markdown
+    assert "1039" in markdown
+    assert "IO35" not in markdown
+    assert "IO39" not in markdown
+
+
+def test_reconciles_spaced_numeric_year_only_with_unique_local_ocr_evidence() -> None:
+    lines = [
+        _pdf_model_line(1, "RUBEDO"),
+        _pdf_model_line(1, "i o i i"),
+    ]
+
+    reconciled = pdf_conversion_module._reconcile_spaced_numeric_year(
+        lines,
+        "RUBEDO\n2022",
+    )
+    ambiguous = pdf_conversion_module._reconcile_spaced_numeric_year(
+        lines,
+        "First published in 2019\nReissued in 2022",
+    )
+    copyright_page = pdf_conversion_module._PdfPage(
+        2,
+        (_pdf_model_line(2, "First published in 2022 by Rubedo Press"),),
+        has_images=False,
+        image_area_ratios=(),
+        has_table=False,
+        image_orientation_mismatch=False,
+    )
+    publication_years = pdf_conversion_module._publication_year_evidence(
+        [copyright_page],
+        {},
+    )
+    reconciled_from_front_matter = pdf_conversion_module._reconcile_spaced_numeric_year(
+        lines,
+        "RUBEDO",
+        publication_years,
+    )
+
+    assert [line.text for line in reconciled] == ["RUBEDO", "2022"]
+    assert ambiguous == lines
+    assert publication_years == {"2022"}
+    assert [line.text for line in reconciled_from_front_matter] == ["RUBEDO", "2022"]
 
 
 def test_adaptive_ocr_quality_score_distinguishes_readable_and_garbled_text() -> None:
@@ -1324,6 +1559,64 @@ def test_restores_only_toc_word_boundaries_confirmed_by_ocr() -> None:
         "121. Example Chart One: Horoscope of Jacqueline Onassis 1154",
         "Native wording stays authoritative 1200",
     ]
+
+
+def test_restores_all_caps_toc_word_boundaries_from_glyph_geometry() -> None:
+    def toc_line(raw_text: str, visual_parts: tuple[str, ...], top: float) -> _PdfLine:
+        characters = []
+        x = 72.0
+        for part in visual_parts:
+            for character in part:
+                characters.append(
+                    pdf_conversion_module._PdfCharacter(
+                        character,
+                        x,
+                        x + 6,
+                        top,
+                        top + 12,
+                        12,
+                        True,
+                    )
+                )
+                x += 6
+            x += 6
+        return replace(
+            _pdf_model_line(1, raw_text),
+            chars=tuple(characters),
+            x1=x,
+            top=top,
+            bottom=top + 12,
+        )
+
+    lines = (
+        toc_line("CONTENIDO", ("CONTENIDO",), 80),
+        toc_line("I-ENERGÍAFUNDAMENTAL 10", ("I", "-", "ENERGÍA", "FUNDAMENTAL", "10"), 110),
+        toc_line("II-NUTRICIÓNEFICAZ 20", ("II", "-", "NUTRICIÓN", "EFICAZ", "20"), 130),
+        toc_line("III-MOVIMIENTOEFICIENTE 30", ("III", "-", "MOVIMIENTO", "EFICIENTE", "30"), 150),
+        toc_line("IV-DESCANSOPROFUNDO 40", ("IV", "-", "DESCANSO", "PROFUNDO", "40"), 170),
+    )
+    page = pdf_conversion_module._PdfPage(
+        number=1,
+        lines=lines,
+        has_images=False,
+        image_area_ratios=(),
+        has_table=False,
+        image_orientation_mismatch=False,
+    )
+
+    markdown, _issues = pdf_conversion_module._render_document(
+        [page],
+        body_size=12,
+        heading_sizes={},
+        repeated_margins=set(),
+        referenced_pages=set(),
+        ocr_pages={},
+        ocr_failed_pages=set(),
+    )
+
+    assert "II - NUTRICIÓN EFICAZ" in markdown
+    assert "III - MOVIMIENTO EFICIENTE" in markdown
+    assert "NUTRICIÓNEFICAZ" not in markdown
 
 
 def test_leaves_an_uncertain_small_page_number_column_untouched() -> None:
@@ -1944,6 +2237,144 @@ def test_preserves_only_sparse_hybrid_full_page_illustrations(
     assert len(boxes) == expected
 
 
+def test_fragmented_graphic_labels_keep_the_complete_page_image() -> None:
+    page = SimpleNamespace(
+        width=600,
+        height=800,
+        bbox=(0, 0, 600, 800),
+        images=[
+            {"x0": 0, "x1": 600, "top": 0, "bottom": 800},
+            {"x0": 100, "x1": 500, "top": 100, "bottom": 770},
+        ],
+        curves=[],
+    )
+    lines = tuple(
+        replace(_pdf_model_line(1, f"A{index}"), top=80 + index * 20, bottom=92 + index * 20)
+        for index in range(10)
+    )
+    model = pdf_conversion_module._PdfPage(
+        number=1,
+        lines=lines,
+        has_images=True,
+        image_area_ratios=(1.0, 0.56),
+        has_table=False,
+        image_orientation_mismatch=False,
+    )
+    ocr = "\n".join(f"A{index}" for index in range(10))
+
+    boxes = pdf_conversion_module._exportable_image_boxes(page, model, ocr)
+
+    assert boxes == ((0.0, 0.0, 600.0, 800.0),)
+
+
+def test_fragmented_graphic_labels_are_not_reflowed_beside_the_page_image() -> None:
+    lines = tuple(
+        replace(_pdf_model_line(1, f"A{index}"), top=80 + index * 20, bottom=92 + index * 20)
+        for index in range(10)
+    )
+    page = pdf_conversion_module._PdfPage(
+        number=1,
+        lines=lines,
+        has_images=True,
+        image_area_ratios=(1.0,),
+        has_table=False,
+        image_orientation_mismatch=False,
+    )
+    resource = pdf_conversion_module.PdfEmbeddedResource(
+        pdf_conversion_module.PurePosixPath("pdf/page-0001-image-01.jpg"),
+        b"image",
+        "image/jpeg",
+        1,
+    )
+    ocr = "\n".join(f"A{index}" for index in range(10))
+
+    markdown, _issues = pdf_conversion_module._render_document(
+        [page],
+        body_size=12,
+        heading_sizes={},
+        repeated_margins=set(),
+        referenced_pages=set(),
+        ocr_pages={1: ocr},
+        ocr_failed_pages=set(),
+        page_images={1: (resource,)},
+    )
+
+    assert "A0" not in markdown
+    assert "A9" not in markdown
+    assert "__parsezen_resources__/pdf/page-0001-image-01.jpg" in markdown
+
+
+def test_short_cover_title_remains_reflowable_text() -> None:
+    page = pdf_conversion_module._PdfPage(
+        number=1,
+        lines=(_pdf_model_line(1, "A SHORT TITLE"),),
+        has_images=True,
+        image_area_ratios=(1.0,),
+        has_table=False,
+        image_orientation_mismatch=False,
+    )
+
+    assert not pdf_conversion_module._fragmented_graphic_text_should_stay_in_image(
+        page,
+        "A SHORT TITLE\nBY AN AUTHOR",
+    )
+
+
+def test_dense_pdf_image_mosaic_is_preserved_as_one_composite_crop() -> None:
+    images = [
+        {"x0": x, "x1": x + 180, "top": y, "bottom": y + 130}
+        for y in (100, 240, 380)
+        for x in (80, 270)
+    ]
+    page = SimpleNamespace(
+        width=600,
+        height=800,
+        bbox=(0, 0, 600, 800),
+        images=images,
+        curves=[],
+    )
+    model = pdf_conversion_module._PdfPage(
+        number=1,
+        lines=(),
+        has_images=True,
+        image_area_ratios=tuple(180 * 130 / (600 * 800) for _image in images),
+        has_table=False,
+        image_orientation_mismatch=False,
+    )
+
+    boxes = pdf_conversion_module._exportable_image_boxes(page, model, None)
+
+    assert boxes == ((80.0, 100.0, 450.0, 510.0),)
+
+
+def test_distant_pdf_images_remain_independent_crops() -> None:
+    page = SimpleNamespace(
+        width=600,
+        height=800,
+        bbox=(0, 0, 600, 800),
+        images=[
+            {"x0": 40, "x1": 160, "top": 40, "bottom": 160},
+            {"x0": 440, "x1": 560, "top": 640, "bottom": 760},
+        ],
+        curves=[],
+    )
+    model = pdf_conversion_module._PdfPage(
+        number=1,
+        lines=(),
+        has_images=True,
+        image_area_ratios=(0.03, 0.03),
+        has_table=False,
+        image_orientation_mismatch=False,
+    )
+
+    boxes = pdf_conversion_module._exportable_image_boxes(page, model, None)
+
+    assert boxes == (
+        (40.0, 40.0, 160.0, 160.0),
+        (440.0, 640.0, 560.0, 760.0),
+    )
+
+
 def test_spatial_character_deduplication_preserves_the_original_choice() -> None:
     characters: list[dict[str, object]] = []
     for index in range(200):
@@ -2212,6 +2643,149 @@ def test_omits_a_standalone_page_number_in_the_top_margin() -> None:
         previous=None,
         body_size=12,
     )
+
+
+def test_omits_a_roman_page_footer_even_on_a_toc_page() -> None:
+    line = replace(
+        _pdf_model_line(7, "vii"),
+        x0=295,
+        x1=315,
+        top=760,
+        bottom=774,
+    )
+
+    assert pdf_conversion_module._omit_margin_line(
+        line,
+        repeated_margins=set(),
+        previous=None,
+        body_size=12,
+        toc_page=True,
+    )
+
+
+def test_strips_an_emphasized_ocr_footer_confirmed_by_the_native_margin() -> None:
+    footer = replace(
+        _pdf_model_line(9, "vii"),
+        top=728,
+        bottom=742,
+    )
+    page = pdf_conversion_module._PdfPage(
+        number=9,
+        lines=(footer,),
+        has_images=False,
+        image_area_ratios=(),
+        has_table=False,
+        image_orientation_mismatch=False,
+    )
+
+    markdown = pdf_conversion_module._strip_native_margin_numbers_from_ocr(
+        page,
+        "Visible index entry 873\n\n*vii*",
+        12,
+    )
+
+    assert "Visible index entry 873" in markdown
+    assert "vii" not in markdown
+
+
+def test_strips_an_ocr_footer_embedded_in_an_otherwise_empty_table_row() -> None:
+    footer = replace(
+        _pdf_model_line(9, "vii"),
+        top=728,
+        bottom=742,
+    )
+    page = pdf_conversion_module._PdfPage(
+        number=9,
+        lines=(footer,),
+        has_images=False,
+        image_area_ratios=(),
+        has_table=False,
+        image_orientation_mismatch=False,
+    )
+
+    markdown = pdf_conversion_module._strip_native_margin_numbers_from_ocr(
+        page,
+        "| Visible index entry | 891 |\n| --- | --- |\n| *vii* | |",
+        12,
+    )
+
+    assert "Visible index entry" in markdown
+    assert "vii" not in markdown
+
+
+def test_repairs_broken_native_toc_folios_inside_an_ocr_page_replacement() -> None:
+    page = pdf_conversion_module._PdfPage(
+        number=11,
+        lines=(
+            _pdf_model_line(11, "Exercise 49 1030"),
+            _pdf_model_line(11, "90. THE ULTIMATE RULERS OF THE CHART IO35"),
+            _pdf_model_line(11, "91. THE PREDOMINATOR IO39"),
+            _pdf_model_line(11, "Procedure 1040"),
+        ),
+        has_images=False,
+        image_area_ratios=(),
+        has_table=False,
+        image_orientation_mismatch=False,
+    )
+
+    repaired = pdf_conversion_module._repair_toc_ocr_numeric_glyphs(
+        page,
+        "Exercise 49 1030\n90. THE ULTIMATE RULERS IO35\n91. THE PREDOMINATOR IO39",
+    )
+
+    assert "1035" in repaired
+    assert "1039" in repaired
+    assert "IO35" not in repaired
+    assert "IO39" not in repaired
+
+
+def test_ocr_additions_ignore_a_long_ordered_copy_with_scattered_ocr_typos() -> None:
+    sentence = (
+        "This house system divides the celestial circle into equal sections and preserves "
+        "every boundary for timing."
+    )
+    native = " ".join(sentence for _index in range(5))
+    noisy_copy = native.replace("celestial", "celestlal", 1).replace(
+        "boundary",
+        "boundarv",
+        1,
+    )
+    page = pdf_conversion_module._PdfPage(
+        number=36,
+        lines=(_pdf_model_line(36, native),),
+        has_images=True,
+        image_area_ratios=(1.0,),
+        has_table=False,
+        image_orientation_mismatch=False,
+    )
+
+    assert (
+        len(
+            pdf_conversion_module._comparison_tokens(noisy_copy)
+            & pdf_conversion_module._comparison_tokens(native)
+        )
+        / len(pdf_conversion_module._comparison_tokens(noisy_copy))
+        < 0.9
+    )
+    assert pdf_conversion_module._ocr_additions(page, noisy_copy) == ""
+
+
+def test_ocr_additions_keep_a_substantially_new_prose_block() -> None:
+    native = "The native layer contains the main paragraph and preserves its structure."
+    addition = (
+        "A newly visible footnote identifies a separate primary source, explains the disputed "
+        "reading, and adds evidence that is absent from the selectable layer."
+    )
+    page = pdf_conversion_module._PdfPage(
+        number=36,
+        lines=(_pdf_model_line(36, native),),
+        has_images=True,
+        image_area_ratios=(1.0,),
+        has_table=False,
+        image_orientation_mismatch=False,
+    )
+
+    assert pdf_conversion_module._ocr_additions(page, addition) == addition
 
 
 def test_omits_an_outer_folio_below_the_narrow_top_margin() -> None:

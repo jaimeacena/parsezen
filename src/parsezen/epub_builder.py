@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+import logging
 import re
 from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from hashlib import sha256
-from html import escape
+from html import escape, unescape
 from io import BytesIO
 from pathlib import Path, PurePosixPath
 from typing import Any, cast
@@ -24,6 +25,8 @@ from parsezen.document_model import RESOURCE_REFERENCE_PREFIX, ConvertedResource
 from parsezen.errors import ConversionError
 from parsezen.final_integrity import FinalIntegrityReport, verify_epub_payload
 from parsezen.semantic_blocks import SemanticDocument, SemanticRole, analyze_markdown
+
+LOGGER = logging.getLogger(__name__)
 
 _SAFE_ANCHOR_PATTERN = re.compile(
     r'<a\s+id="([A-Za-z][A-Za-z0-9._:-]{0,127})"\s*>\s*</a>',
@@ -61,6 +64,14 @@ _NUMERIC_REFERENCE_TOKEN_PATTERN = re.compile(r"\d+(?:[.,:/-]\d+)*")
 _RAW_TABLE_BLOCK_PATTERN = re.compile(
     r"<table(?:\s+[^>]*)?>.*?</table>",
     re.IGNORECASE | re.DOTALL,
+)
+_DOCUMENT_TOC_OPENING_PATTERN = re.compile(
+    r'^\s*<table\s+class=["\']document-toc["\']\s*>',
+    re.IGNORECASE,
+)
+_BARE_XML_AMPERSAND_PATTERN = re.compile(
+    r"&(?!amp;|lt;|gt;|apos;|quot;|#\d+;|#x[0-9a-f]+;)",
+    re.IGNORECASE,
 )
 _SAFE_TABLE_TAGS = frozenset(
     {"table", "thead", "tbody", "tr", "th", "td", "br", "strong", "em", "a"}
@@ -258,6 +269,94 @@ def build_epub(
         len(normalized_resources),
         integrity_report,
     )
+
+
+def reconcile_generated_html_tables(source: str, candidate: str) -> str:
+    """Keep a safe generated table envelope while accepting only aligned text changes.
+
+    Translation and review guards compare the document's table structure, but a model can still
+    mutate a CSS class or link attribute without changing the ordered row/cell tags.  Rebuild that
+    narrow case from the already validated source envelope.  If text nodes no longer align exactly,
+    preserve the complete source table instead of making the whole EPUB unpublishable.
+    """
+
+    source_tables = tuple(_RAW_TABLE_BLOCK_PATTERN.finditer(source))
+    candidate_tables = tuple(_RAW_TABLE_BLOCK_PATTERN.finditer(candidate))
+    if not source_tables or len(source_tables) != len(candidate_tables):
+        return candidate
+
+    replacements: list[tuple[int, int, str]] = []
+    rebuilt_count = 0
+    preserved_count = 0
+    for source_match, candidate_match in zip(source_tables, candidate_tables, strict=True):
+        source_table = source_match.group(0)
+        candidate_table = candidate_match.group(0)
+        if (
+            _safe_table_xhtml(source_table) is None
+            or _safe_table_xhtml(candidate_table) is not None
+        ):
+            continue
+        rebuilt = _rebuild_generated_table_text(source_table, candidate_table)
+        if rebuilt is not None and _safe_table_xhtml(rebuilt) is not None:
+            replacement = rebuilt
+            rebuilt_count += 1
+        else:
+            replacement = source_table
+            preserved_count += 1
+        replacements.append((candidate_match.start(), candidate_match.end(), replacement))
+
+    for start, end, replacement in reversed(replacements):
+        candidate = f"{candidate[:start]}{replacement}{candidate[end:]}"
+    if replacements:
+        LOGGER.info(
+            "generated_table_markup_reconciled rebuilt=%d preserved=%d",
+            rebuilt_count,
+            preserved_count,
+        )
+    return candidate
+
+
+def _rebuild_generated_table_text(source: str, candidate: str) -> str | None:
+    """Copy aligned plain text onto the exact source tag and attribute envelope."""
+
+    tag_pattern = re.compile(r"<\s*(/?)\s*([A-Za-z][\w:-]*)\b[^>]*?(\/?)\s*>")
+
+    def tag_signature(value: str) -> tuple[tuple[str, str, str], ...]:
+        return tuple(
+            (
+                "/" if match.group(1) else "",
+                match.group(2).casefold(),
+                "/" if match.group(3) else "",
+            )
+            for match in tag_pattern.finditer(value)
+        )
+
+    if tag_signature(source) != tag_signature(candidate):
+        return None
+    source_nodes = tuple(re.finditer(r"(?<=>)[^<>]*(?=<)", source))
+    candidate_nodes = tuple(re.finditer(r"(?<=>)[^<>]*(?=<)", candidate))
+    if len(source_nodes) != len(candidate_nodes):
+        return None
+
+    replacements: list[tuple[int, int, str]] = []
+    for source_node, candidate_node in zip(source_nodes, candidate_nodes, strict=True):
+        source_value = source_node.group(0)
+        if not source_value.strip():
+            continue
+        candidate_value = candidate_node.group(0)
+        if not candidate_value.strip() or "\0" in candidate_value:
+            return None
+        leading = source_value[: len(source_value) - len(source_value.lstrip())]
+        trailing = source_value[len(source_value.rstrip()) :]
+        escaped_value = escape(unescape(candidate_value.strip()), quote=False)
+        replacements.append(
+            (source_node.start(), source_node.end(), f"{leading}{escaped_value}{trailing}")
+        )
+
+    rebuilt = source
+    for start, end, replacement in reversed(replacements):
+        rebuilt = f"{rebuilt[:start]}{replacement}{rebuilt[end:]}"
+    return rebuilt
 
 
 def build_epub_from_xhtml(
@@ -718,6 +817,10 @@ def _protect_safe_table_blocks(markdown: str) -> tuple[str, tuple[tuple[str, str
     def replace(match: re.Match[str]) -> str:
         table = _safe_table_xhtml(match.group(0))
         if table is None:
+            if _DOCUMENT_TOC_OPENING_PATTERN.match(match.group(0)):
+                raise ConversionError(
+                    "El índice interno no se pudo convertir en una tabla EPUB segura."
+                )
             return match.group(0)
         sentinel = f"PZDOCEPUBTABLE{sha256(match.group(0).encode('utf-8')).hexdigest()[:24]}"
         while sentinel in markdown or any(item[0] == sentinel for item in replacements):
@@ -732,6 +835,7 @@ def _safe_table_xhtml(value: str) -> str | None:
     """Return normalized XHTML for a strict generated table fragment."""
 
     normalized = re.sub(r"<br\s*/?>", "<br />", value, flags=re.IGNORECASE)
+    normalized = _BARE_XML_AMPERSAND_PATTERN.sub("&amp;", normalized)
     try:
         root = SafeElementTree.fromstring(normalized)
     except (DefusedXmlException, SafeElementTree.ParseError):
@@ -898,17 +1002,29 @@ def _rewrite_internal_links(
     return _RENDERED_LINK_PATTERN.sub(replacement, html)
 
 
-def _xhtml_document(title: str, body: str, language: str) -> str:
+def _xhtml_document(
+    title: str,
+    body: str,
+    language: str,
+    *,
+    body_epub_type: str | None = None,
+) -> str:
+    epub_namespace = (
+        ' xmlns:epub="http://www.idpf.org/2007/ops"' if body_epub_type is not None else ""
+    )
+    body_attributes = (
+        f' epub:type="{escape(body_epub_type, quote=True)}"' if body_epub_type is not None else ""
+    )
     return (
         '<?xml version="1.0" encoding="utf-8"?>\n'
         "<!DOCTYPE html>\n"
-        '<html xmlns="http://www.w3.org/1999/xhtml" '
+        f'<html xmlns="http://www.w3.org/1999/xhtml"{epub_namespace} '
         f'xml:lang="{escape(language, quote=True)}" lang="{escape(language, quote=True)}">\n'
         "<head>\n"
         f"<title>{escape(title)}</title>\n"
         '<meta charset="utf-8" />\n'
         '<link rel="stylesheet" type="text/css" href="../styles/book.css" />\n'
-        "</head>\n<body>\n"
+        f"</head>\n<body{body_attributes}>\n"
         f"{body}"
         "</body>\n</html>\n"
     )
@@ -1045,6 +1161,7 @@ def _cover_document(title: str, cover_resource: str, language: str) -> str:
         title,
         f'<div class="cover"><img src="{source}" alt="Portada" /></div>\n',
         language,
+        body_epub_type="cover",
     )
 
 
@@ -1085,6 +1202,11 @@ def _package_document(
         if cover_resource is not None
         else chapter_spine
     )
+    cover_guide = (
+        '<guide><reference type="cover" title="Portada" href="text/cover.xhtml"/></guide>'
+        if cover_resource is not None
+        else ""
+    )
     creator = f"<dc:creator>{escape(author)}</dc:creator>" if author else ""
     primary_identifier, *additional_identifiers = identifiers
     identifier_elements = (
@@ -1109,7 +1231,7 @@ def _package_document(
         '<manifest><item id="nav" href="nav.xhtml" media-type="application/xhtml+xml" '
         'properties="nav"/><item id="css" href="styles/book.css" '
         f'media-type="text/css"/>{cover_manifest}{chapter_manifest}'
-        f"{resource_manifest}</manifest><spine>{spine}</spine></package>"
+        f"{resource_manifest}</manifest><spine>{spine}</spine>{cover_guide}</package>"
     )
 
 

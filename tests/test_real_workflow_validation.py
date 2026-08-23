@@ -28,6 +28,7 @@ from parsezen.processing import (
     ProcessTelemetry,
     StageTelemetry,
 )
+from parsezen.processing_metrics import AiOperationTelemetry, BatchTelemetry
 from parsezen.revision import RevisionKind, build_revision_draft
 from parsezen.settings import AppSettings
 from parsezen.translation_quality import (
@@ -159,6 +160,7 @@ def test_live_report_contains_no_document_identity_or_text(tmp_path: Path) -> No
     assert str(private_path) not in report
     assert private_text not in report
     assert "prompts" in report
+    assert not (tmp_path / ".report.json.tmp").exists()
 
 
 def test_live_epub_validation_reports_oversized_body_promoted_to_heading(
@@ -297,6 +299,13 @@ def test_live_workflow_forwards_pdf_range_and_records_diagnostic_counts(
             telemetry=ProcessTelemetry(
                 1_500,
                 (StageTelemetry(ProcessStage.TRANSLATING, 1_200, 1),),
+                BatchTelemetry(
+                    local_ai_requests=2,
+                    prompt_tokens=500,
+                    output_tokens=100,
+                    wall_duration_ms=2_000,
+                    operations=(AiOperationTelemetry("translation_batch", 2, 500, 100, 2_000),),
+                ),
             ),
             front_matter_blocks=3,
             toc_blocks=4,
@@ -306,20 +315,23 @@ def test_live_workflow_forwards_pdf_range_and_records_diagnostic_counts(
     monkeypatch.setattr(workflow_module, "process_document", process)
     monkeypatch.setattr(workflow_module, "_validate_generated_output", lambda *_args: None)
 
+    snapshots: list[tuple[LiveWorkflowResult, ...]] = []
     results = run_live_workflows(
         (source,),
         tmp_path / "outputs",
         AppSettings(model="qwen3:4b"),
         page_range=PdfPageRange(1, 100),
+        on_results=snapshots.append,
     )
 
     assert captured_ranges == [PdfPageRange(1, 100)]
-    assert captured_translation_modes == [(None, "Español")]
-    assert results[0].translation_engine == "argos"
+    assert captured_translation_modes == [(ImprovementMode.TRANSLATE, None)]
+    assert results[0].translation_engine == "local_ai"
     assert results[0].processed_pages == 100
     assert results[0].ocr_pages == 2
     assert results[0].revision_changes == 0
     assert results[0].preserved_translation_chunks == 1
+    assert results[0].preserved_translation_chunk_numbers == (2,)
     assert results[0].preserved_images == 7
     assert results[0].epub_chapters == 12
     assert results[0].stage_duration_ms == {"translating": 1_200}
@@ -328,8 +340,17 @@ def test_live_workflow_forwards_pdf_range_and_records_diagnostic_counts(
     assert results[0].front_matter_blocks == 3
     assert results[0].toc_blocks == 4
     assert results[0].terminology_terms == 5
+    assert results[0].ai_operations == {
+        "translation_batch": {
+            "requests": 2,
+            "prompt_tokens": 500,
+            "output_tokens": 100,
+            "wall_duration_ms": 2_000,
+        }
+    }
     assert results[0].passed
     assert not results[0].quality_gate_passed
+    assert snapshots == [results]
 
 
 def test_live_workflow_can_use_local_ai_for_translation(

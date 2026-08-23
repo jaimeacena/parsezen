@@ -47,7 +47,7 @@ python scripts/sync_version.py --check
 - El bloque de configuración está centrado horizontalmente; los menús de cada fila aparecen bajo su
   valor, alineados a la derecha, y no saltan al margen izquierdo de la ventana.
 - Los documentos nuevos parten con revisión completa activada. Una configuración ya guardada conserva
-  su plan. Argos y OCR automático siguen siendo valores iniciales sin preguntas técnicas.
+  su plan. IA local y OCR automático siguen siendo valores iniciales sin preguntas técnicas.
 - Revisión automática con IA local activa una pasada proactiva de texto y, solo en EPUB, también de
   estructura; no existen interruptores independientes ni un resumen técnico del recorrido en esta
   página.
@@ -73,10 +73,13 @@ python scripts/sync_version.py --check
 - Cada elección válida se aplica y persiste inmediatamente. No hay botones Cancelar o Crear/Guardar;
   Volver y Escape cierran sin confirmación porque no existen cambios pendientes.
 - `Traducir — No traducir` oculta Traductor y Glosario. Al elegir cualquier idioma aparecen ambas
-  filas; Argos es el motor inicial y puede sustituirse por IA local. No aparecen proveedores ni
-  direcciones configurables.
+  filas; IA local es el motor inicial y Argos solo se activa mediante una elección explícita. No
+  aparecen proveedores ni direcciones configurables.
 - Elegir traducción con IA o revisión semántica exige un modelo instalado anunciado por Ollama
   `/api/tags`; Argos directo no exige modelo. Argos con revisión usa Ollama después de traducir.
+- Las pruebas reales que traducen usan por defecto IA local y el modelo instalado elegido para un PC
+  estándar. Nunca recurren a Argos por ausencia del modelo o por un fallo: probar Argos requiere
+  indicarlo expresamente.
 - Un resultado directo solo muestra `Revisión sugerida` cuando comprobaciones objetivas permiten
   acotar bloques concretos. La recomendación persiste tipos, cantidades, posiciones y huellas
   no reversible, pero ningún extracto, y nunca inicia Ollama automáticamente.
@@ -196,6 +199,9 @@ python scripts/sync_version.py --check
   permanece intacta.
 - Un índice de un libro largo conserva folios de cuatro cifras como `1023` en la celda derecha sin
   convertirlos en párrafos sueltos ni ampliar a cuatro cifras la detección general de márgenes.
+- Una entrada en mayúsculas cuya fuente PDF omite espacios lógicos, como
+  `II-NUTRICIÓNEFICAZ`, se publica como `II - NUTRICIÓN EFICAZ` cuando los huecos entre glifos lo
+  corroboran; la prosa mixta no se reespacia por esta heurística.
 - Un folio mixto como `62S` solo se convierte en `628` cuando la etiqueta de su fila, la secuencia
   numérica vecina y el OCR local dejan un único candidato. El OCR puede reponer un espacio ausente
   entre palabras de esa fila, pero no sustituye las letras nativas aunque su propia grafía difiera.
@@ -217,14 +223,31 @@ python scripts/sync_version.py --check
 - Una tabla PDF con celdas multilínea se publica como XHTML semántico y conserva los saltos internos;
   sus etiquetas no aparecen impresas como texto. Una tabla HTML con atributos, scripts o estructura
   ajena al generador permanece inerte.
+- La traducción de una tabla simple modifica únicamente texto de celdas: conserva byte por byte su
+  envoltura Markdown/XHTML y sus entidades HTML. El código de una entidad numérica no se compara como
+  una cifra visible; un salto heredado se conserva y un salto añadido por la IA se rechaza.
+- Una celda que conserva un rótulo breve del idioma fuente después del reintento de tabla recibe una
+  sola reparación bilingüe aislada. Solo se acepta si elimina la señal y supera todas las guardas; de
+  lo contrario se conserva el original sin reescribir filas vecinas.
 - Una revisión que elimina una celda HTML vacía, su columna o un salto interno se rechaza aunque otra
   tabla adquiera casualmente la forma perdida y los recuentos globales sigan coincidiendo.
+- Una propuesta que añade un envoltorio `html` o cambia cualquier etiqueta HTML ajena a una tabla
+  generada se rechaza completa y esas etiquetas nunca aparecen como texto visible en el EPUB.
 - Una tabla escaneada solo usa una estructura OCR si conserva cobertura, proporción y todas las
   cifras, filas y columnas en el mismo orden; una salida inflada o que omite una columna vacía
   mantiene la capa nativa y su orden multicolumna.
 - El texto con tracking artificial recupera palabras normales sin eliminar espacios léxicos.
 - Una palabra dividida al final de una página se publica unida si continúa en minúscula en la
   siguiente, sin perder el marcador interno durante la revisión.
+- Una cantidad escrita con palabras en un título breve conserva su valor entre inglés y español:
+  `PART SEVEN` no puede convertirse en `PARTE SEIS`; `TWO` puede publicarse como `DOS`, `AMBOS` o `2`
+  según el contexto. El adverbio inglés `once` no se confunde con el número español y la prosa puede
+  reformular cantidades sin activar una falsa alarma global.
+- La retraducción enfocada protege el cardinal de un rótulo mediante un marcador ligado a ambos
+  idiomas: el modelo recibe una cantidad opaca y Parsezen restaura `SEVEN` como `SIETE`, no como la
+  palabra inglesa original ni como otro valor.
+- Una duración numérica de un título conserva la concordancia: `30 DAY CHALLENGE` puede traducirse como
+  `DESAFÍO DE 30 DÍAS`, pero no como `DESAFÍO DE 30 DÍA`, incluso con énfasis Markdown intermedio.
 - Un folio nativo de los márgenes superior o inferior no reaparece unido al texto OCR cercano.
 - Un folio alterno situado en la banda superior exterior se retira, mientras un número de sección
   centrado en la misma altura se conserva.
@@ -233,6 +256,9 @@ python scripts/sync_version.py --check
   centrado que abre la sección ni un rótulo de figura dentro de la columna.
 - Los grupos de curvas que forman ilustraciones se conservan como imágenes y no duplican recursos
   incrustados solapados.
+- Una composición gráfica de página completa con etiquetas espaciales fragmentadas se conserva como
+  lámina y no publica una secuencia lineal de OCR sin sentido; la prosa y las tablas recuperables no
+  activan esta excepción.
 - Una página dudosa abre la imagen a la izquierda y el texto editable a la derecha.
 - Una página con imagen completa y texto útil puede entrar en la auditoría OCR acotada sin que el OCR
   sustituya automáticamente la capa nativa. El presupuesto no supera el 25 % del intervalo ni seis
@@ -280,6 +306,11 @@ python scripts/sync_version.py --check
   en una sola línea.
 - Un fallo de validación del reensamblado conserva los fragmentos seguros y restaura solamente los
   incompatibles.
+- Una lista que sigue agrupada después de dividir un bloque se degrada de forma transaccional hasta
+  líneas independientes. Una viñeta añadida a una etiqueta sin lista se retira, pero los marcadores
+  existentes se conservan exactamente.
+- Una etiqueta establecida con énfasis Markdown se localiza sin modelo. En una etiqueta breve con
+  cifras, solo sus fragmentos alfabéticos se traducen; cifras y separadores nunca llegan a Ollama.
 - La corrección de una traducción Argos compara el original y el resultado, aplica solo sustituciones
   exactas validadas y conserva una corrección segura aunque otra propuesta del mismo bloque falle.
 - Una respuesta JSON truncada recupera exclusivamente objetos completos; ninguna respuesta de
@@ -322,6 +353,8 @@ python scripts/sync_version.py --check
 - Negrita, cursiva, subrayado, encabezados, listas, alineación y enlaces sobreviven a la publicación.
 - Un encabezado no se divide internamente entre dos páginas en lectores que respetan las reglas CSS
   de paginación ni desborda horizontalmente ante una palabra excepcionalmente larga.
+- Una portada generada aparece una sola vez al convertir el EPUB con un lector que materializa la
+  portada del paquete; la página XHTML está marcada como portada EPUB 3 y en la guía OPF.
 - Las barras de estructura y contenido ocupan una sola fila, usan controles homogéneos y ningún
   control aparece truncado.
 - Guardar y volver conserva el libro.

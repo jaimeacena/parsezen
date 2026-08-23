@@ -116,16 +116,16 @@ def test_translation_choice_reveals_only_translator_and_glossary(
 
     assert dialog.translate_row.value.text() == "Español"
     assert not dialog.translator_row.isHidden()
-    assert dialog.translator_row.value.text() == "Argos · ligero"
+    assert dialog.translator_row.value.text() == "IA local · contextual"
     assert not dialog.glossary_row.isHidden()
     assert dialog.glossary_row.value.text() == "Ninguno"
     assert not hasattr(dialog, "translation_route")
-    assert "verifica la traducción" in dialog.plan_reviewed.accessibleDescription()
+    assert "corrección se integra" in dialog.plan_reviewed.accessibleDescription()
     assert dialog.plan_reviewed.toolTip() == dialog.plan_reviewed.accessibleDescription()
 
     dialog._set_review_enabled(True)  # noqa: SLF001
 
-    assert "verifica la traducción" in dialog.plan_reviewed.accessibleDescription()
+    assert "corrección se integra" in dialog.plan_reviewed.accessibleDescription()
 
 
 def test_translation_menu_contains_no_translation_and_every_supported_language(
@@ -225,8 +225,14 @@ def test_reviewed_plan_maps_to_the_fixed_runtime_phases(
     assert settings.context_window == 8192
 
 
-def test_translation_defaults_to_argos_and_glossary_is_optional(qtbot, tmp_path: Path) -> None:
-    dialog = JobConfigurationDialog(_job(tmp_path), embedded=True)
+def test_translation_defaults_to_local_ai_and_glossary_is_optional(qtbot, tmp_path: Path) -> None:
+    dialog = JobConfigurationDialog(
+        _job(tmp_path),
+        embedded=True,
+        default_ai_model="qwen3:4b-instruct",
+        default_ai_context=8192,
+        ollama_status=OllamaStatus.READY,
+    )
     qtbot.addWidget(dialog)
     dialog._set_translation_language("es")  # noqa: SLF001
     dialog._append_glossary_entry(GlossaryEntry("term", "término"))  # noqa: SLF001
@@ -236,8 +242,10 @@ def test_translation_defaults_to_argos_and_glossary_is_optional(qtbot, tmp_path:
     request, _settings = request_and_settings_from_job(job)
 
     assert configured.translation.glossary == (("term", "término"),)
-    assert configured.translation.method is TranslationMethod.OFFLINE
+    assert configured.translation.method is TranslationMethod.LOCAL_AI
     assert tuple((item.source, item.target) for item in request.glossary) == (("term", "término"),)
+    assert request.target_language == "es"
+    assert request.offline_translation_language is None
     assert dialog.glossary_row.value.text() == "1 término"
 
 

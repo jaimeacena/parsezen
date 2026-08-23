@@ -101,6 +101,9 @@ _MIN_EXPORTED_IMAGE_AREA_RATIO = 0.015
 _MAX_EXPORTED_IMAGE_AREA_RATIO = 0.75
 _MAX_EXPORTED_PDF_IMAGES = 500
 _MAX_EXPORTED_IMAGE_BYTES = 12 * 1024 * 1024
+_MIN_COMPOSITE_IMAGE_COUNT = 2
+_MIN_COMPOSITE_IMAGE_UNION_RATIO = 0.08
+_MIN_COMPOSITE_IMAGE_DENSITY = 0.55
 _OCR_TITLE_TARGET_LAST_PAGE = 4
 _OCR_TITLE_REFERENCE_LAST_PAGE = 12
 _OCR_TITLE_CONNECTORS = frozenset(
@@ -186,6 +189,27 @@ _SUSPICIOUS_NUMERIC_GLYPH_PATTERN = re.compile(
     r"[\dA-Za-z]{2,7}"
     r")(?!\w)"
 )
+_SPACED_NUMERIC_YEAR_GLYPH_PATTERN = re.compile(r"^\s*[iIlLoO](?:\s+[iIlLoO]){3}\s*$")
+_PUBLICATION_YEAR_PATTERN = re.compile(r"(?<!\d)(?:18|19|20|21)\d{2}(?!\d)")
+_PUBLICATION_YEAR_CONTEXT_PATTERN = re.compile(
+    r"(?:first\s+published(?:\s+in)?|primera\s+edici[oó]n\s+publicada(?:\s+en)?|"
+    r"copyright|©)[^0-9]{0,64}(?P<year>(?:18|19|20|21)\d{2})",
+    re.IGNORECASE,
+)
+_NUMERIC_GLYPH_EXPANSIONS: dict[str, tuple[str, ...]] = {
+    "I": ("1",),
+    "i": ("1",),
+    "l": ("1",),
+    "O": ("0",),
+    "o": ("0",),
+    "H": ("11",),
+    "h": ("11",),
+    "n": ("11",),
+    "S": ("5", "8"),
+    "s": ("5", "8"),
+    "B": ("8",),
+    "b": ("8",),
+}
 _VISUAL_ATOM_PATTERN = re.compile(
     r"[\d$^][\d$^A-Za-z]{1,6}(?=(?:[.)](?:\s|$)|\s|$))"
     r"|[\d$^\ufffd°]+(?:[.,][\d$^\ufffd°]+)*"
@@ -523,7 +547,10 @@ def _build_ocr_plan(pages: list[_PdfPage], force_ocr: bool) -> _PdfOcrPlan:
             _has_suspicious_glyph_encoding(page)
             or _has_suspicious_numeric_glyph_encoding(page)
             or page.image_orientation_mismatch
-            or _native_page_quality(page) < _VERY_LOW_NATIVE_QUALITY_THRESHOLD
+            or (
+                bool(_page_letter_count(page) or page.has_images)
+                and _native_page_quality(page) < _VERY_LOW_NATIVE_QUALITY_THRESHOLD
+            )
             or page.number in hidden_text_audit_pages
         )
     }
@@ -533,7 +560,7 @@ def _build_ocr_plan(pages: list[_PdfPage], force_ocr: bool) -> _PdfOcrPlan:
         page.number
         for page in pages
         if (_page_letter_count(page) < _MIN_USABLE_NATIVE_LETTERS and page.has_images)
-        or _native_page_quality(page) < 0.16
+        or (_page_letter_count(page) > 0 and _native_page_quality(page) < 0.16)
     }
     return _PdfOcrPlan(page_numbers, force_full_page_numbers, required_page_numbers)
 
@@ -997,7 +1024,16 @@ def _exportable_image_boxes(
     ocr_contains_table = bool(_MARKDOWN_TABLE_PATTERN.search(ocr_markdown or ""))
     ocr_is_toc = _is_toc_markdown(ocr_markdown or "")
     native_is_toc = _is_toc_page(list(model.lines))
-    if (
+    fragmented_graphic_text = _fragmented_graphic_text_should_stay_in_image(
+        model,
+        ocr_markdown,
+    )
+    if fragmented_graphic_text and full_page:
+        # On charts, diagrams and decorated plates, dozens of tiny labels can look
+        # superficially OCR-like while losing all spatial meaning when reflowed.
+        # The page raster is the canonical representation in that case.
+        candidates = [max(full_page, key=lambda item: item[0])]
+    elif (
         not candidates
         and full_page
         and not native_is_toc
@@ -1009,6 +1045,9 @@ def _exportable_image_boxes(
         )
     ):
         candidates.append(max(full_page, key=lambda item: item[0]))
+    composite = _composite_image_candidate(candidates, page_area)
+    if composite is not None:
+        candidates = [composite]
     candidates.sort(key=lambda item: (item[1][1], item[1][0], -item[0]))
     retained: list[tuple[float, float, float, float]] = []
     for _ratio, bbox in candidates:
@@ -1016,6 +1055,30 @@ def _exportable_image_boxes(
             continue
         retained.append(bbox)
     return tuple(retained)
+
+
+def _composite_image_candidate(
+    candidates: list[tuple[float, tuple[float, float, float, float]]],
+    page_area: float,
+) -> tuple[float, tuple[float, float, float, float]] | None:
+    """Keep a dense PDF mosaic in its original spatial arrangement as one crop."""
+
+    if len(candidates) < _MIN_COMPOSITE_IMAGE_COUNT:
+        return None
+    boxes = [bbox for _ratio, bbox in candidates]
+    union = (
+        min(box[0] for box in boxes),
+        min(box[1] for box in boxes),
+        max(box[2] for box in boxes),
+        max(box[3] for box in boxes),
+    )
+    union_area = max((union[2] - union[0]) * (union[3] - union[1]), 1.0)
+    union_ratio = min(union_area / max(page_area, 1.0), 1.0)
+    placed_area = sum(max(0.0, box[2] - box[0]) * max(0.0, box[3] - box[1]) for box in boxes)
+    density = min(placed_area / union_area, 1.0)
+    if union_ratio < _MIN_COMPOSITE_IMAGE_UNION_RATIO or density < _MIN_COMPOSITE_IMAGE_DENSITY:
+        return None
+    return union_ratio, union
 
 
 def _vector_graphic_boxes(page: Any) -> tuple[tuple[float, float, float, float], ...]:
@@ -1753,11 +1816,10 @@ def _reconcile_suspicious_toc_numbers(
     lines: list[_PdfLine],
     ocr_markdown: str | None,
 ) -> list[_PdfLine]:
-    """Use OCR only to decode a broken native numeric glyph on a contents page.
+    """Decode broken numeric glyphs only with independent or sequential evidence.
 
-    The selectable layer remains authoritative for every letter and for layout.  A suspicious
-    token is changed only when replacing its one opaque glyph with a digit yields exactly one
-    number that the independent OCR pass also saw on the same page.
+    The selectable layer remains authoritative for every letter and for layout. A suspicious
+    token changes only when local OCR or neighbouring clean folios leave one numeric reading.
     """
 
     ocr_numbers = set(re.findall(r"(?<!\d)\d{1,6}(?!\d)", ocr_markdown or ""))
@@ -1767,7 +1829,10 @@ def _reconcile_suspicious_toc_numbers(
         for compact in (re.sub(r"\s+", "", line.text),)
         if re.fullmatch(r"\d{1,6}", compact)
     )
-    if not ocr_numbers and not native_folios:
+    has_trailing_native_folios = any(
+        re.search(r"(?<!\w)\d{1,4}\s*$", line.text) is not None for line in lines
+    )
+    if not ocr_numbers and not native_folios and not has_trailing_native_folios:
         return lines
 
     ocr_lines = tuple(line for line in (ocr_markdown or "").splitlines() if line.strip())
@@ -1843,59 +1908,177 @@ def _reconcile_suspicious_toc_numbers(
         upper = min(following, key=lambda item: item[0].top)[1]
         if lower > upper:
             return set()
-        opaque_positions = [
-            index
-            for index, value in enumerate(token)
-            if value in "$^" or (value.isalpha() and any(char.isdigit() for char in token))
-        ]
-        if len(opaque_positions) != 1:
-            return set()
-        position = opaque_positions[0]
         return {
             candidate
-            for digit in "0123456789"
-            for candidate in (f"{token[:position]}{digit}{token[position + 1 :]}",)
+            for candidate in _numeric_glyph_candidates(token)
             if lower <= int(candidate) <= upper
         }
 
     def reconcile_token(match: re.Match[str], confirmed_numbers: set[str]) -> str:
         token = match.group(0)
-        opaque_positions = [
-            index
-            for index, value in enumerate(token)
-            if value in "$^" or (value.isalpha() and any(char.isdigit() for char in token))
-        ]
-        if len(opaque_positions) != 1 or not any(value.isdigit() for value in token):
+        candidates = _numeric_glyph_candidates(token)
+        if not candidates:
             return token
         # A trailing dollar sign can be a real currency marker.  Without a following ordinal
         # separator or another digit it remains visible and is reported for review.
         if "$" in token and match.end() == len(match.string):
             return token
-        position = opaque_positions[0]
-        candidates = {f"{token[:position]}{digit}{token[position + 1 :]}" for digit in "0123456789"}
         confirmed = candidates & confirmed_numbers
         return next(iter(confirmed)) if len(confirmed) == 1 else token
 
-    def reconciliation_callback(
-        confirmed_numbers: set[str],
-    ) -> Callable[[re.Match[str]], str]:
-        def reconcile_confirmed_token(match: re.Match[str]) -> str:
-            return reconcile_token(match, confirmed_numbers)
-
-        return reconcile_confirmed_token
-
     reconciled: list[_PdfLine] = []
-    for line in lines:
+    for line_index, line in enumerate(lines):
         native_sequence = native_sequence_numbers(line)
         ocr_confirmed_numbers = line_ocr_numbers(ocr_evidence_text(line))
         native_ocr_consensus = native_sequence & ocr_confirmed_numbers
         confirmed_numbers = native_ocr_consensus or native_sequence or ocr_confirmed_numbers
-        text = _SUSPICIOUS_NUMERIC_GLYPH_PATTERN.sub(
-            reconciliation_callback(confirmed_numbers),
-            line.text,
-        )
+
+        def reconcile_with_order(
+            match: re.Match[str],
+            confirmed: set[str] = confirmed_numbers,
+            current_line_index: int = line_index,
+        ) -> str:
+            independently_confirmed = reconcile_token(match, confirmed)
+            if independently_confirmed != match.group(0):
+                return independently_confirmed
+            ordered = _ordered_toc_folio_candidates(lines, current_line_index, match)
+            return reconcile_token(match, ordered)
+
+        text = _SUSPICIOUS_NUMERIC_GLYPH_PATTERN.sub(reconcile_with_order, line.text)
         reconciled.append(replace(line, text=text) if text != line.text else line)
     return reconciled
+
+
+def _reconcile_toc_numbers_with_native_priority(
+    lines: list[_PdfLine],
+    ocr_markdown: str | None,
+) -> list[_PdfLine]:
+    """Prefer a unique native folio sequence over conflicting whole-page OCR."""
+
+    native_reconciled = _reconcile_suspicious_toc_numbers(lines, None)
+    if not ocr_markdown:
+        return native_reconciled
+    ocr_reconciled = _reconcile_suspicious_toc_numbers(lines, ocr_markdown)
+    return [
+        native_candidate if native_candidate.text != source.text else ocr_candidate
+        for source, native_candidate, ocr_candidate in zip(
+            lines,
+            native_reconciled,
+            ocr_reconciled,
+            strict=True,
+        )
+    ]
+
+
+def _reconcile_spaced_numeric_year(
+    lines: list[_PdfLine],
+    ocr_markdown: str | None,
+    publication_years: set[str] | None = None,
+) -> list[_PdfLine]:
+    """Restore an obfuscated year only when independent publication evidence is unique."""
+
+    local_years = set(_PUBLICATION_YEAR_PATTERN.findall(ocr_markdown or ""))
+    years = local_years if len(local_years) == 1 else publication_years or set()
+    if len(years) != 1:
+        return lines
+    replacement = next(iter(years))
+    return [
+        replace(line, text=replacement)
+        if _SPACED_NUMERIC_YEAR_GLYPH_PATTERN.fullmatch(line.text)
+        else line
+        for line in lines
+    ]
+
+
+def _publication_year_evidence(
+    pages: list[_PdfPage],
+    ocr_pages: dict[int, str],
+) -> set[str]:
+    """Collect explicit publication/copyright years without treating arbitrary dates as evidence."""
+
+    sources = [" ".join(line.text for line in page.lines if not line.rotated) for page in pages]
+    sources.extend(ocr_pages.values())
+    return {
+        match.group("year")
+        for source in sources
+        for match in _PUBLICATION_YEAR_CONTEXT_PATTERN.finditer(source)
+    }
+
+
+def _numeric_glyph_candidates(token: str) -> set[str]:
+    """Expand common broken-font number shapes without selecting one by itself."""
+
+    candidates = {""}
+    has_uncertain_shape = False
+    for character in token:
+        replacements: tuple[str, ...]
+        if character.isdigit():
+            replacements = (character,)
+        elif character in _NUMERIC_GLYPH_EXPANSIONS:
+            replacements = _NUMERIC_GLYPH_EXPANSIONS[character]
+            has_uncertain_shape = True
+        elif character in "$^" or character.isalpha():
+            replacements = tuple("0123456789")
+            has_uncertain_shape = True
+        else:
+            return set()
+        candidates = {
+            f"{prefix}{replacement}" for prefix in candidates for replacement in replacements
+        }
+        if len(candidates) > 1_000:
+            return set()
+    return {
+        candidate
+        for candidate in candidates
+        if has_uncertain_shape
+        and candidate.isdecimal()
+        and 1 <= len(candidate) <= 4
+        and not candidate.startswith("0")
+        and 1 <= int(candidate) <= 9_999
+    }
+
+
+def _ordered_toc_folio_candidates(
+    lines: list[_PdfLine],
+    line_index: int,
+    match: re.Match[str],
+) -> set[str]:
+    """Use neighbouring clean TOC folios to select a broken trailing number."""
+
+    if match.end() != len(match.string):
+        return set()
+    candidates = _numeric_glyph_candidates(match.group(0))
+    if not candidates:
+        return set()
+
+    def trailing_folio(line: _PdfLine) -> int | None:
+        found = re.search(r"(?<!\w)(\d{1,4})\s*$", line.text)
+        return int(found.group(1)) if found is not None else None
+
+    lower = next(
+        (
+            value
+            for candidate_line in reversed(lines[:line_index])
+            for value in (trailing_folio(candidate_line),)
+            if value is not None
+        ),
+        None,
+    )
+    upper = next(
+        (
+            value
+            for candidate_line in lines[line_index + 1 :]
+            for value in (trailing_folio(candidate_line),)
+            if value is not None
+        ),
+        None,
+    )
+    if lower is not None and upper is not None and lower <= upper:
+        return {candidate for candidate in candidates if lower <= int(candidate) <= upper}
+    neighbour = lower if lower is not None else upper
+    if neighbour is None:
+        return set()
+    return {candidate for candidate in candidates if int(candidate) == neighbour}
 
 
 def _normalize_toc_entry_rows(lines: list[_PdfLine]) -> list[_PdfLine]:
@@ -2226,12 +2409,14 @@ def _heading_size_levels(lines: list[_PdfLine], body_size: float) -> dict[float,
 
 
 def _repeated_margin_lines(lines: list[_PdfLine], page_count: int) -> set[str]:
-    occurrences: Counter[str] = Counter()
+    del page_count
+    pages_by_line: defaultdict[str, set[int]] = defaultdict(set)
     for line in lines:
         if line.top <= line.page_height * 0.1 or line.bottom >= line.page_height * 0.84:
-            occurrences[_margin_key(line.text)] += 1
-    threshold = max(3, round(page_count * 0.3))
-    return {text for text, count in occurrences.items() if text and count >= threshold}
+            key = _margin_key(line.text)
+            if key:
+                pages_by_line[key].add(line.page_number)
+    return {text for text, pages in pages_by_line.items() if len(pages) >= 3}
 
 
 def _pages_requiring_ocr(pages: list[_PdfPage]) -> set[int]:
@@ -2251,7 +2436,10 @@ def _pages_requiring_ocr(pages: list[_PdfPage]) -> set[int]:
             or (has_full_page_image and lacks_text)
             or _has_suspicious_glyph_encoding(page)
             or _has_suspicious_numeric_glyph_encoding(page)
-            or _native_page_quality(page) < _LOW_NATIVE_QUALITY_THRESHOLD
+            or (
+                bool(_page_letter_count(page) or page.has_images)
+                and _native_page_quality(page) < _LOW_NATIVE_QUALITY_THRESHOLD
+            )
         ):
             selected.add(page.number)
     return selected
@@ -2719,6 +2907,8 @@ def _validated_visual_reading(native: str, ocr: str, proposed: str) -> str | Non
 
 
 def _is_mixed_visual_glyph(atom: str) -> bool:
+    if re.fullmatch(r"\d+(?:st|nd|rd|th)", atom, re.IGNORECASE):
+        return False
     return (
         2 <= len(atom) <= 7
         and any(character.isdigit() for character in atom)
@@ -3426,6 +3616,7 @@ def _render_document(
         heading_sizes,
         repeated_margins,
     )
+    publication_years = _publication_year_evidence(pages, ocr_pages)
 
     total_pages = len(pages)
     for current, page in enumerate(pages, start=1):
@@ -3443,6 +3634,32 @@ def _render_document(
                 ocr_markdown,
                 body_size,
             )
+            if _is_toc_page(list(page.lines)):
+                ocr_markdown = _repair_toc_ocr_numeric_glyphs(
+                    page,
+                    ocr_markdown,
+                )
+        if _fragmented_graphic_text_should_stay_in_image(page, ocr_markdown):
+            if page.number in referenced_pages:
+                blocks.append(
+                    _MarkdownBlock(
+                        kind="raw",
+                        text=f'<a id="page-{page.number}"></a>',
+                        page_number=page.number,
+                    )
+                )
+            _append_page_images(blocks, page.number, page_images)
+            LOGGER.info(
+                "pdf_fragmented_graphic_text_preserved_as_image page=%d native_letters=%d "
+                "ocr_letters=%d",
+                page.number,
+                _page_letter_count(page),
+                _heading_letter_count(ocr_markdown or ""),
+            )
+            previous_body_line = None
+            if on_progress is not None:
+                on_progress(PdfProgressPhase.STRUCTURING, current, total_pages)
+            continue
         if ocr_markdown is not None and _should_replace_with_ocr(page, ocr_markdown):
             if page.number in referenced_pages:
                 blocks.append(
@@ -3487,12 +3704,18 @@ def _render_document(
                 continue
             candidate_lines.append(line)
 
+        candidate_lines = _reconcile_spaced_numeric_year(
+            candidate_lines,
+            ocr_markdown,
+            publication_years,
+        )
         toc_page = _is_toc_page(candidate_lines)
-        if toc_page and not page.has_table:
-            candidate_lines = _reconcile_suspicious_toc_numbers(
+        if toc_page:
+            candidate_lines = _reconcile_toc_numbers_with_native_priority(
                 candidate_lines,
                 ocr_markdown,
             )
+        if toc_page and not page.has_table:
             candidate_lines = _normalize_toc_entry_rows(candidate_lines)
             candidate_lines = _reconcile_toc_spacing_from_ocr(
                 candidate_lines,
@@ -3502,6 +3725,13 @@ def _render_document(
                 candidate_lines,
                 toc_heading_references,
                 toc_roman_references,
+            )
+        if toc_page:
+            # Spacing recovery may borrow a complete OCR row. Reassert the
+            # already-proven native folio sequence after that textual merge.
+            candidate_lines = _reconcile_toc_numbers_with_native_priority(
+                candidate_lines,
+                None,
             )
 
         visible_lines: list[_PdfLine] = []
@@ -3526,6 +3756,18 @@ def _render_document(
             for line in visible_lines
             if not any(_line_inside_table(line, table) for table in page.tables)
         ]
+        if toc_page:
+            # Contents pages frequently encode all-caps labels without explicit
+            # spaces even though the glyph geometry still contains clear word
+            # gaps. Apply the same conservative reconstruction already used for
+            # headings before classifying and rendering TOC rows.
+            visible_lines = [
+                replace(line, text=_display_heading_text(line), chars=()) for line in visible_lines
+            ]
+            visible_lines = _reconcile_toc_numbers_with_native_priority(
+                visible_lines,
+                None,
+            )
         skipped_rotated = skipped_rotated or skipped_vertical or skipped_noise
         if page.number in referenced_pages:
             blocks.append(
@@ -3810,6 +4052,8 @@ def _structured_table_text(rows: tuple[tuple[str, ...], ...]) -> str:
 
 
 def _should_replace_with_ocr(page: _PdfPage, ocr_markdown: str) -> bool:
+    if _fragmented_graphic_text_should_stay_in_image(page, ocr_markdown):
+        return False
     native_letters = _page_letter_count(page)
     ocr_letters = _heading_letter_count(ocr_markdown)
     native_quality = _native_page_quality(page)
@@ -3833,6 +4077,47 @@ def _should_replace_with_ocr(page: _PdfPage, ocr_markdown: str) -> bool:
             _MIN_OCR_REPLACEMENT_QUALITY, native_quality + 0.12
         )
     return False
+
+
+def _fragmented_graphic_text_should_stay_in_image(
+    page: _PdfPage,
+    ocr_markdown: str | None,
+) -> bool:
+    """Prefer a full-page visual when sparse labels cannot survive text reflow.
+
+    This deliberately requires several independent signals. A short cover title or poem remains
+    text; a chart-like page with many one- or two-character fragments remains a faithful image.
+    """
+
+    if (
+        page.has_table
+        or not ocr_markdown
+        or not any(ratio >= _FULL_PAGE_IMAGE_AREA_RATIO for ratio in page.image_area_ratios)
+        or any(line.links for line in page.lines)
+        or _MARKDOWN_TABLE_PATTERN.search(ocr_markdown)
+    ):
+        return False
+    ocr_lines = _visible_ocr_lines(ocr_markdown)
+    ocr_letters = _heading_letter_count(ocr_markdown)
+    if len(ocr_lines) < 8 or ocr_letters >= 80:
+        return False
+    lexical_ocr_words = sum(
+        sum(character.isalpha() for character in word) >= 3
+        for line in ocr_lines
+        for word in line.split()
+    )
+    if ocr_letters / len(ocr_lines) > 4.5 or lexical_ocr_words > 8:
+        return False
+
+    native_lines = tuple(
+        line for line in page.lines if not line.rotated and _LETTER_PATTERN.search(line.text)
+    )
+    native_letters = sum(_heading_letter_count(line.text) for line in native_lines)
+    if native_letters >= 80:
+        return False
+    return not native_lines or (
+        len(native_lines) >= 4 and native_letters / len(native_lines) <= 6.0
+    )
 
 
 def _table_ocr_is_faithful(page: _PdfPage, ocr_markdown: str) -> bool:
@@ -3975,8 +4260,17 @@ def _strip_native_margin_numbers_from_ocr(
         if _normalized_margin_text(stripped) in running_headers:
             lines[index] = ""
             continue
+        table_values = [
+            re.sub(r"^[*_`]+|[*_`]+$", "", cell.strip()).strip().casefold()
+            for cell in re.split(r"(?<!\\)\|", stripped.strip("|"))
+            if cell.strip()
+        ]
+        if len(table_values) == 1 and table_values[0] in margin_numbers:
+            lines[index] = ""
+            continue
+        visible_number = re.sub(r"^[*_`]+|[*_`]+$", "", stripped).strip().casefold()
         for number in margin_numbers:
-            if stripped.casefold() == number:
+            if visible_number == number:
                 lines[index] = ""
                 break
             match = re.match(
@@ -3996,10 +4290,46 @@ def _strip_native_margin_numbers_from_ocr(
     return "\n".join(compacted).strip()
 
 
+def _repair_toc_ocr_numeric_glyphs(page: _PdfPage, markdown: str) -> str:
+    """Carry uniquely repaired native TOC folios into an OCR page replacement.
+
+    OCR can win the whole-page quality comparison while still repeating the same
+    broken font-shaped number as the selectable layer. Native neighbours provide
+    stronger evidence for that one token and must survive the replacement.
+    """
+
+    native_lines = list(page.lines)
+    reconciled_lines = _reconcile_toc_numbers_with_native_priority(native_lines, markdown)
+    replacements: dict[str, str] = {}
+    for native, reconciled in zip(native_lines, reconciled_lines, strict=True):
+        if native.text == reconciled.text:
+            continue
+        for match in _SUSPICIOUS_NUMERIC_GLYPH_PATTERN.finditer(native.text):
+            prefix = native.text[: match.start()]
+            suffix = native.text[match.end() :]
+            if not reconciled.text.startswith(prefix) or not reconciled.text.endswith(suffix):
+                continue
+            end = len(reconciled.text) - len(suffix) if suffix else len(reconciled.text)
+            replacement = reconciled.text[len(prefix) : end]
+            if replacement.isdecimal():
+                replacements[match.group(0)] = replacement
+
+    repaired = markdown
+    for source, replacement in sorted(replacements.items(), key=lambda item: -len(item[0])):
+        repaired = re.sub(
+            rf"(?<!\w){re.escape(source)}(?!\w)",
+            replacement,
+            repaired,
+        )
+    return repaired
+
+
 def _ocr_additions(page: _PdfPage, ocr_markdown: str) -> str:
     if _is_toc_page(list(page.lines)) and _is_toc_markdown(ocr_markdown):
         return ""
-    native_tokens = _comparison_tokens(" ".join(line.text for line in page.lines))
+    native_text = " ".join(line.text for line in page.lines)
+    native_tokens = _comparison_tokens(native_text)
+    native_sequence = _comparison_token_sequence(native_text)
     additions: list[str] = []
     seen_additions: set[tuple[str, ...]] = set()
     for block in re.split(r"\n\s*\n", ocr_markdown):
@@ -4010,9 +4340,14 @@ def _ocr_additions(page: _PdfPage, ocr_markdown: str) -> str:
         alpha_tokens = {token for token in block_tokens if any(char.isalpha() for char in token)}
         is_table = bool(_MARKDOWN_TABLE_PATTERN.search(stripped))
         overlap = block_tokens & native_tokens
+        ordered_copy = _is_ordered_ocr_copy(
+            _comparison_token_sequence(stripped),
+            native_sequence,
+        )
         if block_tokens and (
             block_tokens.issubset(native_tokens)
             or (len(block_tokens) >= 4 and len(overlap) / len(block_tokens) >= 0.9)
+            or ordered_copy
         ):
             continue
         if not is_table and len(alpha_tokens) < 2:
@@ -4028,9 +4363,38 @@ def _ocr_additions(page: _PdfPage, ocr_markdown: str) -> str:
 
 
 def _comparison_tokens(text: str) -> set[str]:
+    return set(_comparison_token_sequence(text))
+
+
+def _comparison_token_sequence(text: str) -> tuple[str, ...]:
     without_targets = re.sub(r"\]\((?:<[^>]+>|[^)]+)\)", "]", text)
     without_targets = _normalize_text(without_targets)
-    return {token.casefold() for token in re.findall(r"[^\W_]+", without_targets, flags=re.UNICODE)}
+    return tuple(
+        token.casefold() for token in re.findall(r"[^\W_]+", without_targets, flags=re.UNICODE)
+    )
+
+
+def _is_ordered_ocr_copy(
+    ocr_tokens: tuple[str, ...],
+    native_tokens: tuple[str, ...],
+) -> bool:
+    """Recognize a noisy OCR copy without hiding a genuinely missing sentence."""
+
+    if len(ocr_tokens) < 12 or not native_tokens:
+        return False
+    matcher = SequenceMatcher(None, ocr_tokens, native_tokens, autojunk=False)
+    matching_words = sum(size for _left, _right, size in matcher.get_matching_blocks())
+    if matching_words / len(ocr_tokens) < 0.90:
+        return False
+    longest_unmatched_run = max(
+        (
+            ocr_end - ocr_start
+            for tag, ocr_start, ocr_end, _native_start, _native_end in matcher.get_opcodes()
+            if tag != "equal"
+        ),
+        default=0,
+    )
+    return longest_unmatched_run <= 4
 
 
 def _restore_page_links(markdown: str, page: _PdfPage) -> str:
@@ -4447,6 +4811,11 @@ def _omit_margin_line(
     *,
     toc_page: bool = False,
 ) -> bool:
+    strict_bottom_margin = line.top >= line.page_height * 0.92
+    if strict_bottom_margin and _is_page_number(re.sub(r"\s+", "", line.text.strip())):
+        # A TOC may legitimately contain detached folios in its body, but a lone
+        # number in the physical footer band is still the page's own running folio.
+        return True
     if toc_page and _toc_entry_page_number(line.text) is not None:
         return False
     in_top_margin = line.top <= line.page_height * 0.1
@@ -4828,7 +5197,16 @@ def _repair_suspicious_glyph_encoding(text: str) -> str:
         lambda match: "Ñ" if match.group().isupper() else "ñ",
         repaired,
     )
-    repaired = re.sub(r"([AEIOU])K(?=[A-ZÑ]|$)", accent_vowel, repaired)
+    # In the affected legacy encoding, ``K`` stands in for an acute accent before
+    # a consonant (``PRAKCTICA`` -> ``PRÁCTICA``).  Treating it as a marker before
+    # any uppercase letter corrupts ordinary English words such as ``MAKE`` and
+    # ``TAKE``.  Ambiguous vowel-to-vowel cases stay native so OCR/visual review can
+    # arbitrate them instead of silently deleting a real character.
+    repaired = re.sub(
+        r"([AEIOU])K(?=[BCDFGHJLMNPQRSTVWXYZÑ]|$)",
+        accent_vowel,
+        repaired,
+    )
     # Some embedded fonts map a digit to ``$``.  Removing every remaining
     # dollar sign used to turn a native TOC label such as ``1$.`` into ``1.``
     # before OCR had a chance to arbitrate it.  Only discard a residue still

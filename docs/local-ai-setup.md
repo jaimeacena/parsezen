@@ -5,6 +5,9 @@ direcciones configurables: la API está fijada a `127.0.0.1:11434`.
 
 Ollama solo es necesario para traducción con IA, corrección o la pre-organización automática de
 capítulos. Conversión, EPUB, OCR, personalización manual y traducción con Argos pueden usarse sin él.
+La traducción nueva usa IA local por defecto; Argos permanece como elección manual y nunca actúa como
+alternativa silenciosa. Para un PC estándar, el punto de partida recomendado es un modelo instalado
+de alrededor de 4B parámetros que aparezca en `GET /api/tags`.
 
 La cabecera comunica su estado y abre el gestor global. Allí `Instalados` permite elegir el modelo
 predeterminado y `Añadir modelo` reúne recomendaciones y descarga. Los documentos que necesitan IA
@@ -137,7 +140,9 @@ quieres resultados reproducibles.
 
 ## Validación real
 
-`Validar con IA real.cmd` recorre una muestra sintética de 20 páginas mediante el modelo elegido. El informe local
+`Validar con IA real.cmd` recorre una muestra sintética de 20 páginas mediante el modelo elegido. Los
+casos que traducen usan IA local por defecto; Argos solo se prueba al añadir explícitamente
+`--translation-engine argos` y nunca se usa para recuperarse de un fallo de Ollama. El informe local
 solo contiene fases, tiempos, tamaños, contadores de calidad y revisión, y tipos de error. La
 aprobación automática aplica únicamente los cambios que la app clasifica como conservadores. El
 informe no se incorpora al repositorio ni contiene texto documental. `OK` exige que no queden

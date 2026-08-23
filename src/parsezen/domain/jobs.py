@@ -171,7 +171,7 @@ class PageRangeConfiguration:
 @dataclass(frozen=True, slots=True)
 class TranslationConfiguration:
     enabled: bool = False
-    method: TranslationMethod = TranslationMethod.OFFLINE
+    method: TranslationMethod = TranslationMethod.LOCAL_AI
     target_language: str | None = None
     glossary: tuple[tuple[str, str], ...] = ()
 

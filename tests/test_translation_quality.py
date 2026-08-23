@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import builtins
+
 import pytest
 
 import parsezen.translation_quality as translation_quality_module
@@ -48,6 +50,67 @@ cada cláusula y rechazó la propuesta porque cambiaba el alcance original.
 print("This code remains in English")
 ```
 """
+
+
+def test_rejects_a_markdown_link_with_a_missing_closing_delimiter() -> None:
+    with pytest.raises(TranslationQualityError, match="enlace Markdown incompleto"):
+        validate_translation_quality(
+            "Read [the note](<#page-36>) before continuing.",
+            "Lee [la nota](<#page-36> antes de continuar.",
+            source_language="en",
+            target_language=None,
+            preserve_paragraphs=True,
+        )
+
+
+def test_rejects_a_new_near_duplicate_long_paragraph() -> None:
+    first_source = (
+        "The first independent paragraph explains the complete method, its historical origin, "
+        "its practical limits, and every condition required before applying the procedure. "
+        "It then gives a distinct example so the reader can verify each step safely."
+    )
+    second_source = (
+        "A separate discussion examines another technique, compares several interpretations, "
+        "and records the evidence needed to choose among them. Its conclusion concerns a wholly "
+        "different question and does not repeat the earlier explanation."
+    )
+    repeated = (
+        "El primer párrafo independiente explica el método completo, su origen histórico, sus "
+        "límites prácticos y todas las condiciones necesarias antes de aplicar el procedimiento. "
+        "Después ofrece un ejemplo distinto para verificar cada paso con seguridad."
+    )
+    near_copy = repeated.replace("primer párrafo", "segundo párrafo").replace(
+        "un ejemplo distinto",
+        "otro ejemplo",
+    )
+
+    with pytest.raises(TranslationQualityError, match="repetido un párrafo"):
+        validate_translation_quality(
+            f"{first_source}\n\n{second_source}",
+            f"{repeated}\n\n{near_copy}",
+            source_language="en",
+            target_language=None,
+            preserve_paragraphs=True,
+        )
+
+
+def test_compact_label_matching_tolerates_a_missing_ocr_possessive_apostrophe() -> None:
+    assert (
+        translation_quality_module.established_compact_label_translation(
+            "Exercise 43: A Planets Assistance from Its Domicile Lord",
+            "en",
+            "es",
+        )
+        == "ejercicio 43: ayuda de un planeta procedente de su regente domiciliario"
+    )
+    assert (
+        translation_quality_module.established_compact_label_translation(
+            "Exercise 48: The Lot of Fortune and the Domicile Lord of Fortune",
+            "en",
+            "es",
+        )
+        == "ejercicio 48: el lote de la fortuna y el regente domiciliario de la fortuna"
+    )
 
 
 @pytest.mark.parametrize(
@@ -200,6 +263,49 @@ def test_reports_an_untranslated_title_below_the_general_language_threshold() ->
     )
 
     assert report.total_issues > 0
+
+
+@pytest.mark.parametrize(
+    "title",
+    (
+        "CHOOSE YO' CHARACTER",
+        "EXPENSE CATEGORY",
+        "BIBLIOGRAPHY",
+        "INDEX",
+    ),
+)
+def test_reports_common_short_english_labels_as_untranslated(title: str) -> None:
+    report = build_translation_quality_report(
+        title,
+        title,
+        source_language="en",
+        target_language="es",
+    )
+
+    assert report.issues_by_kind[TranslationIssueKind.SOURCE_TEXT] >= 1
+
+
+def test_repair_retries_each_aligned_common_short_label_once() -> None:
+    source = "EXPENSE CATEGORY\n\nBIBLIOGRAPHY"
+    replacements = {
+        "EXPENSE CATEGORY": "CATEGORÍA DE GASTOS",
+        "BIBLIOGRAPHY": "BIBLIOGRAFÍA",
+    }
+    requested: list[str] = []
+
+    repair = repair_untranslated_source_text(
+        source,
+        source,
+        source_language="en",
+        target_language="es",
+        translate_segment=lambda source_fragment, _current: (
+            requested.append(source_fragment) or replacements[source_fragment]
+        ),
+    )
+
+    assert requested == ["EXPENSE CATEGORY", "BIBLIOGRAPHY"]
+    assert repair.repaired_segments == 2
+    assert repair.translated == "CATEGORÍA DE GASTOS\n\nBIBLIOGRAFÍA"
 
 
 def test_reports_short_spanish_index_residue_inside_an_otherwise_english_page() -> None:
@@ -453,6 +559,13 @@ def test_numeric_tokens_are_detected_even_when_adjacent_to_letters() -> None:
     assert NUMBER_PATTERN.findall("DAYS6+7 and H2O") == ["6", "7", "2"]
 
 
+def test_numeric_conservation_ignores_html_character_entity_codes() -> None:
+    assert translation_quality_module.numeric_tokens_are_conserved(
+        "House 73&#160;Meaning",
+        "Casa 73\N{NO-BREAK SPACE}Significado",
+    )
+
+
 def test_does_not_treat_a_prefixed_translation_as_an_unchanged_sentence() -> None:
     source = "Read the complete guide before continuing with the workflow."
 
@@ -474,9 +587,87 @@ def test_accepts_a_written_number_converted_to_digits_without_duplication() -> N
     )
 
 
+def test_rejects_a_changed_small_written_number_during_translation() -> None:
+    with pytest.raises(TranslationQualityError, match="cantidad escrita"):
+        validate_translation_quality(
+            "PART SEVEN: DOWN TO EARTH",
+            "PARTE SEIS: HACIA LA TIERRA",
+            source_language="en",
+            target_language="es",
+            preserve_paragraphs=True,
+        )
+
+
+def test_accepts_equivalent_small_written_numbers_and_both() -> None:
+    validate_translation_quality(
+        "PART SEVEN: TWO HOUSES",
+        "PARTE SIETE: AMBAS CASAS",
+        source_language="en",
+        target_language="es",
+        preserve_paragraphs=True,
+    )
+
+
+def test_ignores_ambiguous_written_numbers_in_ordinary_prose() -> None:
+    validate_translation_quality(
+        "Once the two sides agree, both can move forward with the plan.",
+        "Una vez que las partes se ponen de acuerdo, la pareja puede seguir adelante con el plan.",
+        source_language="en",
+        target_language="es",
+        preserve_paragraphs=True,
+    )
+
+
+def test_does_not_treat_english_once_as_the_spanish_number_eleven() -> None:
+    validate_translation_quality(
+        "# ONCE UPON A TIME",
+        "# ÉRASE UNA VEZ",
+        source_language="en",
+        target_language="es",
+        preserve_paragraphs=True,
+    )
+
+
+def test_rejects_singular_spanish_unit_for_a_plural_numeric_duration() -> None:
+    with pytest.raises(TranslationQualityError, match="duración numérica"):
+        validate_translation_quality(
+            "30 DAY MILLIONAIRE CHALLENGE",
+            "30 DÍA MILLONARIO DESAFÍO",
+            source_language="en",
+            target_language="es",
+            preserve_paragraphs=True,
+        )
+
+
+def test_accepts_reordered_plural_spanish_duration() -> None:
+    validate_translation_quality(
+        "30 DAY MILLIONAIRE CHALLENGE",
+        "DESAFÍO DEL MILLONARIO DE 30 DÍAS",
+        source_language="en",
+        target_language="es",
+        preserve_paragraphs=True,
+    )
+
+
 def test_rejects_an_ungrounded_or_duplicated_new_digit() -> None:
     assert not numeric_tokens_are_conserved("ordinary text", "texto ordinario 10")
     assert not numeric_tokens_are_conserved("ten", "diez 10")
+
+
+def test_rejects_local_paragraph_duplication_hidden_by_a_long_document() -> None:
+    source = (
+        ("A long surrounding paragraph keeps the whole-document ratio deceptively normal. " * 18)
+        + "\n\n"
+        + ("A compact footnote explains one source in sufficient detail. " * 4)
+    )
+    translated = (
+        ("Un párrafo largo circundante mantiene normal la proporción de todo el documento. " * 18)
+        + "\n\n"
+        + ("Una nota breve explica una fuente con suficiente detalle. " * 9)
+    )
+
+    with pytest.raises(TranslationQualityError, match="dentro de un párrafo"):
+        translation_quality_module._validate_content_coverage(source, translated)
 
 
 def test_rejects_a_changed_roman_numeral_in_an_index_reference() -> None:
@@ -639,6 +830,21 @@ def test_language_detection_ignores_code_and_link_destinations() -> None:
     assert detect_language_code(markdown) == "es"
     assert "print" not in natural_language_text(markdown)
     assert "https" not in natural_language_text(markdown)
+
+
+def test_language_detection_degrades_safely_when_local_detector_is_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    real_import = builtins.__import__
+
+    def import_without_langdetect(name: str, *args: object, **kwargs: object) -> object:
+        if name == "langdetect":
+            raise ImportError("dependency unavailable")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", import_without_langdetect)
+
+    assert detect_language_code("Este texto contiene suficientes palabras en español.") is None
 
 
 def test_accepts_target_prose_around_a_conserved_third_language_citation() -> None:
@@ -927,6 +1133,40 @@ def test_translation_report_does_not_treat_a_bibliography_as_untranslated_prose(
     )
 
     assert TranslationIssueKind.SOURCE_TEXT not in report.issues_by_kind
+
+
+def test_translation_report_flags_a_residual_english_yo_possessive() -> None:
+    report = build_aligned_translation_quality_report(
+        ("CHOOSE YO' CHARACTER",),
+        ("ELIGE YO' PERSONAJE",),
+        source_language="en",
+        target_language="es",
+    )
+
+    assert report.issues_by_kind[TranslationIssueKind.SOURCE_TEXT] == 1
+    assert report.review_segment_numbers == (1,)
+
+
+def test_repairs_a_residual_english_yo_possessive_as_one_aligned_unit() -> None:
+    source = "CHOOSE YO' CHARACTER"
+    translated = "ELIGE YO' PERSONAJE"
+    requested: list[tuple[str, str]] = []
+
+    def translate_segment(source_fragment: str, current_fragment: str) -> str:
+        requested.append((source_fragment, current_fragment))
+        return "ELIGE TU PERSONAJE"
+
+    repair = repair_untranslated_source_text(
+        source,
+        translated,
+        source_language="en",
+        target_language="es",
+        translate_segment=translate_segment,
+    )
+
+    assert requested == [(source, translated)]
+    assert repair.repaired_segments == 1
+    assert repair.translated == "ELIGE TU PERSONAJE"
 
 
 def test_translation_report_does_not_hide_a_long_uppercase_title() -> None:
@@ -1923,6 +2163,18 @@ def test_established_term_translation_is_available_before_document_generation() 
     )
     assert translation_quality_module.established_term_translation("unknown", "en", "es") is None
     assert (
+        translation_quality_module.established_term_translation("cusps", "en", "es") == "cúspides"
+    )
+    assert (
+        translation_quality_module.replace_established_term_residues(
+            "The remaining house cusps continue around the chart.",
+            "Las cusps restantes de las casas continúan alrededor de la carta.",
+            "en",
+            "es",
+        )
+        == "Las cúspides restantes de las casas continúan alrededor de la carta."
+    )
+    assert (
         translation_quality_module.established_term_translation(
             "Triplicity Rulerships",
             "en",
@@ -2010,6 +2262,86 @@ def test_established_term_translation_is_available_before_document_generation() 
         )
         == "regencias de los signos zodiacales"
     )
+    assert (
+        translation_quality_module.established_term_translation(
+            "The Synodic Cycle",
+            "en",
+            "es",
+        )
+        == "el ciclo sinódico"
+    )
+    assert (
+        translation_quality_module.established_term_translation(
+            "Hermetic Lots",
+            "en",
+            "es",
+        )
+        == "lotes herméticos"
+    )
+    assert (
+        translation_quality_module.established_term_translation(
+            "Cadent  Triplicity Lords ofthe Sect Light",
+            "en",
+            "es",
+        )
+        == "señores cadentes de la triplicidad de la luminaria de la secta"
+    )
+    assert (
+        translation_quality_module.replace_established_term_residues(
+            "PART SEVEN: DOWN  TO  EARTH",
+            "PART SEVEN: DOWN  TO  EARTH",
+            "en",
+            "es",
+        )
+        == "PARTE SIETE: CON LOS PIES EN LA TIERRA"
+    )
+    assert (
+        translation_quality_module.established_compact_label_translation(
+            "PART SEVEN: DOWN TO EARTH",
+            "en",
+            "es",
+        )
+        == "PARTE SIETE: CON LOS PIES EN LA TIERRA"
+    )
+    assert (
+        translation_quality_module.established_compact_label_translation(
+            "Triplicity Lords of the Sect Light, Chart Two",
+            "en",
+            "es",
+        )
+        == "señores de la triplicidad de la luminaria de la secta, carta dos"
+    )
+    assert (
+        translation_quality_module.established_compact_label_translation(
+            "Goddess (Thea)",
+            "en",
+            "es",
+        )
+        == "diosa (Thea)"
+    )
+    assert (
+        translation_quality_module.established_compact_label_translation(
+            "Introducing the Lots",
+            "en",
+            "es",
+        )
+        is None
+    )
+    assert translation_quality_module.is_probable_third_language_compact_value(
+        "kakos daimòn",
+        source_language="en",
+        target_language="es",
+    )
+    assert not translation_quality_module.is_probable_third_language_compact_value(
+        "Subterranean Place",
+        source_language="en",
+        target_language="es",
+    )
+    assert not translation_quality_module.is_probable_third_language_compact_value(
+        "Idle",
+        source_language="en",
+        target_language="es",
+    )
     assert translation_quality_module.established_terms_requiring_translation(
         "Planetary Rulership and Virgo",
         "en",
@@ -2028,6 +2360,38 @@ def test_established_term_translation_is_available_before_document_generation() 
     assert translation_quality_module.contains_established_translation_candidate(
         "Planetary Rulership"
     )
+    assert (
+        translation_quality_module.established_compact_label_translation(
+            "Delineating Planetary Meaning",
+            "en",
+            "es",
+        )
+        == "interpretación del significado planetario"
+    )
+    assert (
+        translation_quality_module.established_compact_label_translation(
+            "The Relative Angularity of the Houses",
+            "en",
+            "es",
+        )
+        == "la angularidad relativa de las casas"
+    )
+    assert (
+        translation_quality_module.established_compact_label_translation(
+            "Angularity, Favorability, Testimony",
+            "en",
+            "es",
+        )
+        == "angularidad, favorabilidad y testimonio"
+    )
+    assert (
+        translation_quality_module.established_compact_label_translation(
+            "Delineations for Chart Two",
+            "en",
+            "es",
+        )
+        == "interpretaciones de la carta dos"
+    )
 
 
 def test_title_residue_detection_does_not_reject_a_target_language_derivative() -> None:
@@ -2035,6 +2399,41 @@ def test_title_residue_detection_does_not_reject_a_target_language_derivative() 
         translation_quality_module.find_titles_with_source_language_residue(
             "- 13. PLANETARY RECEPTION 177",
             "- 13. RECEPCIÓN PLANETARIA 177",
+            "en",
+        )
+        == ()
+    )
+
+
+def test_title_residue_detection_requires_complete_ocr_joined_source_words() -> None:
+    source = (
+        "# VOLUME TWO: DELINEATING PLANETARY MEANING\n\n# THE RELATIVE ANGULARITY OF THE HOUSES"
+    )
+    translated = (
+        "# Volumen Dos: Definición del Significado Planetario\n\n"
+        "# LA ANGULARDAD RELATIVA DE LAS CASAS"
+    )
+
+    assert not translation_quality_module._has_title_language_hint(
+        "Volumen Dos: Definición del Significado Planetario",
+        "en",
+    )
+    assert not translation_quality_module._has_title_language_hint(
+        "LA ANGULARDAD RELATIVA DE LAS CASAS",
+        "en",
+    )
+    assert not translation_quality_module._has_title_language_hint(
+        "ASPECTOS",
+        "en",
+    )
+    assert translation_quality_module._has_title_language_hint(
+        "PARTSEVEN: DOWNTOEARTH",
+        "en",
+    )
+    assert (
+        translation_quality_module.find_titles_with_source_language_residue(
+            source,
+            translated,
             "en",
         )
         == ()

@@ -7,8 +7,9 @@ El nombre *Parsezen* proviene de *parse* (extraer y estructurar información) co
 Parsezen transforma PDFs, documentos de Word y otros archivos con texto, imágenes y tablas en
 Markdown limpio o en un EPUB organizado. El procesamiento directo comprueba el resultado y, solo si
 encuentra señales concretas, puede proponerte una revisión local de los bloques afectados. También
-puedes elegir de antemano una revisión completa; la traducción opcional usa Argos o un modelo local
-de Ollama y nunca envía el documento fuera del equipo. Es open source, privado y gratuito.
+puedes elegir de antemano una revisión completa. La traducción opcional usa por defecto un modelo
+local de Ollama y mantiene Argos únicamente como alternativa manual. La IA se ejecuta en Ollama y
+nunca envía el documento fuera del equipo. Es open source, privado y gratuito.
 
 
 ## Principales características
@@ -19,16 +20,23 @@ de Ollama y nunca envía el documento fuera del equipo. Es open source, privado 
 
 - **Traducción y revisión trazables**. Combina traducción algorítmica o mediante IA con
   glosarios y memoria terminológica. El resultado distingue una corrección integrada de una
-  verificación bilingüe independiente y cuenta bloques comprobados, revisados y pendientes.
+  verificación bilingüe independiente y cuenta bloques comprobados, revisados y pendientes. Las
+  comprobaciones objetivas se ejecutan primero y la revisión con IA se concentra en la prosa donde
+  todavía existe una señal concreta de texto sin traducir.
 
 - **Escalable y preparado para trabajos largos**. Trabaja con varios documentos, consulta el tiempo estimado, pausa el proceso y reanúdalo cuando quieras o repite solo la fase que haya fallado. Una pausa conserva los checkpoints reutilizables y no se registra como cancelación.
 
 - **Gratis, con IA local fácil de configurar**. Todo se procesa gratis en tu equipo, sin modificar los archivos originales. Instala Ollama, comprueba si tu equipo es compatible y elige un modelo adecuado mediante una configuración guiada y sin comandos.
 
-- **Dos traducciones locales.** Elige Argos cuando priorices rapidez y consumo predecible, o el
-  modelo local de Ollama cuando quieras una traducción dependiente de su contexto. Ambos recorridos usan el glosario,
-  la memoria terminológica y las mismas guardas de cifras, enlaces, estructura, idioma y cobertura.
-  El plan revisado es una decisión aparte y puede comprobar después cualquiera de las dos salidas.
+- **Dos traducciones locales.** La IA local de Ollama es el valor inicial; para un PC estándar se
+  recomienda un modelo instalado de aproximadamente 4B parámetros. Argos sigue disponible cuando
+  se elige expresamente, pero Parsezen no cambia a él ni lo usa en pruebas como alternativa
+  silenciosa. Ambos recorridos usan el glosario, la memoria terminológica y las mismas guardas de
+  cifras, enlaces, estructura, idioma y cobertura.
+  Las tablas se traducen por celdas alineadas sin exponer su estructura al modelo; una etiqueta
+  breve que aún conserve inglés recibe una única reparación bilingüe y solo se acepta si mantiene
+  intacta la tabla. El plan revisado es una decisión aparte y puede comprobar después cualquiera de
+  las dos salidas.
 
 - **Local, privado y gratuito.** Tus documentos permanecen en tu equipo y los originales nunca se
   modifican. Parsezen verifica su identidad local en la preparación en segundo plano antes de procesarlos y solo habilita la IA cuando
@@ -57,7 +65,10 @@ de Ollama y nunca envía el documento fuera del equipo. Es open source, privado 
 - **EPUB sin pasos innecesarios.** Antes de publicar confirmas título, autor, idioma, portada y
   capítulos. El editor completo sigue disponible cuando quieres ajustar estructura o contenido. En
   un EPUB de origen, guardar sin cambios conserva el archivo exacto y una edición solo textual
-  mantiene byte por byte navegación, estilos, fuentes, imágenes y demás recursos.
+  mantiene byte por byte navegación, estilos, fuentes, imágenes y demás recursos. Cuando la primera
+  página de un PDF se usa como portada, sus imágenes extraídas no se repiten dentro del cuerpo. La
+  página de portada queda además identificada para lectores EPUB 3 y lectores heredados, evitando
+  que un conversor compatible la añada de nuevo al inicio.
 
 - **Jerarquía conservadora.** Solo anida un contenedor explícito cuando encuentra al menos dos
   capítulos inequívocos contiguos; los casos ambiguos permanecen planos y conservan su orden.
@@ -72,8 +83,9 @@ de Ollama y nunca envía el documento fuera del equipo. Es open source, privado 
 
 - **Índices EPUB fieles.** Las entradas conservan jerarquía, negrita, cursiva, enlaces internos y
   una columna de folios alineada —también en libros de más de mil páginas—, sin convertir el índice
-  en una lista irregular. Un folio con un glifo dudoso solo se corrige cuando coinciden su fila, la
-  secuencia vecina y una lectura OCR local.
+  en una lista irregular. Los términos convencionales inequívocos se localizan sin gastar otra
+  llamada de IA. Un folio con un glifo dudoso solo se corrige cuando lo confirman el OCR local o la
+  secuencia de páginas vecinas.
 
 - **IA local sin complicaciones.** Parsezen te ayuda a instalar Ollama, comprobar tu equipo y elegir
   un modelo adecuado sin que tengas que utilizar comandos.
@@ -121,7 +133,8 @@ probarse sin arrastrar la interfaz o SQLite. Las decisiones y comandos de verifi
 Los benchmarks privados no se versionan. `scripts/benchmark_documents.py profile` mide tiempo total
 y por página, RSS, OCR y recursos de un PDF; `scripts/benchmark_runtime.py` usa solo un payload
 sintético para medir DPAPI, snapshots, recuperación, arranque en frío, disco temporal y tamaños de la
-instalación/instalador indicados.
+instalación/instalador indicados. La validación opcional con documentos reales actualiza su informe
+atómicamente después de cada caso, de modo que una interrupción conserva las métricas ya obtenidas.
 
 ## Licencia
 

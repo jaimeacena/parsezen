@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 
 import httpx
 import pytest
 
+import parsezen.ai_markdown_safety as markdown_safety_module
 import parsezen.improvement as improvement_module
 import parsezen.local_ai_transport as transport_module
 from parsezen.cancellation import CancellationToken
@@ -32,6 +34,7 @@ from parsezen.translation_quality import (
     TranslationIssueKind,
     TranslationQualityIssue,
     TranslationQualityReport,
+    build_translation_quality_report,
 )
 
 LOCAL_SETTINGS = AppSettings(
@@ -39,6 +42,66 @@ LOCAL_SETTINGS = AppSettings(
     context_window=8_192,
     timeout_seconds=30,
 )
+
+
+def test_translation_localizes_copied_english_ordinal_and_era() -> None:
+    context = improvement_module._TranslationContext(
+        source_language="en",
+        target_language="es",
+        preserve_paragraphs=True,
+    )
+
+    translated = markdown_safety_module._localize_copied_english_conventions(
+        "Part II. The tomb dates to the early 3rd millennium BC.",
+        "PART Ii. La tumba data de principios del 3rd milenio BC.",
+        context,
+    )
+
+    assert translated == "PARTE II. La tumba data de principios del 3.º milenio a. C."
+
+
+def test_translation_does_not_localize_ordinals_inside_urls_or_code() -> None:
+    context = improvement_module._TranslationContext(
+        source_language="en",
+        target_language="es",
+        preserve_paragraphs=True,
+    )
+    source = "Use `3rd` and https://example.test/3rd before the 3rd attempt."
+
+    translated = markdown_safety_module._localize_copied_english_conventions(
+        source,
+        "Usa `3rd` y https://example.test/3rd antes del 3rd intento.",
+        context,
+    )
+
+    assert translated == "Usa `3rd` y https://example.test/3rd antes del 3.º intento."
+
+
+def test_translation_localizes_copied_established_terms_but_not_literal_values() -> None:
+    source = (
+        "PartOne says Taurus and Gemini remained important in the mainstream. "
+        "See https://example.test/Taurus and `Gemini`."
+    )
+    proposed = (
+        "ParteUno dice que Taurus y Gemini siguieron siendo importantes en el mainstream. "
+        "Véase https://example.test/Taurus y `Gemini`."
+    )
+    context = improvement_module._TranslationContext(
+        source_language="en",
+        target_language="es",
+        preserve_paragraphs=True,
+    )
+
+    translated = markdown_safety_module._localize_copied_english_conventions(
+        source,
+        proposed,
+        context,
+    )
+
+    assert translated == (
+        "Parte uno dice que Tauro y Géminis siguieron siendo importantes en el ámbito general. "
+        "Véase https://example.test/Taurus y `Gemini`."
+    )
 
 
 def test_quality_guided_review_selects_risky_neighbors_and_a_distributed_clean_sample() -> None:
@@ -85,6 +148,127 @@ def test_quality_guided_review_falls_back_to_every_part_for_an_unanchored_issue(
     assert improvement_module._quality_guided_translation_review_indexes(parts, report) == tuple(
         range(5)
     )
+
+
+def test_quality_guided_review_prefers_stable_segments_over_a_stale_excerpt() -> None:
+    parts = tuple(
+        improvement_module._TranslationReviewPart(
+            f"Source {index} with complete context.",
+            f"Destino {index} con contexto completo.",
+            frozenset({index + 1}),
+        )
+        for index in range(8)
+    )
+    issue = TranslationQualityIssue(
+        1,
+        TranslationIssueKind.SOURCE_TEXT,
+        "Revisar",
+        "Excerpt changed by a guarded repair.",
+        "Extracto ya sustituido por una reparación segura.",
+        "stale-excerpt",
+    )
+    report = TranslationQualityReport(
+        "en",
+        "es",
+        "es",
+        8,
+        100,
+        100,
+        1,
+        (issue,),
+        review_segment_numbers=(4,),
+    )
+
+    assert improvement_module._quality_guided_translation_review_indexes(parts, report) == (
+        0,
+        2,
+        3,
+        4,
+    )
+
+
+def test_quality_guided_review_keeps_every_risky_pdf_segment_beyond_excerpt_cap() -> None:
+    source = "\n\n".join(
+        f"<!-- PZDOC PDF PAGE {page} -->\n\n"
+        f"This original page {page} contains substantial English prose that remains untranslated."
+        for page in range(1, 26)
+    )
+    report = build_translation_quality_report(
+        source,
+        source,
+        source_language="en",
+        target_language="es",
+    )
+    parts = improvement_module._plan_translation_review_parts(source, source)
+
+    assert len(report.issues) == 20
+    assert report.total_issues > len(report.issues)
+    assert report.review_segment_numbers == tuple(range(1, 26))
+    assert not report.requires_full_review
+    assert improvement_module._quality_guided_translation_review_indexes(parts, report) == tuple(
+        range(len(parts))
+    )
+
+
+def test_quality_guided_review_expands_when_a_hidden_issue_has_no_safe_position() -> None:
+    parts = tuple(
+        improvement_module._TranslationReviewPart(
+            f"Source {index} with complete context.",
+            f"Destino {index} con contexto completo.",
+        )
+        for index in range(4)
+    )
+    report = TranslationQualityReport(
+        "en",
+        "es",
+        "es",
+        4,
+        100,
+        100,
+        21,
+        (),
+        requires_full_review=True,
+    )
+
+    assert improvement_module._quality_guided_translation_review_indexes(parts, report) == (
+        0,
+        1,
+        2,
+        3,
+    )
+
+
+def test_quality_guided_review_uses_prose_sample_instead_of_markdown_table() -> None:
+    table = "| Topic | Meaning |\n| --- | --- |\n| House | Interpretation |\n"
+    parts = (
+        improvement_module._TranslationReviewPart(table, table, frozenset({1})),
+        improvement_module._TranslationReviewPart(
+            "A complete prose paragraph for comparison.\n",
+            "Un párrafo completo para comparar.\n",
+            frozenset({2}),
+        ),
+    )
+    issue = TranslationQualityIssue(
+        1,
+        TranslationIssueKind.FIDELITY,
+        "Revisar",
+        "Topic Meaning House Interpretation",
+        "Topic Meaning House Interpretation",
+        "table-risk",
+    )
+    report = TranslationQualityReport(
+        "en",
+        "es",
+        "es",
+        2,
+        100,
+        100,
+        1,
+        (issue,),
+        review_segment_numbers=(1,),
+    )
+
+    assert improvement_module._quality_guided_translation_review_indexes(parts, report) == (1,)
 
 
 def test_translation_chunks_receive_a_bounded_hierarchical_book_context() -> None:
@@ -251,7 +435,8 @@ def test_bilingual_review_runs_a_focused_second_pass_for_embedded_source_words()
         if calls == 1:
             content = "[]"
         else:
-            assert "forma FOCUS" in payload["messages"][0]["content"]
+            assert "lista FOCUS" in payload["messages"][0]["content"]
+            assert 'FOCUS=["decans", "scholarship"]' in payload["messages"][1]["content"]
             content = json.dumps(
                 [
                     {"old": "decans", "new": "decanos"},
@@ -271,7 +456,7 @@ def test_bilingual_review_runs_a_focused_second_pass_for_embedded_source_words()
 
     assert "Los decanos" in result
     assert "tradiciÃ³n acadÃ©mica" in result
-    assert calls == 3
+    assert calls == 2
     assert progress == [(1, 2), (2, 2)]
 
 
@@ -295,7 +480,7 @@ def test_residual_review_sends_only_each_aligned_line_with_residue() -> None:
         elif calls == 2:
             assert "decans" in prompt
             assert "gaggles" not in prompt
-            assert 'FOCUS="decans"' in prompt
+            assert 'FOCUS=["decans"]' in prompt
             content = json.dumps(
                 [
                     {"old": "decans", "new": "decanos"},
@@ -306,17 +491,13 @@ def test_residual_review_sends_only_each_aligned_line_with_residue() -> None:
         elif calls == 3:
             assert "gaggles" in prompt
             assert "decans" not in prompt
-            assert 'FOCUS="gaggles"' in prompt
+            assert 'FOCUS=["gaggles", "scholarship"]' in prompt
             content = json.dumps(
                 [
                     {"old": "gaggles", "new": "grupos"},
                     {"old": "scholarship", "new": "tradición académica"},
                 ]
             )
-        else:
-            assert "scholarship" in prompt
-            assert 'FOCUS="scholarship"' in prompt
-            content = json.dumps([{"old": "scholarship", "new": "tradición académica"}])
         return httpx.Response(200, json={"message": {"content": content}})
 
     result = review_translation_markdown(
@@ -331,7 +512,7 @@ def test_residual_review_sends_only_each_aligned_line_with_residue() -> None:
         "Los decanos conservan la primera tradición.\n"
         "Los grupos conservan un cuerpo de tradición académica.\n"
     )
-    assert calls == 4
+    assert calls == 3
 
 
 def test_residual_review_prioritizes_a_rare_one_edit_variant() -> None:
@@ -374,6 +555,82 @@ def test_residual_review_prioritizes_the_final_report_source_text_signal(
     )
 
     assert selected == (1,)
+
+
+def test_residual_review_uses_only_reported_source_text_prose_segments() -> None:
+    table = "| Topic | Meaning |\n| --- | --- |\n| House | Interpretation |\n"
+    prose = "A short English sentence remains entirely untranslated.\n"
+    parts = (
+        improvement_module._TranslationReviewPart(table, table, frozenset({1})),
+        improvement_module._TranslationReviewPart(prose, prose, frozenset({2})),
+    )
+    issues = (
+        TranslationQualityIssue(
+            1,
+            TranslationIssueKind.SOURCE_TEXT,
+            "Revisar",
+            "Topic Meaning House Interpretation",
+            "Topic Meaning House Interpretation",
+            "table-source-text",
+        ),
+        TranslationQualityIssue(
+            2,
+            TranslationIssueKind.SOURCE_TEXT,
+            "Revisar",
+            prose,
+            prose,
+            "prose-source-text",
+        ),
+    )
+    report = TranslationQualityReport(
+        "en",
+        "es",
+        "en",
+        2,
+        100,
+        100,
+        2,
+        issues,
+        review_segment_numbers=(1, 2),
+    )
+
+    selected = improvement_module._plan_residual_translation_review_part_indexes(
+        parts,
+        table + prose,
+        source_language="en",
+        target_language="es",
+        quality_report=report,
+    )
+
+    assert selected == (1,)
+
+
+def test_residual_review_does_not_chase_non_source_text_report_warnings() -> None:
+    part = improvement_module._TranslationReviewPart(
+        "An original sentence with a specialist term.\n",
+        "Una frase traducida con specialist como término técnico.\n",
+        frozenset({1}),
+    )
+    issue = TranslationQualityIssue(
+        1,
+        TranslationIssueKind.FIDELITY,
+        "Revisar",
+        part.source,
+        part.translated,
+        "fidelity-only",
+    )
+    report = TranslationQualityReport("en", "es", "es", 1, 50, 60, 1, (issue,))
+
+    assert (
+        improvement_module._plan_residual_translation_review_part_indexes(
+            (part,),
+            part.translated,
+            source_language="en",
+            target_language="es",
+            quality_report=report,
+        )
+        == ()
+    )
 
 
 def test_residual_review_does_not_retranslate_a_reference_catalogue() -> None:
@@ -868,7 +1125,7 @@ def test_residual_review_caches_safe_preservation_after_rejected_cleanup() -> No
     )
 
     assert first == resumed == translated
-    assert calls == 3
+    assert calls == 2
     assert len(cache) == 2
 
 
@@ -903,15 +1160,19 @@ def test_bilingual_review_logs_a_private_document_validation_reason(
     assert translated.strip() not in caplog.text
 
 
-def test_bilingual_review_rejects_unaligned_source_and_translation() -> None:
-    with pytest.raises(ImprovementError, match="alinear"):
-        review_translation_markdown(
-            "First.\n\nSecond.\n",
-            "Primero y segundo en un solo bloque.\n",
-            LOCAL_SETTINGS,
-            "es",
-            transport=httpx.MockTransport(lambda _request: pytest.fail("Unexpected request")),
-        )
+def test_bilingual_review_safely_skips_unaligned_source_and_translation(caplog) -> None:
+    translated = "Primero y segundo en un solo bloque.\n"
+
+    result = review_translation_markdown(
+        "First.\n\nSecond.\n",
+        translated,
+        LOCAL_SETTINGS,
+        "es",
+        transport=httpx.MockTransport(lambda _request: pytest.fail("Unexpected request")),
+    )
+
+    assert result == translated
+    assert "translation_review_skipped alignment_unavailable=true" in caplog.text
 
 
 def test_bilingual_review_splits_aligned_long_line_sequences_without_loss() -> None:
@@ -1430,6 +1691,255 @@ def test_local_ai_translation_preserves_an_all_caps_heading() -> None:
     assert result == "## CREA TU VISIÓN"
 
 
+def test_translation_resolves_an_emphasized_established_label_without_a_model() -> None:
+    result = improve_markdown(
+        "**TAURUS**",
+        ImprovementMode.TRANSLATE,
+        LOCAL_SETTINGS,
+        "Español",
+        transport=httpx.MockTransport(lambda _request: pytest.fail("Unexpected request")),
+        source_language_code="en",
+    )
+
+    assert result == "**TAURO**"
+
+
+def test_locked_value_fallback_translates_a_short_numeric_label() -> None:
+    requests: list[str] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        content = json.loads(request.content)["messages"][1]["content"]
+        requests.append(content)
+        return httpx.Response(200, json={"message": {"content": "Tabla"}})
+
+    with httpx.Client(transport=httpx.MockTransport(respond)) as client:
+        translated = improvement_module._improve_translation_with_locked_values(
+            client,
+            "parsezen-local",
+            8_192,
+            build_instructions(ImprovementMode.TRANSLATE, "Español"),
+            "Table 1 / 2 / 3",
+            improvement_module._TranslationContext("en", "es", True),
+            None,
+        )
+
+    assert requests == ["Table"]
+    assert translated == "Tabla 1 / 2 / 3"
+
+
+def test_short_pdf_headings_are_translated_in_one_aligned_batch() -> None:
+    headings = (
+        ("BUILD YOUR VISION", "CONSTRUYE TU VISIÓN"),
+        ("DEFINE YOUR GOALS", "DEFINE TUS METAS"),
+        ("CHOOSE YOUR FUTURE", "ELIGE TU FUTURO"),
+        ("CREATE YOUR PLAN", "CREA TU PLAN"),
+        ("REVIEW YOUR PROGRESS", "REVISA TU PROGRESO"),
+        ("CELEBRATE YOUR SUCCESS", "CELEBRA TU ÉXITO"),
+    )
+    source = "\n\n".join(
+        f"<!-- PZDOC PDF PAGE {index} -->\n\n## {heading}"
+        for index, (heading, _translation) in enumerate(headings, 1)
+    )
+    translations = dict(headings)
+    calls = 0
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        request_payload = json.loads(request.content)
+        assert request_payload["format"] == "json"
+        batch = json.loads(request_payload["messages"][1]["content"])
+        response_items = [
+            {"id": item["id"], "text": translations[item["text"]]} for item in batch["items"]
+        ]
+        return httpx.Response(
+            200,
+            json={"message": {"content": json.dumps({"items": response_items})}},
+        )
+
+    result = improve_markdown(
+        source,
+        ImprovementMode.TRANSLATE,
+        LOCAL_SETTINGS,
+        "Español",
+        transport=httpx.MockTransport(respond),
+        source_language_code="en",
+    )
+
+    assert calls == 1
+    assert all(translation in result for _source, translation in headings)
+    assert all(source_heading not in result for source_heading, _translation in headings)
+    assert result.count("<!-- PZDOC PDF PAGE") == len(headings)
+
+
+def test_segmented_list_fallback_reuses_aligned_batching() -> None:
+    translations = {
+        "Build a practical vision.": "Construye una visión práctica.",
+        "Define every relevant goal.": "Define cada meta relevante.",
+        "Choose a realistic future.": "Elige un futuro realista.",
+        "Create a careful plan.": "Crea un plan cuidadoso.",
+        "Review measurable progress.": "Revisa el progreso medible.",
+        "Celebrate meaningful success.": "Celebra un éxito significativo.",
+    }
+    source = "\n".join(f"- {text}" for text in translations)
+    calls = 0
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        request_payload = json.loads(request.content)
+        batch = json.loads(request_payload["messages"][1]["content"])
+        response_items = [
+            {"id": item["id"], "text": translations[item["text"]]} for item in batch["items"]
+        ]
+        return httpx.Response(
+            200,
+            json={"message": {"content": json.dumps({"items": response_items})}},
+        )
+
+    with httpx.Client(transport=httpx.MockTransport(respond)) as client:
+        result = improvement_module._improve_translation_segments(
+            client,
+            "parsezen-local",
+            8_192,
+            build_instructions(ImprovementMode.TRANSLATE, "Español"),
+            source,
+            improvement_module._TranslationContext("en", "es", True),
+            None,
+        )
+
+    assert calls == 1
+    assert result == "\n".join(f"- {text}" for text in translations.values())
+
+
+def test_segmented_short_titles_receive_bounded_neighbor_context() -> None:
+    source = "CHOOSE YO'\nCHARACTER"
+    requests: list[tuple[str, str]] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        request_payload = json.loads(request.content)
+        system_prompt = request_payload["messages"][0]["content"]
+        content = request_payload["messages"][1]["content"]
+        requests.append((system_prompt, content))
+        translated = "ELIGE TU" if content == "CHOOSE YO'" else "PERSONAJE"
+        return httpx.Response(
+            200,
+            json={"message": {"content": translated}},
+        )
+
+    with httpx.Client(transport=httpx.MockTransport(respond)) as client:
+        result = improvement_module._improve_translation_segments(
+            client,
+            "parsezen-local",
+            8_192,
+            build_instructions(ImprovementMode.TRANSLATE, "Español"),
+            source,
+            improvement_module._TranslationContext("en", "es", True),
+            None,
+        )
+
+    assert result == "ELIGE TU\nPERSONAJE"
+    assert requests[0][1] == "CHOOSE YO'"
+    assert "CHARACTER" in requests[0][0]
+    assert requests[1][1] == "CHARACTER"
+    assert "CHOOSE YO'" in requests[1][0]
+
+
+def test_translation_discards_an_echoed_list_marker_before_restoring_the_source_prefix() -> None:
+    requests: list[str] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        content = json.loads(request.content)["messages"][1]["content"]
+        requests.append(content)
+        return httpx.Response(200, json={"message": {"content": "- Lee la guía completa."}})
+
+    result = improve_markdown(
+        "- Read the complete guide.",
+        ImprovementMode.TRANSLATE,
+        LOCAL_SETTINGS,
+        "Español",
+        transport=httpx.MockTransport(respond),
+        source_language_code="en",
+    )
+
+    assert requests == ["Read the complete guide."]
+    assert result == "- Lee la guía completa."
+
+
+def test_translation_discards_a_list_marker_added_to_an_unmarked_title() -> None:
+    requests: list[str] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        content = json.loads(request.content)["messages"][1]["content"]
+        requests.append(content)
+        return httpx.Response(
+            200,
+            json={"message": {"content": "- Interpretación de la condición planetaria"}},
+        )
+
+    result = improve_markdown(
+        "Interpreting planetary condition",
+        ImprovementMode.TRANSLATE,
+        LOCAL_SETTINGS,
+        "Español",
+        transport=httpx.MockTransport(respond),
+        source_language_code="en",
+    )
+
+    assert requests == ["Interpreting planetary condition"]
+    assert result == "Interpretación de la condición planetaria"
+
+
+def test_translation_expands_unambiguous_english_yo_possessive_only_for_the_model() -> None:
+    requests: list[str] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        content = json.loads(request.content)["messages"][1]["content"]
+        requests.append(content)
+        return httpx.Response(200, json={"message": {"content": "ELIGE TU PERSONAJE"}})
+
+    result = improve_markdown(
+        "## CHOOSE YO' CHARACTER",
+        ImprovementMode.TRANSLATE,
+        LOCAL_SETTINGS,
+        "Español",
+        transport=httpx.MockTransport(respond),
+        source_language_code="en",
+    )
+
+    assert requests == ["CHOOSE YOUR CHARACTER"]
+    assert result == "## ELIGE TU PERSONAJE"
+
+
+def test_empty_private_image_reference_never_reaches_the_translation_model() -> None:
+    source = (
+        "This complete paragraph needs a faithful translation.\n\n"
+        "![](<__parsezen_resources__/pdf/page-0001-image-01.jpg>)"
+    )
+    calls = 0
+
+    def respond(_request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(
+            200,
+            json={"message": {"content": "Este párrafo completo necesita una traducción fiel."}},
+        )
+
+    result = improve_markdown(
+        source,
+        ImprovementMode.TRANSLATE,
+        LOCAL_SETTINGS,
+        "Español",
+        transport=httpx.MockTransport(respond),
+        source_language_code="en",
+    )
+
+    assert calls == 1
+    assert "Este párrafo completo" in result
+    assert "![](<__parsezen_resources__/pdf/page-0001-image-01.jpg>)" in result
+
+
 def test_uppercase_normalization_does_not_change_protected_link_destinations() -> None:
     source = "# VISIT OUR SITE"
     translated = "# Visita [nuestro sitio](https://Example.com/Path)"
@@ -1517,6 +2027,32 @@ def test_initial_translation_request_omits_lexical_attention_without_candidates(
     assert "Condición léxica de aceptación" not in prompts[0]
 
 
+def test_focused_source_repair_explicitly_forbids_copying_residual_prose() -> None:
+    prompts: list[str] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        prompts.append(payload["messages"][0]["content"])
+        return httpx.Response(
+            200,
+            json={"message": {"content": "El horizonte separa ambos hemisferios."}},
+        )
+
+    result = improve_markdown(
+        "The horizon separates both hemispheres.",
+        ImprovementMode.TRANSLATE,
+        LOCAL_SETTINGS,
+        "Español",
+        transport=httpx.MockTransport(respond),
+        source_language_code="en",
+        focused_source_repair=True,
+    )
+
+    assert result == "El horizonte separa ambos hemisferios."
+    assert "conservó prosa en el idioma de origen" in prompts[0]
+    assert "No copies ninguna oración" in prompts[0]
+
+
 def test_established_term_is_grounded_without_asking_model_to_classify_it() -> None:
     source = "Rulership defines an essential planetary dignity."
     requests: list[str] = []
@@ -1546,7 +2082,7 @@ def test_established_term_is_grounded_without_asking_model_to_classify_it() -> N
     assert "lexicógrafo" not in requests[0]
 
 
-def test_short_index_term_keeps_the_document_source_language(
+def test_short_index_term_uses_the_document_source_language_without_a_model_call(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     fragments: list[str] = []
@@ -1568,11 +2104,10 @@ def test_short_index_term_keeps_the_document_source_language(
     )
 
     assert result == "54. RESUMEN Y LECTURAS DE FUENTES 525"
-    assert fragments
-    assert all("SUMMARY AND SOURCE READINGS" not in fragment for fragment in fragments)
+    assert fragments == []
 
 
-def test_structural_title_is_fully_grounded_before_the_model_request() -> None:
+def test_fully_grounded_structural_title_skips_the_model_request() -> None:
     fragments: list[str] = []
 
     def respond(request: httpx.Request) -> httpx.Response:
@@ -1591,9 +2126,7 @@ def test_structural_title_is_fully_grounded_before_the_model_request() -> None:
     )
 
     assert result == "PARTE SEIS: EL ARTE DEL JUICIO 531"
-    assert len(fragments) == 1
-    assert "PART SIX" not in fragments[0]
-    assert "ART OF JUDGMENT" not in fragments[0]
+    assert fragments == []
 
 
 def test_bilingual_review_cannot_degrade_an_established_equivalent() -> None:
@@ -1662,7 +2195,12 @@ def test_long_translation_with_risky_word_is_segmented_before_initial_generation
     assert "scholarship" not in result
     assert len(requested_fragments) > 1
     assert all(
-        len(fragment) <= improvement_module.MAX_FOCUSED_LEXICAL_TRANSLATION_CHARACTERS
+        all(
+            len(item["text"]) <= improvement_module.MAX_FOCUSED_LEXICAL_TRANSLATION_CHARACTERS
+            for item in json.loads(fragment)["items"]
+        )
+        if fragment.startswith('{"items":')
+        else len(fragment) <= improvement_module.MAX_FOCUSED_LEXICAL_TRANSLATION_CHARACTERS
         for fragment in requested_fragments
     )
 
@@ -1886,6 +2424,69 @@ def test_translation_segment_fallback_preserves_list_prefixes_locally() -> None:
     assert calls == 4
 
 
+def test_translation_segment_fallback_recurses_into_a_list_paragraph(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    introduction = "This introduction explains the complete exercise."
+    list_block = "- Read the complete guide.\n- Keep every useful detail."
+    source = f"{introduction}\n\n{list_block}"
+    context = improvement_module._TranslationContext("en", "es", True)
+    calls: list[str] = []
+    translations = {
+        introduction: "Esta introducción explica el ejercicio completo.",
+        "- Read the complete guide.": "- Lee la guía completa.",
+        "- Keep every useful detail.": "- Conserva cada detalle útil.",
+    }
+
+    monkeypatch.setattr(
+        improvement_module,
+        "_aligned_translation_batch_item",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        improvement_module,
+        "_prepare_and_validate_response",
+        lambda _source, response, *_args, **_kwargs: response,
+    )
+
+    def translate_part(
+        _client: httpx.Client,
+        _model: str,
+        _context_window: int,
+        _instructions: str,
+        markdown: str,
+        **_kwargs: object,
+    ) -> str:
+        calls.append(markdown)
+        if markdown == list_block:
+            raise ImprovementError("La traducción cambió la estructura de las listas.")
+        return translations[markdown]
+
+    monkeypatch.setattr(improvement_module, "_improve_part", translate_part)
+    with httpx.Client() as client:
+        translated = improvement_module._improve_translation_segments(
+            client,
+            "parsezen-local",
+            8_192,
+            "Translate",
+            source,
+            context,
+            None,
+        )
+
+    assert translated == (
+        "Esta introducción explica el ejercicio completo.\n\n"
+        "- Lee la guía completa.\n- Conserva cada detalle útil."
+    )
+    assert calls == [
+        introduction,
+        list_block,
+        "- Read the complete guide.",
+        "- Keep every useful detail.",
+    ]
+    assert context.preserved_segments == []
+
+
 def test_translation_segment_fallback_keeps_each_toc_folio_attached() -> None:
     source = "- FIRST HOUSE 10\n- SECOND HOUSE 20"
     calls = 0
@@ -2033,6 +2634,17 @@ def test_translation_repairs_individual_lines_in_a_dense_index() -> None:
         calls += 1
         payload = json.loads(request.content)
         content = payload["messages"][1]["content"]
+        if content.startswith('{"items":'):
+            batch = json.loads(content)
+            response_items = []
+            for item, translated_line in zip(batch["items"], translated_lines, strict=True):
+                protected_number = item["text"].rsplit(" ", 1)[1]
+                translated_text = f"{translated_line.rsplit(' ', 1)[0]} {protected_number}"
+                response_items.append({"id": item["id"], "text": translated_text})
+            return httpx.Response(
+                200,
+                json={"message": {"content": json.dumps({"items": response_items})}},
+            )
         translated = translations.get(content, content)
         return httpx.Response(200, json={"message": {"content": translated}})
 
@@ -2045,7 +2657,7 @@ def test_translation_repairs_individual_lines_in_a_dense_index() -> None:
     )
 
     assert result == "\n".join(translated_lines)
-    assert calls == 1 + len(source_lines)
+    assert calls == 2
 
 
 def test_translation_repairs_a_partially_translated_line_in_a_dense_index() -> None:
@@ -2137,6 +2749,62 @@ def test_translation_repairs_an_unchanged_title_with_one_focused_request() -> No
 
     assert result.startswith("DESAFÍO DEL MILLONARIO EN 30 DÍAS\n\nEste párrafo")
     assert calls == 3
+
+
+def test_bilingual_title_retranslation_allows_a_complete_short_label_translation() -> None:
+    def respond(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "message": {
+                    "content": "Imágenes del Picatrix",
+                }
+            },
+        )
+
+    result = improvement_module.retranslate_residual_title(
+        "9. Images from the Picatrix",
+        "9. Images from the Picatrix",
+        LOCAL_SETTINGS,
+        "Español",
+        source_language_code="en",
+        transport=httpx.MockTransport(respond),
+    )
+
+    assert result == "9. Imágenes del Picatrix"
+
+
+def test_bilingual_title_retranslation_protects_written_cardinals_semantically() -> None:
+    requests: list[str] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        protected_title = payload["messages"][1]["content"]
+        requests.append(protected_title)
+        marker_match = re.search(r"PZDOCCARD[A-Z]+XZQ", protected_title)
+        assert marker_match is not None
+        marker = marker_match.group(0)
+        return httpx.Response(
+            200,
+            json={
+                "message": {
+                    "content": f"PARTE {marker}: CON LOS PIES EN LA TIERRA",
+                }
+            },
+        )
+
+    result = improvement_module.retranslate_residual_title(
+        "PART SEVEN: DOWN TO EARTH",
+        "PARTE SIETE: DOWN TOEARTH",
+        LOCAL_SETTINGS,
+        "Español",
+        source_language_code="en",
+        transport=httpx.MockTransport(respond),
+    )
+
+    assert result == "PARTE SIETE: CON LOS PIES EN LA TIERRA"
+    assert len(requests) == 1
+    assert "SEVEN" not in requests[0]
 
 
 def test_focused_title_repair_detaches_a_list_prefix_and_protects_its_folio(
@@ -2267,6 +2935,86 @@ def test_translation_protects_formulas_and_reference_identifiers_before_the_requ
     assert "[12-14]" not in protected.text
     assert "doi:10.1000/XYZ-123" not in protected.text
     assert "978-1-4028-9462-6" not in protected.text
+
+
+def test_translation_protects_complete_numeric_footnote_links() -> None:
+    source = "The source explains the method.[6](<#page-36>) [7](<#page-36>)"
+
+    protected = improvement_module._protect_translation_values(
+        source,
+        protect_headings=False,
+        protect_paragraphs=False,
+    )
+
+    assert {value.value for value in protected.values} == {
+        "[6](<#page-36>)",
+        "[7](<#page-36>)",
+    }
+    assert "page-36" not in protected.text
+    assert improvement_module._restore_protected_values(protected.text, protected.values) == source
+
+
+def test_translation_protects_short_foreign_terms_inside_emphasis() -> None:
+    source = (
+        "The Greek verb *chrēmatizō*, the noun *oikonomia* and *Tetrabiblos* remain exact, "
+        "while *business* is ordinary English prose."
+    )
+
+    protected = improvement_module._protect_translation_values(
+        source,
+        protect_headings=False,
+        protect_paragraphs=False,
+        foreign_emphasis_languages=("en", "es"),
+    )
+    protected_values = {value.value for value in protected.values}
+
+    assert {"chrēmatizō", "oikonomia", "Tetrabiblos"} <= protected_values
+    assert "business" not in protected_values
+    assert improvement_module._restore_protected_values(protected.text, protected.values) == source
+
+
+def test_translation_protects_macron_transliterations_without_pdf_inline_emphasis() -> None:
+    source = "The terms chrēmatizō and chrēmatistikos remain exact in translated prose."
+
+    protected = improvement_module._protect_translation_values(
+        source,
+        protect_headings=False,
+        protect_paragraphs=False,
+        foreign_emphasis_languages=("en", "es"),
+    )
+
+    assert {value.value for value in protected.values} == {
+        "chrēmatizō",
+        "chrēmatistikos",
+    }
+    assert improvement_module._restore_protected_values(protected.text, protected.values) == source
+
+
+def test_translation_fallback_can_split_sentences_inside_whole_line_emphasis() -> None:
+    parts = improvement_module._translation_fallback_parts(
+        "*The first sentence needs translation. The second sentence needs translation.*"
+    )
+
+    assert "".join(part.text for part in parts) == (
+        "*The first sentence needs translation. The second sentence needs translation.*"
+    )
+    assert [part.text for part in parts if part.should_improve] == [
+        "The first sentence needs translation.",
+        "The second sentence needs translation.",
+    ]
+
+
+def test_translation_fallback_splits_a_long_single_sentence_at_safe_clauses() -> None:
+    source = (
+        "In this system the first house begins at the degree of the Ascendant, "
+        "each following house uses the same interval for its boundary, "
+        "and the remaining divisions continue around the complete chart without omission"
+    )
+
+    parts = improvement_module._translation_fallback_parts(source)
+
+    assert "".join(part.text for part in parts) == source
+    assert len([part for part in parts if part.should_improve]) >= 2
 
 
 def test_bilingual_residual_title_retries_once_when_source_words_remain() -> None:
@@ -2578,6 +3326,22 @@ def test_translation_localizes_an_established_term_copied_inside_a_toc_entry() -
     assert restored == "- 1. Esquemas de regencia Planetaria Principal 274"
 
 
+def test_translation_restores_an_exact_emphasized_running_title() -> None:
+    context = improvement_module._TranslationContext(
+        source_language="en",
+        target_language="es",
+        preserve_paragraphs=True,
+    )
+
+    restored = improvement_module._restore_established_index_classifications(
+        "*Part One*\n",
+        "*ParteUno*\n",
+        context,
+    )
+
+    assert restored == "*Parte uno*\n"
+
+
 def test_translation_repairs_established_classifications_loaded_from_cache() -> None:
     source = "- VIRGO I 138\n- VIRGO II 144\n- VIRGO III 150"
     cached = "- TÁRIGO I 138\n- TÁRIGO II 144\n- TURIA III 150"
@@ -2599,6 +3363,30 @@ def test_translation_repairs_established_classifications_loaded_from_cache() -> 
 
     assert result == source
     assert saved == [source]
+
+
+def test_translation_upgrades_copied_conventions_loaded_from_cache() -> None:
+    source = "During the 3rd century BC, Taurus entered the mainstream of practice."
+    cached = "Durante el siglo 3rd BC, Taurus entró en el mainstream de la práctica."
+    saved: list[str] = []
+
+    def unexpected_request(_request: httpx.Request) -> httpx.Response:
+        raise AssertionError("A repairable cache entry must not call the model.")
+
+    result = improve_markdown(
+        source,
+        ImprovementMode.TRANSLATE,
+        LOCAL_SETTINGS,
+        "Español",
+        source_language_code="en",
+        transport=httpx.MockTransport(unexpected_request),
+        load_checkpoint=lambda _key: cached,
+        save_checkpoint=lambda _key, value: saved.append(value) or True,
+    )
+
+    expected = "Durante el siglo 3.º a. C., Tauro entró en el ámbito general de la práctica."
+    assert result == expected
+    assert saved == [expected]
 
 
 def test_translation_restores_a_plain_marker_wrapped_in_an_html_comment() -> None:
@@ -3109,32 +3897,38 @@ def test_global_structure_preserves_document_on_invalid_or_unsafe_directives(
     assert result == source
 
 
-def test_translation_recovers_table_rows_when_a_full_response_breaks_the_table() -> None:
+def test_translation_changes_only_markdown_table_cells() -> None:
     source = (
         "| Topic | Description |\n"
         "| --- | --- |\n"
         "| First house | This section explains the first astrological house clearly. |\n"
         "| Second house | This section explains the second astrological house clearly. |"
     )
-    translations = {
-        "| Topic | Description |": "| Tema | Descripción |",
-        (
-            "| First house | This section explains the first astrological house clearly. |"
-        ): "| Primera casa | Esta sección explica claramente la primera casa astrológica. |",
-        (
-            "| Second house | This section explains the second astrological house clearly. |"
-        ): "| Segunda casa | Esta sección explica claramente la segunda casa astrológica. |",
-    }
 
     def respond(request: httpx.Request) -> httpx.Response:
         payload = json.loads(request.content)
         content = payload["messages"][1]["content"]
-        translated = (
-            content.replace("| --- | --- |\n", "")
-            if "\n" in content
-            else translations.get(content, content)
+        assert "|" not in content
+        translations = {
+            "Topic": "Tema",
+            "Description": "Descripción",
+            "First house": "Primera casa",
+            "This section explains the first astrological house clearly.": (
+                "Esta sección explica claramente la primera casa astrológica."
+            ),
+            "Second house": "Segunda casa",
+            "This section explains the second astrological house clearly.": (
+                "Esta sección explica claramente la segunda casa astrológica."
+            ),
+        }
+        items = json.loads(content)["items"]
+        translated = {
+            "items": [{"id": item["id"], "text": translations[item["text"]]} for item in items]
+        }
+        return httpx.Response(
+            200,
+            json={"message": {"content": json.dumps(translated)}},
         )
-        return httpx.Response(200, json={"message": {"content": translated}})
 
     result = improve_markdown(
         source,
@@ -3228,6 +4022,98 @@ def test_splits_an_oversized_prose_block_at_safe_boundaries() -> None:
     assert result == source
     assert len(requests) >= 2
     assert all(len(chunk) <= MAX_INPUT_CHARACTERS for chunk in requests)
+
+
+def test_translation_planner_splits_long_prose_across_ordinary_parentheses() -> None:
+    source = "(Editorial aside " + ("with natural language words " * 120).strip() + ")"
+
+    parts = improvement_module._plan_markdown_parts(
+        source,
+        max_characters=MAX_TRANSLATION_CHUNK_CHARACTERS,
+        protect_paragraphs=True,
+    )
+
+    assert len(parts) >= 2
+    assert "".join(part.separator_before + part.text for part in parts) == source
+    assert all(len(part.text) <= MAX_TRANSLATION_CHUNK_CHARACTERS for part in parts)
+
+
+def test_translation_planner_splits_number_dense_text_with_unmatched_parenthesis() -> None:
+    source = "(Chart row " + " ".join(f"Value {index}" for index in range(30))
+
+    parts = improvement_module._plan_markdown_parts(
+        source,
+        max_characters=MAX_TRANSLATION_CHUNK_CHARACTERS,
+        protect_paragraphs=True,
+    )
+
+    assert len(parts) >= 3
+    assert "".join(part.separator_before + part.text for part in parts) == source
+    assert all(
+        len(NUMBER_PATTERN.findall(part.text)) <= MAX_TRANSLATION_PROTECTED_VALUES_PER_CHUNK
+        for part in parts
+    )
+
+
+def test_translation_planner_keeps_large_markdown_table_as_one_safe_unit() -> None:
+    rows = "\n".join(f"| {index} | The First House |" for index in range(60))
+    source = f"| 1 | 2 |\n| --- | --- |\n{rows}"
+
+    parts = improvement_module._plan_markdown_parts(
+        source,
+        max_characters=MAX_TRANSLATION_CHUNK_CHARACTERS,
+        protect_paragraphs=True,
+    )
+
+    assert len(source) > MAX_TRANSLATION_CHUNK_CHARACTERS
+    assert len(parts) == 1
+    assert parts[0].text == source
+    assert parts[0].should_improve is True
+
+
+def test_translates_markdown_table_cells_without_changing_its_envelope(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = "| Topic | Meaning |\n| :--- | ---: |\n| Bound rulerships | General description |"
+    translations = {
+        "Topic": "Tema",
+        "Meaning": "Significado",
+        "Bound rulerships": "Regencias vinculadas",
+        "General description": "Descripción general",
+    }
+
+    def translate_cells(*args: object, **_kwargs: object) -> str:
+        values = str(args[4]).split("\n\n")
+        return "\n\n".join(translations[value] for value in values)
+
+    monkeypatch.setattr(improvement_module, "_translate_table_text_batch", translate_cells)
+    monkeypatch.setattr(
+        improvement_module,
+        "_validate_mode_output",
+        lambda *_args, **_kwargs: pytest.fail(
+            "Una tabla reconstruida por celdas no debe repetir la validación numérica global."
+        ),
+    )
+    context = improvement_module._TranslationContext(
+        source_language="en",
+        target_language="es",
+        preserve_paragraphs=True,
+    )
+    with httpx.Client() as client:
+        translated = improvement_module._translate_safe_markdown_table(
+            client,
+            "parsezen-local",
+            8_192,
+            "Translate",
+            source,
+            context,
+            None,
+        )
+
+    assert translated == (
+        "| Tema | Significado |\n| :--- | ---: |\n| regencias por término | Descripción general |"
+    )
+    assert context.preserved_segments == []
 
 
 def test_splits_a_number_dense_index_without_changing_it() -> None:
@@ -3599,6 +4485,19 @@ def test_rejects_changes_to_inline_code() -> None:
             ImprovementMode.CLEAN,
             LOCAL_SETTINGS,
             transport=httpx.MockTransport(respond),
+        )
+
+
+@pytest.mark.parametrize(
+    "mode",
+    (ImprovementMode.CLEAN, ImprovementMode.REVIEW_CONTENT),
+)
+def test_rejects_an_html_document_wrapper_added_by_the_model(mode: ImprovementMode) -> None:
+    with pytest.raises(ImprovementError, match="etiquetas HTML"):
+        markdown_safety_module._validate_mode_output(
+            "Texto conservado.",
+            "<html>\nTexto conservado.\n</html>",
+            mode,
         )
 
 
@@ -4020,6 +4919,32 @@ def test_translation_plans_a_generated_html_table_as_one_atomic_unit() -> None:
     assert parts[0].should_improve
 
 
+def test_table_checkpoint_invalidates_pre_bilingual_residue_fallbacks() -> None:
+    source = "<table><tbody><tr><td>The Special Lot of the Moon</td></tr></tbody></table>"
+    stale_key = hashlib.sha256(
+        f"ollama-translation-table-v4\ntranslate\n{source}".encode()
+    ).hexdigest()
+
+    assert improvement_module._chunk_checkpoint_key(ImprovementMode.TRANSLATE, source) != stale_key
+
+
+def test_contextual_table_checkpoint_keeps_its_table_revision() -> None:
+    source = "<table><tbody><tr><td>The Special Lot of the Moon</td></tr></tbody></table>"
+    identity = f"Chapter context\n{source}"
+    expected = hashlib.sha256(
+        f"ollama-translation-table-v6\ntranslate\n{identity}".encode()
+    ).hexdigest()
+
+    assert (
+        improvement_module._chunk_checkpoint_key(
+            ImprovementMode.TRANSLATE,
+            identity,
+            classification_text=source,
+        )
+        == expected
+    )
+
+
 def test_translation_changes_only_text_nodes_of_generated_toc_table() -> None:
     source = (
         '<table class="document-toc">\n'
@@ -4038,19 +4963,21 @@ def test_translation_changes_only_text_nodes_of_generated_toc_table() -> None:
         payload = json.loads(request.content)
         content = payload["messages"][-1]["content"]
         requests.append(content)
-        if "FOCUS:" in content:
-            focus = re.search(r"FOCUS: ([^\n]+)", content)
-            assert focus is not None
-            equivalents = {
-                "practical": "práctica",
-                "useful": "útil",
-                "method": "método",
-            }
-            response = equivalents.get(focus.group(1).casefold(), "término")
-        else:
-            assert "<table" not in content
-            response = "Entrada\n\nPágina\n\nPrimera lección práctica\n\nSegundo método útil"
-        return httpx.Response(200, json={"message": {"content": response}})
+        assert "<table" not in content
+        translations = {
+            "Entry": "Entrada",
+            "Page": "Página",
+            "First practical lesson": "Primera lección práctica",
+            "Second useful method": "Segundo método útil",
+        }
+        items = json.loads(content)["items"]
+        response = {
+            "items": [{"id": item["id"], "text": translations[item["text"]]} for item in items]
+        }
+        return httpx.Response(
+            200,
+            json={"message": {"content": json.dumps(response)}},
+        )
 
     translated = improve_markdown(
         source,
@@ -4124,12 +5051,27 @@ def test_table_batch_keeps_numbering_outside_the_model_request() -> None:
 
     def respond(request: httpx.Request) -> httpx.Response:
         payload = json.loads(request.content)
-        prompt = payload["messages"][1]["content"]
-        assert "64." not in prompt
-        assert "65." not in prompt
+        prompt = json.loads(payload["messages"][1]["content"])
+        assert prompt == {
+            "items": [
+                {"id": "PZB0001", "context": "", "text": "The First House"},
+                {"id": "PZB0002", "context": "", "text": "The Second House"},
+            ]
+        }
         return httpx.Response(
             200,
-            json={"message": {"content": "La primera casa\n\nLa segunda casa"}},
+            json={
+                "message": {
+                    "content": json.dumps(
+                        {
+                            "items": [
+                                {"id": "PZB0001", "text": "La primera casa"},
+                                {"id": "PZB0002", "text": "La segunda casa"},
+                            ]
+                        }
+                    )
+                }
+            },
         )
 
     context = improvement_module._TranslationContext(
@@ -4149,6 +5091,35 @@ def test_table_batch_keeps_numbering_outside_the_model_request() -> None:
         )
 
     assert translated == "64. La primera casa\n\n65. La segunda casa"
+
+
+def test_table_batch_preserves_only_an_unaccepted_cell_for_focused_review(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = "64. The First House\n\n65. A deliberately uncommon table label"
+    context = improvement_module._TranslationContext(
+        source_language="en",
+        target_language="es",
+        preserve_paragraphs=True,
+    )
+
+    monkeypatch.setattr(
+        improvement_module,
+        "_translate_aligned_batch",
+        lambda *_args, **_kwargs: {0: "La primera casa"},
+    )
+    with httpx.Client() as client:
+        translated = improvement_module._translate_table_text_batch(
+            client,
+            "parsezen-local",
+            8_192,
+            build_instructions(ImprovementMode.TRANSLATE, "Español"),
+            source,
+            context,
+            cancellation=None,
+        )
+
+    assert translated == "64. La primera casa\n\n65. A deliberately uncommon table label"
 
 
 def test_table_cell_retranslates_an_unchanged_source_language_title() -> None:
@@ -4193,6 +5164,518 @@ def test_established_table_title_keeps_number_and_uses_conventional_ordinal() ->
         )
         == "6S. LA QUINTA CASA"
     )
+    assert (
+        improvement_module._translate_established_table_cell(
+            "99· AFTERWORD",
+            context,
+        )
+        == "99· EPÍLOGO"
+    )
+    assert (
+        improvement_module._translate_established_table_cell(
+            "TAURUS III",
+            context,
+        )
+        == "TAURO III"
+    )
+    assert improvement_module._translate_established_table_cell("xviii", context) == "xviii"
+    assert (
+        improvement_module._translate_established_table_cell("(Oikodespotes)", context)
+        == "(Oikodespotes)"
+    )
+    assert (
+        improvement_module._translate_established_table_cell("(Introduction)", context)
+        == "(introducción)"
+    )
+
+
+@pytest.mark.parametrize(
+    ("source", "expected"),
+    (
+        ("21. THE SYNODIC CYCLE", "21. EL CICLO SINÓDICO"),
+        ("100. Angular Triads", "100. tríadas angulares"),
+        ("78. Hermetic Lots", "78. lotes herméticos"),
+        (
+            "116. Cadent Triplicity Lords of the Light Sect",
+            "116. señores cadentes de la triplicidad de la luminaria de la secta",
+        ),
+        (
+            "116. Cadent Triplicity Lords of the Sect Light",
+            "116. señores cadentes de la triplicidad de la luminaria de la secta",
+        ),
+        ("PART SEVEN: DOWN TO EARTH", "PARTE SIETE: CON LOS PIES EN LA TIERRA"),
+        ("PART SEVEN: DOWN  TO  EARTH", "PARTE SIETE: CON LOS PIES EN LA TIERRA"),
+        (
+            "116. Cadent Triplicity Lords ofthe Sect Light",
+            "116. señores cadentes de la triplicidad de la luminaria de la secta",
+        ),
+        (
+            "Exercise 49: Triplicity Lords of the Sect Light",
+            "ejercicio 49: señores de la triplicidad de la luminaria de la secta",
+        ),
+        (
+            "Exercise 49: Triplicity Lords ofthe Sect Light",
+            "ejercicio 49: señores de la triplicidad de la luminaria de la secta",
+        ),
+        ("Interpreting Retrograde Motion", "interpretación del movimiento retrógrado"),
+        ("Determining Phasis", "determinación de la fasis"),
+        ("Interpreting Phasis", "interpretación de la fasis"),
+        (
+            "Historical Overview of Aspect Doctrines",
+            "panorama histórico de las doctrinas de los aspectos",
+        ),
+        ("and the Moon under the Bonds", "y la Luna bajo los lazos"),
+        ("76. Traditional Sign Rulerships", "76. regencias tradicionales de los signos"),
+        (
+            "82. Triplicity Lords of the Sect Light, Chart One",
+            "82. señores de la triplicidad de la luminaria de la secta, carta uno",
+        ),
+        ("Goddess (Thea)", "diosa (Thea)"),
+        ("Setting (Dusis)", "ocaso (Dusis)"),
+        ("Midheaven (Mesouranema)", "medio cielo (Mesouranema)"),
+        ("Good Spirit (Agathos Daimon)", "buen espíritu (Agathos Daimon)"),
+        ("Bad Spirit (Kakos Daimon)", "mal espíritu (Kakos Daimon)"),
+        ("NINTH HOUSE", "NOVENA CASA"),
+        ("TENTH HOUSE", "DÉCIMA CASA"),
+        ("ELEVENTH HOUSE", "UNDÉCIMA CASA"),
+        ("TWELFTH HOUSE", "DUODÉCIMA CASA"),
+        ("Subterranean Place", "Lugar subterráneo"),
+        ("Idle", "Inactivo"),
+        ("Delineating Planetary Meaning", "interpretación del significado planetario"),
+        ("Placing the Planets in the Houses", "colocación de los planetas en las casas"),
+        (
+            "The Relative Angularity of the Houses",
+            "la angularidad relativa de las casas",
+        ),
+        (
+            "The Planet’s Domicile Lord",
+            "el regente domiciliario del planeta",
+        ),
+        (
+            "Angularity, Favorability, Testimony",
+            "angularidad, favorabilidad y testimonio",
+        ),
+        (
+            "Step Four: The Condition and Location of the Domicile Lord",
+            "paso cuatro: condición y ubicación del regente domiciliario",
+        ),
+        ("Delineations for Chart One", "interpretaciones de la carta uno"),
+        ("Delineations for Chart Two", "interpretaciones de la carta dos"),
+        ("An Introduction", "una introducción"),
+        ("Steering the Ship of Life", "llevar el timón de la vida"),
+        (
+            "The Domicile Lord of the Ascendant",
+            "el regente domiciliario del Ascendente",
+        ),
+        ("Introducing Lots", "presentación de los lotes"),
+        (
+            "The Lot of Fortune and the Lord of Fortune",
+            "el lote de la fortuna y el regente de la fortuna",
+        ),
+        ("From Its Domicile Lord", "de su regente domiciliario"),
+        (
+            "The Domicile Lord of Fortune",
+            "el regente domiciliario de la fortuna",
+        ),
+        (
+            "Step Six: Location and Topics of the Lord",
+            "paso seis: ubicación y ámbitos del regente",
+        ),
+        ("kakos daimòn", "kakos daimòn"),
+    ),
+)
+def test_established_table_title_covers_conventional_compact_labels(
+    source: str,
+    expected: str,
+) -> None:
+    context = improvement_module._TranslationContext(
+        source_language="en",
+        target_language="es",
+        preserve_paragraphs=True,
+    )
+
+    assert improvement_module._translate_established_table_cell(source, context) == expected
+
+
+def test_cached_aligned_heading_uses_the_complete_established_source_label() -> None:
+    context = improvement_module._TranslationContext(
+        source_language="en",
+        target_language="es",
+        preserve_paragraphs=True,
+    )
+
+    assert (
+        improvement_module._restore_established_index_classifications(
+            "PART SEVEN: DOWN TO EARTH\n",
+            "PARTE SIETE HACIA LA TIERRA\n",
+            context,
+        )
+        == "PARTE SIETE: CON LOS PIES EN LA TIERRA\n"
+    )
+
+    assert (
+        improvement_module._restore_established_index_classifications(
+            "THE RELATIVE ANGULARITY OF THE HOUSES\n",
+            "LA ANGULARDAD RELATIVA DE LAS CASAS\n",
+            context,
+        )
+        == "LA ANGULARIDAD RELATIVA DE LAS CASAS\n"
+    )
+    assert (
+        improvement_module._restore_established_index_classifications(
+            "90. THE ULTIMATE RULERS OF THE CHART 1035\n",
+            "90. LOS GOBIERNALES ULTIMOS DEL GRÁFICO 1035\n",
+            context,
+        )
+        == "90. LOS REGENTES FINALES DE LA CARTA 1035\n"
+    )
+
+
+def test_table_grounding_resolves_known_phrases_inside_longer_labels() -> None:
+    context = improvement_module._TranslationContext(
+        source_language="en",
+        target_language="es",
+        preserve_paragraphs=True,
+    )
+
+    assert (
+        improvement_module._ground_established_table_terms(
+            "Formulas for Calculating the Seven Hermetic Lots",
+            context,
+        )
+        == "Formulas for Calculating los siete lotes herméticos"
+    )
+    assert (
+        improvement_module._ground_established_table_terms(
+            "Step Six: Location and Themes of the Lord",
+            context,
+        )
+        == "paso seis: Location and Themes of the señor"
+    )
+    assert (
+        improvement_module._ground_established_table_terms(
+            "Introducing the Lots",
+            context,
+        )
+        == "Introducing los lotes"
+    )
+
+
+def test_aligned_table_cache_rejects_partial_source_language_residue() -> None:
+    context = improvement_module._TranslationContext(
+        source_language="en",
+        target_language="es",
+        preserve_paragraphs=True,
+    )
+    source = (
+        "<table><tbody><tr><td>116. Cadent Triplicity Lords of the Sect Light</td>"
+        "</tr><tr><td>Step Six: Location and Themes of the Lord</td></tr></tbody></table>"
+    )
+    translated = (
+        "<table><tbody><tr><td>116. Cadent señores de la triplicidad of the secta Light</td>"
+        "</tr><tr><td>Paso Six: ubicación y temas del señor</td></tr></tbody></table>"
+    )
+
+    assert improvement_module._has_aligned_table_source_language_residue(
+        source,
+        translated,
+        context,
+    )
+
+
+def test_table_normalization_repairs_only_copied_conventional_terms() -> None:
+    context = improvement_module._TranslationContext(
+        source_language="en",
+        target_language="es",
+        preserve_paragraphs=True,
+    )
+
+    assert (
+        improvement_module._normalize_established_table_translation(
+            "Sign Rulerships",
+            "Rulerships de los Signos",
+            context,
+        )
+        == "Regencias de los Signos"
+    )
+    assert (
+        improvement_module._normalize_established_table_translation(
+            "PART II: THE 36 FACES",
+            "PART Ii: LOS 36 FACES",
+            context,
+        )
+        == "PARTE II: LOS 36 FACES"
+    )
+    assert (
+        improvement_module._normalize_established_table_translation(
+            "PART TEN: GLOSSARY AND SOURCES",
+            "PART DIEZ: GLOSARIO Y FUENTES",
+            context,
+        )
+        == "PARTE DIEZ: GLOSARIO Y FUENTES"
+    )
+
+
+def test_cached_table_is_upgraded_without_calling_the_model() -> None:
+    source = (
+        '<table class="document-toc"><thead><tr><th class="toc-label">PART II: THE 36 FACES</th>'
+        '<th class="toc-folio">Page</th></tr></thead><tbody><tr>'
+        '<td class="toc-label toc-level-1">TAURUS III</td>'
+        '<td class="toc-folio">80</td></tr></tbody></table>'
+    )
+    cached = (
+        '<table class="document-toc"><thead><tr><th class="toc-label">PART Ii: LOS 36 FACES</th>'
+        '<th class="toc-folio">Página</th></tr></thead><tbody><tr>'
+        '<td class="toc-label toc-level-1">TAURUS III</td>'
+        '<td class="toc-folio">80</td></tr></tbody></table>'
+    )
+    context = improvement_module._TranslationContext(
+        source_language="en",
+        target_language="es",
+        preserve_paragraphs=True,
+    )
+
+    restored = improvement_module._restore_established_index_classifications(
+        source,
+        cached,
+        context,
+    )
+
+    assert "PARTE II: LOS 36 FACES" in restored
+    assert "TAURO III" in restored
+    assert "TAURUS" not in restored
+
+
+def test_cached_table_restores_a_substantive_label_collapsed_to_a_roman_number() -> None:
+    source = (
+        '<table class="document-toc"><tbody><tr>'
+        '<td class="toc-label toc-level-0">A complete explanation of planetary timing</td>'
+        '<td class="toc-folio">891</td></tr></tbody></table>'
+    )
+    cached = source.replace(
+        "A complete explanation of planetary timing",
+        "vii",
+    )
+    context = improvement_module._TranslationContext(
+        source_language="en",
+        target_language="es",
+        preserve_paragraphs=True,
+    )
+
+    normalized = improvement_module._normalize_aligned_table_translation(
+        source,
+        cached,
+        context,
+    )
+
+    assert "A complete explanation of planetary timing" in normalized
+    assert ">vii<" not in normalized
+
+
+def test_table_cell_retries_a_substantive_label_collapsed_to_a_roman_number(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = (
+        '<table class="document-toc"><tbody><tr>'
+        '<td class="toc-label toc-level-0">A complete explanation of planetary timing</td>'
+        '<td class="toc-folio">891</td></tr></tbody></table>'
+    )
+    responses = iter(("vii", "Una explicación completa de la cronología planetaria"))
+
+    def translate(*_args: object, **_kwargs: object) -> str:
+        return next(responses)
+
+    monkeypatch.setattr(improvement_module, "_translate_table_text_batch", translate)
+    context = improvement_module._TranslationContext(
+        source_language="en",
+        target_language="es",
+        preserve_paragraphs=True,
+    )
+    with httpx.Client(
+        transport=httpx.MockTransport(lambda _request: httpx.Response(500))
+    ) as client:
+        translated = improvement_module._translate_safe_html_table(
+            client,
+            "model",
+            8192,
+            "Translate.",
+            source,
+            context,
+            None,
+        )
+
+    assert "Una explicación completa de la cronología planetaria" in translated
+    assert ">vii<" not in translated
+
+
+def test_established_table_cells_do_not_repeat_a_whole_table_language_check(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = (
+        "<table><thead><tr><th>INTRODUCTION</th></tr></thead>"
+        "<tbody><tr><td>TAURUS III</td></tr></tbody></table>"
+    )
+    context = improvement_module._TranslationContext(
+        source_language="en",
+        target_language="es",
+        preserve_paragraphs=True,
+    )
+
+    def unexpected_global_validation(*_args: object) -> None:
+        raise AssertionError("Validated cells must not be rejected by a redundant table check.")
+
+    monkeypatch.setattr(improvement_module, "_validate_translation", unexpected_global_validation)
+    with httpx.Client(
+        transport=httpx.MockTransport(lambda _request: httpx.Response(500))
+    ) as client:
+        translated = improvement_module._translate_safe_html_table(
+            client,
+            "parsezen-local",
+            8_192,
+            "Translate",
+            source,
+            context,
+            None,
+        )
+
+    assert "INTRODUCCIÓN" in translated
+    assert "TAURO III" in translated
+
+
+def test_table_translation_preserves_numeric_html_entities_byte_for_byte(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = "<table><tbody><tr><td>First&#10;House</td></tr></tbody></table>"
+    context = improvement_module._TranslationContext(
+        source_language="en",
+        target_language="es",
+        preserve_paragraphs=True,
+    )
+
+    def translate(*args: object, **_kwargs: object) -> str:
+        value = str(args[4])
+        assert "&#10;" not in value
+        assert "\n" not in value
+        assert "PZTABLEENTITY" in value
+        return value.replace("First", "Primera").replace("House", "Casa")
+
+    monkeypatch.setattr(improvement_module, "_translate_table_text_batch", translate)
+    with httpx.Client() as client:
+        translated = improvement_module._translate_safe_html_table(
+            client,
+            "parsezen-local",
+            8_192,
+            "Translate",
+            source,
+            context,
+            None,
+        )
+
+    assert translated == "<table><tbody><tr><td>Primera&#10;Casa</td></tr></tbody></table>"
+    assert context.preserved_segments == []
+
+
+def test_html_table_keeps_a_source_internal_linebreak_without_false_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = "<table><tbody><tr><td>First\nHouse</td></tr></tbody></table>"
+    context = improvement_module._TranslationContext(
+        source_language="en",
+        target_language="es",
+        preserve_paragraphs=True,
+    )
+
+    monkeypatch.setattr(
+        improvement_module,
+        "_translate_table_text_batch",
+        lambda *_args, **_kwargs: "Primera\nCasa",
+    )
+    with httpx.Client() as client:
+        translated = improvement_module._translate_safe_html_table(
+            client,
+            "parsezen-local",
+            8_192,
+            "Translate",
+            source,
+            context,
+            None,
+        )
+
+    assert translated == "<table><tbody><tr><td>Primera\nCasa</td></tr></tbody></table>"
+    assert context.preserved_segments == []
+
+
+def test_html_table_rejects_a_linebreak_added_to_a_single_line_cell(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = "<table><tbody><tr><td>Sample Heading</td></tr></tbody></table>"
+    context = improvement_module._TranslationContext(
+        source_language="en",
+        target_language="es",
+        preserve_paragraphs=True,
+    )
+
+    monkeypatch.setattr(
+        improvement_module,
+        "_translate_table_text_batch",
+        lambda *_args, **_kwargs: "Primera\nCasa",
+    )
+    with httpx.Client() as client:
+        translated = improvement_module._translate_safe_html_table(
+            client,
+            "parsezen-local",
+            8_192,
+            "Translate",
+            source,
+            context,
+            None,
+        )
+
+    assert translated == source
+    assert context.preserved_segments == ["Sample Heading"]
+
+
+def test_table_does_not_retry_a_translated_cell_on_a_short_language_false_positive(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = "<table><tbody><tr><td>61. Down to Earth</td></tr></tbody></table>"
+    context = improvement_module._TranslationContext(
+        source_language="en",
+        target_language="es",
+        preserve_paragraphs=True,
+    )
+    requests: list[str] = []
+
+    def translated_batch(
+        _client: httpx.Client,
+        _model: str,
+        _context_window: int,
+        _instructions: str,
+        value: str,
+        _context: object,
+        *,
+        cancellation: object,
+        focused: bool = False,
+    ) -> str:
+        del cancellation
+        requests.append(f"{focused}:{value}")
+        return "61. HACIA ABAJO EN LA TIERRA"
+
+    monkeypatch.setattr(improvement_module, "_translate_table_text_batch", translated_batch)
+    monkeypatch.setattr(improvement_module, "detect_language_code", lambda *_args, **_kwargs: "en")
+    with httpx.Client() as client:
+        translated = improvement_module._translate_safe_html_table(
+            client,
+            "parsezen-local",
+            8_192,
+            "Translate",
+            source,
+            context,
+            None,
+        )
+
+    assert "61. con los pies en la tierra" in translated
+    assert requests == []
 
 
 def test_table_batch_accepts_one_line_per_cell_without_individual_fallback() -> None:
@@ -4200,3 +5683,178 @@ def test_table_batch_accepts_one_line_per_cell_without_individual_fallback() -> 
         "Primera casa\nSegunda casa\nTercera casa",
         3,
     ) == ["Primera casa", "Segunda casa", "Tercera casa"]
+
+
+@pytest.mark.parametrize(
+    ("translated", "expected"),
+    (
+        ("<Hacia abajo en la Tierra>", "Hacia abajo en la Tierra"),
+        ("<span>Hacia abajo en la Tierra</span>", "Hacia abajo en la Tierra"),
+        ("La <traducción> natural", "La traducción natural"),
+        ("La <em>traducción</em> natural", "La traducción natural"),
+        ("La <traducción natural", "La traducción natural"),
+    ),
+)
+def test_table_text_removes_added_markup_wrappers(
+    translated: str,
+    expected: str,
+) -> None:
+    assert (
+        improvement_module._strip_added_table_text_markup("Down to Earth", translated) == expected
+    )
+    assert improvement_module._strip_added_table_text_markup("A < B", translated) == translated
+
+
+def test_focused_table_retry_removes_an_added_markup_wrapper(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = "<table><tbody><tr><td>THE UNKNOWN SOURCE READING</td></tr></tbody></table>"
+    context = improvement_module._TranslationContext(
+        source_language="en",
+        target_language="es",
+        preserve_paragraphs=True,
+    )
+    calls = 0
+
+    def translate(*_args: object, **_kwargs: object) -> str:
+        nonlocal calls
+        calls += 1
+        return "THE UNKNOWN SOURCE READING" if calls == 1 else "<Título traducido>"
+
+    monkeypatch.setattr(improvement_module, "_translate_table_text_batch", translate)
+    with httpx.Client() as client:
+        translated = improvement_module._translate_safe_html_table(
+            client,
+            "parsezen-local",
+            8_192,
+            "Translate",
+            source,
+            context,
+            None,
+        )
+
+    assert "Título traducido" in translated
+    assert "&lt;" not in translated
+    assert context.preserved_segments == []
+
+
+def test_table_residual_uses_bilingual_single_cell_repair(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = "<table><tbody><tr><td>9. Images from the Picatrix</td></tr></tbody></table>"
+    context = improvement_module._TranslationContext(
+        source_language="en",
+        target_language="es",
+        preserve_paragraphs=True,
+    )
+    bilingual_parts: list[improvement_module._TranslationReviewPart] = []
+
+    monkeypatch.setattr(
+        improvement_module,
+        "_translate_table_text_batch",
+        lambda *_args, **_kwargs: "9. Images from the Picatrix",
+    )
+
+    def bilingual_repair(
+        _client: httpx.Client,
+        _model: str,
+        _context_window: int,
+        part: improvement_module._TranslationReviewPart,
+        **_kwargs: object,
+    ) -> tuple[str, bool]:
+        bilingual_parts.append(part)
+        return "9. Imágenes del Picatrix", True
+
+    monkeypatch.setattr(
+        improvement_module,
+        "_retranslate_priority_title",
+        bilingual_repair,
+    )
+    with httpx.Client() as client:
+        translated = improvement_module._translate_safe_html_table(
+            client,
+            "parsezen-local",
+            8_192,
+            "Translate",
+            source,
+            context,
+            None,
+        )
+
+    assert "9. Imágenes del Picatrix" in translated
+    assert len(bilingual_parts) == 1
+    assert context.preserved_segments == []
+
+
+def test_table_residual_recognizes_a_partially_translated_compact_title() -> None:
+    assert improvement_module._has_table_source_language_residue(
+        "PART SEVEN: DOWN TO EARTH",
+        "PARTE SIETE: DOWN TOEARTH",
+        "en",
+        "es",
+    )
+
+
+def test_table_residual_is_preserved_when_bilingual_repair_still_has_source_language(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = "<table><tbody><tr><td>The Special Lot of the Moon</td></tr></tbody></table>"
+    context = improvement_module._TranslationContext(
+        source_language="en",
+        target_language="es",
+        preserve_paragraphs=True,
+    )
+    monkeypatch.setattr(
+        improvement_module,
+        "_translate_table_text_batch",
+        lambda *_args, **_kwargs: "The Special Lot of the Moon",
+    )
+    monkeypatch.setattr(
+        improvement_module,
+        "_retranslate_priority_title",
+        lambda *_args, **_kwargs: ("The Special Lot of the Moon", True),
+    )
+    with httpx.Client() as client:
+        translated = improvement_module._translate_safe_html_table(
+            client,
+            "parsezen-local",
+            8_192,
+            "Translate",
+            source,
+            context,
+            None,
+        )
+
+    assert translated == source
+    assert context.preserved_segments == ["The Special Lot of the Moon"]
+
+
+def test_table_keeps_and_escapes_source_angle_brackets(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = "<table><tbody><tr><td>A &lt; B</td></tr></tbody></table>"
+    context = improvement_module._TranslationContext(
+        source_language="en",
+        target_language="es",
+        preserve_paragraphs=True,
+    )
+
+    monkeypatch.setattr(
+        improvement_module,
+        "_translate_table_text_batch",
+        lambda *_args, **_kwargs: "A < B",
+    )
+    with httpx.Client() as client:
+        translated = improvement_module._translate_safe_html_table(
+            client,
+            "parsezen-local",
+            8_192,
+            "Translate",
+            source,
+            context,
+            None,
+        )
+
+    assert "A &lt; B" in translated
+    assert "A < B" not in translated
+    assert context.preserved_segments == []

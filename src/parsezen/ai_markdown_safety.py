@@ -27,11 +27,15 @@ from parsezen.translation_quality import (
     ATX_HEADING_PATTERN,
     FENCE_PATTERN,
     HTML_COMMENT_PATTERN,
+    HTML_TAG_PATTERN,
     INLINE_CODE_PATTERN,
+    MARKDOWN_LINK_PATTERN,
     NUMBER_PATTERN,
     TABLE_DIVIDER_PATTERN,
+    TITLE_LANGUAGE_HINTS,
     TranslationQualityError,
     detect_language_code,
+    html_tag_structure,
     is_probable_organization_name_line,
     is_unmarked_title_line,
     link_destination_spans,
@@ -39,7 +43,9 @@ from parsezen.translation_quality import (
     markdown_link_destinations,
     markdown_table_shapes,
     natural_language_text,
+    numeric_token_counts,
     probable_uppercase_person_name_bases,
+    replace_established_term_residues,
     uppercase_person_name_base,
     validate_translation_quality,
 )
@@ -52,6 +58,13 @@ MAX_TRANSLATION_PROTECTED_VALUES_PER_CHUNK = 8
 LOGGER = logging.getLogger(__name__)
 
 RAW_URL_PATTERN = re.compile(r"(?:https?://|mailto:)[^\s<>)\]]+")
+EMPHASIZED_TEXT_PATTERN = re.compile(
+    r"(?<![*_])(?P<marker>[*_])(?P<body>[^*_\r\n]{2,100})(?P=marker)(?![*_])"
+)
+FOREIGN_MACRON_WORD_PATTERN = re.compile(
+    r"(?<!\w)[A-Za-zĀāĒēĪīŌōŪūȲȳ]*[ĀāĒēĪīŌōŪūȲȳ]"
+    r"[A-Za-zĀāĒēĪīŌōŪūȲȳ]{1,47}(?!\w)"
+)
 FORMULA_PATTERN = re.compile(
     r"(?<!\\)\$(?=[^\r\n$]{1,200}\$)[^\r\n$]+\$"
     r"|\\\([^\r\n]{1,200}\\\)"
@@ -84,6 +97,9 @@ TITLE_ROMAN_REFERENCE_PATTERN = re.compile(
 _PRIVATE_IMAGE_PATTERN = re.compile(
     r"!\[(?P<alt>(?:\\.|[^\]\\])*)\]"
     r"\(\s*(?:<)?(?P<resource>__parsezen_resources__/[^\s)>\"']+)(?:>)?[^)]*\)",
+)
+_EMPTY_PRIVATE_IMAGE_PATTERN = re.compile(
+    r"\s*!\[[ \t]*]\(\s*(?:<)?__parsezen_resources__/[^\s)>\"']+(?:>)?[^)]*\)\s*"
 )
 _PRIVATE_MARKER_TOKEN_PATTERN = re.compile(r"\bPZDOC[^\s<>()\]`]*", re.IGNORECASE)
 _PRIVATE_COMMENT_TEXT_PATTERN = re.compile(r"comentario\s+interno", re.IGNORECASE)
@@ -135,6 +151,7 @@ def _prepare_and_validate_response(
     response = _remove_added_instruction_placeholders(source, response)
     if translation_context is not None:
         response = _restore_single_line_translation_layout(source, response)
+        response = _localize_copied_english_conventions(source, response, translation_context)
     restored = response
     restored = _repair_common_markdown_spacing(restored)
     if mode is not ImprovementMode.REVIEW_STRUCTURE:
@@ -152,6 +169,145 @@ def _prepare_and_validate_response(
     if translation_context is not None:
         _validate_translation(source, restored, translation_context)
     return restored
+
+
+def _localize_copied_english_conventions(
+    source: str,
+    translated: str,
+    context: _TranslationContext,
+) -> str:
+    """Localize copied English conventions without touching literal Markdown values."""
+
+    if (context.source_language, context.target_language) != ("en", "es"):
+        return translated
+    source_spans = _literal_markdown_spans(source)
+    translated_spans = _literal_markdown_spans(translated)
+
+    def outside_literal(spans: tuple[tuple[int, int], ...], position: int) -> bool:
+        return not any(start <= position < end for start, end in spans)
+
+    patterns = (
+        (
+            re.compile(r"(?<![\w/])(?P<number>\d{1,4})(?:st|nd|rd|th)\b", re.IGNORECASE),
+            lambda match: f"{match.group('number')}.º",
+        ),
+        (
+            re.compile(r"(?<![\w/])BCE\b\.?", re.IGNORECASE),
+            lambda _match: "a. e. c.",
+        ),
+        (
+            re.compile(r"(?<![\w/])BC\b\.?", re.IGNORECASE),
+            lambda _match: "a. C.",
+        ),
+        (
+            re.compile(
+                r"(?<!\w)PART[ \t]+(?P<roman>[IVXLCDM]{1,8})(?!\w)",
+                re.IGNORECASE,
+            ),
+            lambda match: f"PARTE {match.group('roman').upper()}",
+        ),
+    )
+    result = translated
+    for pattern, replacement in patterns:
+        source_count = sum(
+            outside_literal(source_spans, match.start()) for match in pattern.finditer(source)
+        )
+        if source_count == 0:
+            continue
+        replaced = 0
+
+        def replace_copied(
+            match: re.Match[str],
+            maximum: int = source_count,
+            literal_spans: tuple[tuple[int, int], ...] = translated_spans,
+            replace_value: Callable[[re.Match[str]], str] = replacement,
+        ) -> str:
+            nonlocal replaced
+            if replaced >= maximum or not outside_literal(literal_spans, match.start()):
+                return match.group(0)
+            replaced += 1
+            return replace_value(match)
+
+        result = pattern.sub(replace_copied, result)
+        translated_spans = _literal_markdown_spans(result)
+    source_visible = _text_outside_literal_spans(source, source_spans)
+    return _replace_outside_literal_spans(
+        result,
+        translated_spans,
+        lambda value: replace_established_term_residues(
+            source_visible,
+            value,
+            context.source_language or "",
+            context.target_language,
+        ),
+    )
+
+
+def _literal_markdown_spans(markdown: str) -> tuple[tuple[int, int], ...]:
+    """Return code, URL, destination and private-comment spans excluded from post-editing."""
+
+    spans = [
+        *((match.start(), match.end()) for match in INLINE_CODE_PATTERN.finditer(markdown)),
+        *((match.start(), match.end()) for match in RAW_URL_PATTERN.finditer(markdown)),
+        *((start, end) for start, end, _value in link_destination_spans(markdown)),
+        *((match.start(), match.end()) for match in HTML_COMMENT_PATTERN.finditer(markdown)),
+    ]
+    offset = 0
+    fence_start: int | None = None
+    fence_character: str | None = None
+    fence_length = 0
+    for line in markdown.splitlines(keepends=True):
+        fence = FENCE_PATTERN.match(line)
+        if fence is not None:
+            marker = fence.group(1)
+            if fence_start is None:
+                fence_start = offset
+                fence_character = marker[0]
+                fence_length = len(marker)
+            elif marker[0] == fence_character and len(marker) >= fence_length:
+                spans.append((fence_start, offset + len(line)))
+                fence_start = None
+                fence_character = None
+                fence_length = 0
+        offset += len(line)
+    if fence_start is not None:
+        spans.append((fence_start, len(markdown)))
+    return tuple(sorted(spans))
+
+
+def _text_outside_literal_spans(
+    markdown: str,
+    spans: tuple[tuple[int, int], ...],
+) -> str:
+    visible: list[str] = []
+    cursor = 0
+    for start, end in spans:
+        if end <= cursor:
+            continue
+        if start > cursor:
+            visible.append(markdown[cursor:start])
+        cursor = max(cursor, end)
+    visible.append(markdown[cursor:])
+    return " ".join(visible)
+
+
+def _replace_outside_literal_spans(
+    markdown: str,
+    spans: tuple[tuple[int, int], ...],
+    transform: Callable[[str], str],
+) -> str:
+    rebuilt: list[str] = []
+    cursor = 0
+    for start, end in spans:
+        if end <= cursor:
+            continue
+        if start > cursor:
+            rebuilt.append(transform(markdown[cursor:start]))
+        literal_start = max(start, cursor)
+        rebuilt.append(markdown[literal_start:end])
+        cursor = end
+    rebuilt.append(transform(markdown[cursor:]))
+    return "".join(rebuilt)
 
 
 def _reconcile_structure_response(source: str, proposed: str) -> str | None:
@@ -296,6 +452,7 @@ def _protect_translation_values(
     protect_numbers: bool = True,
     protect_headings: bool = True,
     protect_paragraphs: bool = True,
+    foreign_emphasis_languages: tuple[str, str] | None = None,
 ) -> _ProtectedMarkdown:
     spans = (
         [(match.start(), match.end(), False) for match in NUMBER_PATTERN.finditer(markdown)]
@@ -313,6 +470,11 @@ def _protect_translation_values(
         for match in REFERENCE_IDENTIFIER_PATTERN.finditer(markdown)
     )
     spans.extend((start, end, False) for start, end in _title_roman_reference_spans(markdown))
+    spans.extend(
+        (match.start(), match.end(), False)
+        for match in MARKDOWN_LINK_PATTERN.finditer(markdown)
+        if not any(character.isalpha() for character in natural_language_text(match.group(1)))
+    )
     spans.extend((start, end, False) for start, end, _value in link_destination_spans(markdown))
     spans.extend(
         (match.start(), match.end(), False) for match in RAW_URL_PATTERN.finditer(markdown)
@@ -320,6 +482,20 @@ def _protect_translation_values(
     spans.extend(
         (match.start(), match.end(), False) for match in HTML_COMMENT_PATTERN.finditer(markdown)
     )
+    if foreign_emphasis_languages is not None:
+        source_language, target_language = foreign_emphasis_languages
+        spans.extend(
+            (start, end, False)
+            for start, end in _foreign_emphasis_value_spans(
+                markdown,
+                source_language=source_language,
+                target_language=target_language,
+            )
+        )
+        spans.extend(
+            (match.start(), match.end(), False)
+            for match in FOREIGN_MACRON_WORD_PATTERN.finditer(markdown)
+        )
     if protect_headings:
         spans.extend(
             (match.start(1), match.end(1), False)
@@ -358,6 +534,46 @@ def _protect_translation_values(
         protected = protected[:start] + replacement + protected[end:]
     values.reverse()
     return _ProtectedMarkdown(protected, tuple(values))
+
+
+def _foreign_emphasis_value_spans(
+    markdown: str,
+    *,
+    source_language: str,
+    target_language: str,
+) -> tuple[tuple[int, int], ...]:
+    """Keep short emphasized foreign terms exact while surrounding prose is translated."""
+
+    source_hints = TITLE_LANGUAGE_HINTS.get(source_language, frozenset())
+    spans: list[tuple[int, int]] = []
+    for match in EMPHASIZED_TEXT_PATTERN.finditer(markdown):
+        body = match.group("body").strip()
+        words = re.findall(r"[^\W\d_]+", natural_language_text(body))
+        normalized_words = {word.casefold() for word in words}
+        if (
+            not 1 <= len(words) <= 5
+            or sum(character.isalpha() for character in body) < 5
+            or normalized_words & source_hints
+            or re.search(r"[.!?;](?:\s|$)", body)
+        ):
+            continue
+        detected = detect_language_code(
+            body,
+            minimum_letters=4,
+            minimum_confidence=0.50,
+        )
+        has_non_ascii_letter = any(
+            character.isalpha() and ord(character) > 127 for character in body
+        )
+        single_title_word = len(words) == 1 and (words[0].istitle() or words[0].isupper())
+        if not (
+            has_non_ascii_letter
+            or detected not in {None, source_language, target_language}
+            or single_title_word
+        ):
+            continue
+        spans.append((match.start("body"), match.end("body")))
+    return tuple(spans)
 
 
 def _restore_protected_values(
@@ -506,14 +722,20 @@ def _plan_markdown_parts(
             flush_pending()
             parts.append(_MarkdownPart(block, False, "\n\n" if parts else ""))
             continue
+        if protect_paragraphs and _EMPTY_PRIVATE_IMAGE_PATTERN.fullmatch(block):
+            flush_pending()
+            parts.append(_MarkdownPart(block, False, "\n\n" if parts else ""))
+            continue
         if protect_paragraphs and is_probable_organization_name_line(block):
             flush_pending()
             parts.append(_MarkdownPart(block, False, "\n\n" if parts else ""))
             continue
-        if protect_paragraphs and _is_safe_translation_html_table(block):
-            # A complete generated table is one resumable unit. Splitting it on
-            # newlines creates invalid HTML fragments and multiplies retries; the
-            # translation layer handles only its text nodes in bounded batches.
+        if protect_paragraphs and (
+            _is_safe_translation_html_table(block) or _is_safe_translation_markdown_table(block)
+        ):
+            # A complete table is one resumable unit. Splitting it on newlines
+            # creates invalid fragments and multiplies retries; the translation
+            # layer handles only its text cells in bounded batches.
             flush_pending()
             parts.append(_MarkdownPart(block, True, "\n\n" if parts else ""))
             continue
@@ -731,12 +953,18 @@ def _title_roman_reference_values(markdown: str) -> Counter[str]:
 
 
 def _is_safe_markdown_boundary(text: str, position: int) -> bool:
-    prefix = text[:position]
-    return (
-        prefix.count("`") % 2 == 0
-        and prefix.rfind("[") <= prefix.rfind("]")
-        and prefix.rfind("(") <= prefix.rfind(")")
+    protected_spans = (
+        (match.start(), match.end())
+        for pattern in (
+            INLINE_CODE_PATTERN,
+            MARKDOWN_LINK_PATTERN,
+            HTML_COMMENT_PATTERN,
+            HTML_TAG_PATTERN,
+            FORMULA_PATTERN,
+        )
+        for match in pattern.finditer(text)
     )
+    return not any(start < position < end for start, end in protected_spans)
 
 
 def _markdown_blocks(markdown: str) -> list[str]:
@@ -771,6 +999,65 @@ def _markdown_blocks(markdown: str) -> list[str]:
 def _is_fenced_code_block(block: str) -> bool:
     first_line = block.splitlines()[0] if block else ""
     return FENCE_PATTERN.match(first_line) is not None
+
+
+def _safe_translation_markdown_table_cell_spans(
+    block: str,
+) -> tuple[tuple[int, int], ...] | None:
+    """Return exact cell spans for one simple complete Markdown table."""
+
+    lines = block.splitlines(keepends=True)
+    if len(lines) < 2:
+        return None
+    divider_rows = [
+        index
+        for index, line in enumerate(lines)
+        if TABLE_DIVIDER_PATTERN.fullmatch(line.rstrip("\r\n"))
+    ]
+    if divider_rows != [1]:
+        return None
+
+    expected_pipes: int | None = None
+    spans: list[tuple[int, int]] = []
+    offset = 0
+    for row_index, line in enumerate(lines):
+        body = line.rstrip("\r\n")
+        pipe_positions: list[int] = []
+        for position, character in enumerate(body):
+            if character != "|":
+                continue
+            preceding_backslashes = 0
+            cursor = position - 1
+            while cursor >= 0 and body[cursor] == "\\":
+                preceding_backslashes += 1
+                cursor -= 1
+            if preceding_backslashes % 2 == 0:
+                pipe_positions.append(position)
+        if (
+            len(pipe_positions) < 2
+            or body[: pipe_positions[0]].strip()
+            or body[pipe_positions[-1] + 1 :].strip()
+        ):
+            return None
+        if expected_pipes is None:
+            expected_pipes = len(pipe_positions)
+        elif len(pipe_positions) != expected_pipes:
+            return None
+        if row_index != 1:
+            spans.extend(
+                (offset + start + 1, offset + end)
+                for start, end in zip(pipe_positions, pipe_positions[1:], strict=False)
+            )
+        offset += len(line)
+
+    expected_columns = (expected_pipes or 1) - 1
+    if markdown_table_shapes(block) != ((len(lines), expected_columns),):
+        return None
+    return tuple(spans)
+
+
+def _is_safe_translation_markdown_table(block: str) -> bool:
+    return _safe_translation_markdown_table_cell_spans(block) is not None
 
 
 def _is_safe_translation_html_table(block: str) -> bool:
@@ -897,10 +1184,20 @@ def _validate_revision_common(
         raise ImprovementError("El modelo cambió números romanos de un título o índice.")
     if markdown_link_destinations(source) != markdown_link_destinations(improved):
         raise ImprovementError("El modelo cambió u omitió destinos de enlaces del documento.")
+    if len(MARKDOWN_LINK_PATTERN.findall(source)) != len(MARKDOWN_LINK_PATTERN.findall(improved)):
+        raise ImprovementError("El modelo dejó un enlace Markdown incompleto.")
     if Counter(INLINE_CODE_PATTERN.findall(source)) != Counter(
         INLINE_CODE_PATTERN.findall(improved)
     ):
         raise ImprovementError("El modelo cambió u omitió código en línea del documento.")
+    _validate_html_tags(source, improved)
+
+
+def _validate_html_tags(source: str, improved: str) -> None:
+    """Keep raw markup byte-stable so model wrappers can never become reader text."""
+
+    if html_tag_structure(source) != html_tag_structure(improved):
+        raise ImprovementError("El modelo añadió o cambió etiquetas HTML del documento.")
 
 
 def _validate_internal_markers(source: str, improved: str) -> None:
@@ -1041,16 +1338,19 @@ def _validate_output(
     if len(improved) > max_characters:
         raise ImprovementError("La respuesta del modelo es demasiado grande para publicarla.")
     _validate_internal_markers(source, improved)
-    if Counter(NUMBER_PATTERN.findall(source)) != Counter(NUMBER_PATTERN.findall(improved)):
+    if numeric_token_counts(source) != numeric_token_counts(improved):
         raise ImprovementError("El modelo cambió u omitió números o fechas del documento.")
     if _title_roman_reference_values(source) != _title_roman_reference_values(improved):
         raise ImprovementError("El modelo cambió números romanos de un título o índice.")
     if markdown_link_destinations(source) != markdown_link_destinations(improved):
         raise ImprovementError("El modelo cambió u omitió destinos de enlaces del documento.")
+    if len(MARKDOWN_LINK_PATTERN.findall(source)) != len(MARKDOWN_LINK_PATTERN.findall(improved)):
+        raise ImprovementError("El modelo dejó un enlace Markdown incompleto.")
     if Counter(INLINE_CODE_PATTERN.findall(source)) != Counter(
         INLINE_CODE_PATTERN.findall(improved)
     ):
         raise ImprovementError("El modelo cambió u omitió código en línea del documento.")
+    _validate_html_tags(source, improved)
     if markdown_heading_levels(source) != markdown_heading_levels(improved):
         raise ImprovementError("El modelo cambió la estructura de encabezados del documento.")
     if markdown_table_shapes(source) != markdown_table_shapes(improved):

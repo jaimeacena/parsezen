@@ -813,6 +813,71 @@ def test_aligned_translation_corrects_only_pdf_pages_with_quality_signals(
     assert result.linguistic_review_coverage.remaining_issues == 1
 
 
+def test_redundant_pdf_translation_reviews_only_pages_with_quality_signals(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "book.pdf"
+    source.write_bytes(b"placeholder")
+    extracted = (
+        "<!-- PZDOC PDF PAGE 1 -->\n\n"
+        "# Uno\n\nPrimera página correcta.\n\n"
+        "<!-- PZDOC PDF PAGE 2 -->\n\n"
+        "# Dos\n\nSegunda página dañada.\n"
+    )
+    report = PdfQualityReport(
+        processed_pages=(1, 2),
+        ocr_pages=(2,),
+        issues=(
+            PdfReviewIssue(
+                2,
+                "La página necesita revisión.",
+                "Segunda página dañada.",
+                blocking=True,
+            ),
+        ),
+    )
+    reviewed_payloads: list[str] = []
+
+    def convert(*_args: object, **kwargs: object) -> ConvertedDocument:
+        callback = kwargs.get("on_pdf_quality_report")
+        assert callable(callback)
+        callback(report)
+        return ConvertedDocument(extracted)
+
+    def improve(
+        text: str,
+        mode: ImprovementMode,
+        *_args: object,
+        **_kwargs: object,
+    ) -> str:
+        assert mode is ImprovementMode.REVIEW_CONTENT
+        reviewed_payloads.append(text)
+        return text.replace("dañada", "corregida")
+
+    monkeypatch.setattr(processing_module, "convert_document", convert)
+    _patch_transform_dependency(monkeypatch, "improve_markdown", improve)
+    monkeypatch.setattr(transform_module, "detect_language_code", lambda *_args: "es")
+
+    result = process_document(
+        ProcessRequest(
+            source,
+            convert_to_markdown=True,
+            improvement_mode=ImprovementMode.TRANSLATE,
+            target_language="Español",
+            review_content=True,
+        ),
+        settings=LOCAL_SETTINGS,
+        work_checkpoint_root=tmp_path / "checkpoints",
+    )
+
+    assert reviewed_payloads
+    assert all("Primera página correcta" not in payload for payload in reviewed_payloads)
+    assert any("Segunda página dañada" in payload for payload in reviewed_payloads)
+    assert result.revision_draft is not None
+    assert "Segunda página corregida" in result.revision_draft.proposed_markdown
+
+
 def test_fused_translation_skips_visual_blocks_without_reviewable_text(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -867,6 +932,107 @@ def test_fused_translation_skips_visual_blocks_without_reviewable_text(
 
     assert reviewed_payloads == [text.markdown]
     assert result == visual.markdown + "Texto corregido.\n"
+
+
+def test_fused_translation_keeps_tables_and_toc_out_of_generic_cleanup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    table = SemanticBlock(
+        identifier="table",
+        markdown="| Etiqueta | Valor |\n| --- | --- |\n| Casa | Texto |\n\n",
+        position=0,
+        role=SemanticRole.TABLE,
+        page_number=2,
+        confidence=0.9,
+    )
+    toc = SemanticBlock(
+        identifier="toc",
+        markdown="Capítulo — 12\n\n",
+        position=1,
+        role=SemanticRole.TOC,
+        page_number=2,
+        confidence=0.9,
+    )
+    body = SemanticBlock(
+        identifier="body",
+        markdown="Texto dañado.\n",
+        position=2,
+        role=SemanticRole.BODY,
+        page_number=2,
+        confidence=0.9,
+    )
+    document = SemanticDocument((table, toc, body), ())
+    report = PdfQualityReport(
+        processed_pages=(2,),
+        ocr_pages=(2,),
+        issues=(PdfReviewIssue(2, "Revisar.", "Texto dudoso.", blocking=False),),
+    )
+    reviewed_payloads: list[str] = []
+
+    def improve(value: str, *_args: object, **_kwargs: object) -> str:
+        reviewed_payloads.append(value)
+        return value.replace("dañado", "corregido")
+
+    monkeypatch.setattr(transform_module, "improve_with_checkpoints", improve)
+
+    result = transform_module.improve_selected_content(
+        table.markdown + toc.markdown + body.markdown,
+        LOCAL_SETTINGS,
+        ProcessRequest(tmp_path / "book.pdf", convert_to_markdown=True),
+        None,
+        None,
+        None,
+        semantic_document=document,
+        pdf_quality_report=report,
+    )
+
+    assert reviewed_payloads == [body.markdown]
+    assert result == table.markdown + toc.markdown + "Texto corregido.\n"
+
+
+def test_selected_content_review_batches_blocks_from_the_same_problem_page(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    blocks = tuple(
+        SemanticBlock(
+            identifier=f"block-{index}",
+            markdown=f"Texto dañado {index}.\n\n",
+            position=index,
+            role=SemanticRole.BODY,
+            page_number=3,
+            confidence=0.8,
+        )
+        for index in range(4)
+    )
+    document = SemanticDocument(blocks, ())
+    report = PdfQualityReport(
+        processed_pages=(3,),
+        ocr_pages=(3,),
+        issues=(PdfReviewIssue(3, "Revisar.", "Daño.", blocking=False),),
+    )
+    reviewed_payloads: list[str] = []
+
+    def improve(value: str, *_args: object, **_kwargs: object) -> str:
+        reviewed_payloads.append(value)
+        return value.replace("dañado", "corregido")
+
+    monkeypatch.setattr(transform_module, "improve_with_checkpoints", improve)
+
+    result = transform_module.improve_selected_content(
+        "".join(block.markdown for block in blocks),
+        LOCAL_SETTINGS,
+        ProcessRequest(tmp_path / "book.pdf", convert_to_markdown=True),
+        None,
+        None,
+        None,
+        semantic_document=document,
+        pdf_quality_report=report,
+    )
+
+    assert reviewed_payloads == ["".join(block.markdown for block in blocks)]
+    assert result.count("corregido") == len(blocks)
 
 
 def test_offline_translation_applies_and_restores_the_glossary(
@@ -1038,11 +1204,17 @@ def test_ai_translation_repair_reuses_encrypted_work_checkpoints(
         load=lambda _key: None,
         save=lambda _key, _payload: True,
     )
-    callbacks: list[tuple[object, object]] = []
+    callbacks: list[tuple[object, object, object]] = []
     repair_results: list[tuple[int, int]] = []
 
     def improve(_text: str, *_args: object, **kwargs: object) -> str:
-        callbacks.append((kwargs.get("load_checkpoint"), kwargs.get("save_checkpoint")))
+        callbacks.append(
+            (
+                kwargs.get("load_checkpoint"),
+                kwargs.get("save_checkpoint"),
+                kwargs.get("focused_source_repair"),
+            )
+        )
         return "Texto reparado."
 
     def repair(*_args: object, **kwargs: object) -> SimpleNamespace:
@@ -1075,7 +1247,7 @@ def test_ai_translation_repair_reuses_encrypted_work_checkpoints(
     )
 
     assert result == "Texto reparado."
-    assert callbacks == [(checkpoint.load, checkpoint.save)]
+    assert callbacks == [(checkpoint.load, checkpoint.save, True)]
     assert repair_results == [(1, 1)]
 
 
@@ -1464,7 +1636,24 @@ def test_pdf_first_selected_page_can_become_the_epub_cover(
     monkeypatch.setattr(
         processing_module,
         "convert_document",
-        lambda *_args, **_kwargs: ConvertedDocument("# Book\n\nContent"),
+        lambda *_args, **_kwargs: ConvertedDocument(
+            "# Book\n\n"
+            "![](<__parsezen_resources__/pdf/page-0007-image-01.jpg>)\n\n"
+            "Content\n\n"
+            "![](<__parsezen_resources__/pdf/page-0008-image-01.jpg>)\n",
+            (
+                ConvertedResource(
+                    PurePosixPath("pdf/page-0007-image-01.jpg"),
+                    b"duplicated-cover",
+                    "image/jpeg",
+                ),
+                ConvertedResource(
+                    PurePosixPath("pdf/page-0008-image-01.jpg"),
+                    b"next-page-image",
+                    "image/jpeg",
+                ),
+            ),
+        ),
     )
     monkeypatch.setattr(
         processing_module,
@@ -1488,6 +1677,90 @@ def test_pdf_first_selected_page_can_become_the_epub_cover(
         assert 'properties="cover-image"' in package
         assert archive.read("EPUB/images/cover/first-page.jpg") == b"jpeg-cover"
         assert "first-page.jpg" in archive.read("EPUB/text/cover.xhtml").decode("utf-8")
+        assert "EPUB/images/pdf/page-0007-image-01.jpg" not in archive.namelist()
+        assert archive.read("EPUB/images/pdf/page-0008-image-01.jpg") == b"next-page-image"
+        chapters = "".join(
+            archive.read(name).decode("utf-8")
+            for name in archive.namelist()
+            if name.startswith("EPUB/text/chapter-")
+        )
+        assert "page-0007-image-01.jpg" not in chapters
+        assert "page-0008-image-01.jpg" in chapters
+
+
+def test_pdf_first_page_cover_remains_removed_after_applying_review(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "book.pdf"
+    source.write_bytes(b"placeholder")
+    selected = PdfPageRange(7, 12)
+    monkeypatch.setattr(
+        processing_module,
+        "resolve_pdf_page_range",
+        lambda _path, requested: requested,
+    )
+    monkeypatch.setattr(
+        processing_module,
+        "convert_document",
+        lambda *_args, **_kwargs: ConvertedDocument(
+            "# Book\n\n"
+            "![](<__parsezen_resources__/pdf/page-0007-image-01.jpg>)\n\n"
+            "Content\n\n"
+            "![](<__parsezen_resources__/pdf/page-0008-image-01.jpg>)\n",
+            (
+                ConvertedResource(
+                    PurePosixPath("pdf/page-0007-image-01.jpg"),
+                    b"duplicated-cover",
+                    "image/jpeg",
+                ),
+                ConvertedResource(
+                    PurePosixPath("pdf/page-0008-image-01.jpg"),
+                    b"next-page-image",
+                    "image/jpeg",
+                ),
+            ),
+        ),
+    )
+    monkeypatch.setattr(
+        processing_module,
+        "render_pdf_page_cover",
+        lambda _path, _page: b"jpeg-cover",
+    )
+    _patch_transform_dependency(
+        monkeypatch,
+        "_improve_with_checkpoints",
+        lambda markdown, *_args, **_kwargs: markdown.replace("Content", "Reviewed content"),
+    )
+
+    result = process_document(
+        ProcessRequest(
+            source,
+            True,
+            pdf_page_range=selected,
+            output_format=OutputFormat.EPUB,
+            epub_first_page_cover=True,
+            review_content=True,
+        ),
+        settings=LOCAL_SETTINGS,
+    )
+
+    assert result.revision_draft is not None
+    assert "page-0007-image-01.jpg" not in result.revision_draft.original_markdown
+    assert "page-0007-image-01.jpg" not in result.revision_draft.proposed_markdown
+    updated = apply_reviewed_revision(result, result.revision_draft.render())
+
+    with ZipFile(updated.final_path) as archive:
+        assert "EPUB/images/pdf/page-0007-image-01.jpg" not in archive.namelist()
+        assert archive.read("EPUB/images/pdf/page-0008-image-01.jpg") == b"next-page-image"
+        chapters = "".join(
+            archive.read(name).decode("utf-8")
+            for name in archive.namelist()
+            if name.startswith("EPUB/text/chapter-")
+        )
+    assert "page-0007-image-01.jpg" not in chapters
+    assert "page-0008-image-01.jpg" in chapters
+    assert "Reviewed content" in chapters
 
 
 def test_epub_cover_is_rejected_when_images_are_disabled(tmp_path: Path) -> None:

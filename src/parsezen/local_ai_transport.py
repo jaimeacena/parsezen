@@ -15,6 +15,7 @@ from parsezen.cancellation import CancellationToken, check_cancelled
 from parsezen.errors import ImprovementError
 from parsezen.improvement_contracts import MAX_LOCAL_AI_OUTPUT_CHARACTERS
 from parsezen.local_models import OLLAMA_BASE_URL
+from parsezen.processing_metrics import record_local_ai_request
 
 LOGGER = logging.getLogger(__name__)
 _DEFAULT_MAX_GENERATION_SECONDS = 600.0
@@ -46,6 +47,7 @@ def request_local_ai(
     max_generation_seconds: float | None = None,
     image: bytes | None = None,
     json_response: bool = False,
+    operation: str = "other",
     on_metrics: Callable[[LocalAiMetrics], None] | None = None,
 ) -> str:
     """Return one deterministic local transformation with independent stream bounds."""
@@ -146,8 +148,9 @@ def request_local_ai(
         output_tokens_per_second=round(tokens_per_second, 2),
     )
     LOGGER.info(
-        "local_ai_completed wall_ms=%d prompt_tokens=%d output_tokens=%d "
+        "local_ai_completed operation=%s wall_ms=%d prompt_tokens=%d output_tokens=%d "
         "ollama_total_ms=%d load_ms=%d output_tokens_per_second=%.2f",
+        operation,
         metrics.wall_duration_ms,
         metrics.prompt_tokens,
         metrics.output_tokens,
@@ -157,6 +160,15 @@ def request_local_ai(
     )
     if on_metrics is not None:
         on_metrics(metrics)
+    record_local_ai_request(
+        input_characters=len(document_fragment),
+        prompt_tokens=metrics.prompt_tokens,
+        output_tokens=metrics.output_tokens,
+        wall_duration_ms=metrics.wall_duration_ms,
+        ollama_total_duration_ms=metrics.ollama_total_duration_ms,
+        ollama_load_duration_ms=metrics.ollama_load_duration_ms,
+        operation=operation,
+    )
     return "".join(content_parts)
 
 

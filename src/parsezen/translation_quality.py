@@ -50,6 +50,7 @@ TITLE_LANGUAGE_HINTS = {
             "of",
             "to",
             "day",
+            "days",
             "chapter",
             "introduction",
             "challenge",
@@ -79,29 +80,60 @@ TITLE_LANGUAGE_HINTS = {
             "appendix",
             "ancient",
             "afterword",
+            "acknowledgement",
+            "acknowledgements",
+            "acknowledgment",
+            "acknowledgments",
             "astrology",
             "aquarius",
             "appendices",
             "cancer",
             "capricorn",
             "condition",
+            "category",
+            "character",
+            "calculating",
+            "choose",
             "benefic",
             "bodyguard",
             "bodyguards",
+            "bad",
+            "chart",
+            "god",
+            "goddess",
+            "good",
             "exercise",
+            "energized",
+            "egyptian",
+            "english",
+            "edition",
+            "editions",
+            "expense",
+            "factors",
+            "favorability",
             "fortune",
+            "greek",
+            "history",
             "gemini",
             "judgment",
+            "index",
+            "illustration",
+            "illustrations",
             "lot",
             "moon",
             "money",
+            "meaning",
+            "amount",
             "nodes",
             "planets",
             "planetary",
+            "primary",
             "phases",
             "pisces",
             "quadrant",
             "readings",
+            "bibliography",
+            "carpet",
             "reception",
             "rejoicing",
             "releasing",
@@ -109,15 +141,66 @@ TITLE_LANGUAGE_HINTS = {
             "scorpio",
             "scorpion",
             "source",
+            "setting",
+            "sign",
+            "spirit",
+            "spending",
+            "subterranean",
+            "summary",
             "sect",
             "striking",
             "taurus",
             "your",
+            "dream",
+            "down",
+            "earth",
+            "self",
+            "success",
+            "team",
+            "treat",
             "level",
             "overview",
             "rulerships",
             "triplicity",
             "triplicities",
+            "angularity",
+            "angular",
+            "aspect",
+            "aspects",
+            "cadent",
+            "determining",
+            "directions",
+            "doctrine",
+            "doctrines",
+            "hermetic",
+            "historical",
+            "identifying",
+            "interpretation",
+            "interpreting",
+            "introducing",
+            "light",
+            "idle",
+            "lord",
+            "lords",
+            "location",
+            "lots",
+            "motion",
+            "midheaven",
+            "other",
+            "phasis",
+            "retrograde",
+            "themes",
+            "timing",
+            "trine",
+            "traditional",
+            "triad",
+            "triads",
+            "analyzing",
+            "comparing",
+            "contrasting",
+            "dignified",
+            "formulas",
+            "witnessing",
         }
     ),
     "es": frozenset(
@@ -234,6 +317,11 @@ TITLE_LANGUAGE_HINTS = {
 _ESTABLISHED_TITLE_TRANSLATIONS = {
     ("en", "es"): {
         "afterword": "epílogo",
+        "an introduction": "una introducción",
+        "an overview of procedures": "panorama de los procedimientos",
+        "an overview of timing methods": "panorama de los métodos de cronología",
+        "angularity": "angularidad",
+        "angularity, favorability, testimony": "angularidad, favorabilidad y testimonio",
         "aries": "Aries",
         "art of judgment": "arte del juicio",
         "benefic": "benéfico",
@@ -246,6 +334,12 @@ _ESTABLISHED_TITLE_TRANSLATIONS = {
         "bound lord": "señor de los términos",
         "bound lords": "señores de los términos",
         "bound rulerships": "regencias por término",
+        "cadent triplicity lords of the light sect": (
+            "señores cadentes de la triplicidad de la luminaria de la secta"
+        ),
+        "cadent triplicity lords of the sect light": (
+            "señores cadentes de la triplicidad de la luminaria de la secta"
+        ),
         "taurus": "Tauro",
         "gemini": "Géminis",
         "cancer": "Cáncer",
@@ -258,15 +352,76 @@ _ESTABLISHED_TITLE_TRANSLATIONS = {
         "aquarius": "Acuario",
         "pisces": "Piscis",
         "domicile rulerships": "regencias por domicilio",
+        "down to earth": "con los pies en la tierra",
+        "exercise": "ejercicio",
+        "chart one": "carta uno",
+        "chart two": "carta dos",
+        "contents": "índice",
+        "cusp": "cúspide",
+        "cusps": "cúspides",
         "delineating a planet in a house": "delineación de un planeta en una casa",
         "delineating a planet with its condition in a house": (
             "delineación de un planeta con su condición en una casa"
         ),
+        "delineating planetary meaning": "interpretación del significado planetario",
+        "delineations for chart one": "interpretaciones de la carta uno",
+        "delineations for chart two": "interpretaciones de la carta dos",
+        "placing the planets in the houses": "colocación de los planetas en las casas",
+        "the planet's domicile lord": "el regente domiciliario del planeta",
+        "the planet’s domicile lord": "el regente domiciliario del planeta",
+        "domicile lord": "regente domiciliario",
+        "domicile lords": "regentes domiciliarios",
+        "condition and location of the domicile lord": (
+            "condición y ubicación del regente domiciliario"
+        ),
+        "a planet's assistance from its domicile lord": (
+            "ayuda de un planeta procedente de su regente domiciliario"
+        ),
+        "a planet’s assistance from its domicile lord": (
+            "ayuda de un planeta procedente de su regente domiciliario"
+        ),
+        "a planet's assistance": "ayuda de un planeta",
+        "a planet’s assistance": "ayuda de un planeta",
+        "from its domicile lord": "de su regente domiciliario",
+        "its domicile lord": "su regente domiciliario",
+        "the relative angularity of the houses": ("la angularidad relativa de las casas"),
+        "relative angularity of the houses": "angularidad relativa de las casas",
+        "the relative favorability of the houses": ("la favorabilidad relativa de las casas"),
+        "relative favorability of the houses": "favorabilidad relativa de las casas",
+        "angularity and favorability in quadrant and equal house divisions": (
+            "angularidad y favorabilidad en las divisiones de casas por cuadrantes e iguales"
+        ),
+        "the houses and chronological ages": "las casas y las edades cronológicas",
         "according to zodiacal sign": "según el signo zodiacal",
+        "favorability": "favorabilidad",
         "historical overview": "panorama histórico",
         "historical overview of aspect doctrine": (
             "panorama histórico de la doctrina de los aspectos"
         ),
+        "historical overview of aspect doctrines": (
+            "panorama histórico de las doctrinas de los aspectos"
+        ),
+        "hermetic lots": "lotes herméticos",
+        "glossary": "glosario",
+        "goddess": "diosa",
+        "god": "dios",
+        "setting": "ocaso",
+        "midheaven": "medio cielo",
+        "good spirit": "buen espíritu",
+        "bad spirit": "mal espíritu",
+        "subterranean place": "Lugar subterráneo",
+        "idle": "Inactivo",
+        "introduction": "introducción",
+        "introducing lots": "presentación de los lotes",
+        "interpreting phasis": "interpretación de la fasis",
+        "interpreting retrograde motion": "interpretación del movimiento retrógrado",
+        "determining phasis": "determinación de la fasis",
+        "angular triads": "tríadas angulares",
+        "lot of fortune": "lote de la fortuna",
+        "length of life": "duración de la vida",
+        "lord": "señor",
+        "lords": "señores",
+        "mainstream": "ámbito general",
         "malefic": "maléfico",
         "maltreatment": "maltrato",
         "maltreatment by striking with a ray": "maltrato al golpear con un rayo",
@@ -274,6 +429,7 @@ _ESTABLISHED_TITLE_TRANSLATIONS = {
         "planetary reception": "recepción planetaria",
         "planetary domiciles": "domicilios planetarios",
         "primary source readings": "lecturas de fuentes primarias",
+        "readings": "lecturas",
         "ray": "rayo",
         "rays": "rayos",
         "rejoicing": "gozo",
@@ -284,34 +440,104 @@ _ESTABLISHED_TITLE_TRANSLATIONS = {
         "sect rejoicing by hemisphere": "gozo por secta según el hemisferio",
         "science of judgment": "ciencia del juicio",
         "source readings": "lecturas de fuentes",
+        "step one": "paso uno",
+        "step two": "paso dos",
+        "step three": "paso tres",
+        "step four": "paso cuatro",
+        "step four: the condition and location of the domicile lord": (
+            "paso cuatro: condición y ubicación del regente domiciliario"
+        ),
+        "step five": "paso cinco",
+        "step six": "paso seis",
+        "step six: location and topics of the lord": ("paso seis: ubicación y ámbitos del regente"),
         "spear-bearing bodyguards": "guardaespaldas portadores de lanza",
         "striking with a ray": "golpear con un rayo",
         "summary and source readings": "resumen y lecturas de fuentes",
+        "steering the ship of life": "llevar el timón de la vida",
+        "synodic cycle": "ciclo sinódico",
+        "symbols and abbreviations used in this book": (
+            "símbolos y abreviaturas utilizados en este libro"
+        ),
+        "part one": "parte uno",
+        "part two": "parte dos",
+        "part three": "parte tres",
+        "part four": "parte cuatro",
+        "part five": "parte cinco",
+        "part seven": "parte siete",
+        "part eight": "parte ocho",
+        "part nine": "parte nueve",
+        "part ten": "parte diez",
+        "part eleven": "parte once",
+        "part twelve": "parte doce",
         "part six: the art of judgment": "parte seis: el arte del juicio",
+        "part six": "parte seis",
+        "part": "parte",
+        "ruler": "regente",
+        "rulers": "regentes",
+        "rulers of the nativity": "regentes de la natividad",
+        "source reading": "lectura de fuentes",
         "the art of judgment": "el arte del juicio",
         "the bound lord": "el señor de los términos",
         "the bound lords": "los señores de los términos",
         "the first house": "la primera casa",
+        "first house": "Primera casa",
         "the second house": "la segunda casa",
+        "second house": "Segunda casa",
         "the third house": "la tercera casa",
+        "third house": "Tercera casa",
         "the fourth house": "la cuarta casa",
+        "fourth house": "Cuarta casa",
         "the fifth house": "la quinta casa",
+        "fifth house": "Quinta casa",
         "the sixth house": "la sexta casa",
+        "sixth house": "Sexta casa",
         "the seventh house": "la séptima casa",
+        "seventh house": "Séptima casa",
         "the eighth house": "la octava casa",
+        "eighth house": "Octava casa",
         "the ninth house": "la novena casa",
+        "ninth house": "Novena casa",
         "the tenth house": "la décima casa",
+        "tenth house": "Décima casa",
         "the eleventh house": "la undécima casa",
+        "eleventh house": "Undécima casa",
         "the twelfth house": "la duodécima casa",
+        "twelfth house": "Duodécima casa",
         "the science of judgment": "la ciencia del juicio",
+        "the seven hermetic lots": "los siete lotes herméticos",
+        "the domicile lord of the ascendant": "el regente domiciliario del Ascendente",
+        "the domicile lord of the ascendant and the vital times": (
+            "el regente domiciliario del Ascendente y los períodos vitales"
+        ),
+        "the domicile lord of fortune": "el regente domiciliario de la fortuna",
+        "domicile lord of fortune": "regente domiciliario de la fortuna",
+        "the lot of fortune and the lord of fortune": (
+            "el lote de la fortuna y el regente de la fortuna"
+        ),
+        "the lot of fortune and the domicile lord of fortune": (
+            "el lote de la fortuna y el regente domiciliario de la fortuna"
+        ),
+        "the lots": "los lotes",
+        "the synodic cycle": "el ciclo sinódico",
+        "and the moon under the bonds": "y la Luna bajo los lazos",
         "the triplicity lord": "el señor de la triplicidad",
         "the triplicity lords": "los señores de la triplicidad",
+        "the ultimate rulers of the chart": "los regentes finales de la carta",
+        "triplicity lords of the sect light": (
+            "señores de la triplicidad de la luminaria de la secta"
+        ),
         "triplicity": "triplicidad",
         "triplicities": "triplicidades",
         "triplicity lord": "señor de la triplicidad",
         "triplicity lords": "señores de la triplicidad",
         "triplicity rulerships": "regencias por triplicidad",
+        "trine": "trígono",
         "three types of bodyguards": "tres tipos de guardaespaldas",
+        "testimony": "testimonio",
+        "ultimate rulers of the chart": "regentes finales de la carta",
+        "sign rulerships": "regencias de los signos",
+        "traditional sign rulerships": "regencias tradicionales de los signos",
+        "rulerships of the signs": "regencias de los signos",
         "zodiacal sign rulerships": "regencias de los signos zodiacales",
     },
     ("es", "en"): {
@@ -331,6 +557,16 @@ _ESTABLISHED_TITLE_TRANSLATIONS = {
     },
 }
 
+_ESTABLISHED_COMPACT_RESIDUAL_TOKEN_TRANSLATIONS = {
+    ("en", "es"): {
+        # These tokens are only localized when they belong to a longer established
+        # expression found in the same compact label. They must not rewrite ordinary
+        # prose such as "a lot" or an unrelated cardinal.
+        "lots": "lotes",
+        "six": "seis",
+    },
+}
+
 _ESTABLISHED_UNCHANGED_TITLE_TERMS = {
     languages: frozenset(
         source for source, target in translations.items() if source == target.casefold()
@@ -346,10 +582,88 @@ def established_term_translation(
 ) -> str | None:
     """Return a curated conventional equivalent independently of document layout."""
 
-    return _ESTABLISHED_TITLE_TRANSLATIONS.get(
+    translations = _ESTABLISHED_TITLE_TRANSLATIONS.get(
         (source_language, target_language),
         {},
-    ).get(source_term.strip().casefold())
+    )
+    normalized = re.sub(r"\s+", " ", source_term.strip()).casefold()
+    translated = translations.get(normalized)
+    if translated is not None:
+        return translated
+    collapsed = re.sub(r"\s+", "", normalized)
+    matches = {
+        target for source, target in translations.items() if re.sub(r"\s+", "", source) == collapsed
+    }
+    return next(iter(matches)) if len(matches) == 1 else None
+
+
+def established_compact_label_translation(
+    source_label: str,
+    source_language: str,
+    target_language: str,
+) -> str | None:
+    """Compose a complete compact label only from unambiguous curated terms.
+
+    This intentionally refuses partial prose: every characteristic source-language
+    word must disappear after composition. It is therefore safe for deterministic
+    title and generated-TOC repair while longer sentences still go through the model.
+    """
+
+    exact = established_term_translation(source_label, source_language, target_language)
+    if exact is not None:
+        return exact
+    composed = replace_established_compact_term_residues(
+        source_label,
+        source_label,
+        source_language,
+        target_language,
+    )
+    if composed == source_label or _has_title_language_hint(composed, source_language):
+        return None
+    return composed
+
+
+def is_probable_third_language_compact_value(
+    text: str,
+    *,
+    source_language: str,
+    target_language: str,
+) -> bool:
+    """Recognize a short foreign term embedded in a table of another language.
+
+    Requiring at least two words (or a diacritic) avoids preserving ordinary
+    one-word English labels when short-text language detection is uncertain.
+    """
+
+    natural = natural_language_text(text).strip()
+    words = re.findall(r"[^\W\d_]+", natural)
+    normalized_words = {_normalized_word(word) for word in words}
+    if (
+        not 1 <= len(words) <= 5
+        or _letter_count(natural) < 5
+        or (
+            all(ord(character) < 128 for character in natural)
+            and (len(words) == 1 or any(word[:1].isupper() for word in words))
+        )
+        or normalized_words & TITLE_LANGUAGE_HINTS.get(source_language, frozenset())
+        or contains_established_translation_candidate(natural)
+    ):
+        return False
+    detected = detect_language_code(
+        natural,
+        minimum_letters=4,
+        minimum_confidence=0.50,
+    )
+    return detected not in {None, source_language, target_language}
+
+
+def _established_term_pattern(source_term: str) -> str:
+    """Match a curated phrase despite harmless PDF whitespace variation."""
+
+    words = re.split(r"\s+", source_term.strip())
+    whitespace = r"\s*"
+    word_patterns = [re.escape(word).replace("'", "['’]?").replace("’", "['’]?") for word in words]
+    return rf"(?<!\w){whitespace.join(word_patterns)}(?!\w)"
 
 
 def established_terms_requiring_translation(
@@ -369,7 +683,7 @@ def established_terms_requiring_translation(
     for term in sorted(candidates, key=len, reverse=True):
         if " " not in term:
             continue
-        if re.search(rf"(?<!\w){re.escape(term)}(?!\w)", source, re.IGNORECASE):
+        if re.search(_established_term_pattern(term), source, re.IGNORECASE):
             seen.add(term)
             found.append(term)
     for match in re.finditer(r"[^\W\d_]+", source, re.UNICODE):
@@ -390,7 +704,7 @@ def contains_established_translation_candidate(source: str) -> bool:
         if term != target.casefold()
     }
     return any(
-        re.search(rf"(?<!\w){re.escape(term)}(?!\w)", source, re.IGNORECASE) for term in candidates
+        re.search(_established_term_pattern(term), source, re.IGNORECASE) for term in candidates
     )
 
 
@@ -402,6 +716,7 @@ _SOURCE_LANGUAGE_WORD_RESIDUE_HINTS = {
             "between",
             "during",
             "however",
+            "mainstream",
             "through",
             "toward",
             "towards",
@@ -433,7 +748,11 @@ ORGANIZATION_NAME_SUFFIXES = frozenset(
 )
 
 NUMBER_PATTERN = re.compile(r"(?<!\d)[+-]?\d+(?:[.,:/-]\d+)*(?!\d)")
+NUMERIC_HTML_ENTITY_PATTERN = re.compile(r"&#(?:x[0-9a-f]+|\d+);", re.IGNORECASE)
 WRITTEN_NUMBER_VALUES = {
+    "both": 2,
+    "ambos": 2,
+    "ambas": 2,
     "two": 2,
     "dos": 2,
     "three": 3,
@@ -489,6 +808,51 @@ WRITTEN_NUMBER_VALUES = {
     "hundred": 100,
     "cien": 100,
     "ciento": 100,
+}
+WRITTEN_NUMBER_VALUES_BY_LANGUAGE = {
+    "en": {
+        "both": 2,
+        "two": 2,
+        "three": 3,
+        "four": 4,
+        "five": 5,
+        "six": 6,
+        "seven": 7,
+        "eight": 8,
+        "nine": 9,
+        "ten": 10,
+        "eleven": 11,
+        "twelve": 12,
+        "thirteen": 13,
+        "fourteen": 14,
+        "fifteen": 15,
+        "sixteen": 16,
+        "seventeen": 17,
+        "eighteen": 18,
+        "nineteen": 19,
+    },
+    "es": {
+        "ambos": 2,
+        "ambas": 2,
+        "dos": 2,
+        "tres": 3,
+        "cuatro": 4,
+        "cinco": 5,
+        "seis": 6,
+        "siete": 7,
+        "ocho": 8,
+        "nueve": 9,
+        "diez": 10,
+        "once": 11,
+        "doce": 12,
+        "trece": 13,
+        "catorce": 14,
+        "quince": 15,
+        "dieciséis": 16,
+        "diecisiete": 17,
+        "dieciocho": 18,
+        "diecinueve": 19,
+    },
 }
 WRITTEN_ORDINAL_VALUES = {
     "first": 1,
@@ -644,6 +1008,8 @@ class TranslationQualityReport:
     issue_totals: tuple[tuple[TranslationIssueKind, int], ...] = ()
     source_blocks: int = 0
     translated_blocks: int = 0
+    review_segment_numbers: tuple[int, ...] = ()
+    requires_full_review: bool = False
 
     @property
     def issues_by_kind(self) -> dict[TranslationIssueKind, int]:
@@ -722,10 +1088,13 @@ def detect_language_code(
         return None
     try:
         from langdetect import DetectorFactory, LangDetectException, detect_langs
+    except ImportError:
+        return None
 
+    try:
         DetectorFactory.seed = 0
         candidates = detect_langs(sample)
-    except (ImportError, LangDetectException):
+    except LangDetectException:
         return None
     if not candidates or candidates[0].prob < minimum_confidence:
         return None
@@ -744,6 +1113,23 @@ def validate_translation_quality(
     """Reject incomplete, wrong-language or structurally unsafe translations."""
     _validate_structure(source, translated, preserve_paragraphs=preserve_paragraphs)
     _validate_content_coverage(source, translated)
+    if {source_language, target_language} == {"en", "es"} and not (
+        _written_number_meaning_is_conserved(
+            source,
+            translated,
+            source_language=source_language,
+            target_language=target_language,
+        )
+    ):
+        raise TranslationQualityError(
+            "La traducción cambió el valor de una cantidad escrita con palabras."
+        )
+    if (source_language, target_language) == ("en", "es") and not (
+        _english_spanish_duration_units_are_conserved(source, translated)
+    ):
+        raise TranslationQualityError(
+            "La traducción no mantuvo la concordancia de una duración numérica."
+        )
     if _has_critical_polarity_reversal(
         source,
         translated,
@@ -827,11 +1213,23 @@ def _build_translation_quality_report(
     issues: list[TranslationQualityIssue] = []
     total_issues = 0
     issue_totals: Counter[TranslationIssueKind] = Counter()
+    review_segment_numbers: set[int] = set()
+    requires_full_review = False
 
-    def add_issue(issue: TranslationQualityIssue) -> None:
-        nonlocal total_issues
+    def add_issue(
+        issue: TranslationQualityIssue,
+        *,
+        review_segment_number: int | None = None,
+    ) -> None:
+        nonlocal requires_full_review, total_issues
         total_issues += 1
         issue_totals[issue.kind] += 1
+        if review_segment_number is not None:
+            review_segment_numbers.add(review_segment_number)
+        elif len(issues) >= MAX_REPORT_ISSUES:
+            # Detailed excerpts remain bounded, but an unlocatable hidden issue
+            # must increase review coverage instead of disappearing silently.
+            requires_full_review = True
         if len(issues) < MAX_REPORT_ISSUES:
             issues.append(issue)
 
@@ -888,7 +1286,7 @@ def _build_translation_quality_report(
         ):
             issue = None
         if issue is not None:
-            add_issue(issue)
+            add_issue(issue, review_segment_number=index)
 
     if (
         check_heading_fidelity
@@ -932,6 +1330,8 @@ def _build_translation_quality_report(
         ),
         source_blocks=len(source_blocks),
         translated_blocks=len(translated_blocks),
+        review_segment_numbers=tuple(sorted(review_segment_numbers)),
+        requires_full_review=requires_full_review,
     )
 
 
@@ -1663,8 +2063,64 @@ def _has_title_language_hint(text: str, language: str) -> bool:
     }
     if words & hints:
         return True
-    long_hints = {hint for hint in hints if len(hint) >= 4}
-    return any(hint in word and len(word) - len(hint) >= 3 for word in words for hint in long_hints)
+    other_language_hints = {
+        _normalized_word(hint)
+        for other_language, language_hints in TITLE_LANGUAGE_HINTS.items()
+        if other_language != language
+        for hint in language_hints
+    }
+    return any(
+        _is_joined_title_language_hint(word, hints)
+        or _is_mixed_joined_title_language_hint(word, hints, other_language_hints)
+        for word in words
+    )
+
+
+def _is_joined_title_language_hint(word: str, hints: set[str]) -> bool:
+    """Accept only complete OCR-joined hint sequences, not target-language derivatives."""
+
+    if len(word) < 5:
+        return False
+    candidates = tuple(sorted((hint for hint in hints if len(hint) >= 2), key=len, reverse=True))
+    segment_counts: dict[int, int] = {0: 0}
+    for position in range(len(word)):
+        count = segment_counts.get(position)
+        if count is None:
+            continue
+        for hint in candidates:
+            if not word.startswith(hint, position):
+                continue
+            end = position + len(hint)
+            segment_counts[end] = max(segment_counts.get(end, 0), count + 1)
+    return segment_counts.get(len(word), 0) >= 2
+
+
+def _is_mixed_joined_title_language_hint(
+    word: str,
+    source_hints: set[str],
+    other_language_hints: set[str],
+) -> bool:
+    """Recognize a source residue attached to complete words from another language."""
+
+    for hint in sorted((value for value in source_hints if len(value) >= 4), key=len, reverse=True):
+        remainders: list[str] = []
+        if word.startswith(hint) and len(word) > len(hint):
+            remainders.append(word[len(hint) :])
+        if word.endswith(hint) and len(word) > len(hint):
+            remainders.append(word[: -len(hint)])
+        for remainder in remainders:
+            # Two-letter endings are commonly target-language inflections
+            # (for example ``aspect`` -> ``aspectos``), not a second word
+            # joined by PDF extraction.
+            if len(remainder) >= 3 and (
+                remainder in other_language_hints
+                or _is_joined_title_language_hint(
+                    remainder,
+                    other_language_hints,
+                )
+            ):
+                return True
+    return False
 
 
 def _title_source_language_residues(
@@ -2096,6 +2552,19 @@ def _translation_segment_issue(
         else None
     )
     if (
+        source_language == "en"
+        and target_language != "en"
+        and re.search(r"(?i)(?<!\w)yo['’](?:[ \t]+self)?(?!\w)", source_natural)
+        and re.search(r"(?i)(?<!\w)yo['’](?:[ \t]+self)?(?!\w)", translated_natural)
+    ):
+        return _report_issue(
+            segment_number,
+            TranslationIssueKind.SOURCE_TEXT,
+            "Una contracción posesiva inglesa conserva su forma original.",
+            source,
+            translated,
+        )
+    if (
         unchanged is not None
         and source_language is not None
         and (
@@ -2488,13 +2957,43 @@ def replace_established_index_term_residues(
 
     if not is_index_entry(source):
         return translated
+    return replace_established_term_residues(
+        source,
+        translated,
+        source_language,
+        target_language,
+    )
+
+
+def replace_established_term_residues(
+    source: str,
+    translated: str,
+    source_language: str,
+    target_language: str,
+) -> str:
+    """Localize copied conventional terms in an already aligned compact label."""
+
     translations = _ESTABLISHED_TITLE_TRANSLATIONS.get(
         (source_language, target_language),
         {},
     )
     result = translated
-    for source_term, target_term in translations.items():
-        if re.search(rf"(?<!\w){re.escape(source_term)}(?!\w)", source, re.IGNORECASE) is None:
+    for source_term, target_term in sorted(
+        translations.items(),
+        key=lambda item: len(item[0]),
+        reverse=True,
+    ):
+        if source_term == target_term.casefold():
+            continue
+        copied_source = re.compile(_established_term_pattern(source_term), re.IGNORECASE)
+        collapsed_source_term = re.sub(r"\s+", "", source_term)
+        collapsed_source = re.compile(
+            rf"(?<!\w){re.escape(collapsed_source_term)}(?!\w)",
+            re.IGNORECASE,
+        )
+        if copied_source.search(source) is None and (
+            collapsed_source_term == source_term or collapsed_source.search(source) is None
+        ):
             continue
 
         def replacement(match: re.Match[str], term: str = target_term) -> str:
@@ -2504,12 +3003,79 @@ def replace_established_index_term_residues(
                 return term.lower()
             return term
 
-        result = re.sub(
-            rf"(?<!\w){re.escape(source_term)}(?!\w)",
-            replacement,
-            result,
-            flags=re.IGNORECASE,
+        if copied_source.search(result) is not None:
+            result = copied_source.sub(replacement, result)
+        if collapsed_source_term != source_term and collapsed_source.search(result) is not None:
+            result = collapsed_source.sub(replacement, result)
+        collapsed_target = re.sub(r"\s+", "", target_term)
+        if collapsed_target != target_term:
+
+            def collapsed_replacement(
+                match: re.Match[str],
+                term: str = target_term,
+            ) -> str:
+                if match.group().isupper():
+                    return term.upper()
+                if match.group().islower():
+                    return term.lower()
+                if match.group()[:1].isupper():
+                    return f"{term[:1].upper()}{term[1:]}"
+                return term
+
+            result = re.sub(
+                rf"(?<!\w){re.escape(collapsed_target)}(?!\w)",
+                collapsed_replacement,
+                result,
+                flags=re.IGNORECASE,
+            )
+    return result
+
+
+def replace_established_compact_term_residues(
+    source: str,
+    translated: str,
+    source_language: str,
+    target_language: str,
+) -> str:
+    """Localize partial residues only when backed by a known multiword label term."""
+
+    result = replace_established_term_residues(
+        source,
+        translated,
+        source_language,
+        target_language,
+    )
+    translations = _ESTABLISHED_TITLE_TRANSLATIONS.get(
+        (source_language, target_language),
+        {},
+    )
+    residual_tokens = _ESTABLISHED_COMPACT_RESIDUAL_TOKEN_TRANSLATIONS.get(
+        (source_language, target_language),
+        {},
+    )
+    for source_token, target_token in residual_tokens.items():
+        supporting_terms = (
+            term
+            for term in translations
+            if " " in term
+            and re.search(rf"(?<!\w){re.escape(source_token)}(?!\w)", term, re.IGNORECASE)
         )
+        if not any(
+            re.search(_established_term_pattern(term), source, re.IGNORECASE)
+            for term in supporting_terms
+        ):
+            continue
+        pattern = re.compile(
+            rf"(?<!\w){re.escape(source_token)}(?!\w)",
+            re.IGNORECASE,
+        )
+
+        def replacement(match: re.Match[str], term: str = target_token) -> str:
+            if match.group().isupper():
+                return term.upper()
+            return term.lower()
+
+        result = pattern.sub(replacement, result)
     return result
 
 
@@ -2764,6 +3330,8 @@ def _validate_structure(source: str, translated: str, *, preserve_paragraphs: bo
         raise TranslationQualityError("La traducción cambió números romanos de un título o índice.")
     if markdown_link_destinations(source) != markdown_link_destinations(translated):
         raise TranslationQualityError("La traducción cambió u omitió destinos de enlaces.")
+    if len(MARKDOWN_LINK_PATTERN.findall(source)) != len(MARKDOWN_LINK_PATTERN.findall(translated)):
+        raise TranslationQualityError("La traducción dejó un enlace Markdown incompleto.")
     if Counter(INLINE_CODE_PATTERN.findall(source)) != Counter(
         INLINE_CODE_PATTERN.findall(translated)
     ):
@@ -2790,6 +3358,8 @@ def _validate_structure(source: str, translated: str, *, preserve_paragraphs: bo
         HTML_COMMENT_PATTERN.findall(translated)
     ):
         raise TranslationQualityError("La traducción cambió comentarios HTML protegidos.")
+    if html_tag_structure(source) != html_tag_structure(translated):
+        raise TranslationQualityError("La traducción añadió o cambió etiquetas HTML.")
     if preserve_paragraphs and _block_count(source) != _block_count(translated):
         raise TranslationQualityError("La traducción cambió la separación de párrafos.")
 
@@ -2809,6 +3379,54 @@ def _validate_content_coverage(source: str, translated: str) -> None:
     )
     if excessive_growth:
         raise TranslationQualityError("La traducción parece haber duplicado o añadido contenido.")
+    if _near_duplicate_long_block_count(translated) > _near_duplicate_long_block_count(source):
+        raise TranslationQualityError(
+            "La traducción parece haber repetido un párrafo que no estaba duplicado."
+        )
+    source_blocks = tuple(
+        natural_language_text(block)
+        for block in re.split(r"\n\s*\n", source.strip())
+        if natural_language_text(block)
+    )
+    translated_blocks = tuple(
+        natural_language_text(block)
+        for block in re.split(r"\n\s*\n", translated.strip())
+        if natural_language_text(block)
+    )
+    if len(source_blocks) != len(translated_blocks):
+        return
+    for source_block, translated_block in zip(
+        source_blocks,
+        translated_blocks,
+        strict=True,
+    ):
+        source_block_letters = _letter_count(source_block)
+        if source_block_letters < 80:
+            continue
+        if _letter_count(translated_block) / source_block_letters > MAX_CONTENT_RATIO:
+            raise TranslationQualityError(
+                "La traducción parece haber duplicado contenido dentro de un párrafo."
+            )
+
+
+def _near_duplicate_long_block_count(markdown: str) -> int:
+    """Count nearby near-duplicate prose blocks with bounded comparison work."""
+
+    blocks = [
+        re.sub(r"\s+", " ", natural_language_text(block)).strip().casefold()
+        for block in re.split(r"\n\s*\n", markdown.strip())
+    ]
+    long_blocks = [block for block in blocks if _letter_count(block) >= 180]
+    duplicates = 0
+    for index, current in enumerate(long_blocks):
+        for previous in long_blocks[max(0, index - 12) : index]:
+            length_ratio = min(len(previous), len(current)) / max(len(previous), len(current))
+            if length_ratio < 0.70:
+                continue
+            if SequenceMatcher(None, previous, current, autojunk=False).ratio() >= 0.88:
+                duplicates += 1
+                break
+    return duplicates
 
 
 def _validate_target_language(
@@ -3037,8 +3655,8 @@ def markdown_link_destinations(markdown: str) -> Counter[str]:
 def numeric_tokens_are_conserved(source: str, translated: str) -> bool:
     """Keep explicit values exact while allowing a written number to become digits once."""
 
-    source_tokens = Counter(NUMBER_PATTERN.findall(source))
-    translated_tokens = Counter(NUMBER_PATTERN.findall(translated))
+    source_tokens = numeric_token_counts(source)
+    translated_tokens = numeric_token_counts(translated)
     if source_tokens - translated_tokens:
         return False
     added_tokens = translated_tokens - source_tokens
@@ -3057,6 +3675,13 @@ def numeric_tokens_are_conserved(source: str, translated: str) -> bool:
     return True
 
 
+def numeric_token_counts(text: str) -> Counter[str]:
+    """Count reader-visible numeric tokens, excluding numeric HTML character entities."""
+
+    visible = NUMERIC_HTML_ENTITY_PATTERN.sub("", text)
+    return Counter(NUMBER_PATTERN.findall(visible))
+
+
 def _written_number_value_counts(text: str) -> Counter[int]:
     values: list[int] = []
     for word in re.findall(r"[^\W\d_]+", natural_language_text(text)):
@@ -3072,6 +3697,106 @@ def _written_number_value_counts(text: str) -> Counter[int]:
         if value is not None:
             values.append(value)
     return Counter(values)
+
+
+def _written_number_meaning_is_conserved(
+    source: str,
+    translated: str,
+    *,
+    source_language: str,
+    target_language: str,
+) -> bool:
+    """Conserve unambiguous small cardinal values across English and Spanish.
+
+    Values from two through nineteen avoid the article ambiguity of ``one`` and
+    the compound spelling ambiguity of larger numbers. A model may still render
+    one of these values as a digit exactly once.
+    """
+
+    if not _looks_like_title(source):
+        return True
+    if natural_language_text(source).casefold() == natural_language_text(translated).casefold():
+        # Unchanged publisher names and other protected labels are handled by
+        # the residual-language review; they are not evidence of a changed
+        # quantity by themselves.
+        return True
+
+    def bounded_written(value: str, language: str) -> Counter[int]:
+        mapping = WRITTEN_NUMBER_VALUES_BY_LANGUAGE.get(language, {})
+        return Counter(
+            mapping[word.casefold()]
+            for word in re.findall(r"[^\W\d_]+", natural_language_text(value))
+            if word.casefold() in mapping
+        )
+
+    source_values = bounded_written(source, source_language)
+    translated_values = bounded_written(translated, target_language)
+    if not source_values and not translated_values:
+        return True
+    source_digits = Counter(
+        int(token)
+        for token in numeric_token_counts(source).elements()
+        if token.isdigit() and 2 <= int(token) <= 19
+    )
+    translated_digits = Counter(
+        int(token)
+        for token in numeric_token_counts(translated).elements()
+        if token.isdigit() and 2 <= int(token) <= 19
+    )
+    converted_to_digits = translated_digits - source_digits
+    return source_values == translated_values + converted_to_digits
+
+
+def _english_spanish_duration_units_are_conserved(source: str, translated: str) -> bool:
+    """Require a numeric English duration to retain its value and Spanish agreement."""
+
+    if not _looks_like_title(source):
+        return True
+
+    def visible_text(value: str) -> str:
+        text = INLINE_CODE_PATTERN.sub(" ", value)
+        text = MARKDOWN_LINK_PATTERN.sub(lambda match: match.group(1), text)
+        text = HTML_TAG_PATTERN.sub(" ", text)
+        text = RAW_URL_PATTERN.sub(" ", text)
+        text = re.sub(r"[\\`*_~#>\[\]{}|]", "", text)
+        return re.sub(r"\s+", " ", text).strip()
+
+    source = visible_text(source)
+    translated = visible_text(translated)
+
+    units = {
+        "day": ("día", "días"),
+        "hour": ("hora", "horas"),
+        "minute": ("minuto", "minutos"),
+        "month": ("mes", "meses"),
+        "week": ("semana", "semanas"),
+        "year": ("año", "años"),
+    }
+    requirements: Counter[tuple[str, str, str]] = Counter()
+    for match in re.finditer(
+        r"(?<!\w)(?P<number>\d+)[ \t-]+(?P<unit>day|hour|minute|month|week|year)s?\b",
+        source,
+        re.IGNORECASE,
+    ):
+        number = match.group("number")
+        english_unit = match.group("unit").casefold()
+        singular, plural = units[english_unit]
+        requirements[(number, singular if int(number) == 1 else plural, english_unit)] += 1
+    for (number, unit, english_unit), required_count in requirements.items():
+        translated_pattern = re.compile(
+            rf"(?<!\d){re.escape(number)}[ \t-]+{re.escape(unit)}\b",
+            re.IGNORECASE,
+        )
+        residual_pattern = re.compile(
+            rf"(?<!\d){re.escape(number)}[ \t-]+{re.escape(english_unit)}s?\b",
+            re.IGNORECASE,
+        )
+        if (
+            len(translated_pattern.findall(translated)) + len(residual_pattern.findall(translated))
+            < required_count
+        ):
+            return False
+    return True
 
 
 def _roman_reference_tokens_are_conserved(source: str, translated: str) -> bool:
@@ -3136,6 +3861,25 @@ def markdown_heading_levels(markdown: str) -> tuple[int, ...]:
     """Return the ordered ATX heading hierarchy."""
 
     return tuple(len(match.group(1)) for match in ATX_HEADING_PATTERN.finditer(markdown))
+
+
+def html_tag_structure(markdown: str) -> tuple[tuple[str, str, str], ...]:
+    """Return ordered raw HTML tags while normalizing harmless ``br`` syntax."""
+
+    structure: list[tuple[str, str, str]] = []
+    for raw_tag in HTML_TAG_PATTERN.findall(markdown):
+        match = re.fullmatch(
+            r"<(?P<closing>/)?(?P<name>[A-Za-z][^\s/>]*)(?P<suffix>[^>]*)>",
+            raw_tag,
+        )
+        if match is None:
+            continue
+        name = match.group("name").casefold()
+        suffix = re.sub(r"\s+", " ", match.group("suffix").strip())
+        if name == "br" and suffix == "/":
+            suffix = ""
+        structure.append(("/" if match.group("closing") else "", name, suffix))
+    return tuple(structure)
 
 
 def markdown_table_shapes(markdown: str) -> tuple[tuple[int, int], ...]:

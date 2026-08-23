@@ -50,10 +50,10 @@ def test_reviewed_plan_uses_the_single_global_ai_profile() -> None:
     assert configuration_issues(source(), configuration) == ()
 
 
-def test_standard_plan_never_requires_ai() -> None:
+def test_standard_plan_with_explicit_argos_never_requires_ai() -> None:
     configuration = JobConfiguration(
         output=OutputConfiguration(format=DocumentFormat.MARKDOWN),
-        translation=TranslationConfiguration(enabled=True),
+        translation=TranslationConfiguration(enabled=True, method=TranslationMethod.OFFLINE),
     )
 
     issues = configuration_issues(source(DocumentFormat.TEXT), configuration)

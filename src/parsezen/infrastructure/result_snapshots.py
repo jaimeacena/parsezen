@@ -29,6 +29,7 @@ from parsezen.pipeline.contracts import (
     ProcessTelemetry,
     StageTelemetry,
 )
+from parsezen.processing_metrics import AiOperationTelemetry, BatchTelemetry
 from parsezen.revision import RevisionDraft, RevisionKind, build_revision_draft
 from parsezen.translation_quality import (
     LinguisticReviewCoverage,
@@ -543,6 +544,29 @@ def _result_to_json(result: ProcessResult) -> dict[str, Any]:
                     }
                     for stage in result.telemetry.stages
                 ],
+                "batches": {
+                    "local_ai_requests": result.telemetry.batches.local_ai_requests,
+                    "checkpoint_hits": result.telemetry.batches.checkpoint_hits,
+                    "checkpoint_misses": result.telemetry.batches.checkpoint_misses,
+                    "retries": result.telemetry.batches.retries,
+                    "validation_rejections": result.telemetry.batches.validation_rejections,
+                    "input_characters": result.telemetry.batches.input_characters,
+                    "prompt_tokens": result.telemetry.batches.prompt_tokens,
+                    "output_tokens": result.telemetry.batches.output_tokens,
+                    "wall_duration_ms": result.telemetry.batches.wall_duration_ms,
+                    "ollama_total_duration_ms": (result.telemetry.batches.ollama_total_duration_ms),
+                    "ollama_load_duration_ms": result.telemetry.batches.ollama_load_duration_ms,
+                    "operations": [
+                        {
+                            "operation": item.operation,
+                            "requests": item.requests,
+                            "prompt_tokens": item.prompt_tokens,
+                            "output_tokens": item.output_tokens,
+                            "wall_duration_ms": item.wall_duration_ms,
+                        }
+                        for item in result.telemetry.batches.operations
+                    ],
+                },
             }
             if result.telemetry is not None
             else None
@@ -656,9 +680,42 @@ def _telemetry_from_json(raw: object) -> ProcessTelemetry | None:
                 for item in stages
                 if isinstance(item, dict)
             ),
+            batches=_batch_telemetry_from_json(raw.get("batches")),
         )
     except (KeyError, TypeError, ValueError):
         return None
+
+
+def _batch_telemetry_from_json(raw: object) -> BatchTelemetry:
+    if not isinstance(raw, dict):
+        return BatchTelemetry()
+    operations = raw.get("operations")
+    if not isinstance(operations, list):
+        operations = []
+    return BatchTelemetry(
+        local_ai_requests=max(0, int(raw.get("local_ai_requests", 0))),
+        checkpoint_hits=max(0, int(raw.get("checkpoint_hits", 0))),
+        checkpoint_misses=max(0, int(raw.get("checkpoint_misses", 0))),
+        retries=max(0, int(raw.get("retries", 0))),
+        validation_rejections=max(0, int(raw.get("validation_rejections", 0))),
+        input_characters=max(0, int(raw.get("input_characters", 0))),
+        prompt_tokens=max(0, int(raw.get("prompt_tokens", 0))),
+        output_tokens=max(0, int(raw.get("output_tokens", 0))),
+        wall_duration_ms=max(0, int(raw.get("wall_duration_ms", 0))),
+        ollama_total_duration_ms=max(0, int(raw.get("ollama_total_duration_ms", 0))),
+        ollama_load_duration_ms=max(0, int(raw.get("ollama_load_duration_ms", 0))),
+        operations=tuple(
+            AiOperationTelemetry(
+                operation=str(item.get("operation", "other")),
+                requests=max(0, int(item.get("requests", 0))),
+                prompt_tokens=max(0, int(item.get("prompt_tokens", 0))),
+                output_tokens=max(0, int(item.get("output_tokens", 0))),
+                wall_duration_ms=max(0, int(item.get("wall_duration_ms", 0))),
+            )
+            for item in operations
+            if isinstance(item, dict)
+        ),
+    )
 
 
 def _integrity_report_to_json(
@@ -788,6 +845,8 @@ def _translation_report_to_json(
         "translated_characters": report.translated_characters,
         "source_blocks": report.source_blocks,
         "translated_blocks": report.translated_blocks,
+        "review_segment_numbers": list(report.review_segment_numbers),
+        "requires_full_review": report.requires_full_review,
         "total_issues": report.total_issues,
         "issue_totals": {kind.value: count for kind, count in report.issue_totals},
         "issues": [
@@ -866,4 +925,8 @@ def _translation_report_from_json(raw: object) -> TranslationQualityReport | Non
         ),
         source_blocks=max(0, int(source_blocks)),
         translated_blocks=max(0, int(translated_blocks)),
+        review_segment_numbers=tuple(
+            sorted({max(1, int(value)) for value in raw.get("review_segment_numbers", ())})
+        ),
+        requires_full_review=bool(raw.get("requires_full_review", False)),
     )

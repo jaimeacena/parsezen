@@ -137,6 +137,7 @@ from parsezen.pipeline.transform import (
 from parsezen.pipeline.transform import (
     translation_quality_report as _translation_quality_report,
 )
+from parsezen.processing_metrics import BatchTelemetry, capture_batch_telemetry
 from parsezen.revision import (
     RevisionDraft,
     RevisionKind,
@@ -187,7 +188,7 @@ class _ProcessingTelemetryCollector:
         self._stage_started_at = now
         self._visits[stage] = self._visits.get(stage, 0) + 1
 
-    def snapshot(self, now: float) -> ProcessTelemetry:
+    def snapshot(self, now: float, batches: BatchTelemetry) -> ProcessTelemetry:
         self._close_current(now)
         stages = tuple(
             StageTelemetry(
@@ -201,6 +202,7 @@ class _ProcessingTelemetryCollector:
         return ProcessTelemetry(
             total_duration_ms=max(0, round((now - self._started_at) * 1000)),
             stages=stages,
+            batches=batches,
         )
 
     def _close_current(self, now: float) -> None:
@@ -313,17 +315,18 @@ def process_document(
             from parsezen.offline_translation_executor import offline_translation_session
 
             translation_session = offline_translation_session()
-        with translation_session:
-            with _attempt_stage_context(effective_attempt_id):
-                result = _process_document(
-                    request,
-                    report_stage,
-                    on_progress,
-                    settings=settings,
-                    cancellation=cancellation,
-                    epub_checkpoint_root=epub_checkpoint_root,
-                    work_checkpoint_root=work_checkpoint_root,
-                )
+        with capture_batch_telemetry() as batch_telemetry:
+            with translation_session:
+                with _attempt_stage_context(effective_attempt_id):
+                    result = _process_document(
+                        request,
+                        report_stage,
+                        on_progress,
+                        settings=settings,
+                        cancellation=cancellation,
+                        epub_checkpoint_root=epub_checkpoint_root,
+                        work_checkpoint_root=work_checkpoint_root,
+                    )
     except ProcessingCancelledError as exc:
         phase = phase_for_process_stage(current_stage)
         LOGGER.info(
@@ -370,7 +373,7 @@ def process_document(
             f"Se produjo un error inesperado. Referencia local: {incident_id}."
         ) from exc
 
-    process_telemetry = telemetry.snapshot(monotonic())
+    process_telemetry = telemetry.snapshot(monotonic(), batch_telemetry.snapshot())
     result = replace(result, telemetry=process_telemetry)
     LOGGER.info(
         "processing_completed attempt_id=%s phase=%s extension=%s output_format=%s "
@@ -1396,7 +1399,9 @@ def _open_pdf_conversion_checkpoints(
     # number. Keeping the directory independent from the selected interval lets
     # the representative early check feed the later full run without ever
     # sharing data between different source bytes or OCR strategies.
-    resume_key = repr(("pdf-conversion-v2", request.force_pdf_ocr))
+    # Bump this whenever deterministic native-page reconciliation changes. Reusing
+    # an older page payload would otherwise retain already-fixed TOC glyph errors.
+    resume_key = repr(("pdf-conversion-v7", request.force_pdf_ocr))
     return open_work_checkpoints(
         request.source_path,
         resume_key,

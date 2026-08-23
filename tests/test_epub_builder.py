@@ -14,6 +14,7 @@ from parsezen.epub_builder import (
     classify_heading_role,
     iter_epub_text_documents,
     plan_epub,
+    reconcile_generated_html_tables,
     validate_epub_archive,
     validate_epub_file,
 )
@@ -253,6 +254,72 @@ def test_epub_renders_a_source_faithful_document_contents_table() -> None:
     assert "font-variant-numeric: tabular-nums" in stylesheet
 
 
+def test_epub_escapes_a_bare_ampersand_inside_a_safe_generated_table() -> None:
+    markdown = """# Contenidos
+
+<table class="document-toc">
+<thead><tr><th class="toc-label">Entrada</th><th class="toc-folio">Página</th></tr></thead>
+<tbody><tr><td class="toc-label toc-level-0">Research & Practice</td>
+<td class="toc-folio">12</td></tr></tbody>
+</table>
+"""
+
+    chapter = next(iter_epub_text_documents(_build(markdown).content))[1]
+
+    assert '<table class="document-toc">' in chapter
+    assert "Research &amp; Practice" in chapter
+    assert "&lt;table" not in chapter
+
+
+def test_epub_rejects_an_invalid_internal_contents_table_instead_of_printing_its_html() -> None:
+    markdown = """# Contenidos
+
+<table class="document-toc">
+<tbody><tr><td class="toc-label toc-level-0">Entrada</td></tr></tbody>
+</table>
+"""
+
+    with pytest.raises(ConversionError, match="índice interno"):
+        _build(markdown)
+
+
+def test_generated_table_reconciliation_keeps_source_attributes_and_candidate_text() -> None:
+    source = (
+        '<table class="document-toc"><thead><tr><th class="toc-label">Entry</th>'
+        '<th class="toc-folio">Page</th></tr></thead><tbody><tr>'
+        '<td class="toc-label toc-level-0"><a href="#page-12">First lesson</a></td>'
+        '<td class="toc-folio">12</td></tr></tbody></table>'
+    )
+    candidate = (
+        '<table class="changed"><thead><tr><th class="changed">Entrada</th>'
+        '<th class="toc-folio">Página</th></tr></thead><tbody><tr>'
+        '<td class="toc-label toc-level-0"><a href="#wrong">Primera lección</a></td>'
+        '<td class="toc-folio">12</td></tr></tbody></table>'
+    )
+
+    reconciled = reconcile_generated_html_tables(source, candidate)
+    chapter = next(iter_epub_text_documents(_build(reconciled).content))[1]
+
+    assert '<a href="#page-12">Primera lección</a>' in reconciled
+    assert '<table class="document-toc">' in chapter
+    assert "Primera lección" in chapter
+    assert "Página" in chapter
+    assert "#wrong" not in chapter
+    assert 'class="changed"' not in chapter
+
+
+def test_generated_table_reconciliation_preserves_source_when_nodes_do_not_align() -> None:
+    source = (
+        '<table class="document-toc"><thead><tr><th class="toc-label">Entry</th>'
+        '<th class="toc-folio">Page</th></tr></thead><tbody><tr>'
+        '<td class="toc-label toc-level-0">First lesson</td>'
+        '<td class="toc-folio">12</td></tr></tbody></table>'
+    )
+    candidate = source.replace("First lesson", "<span>Primera lección</span>")
+
+    assert reconcile_generated_html_tables(source, candidate) == source
+
+
 def test_epub_keeps_untrusted_raw_table_html_disabled() -> None:
     markdown = """# Datos
 
@@ -461,9 +528,12 @@ def test_epub_marks_the_selected_resource_as_its_cover() -> None:
         assert "<dc:creator>Autora</dc:creator>" in package
         assert 'properties="cover-image"' in package
         assert '<itemref idref="cover-page"/>' in package
+        assert '<reference type="cover" title="Portada" href="text/cover.xhtml"/>' in package
         assert archive.read("EPUB/images/cover/front.jpg") == b"cover-bytes"
         cover_page = archive.read("EPUB/text/cover.xhtml").decode("utf-8")
         assert 'src="../images/cover/front.jpg"' in cover_page
+        assert 'xmlns:epub="http://www.idpf.org/2007/ops"' in cover_page
+        assert '<body epub:type="cover">' in cover_page
 
 
 def test_epub_rejects_a_cover_that_is_not_in_its_resources() -> None:

@@ -78,6 +78,7 @@ class LocalVisualTextArbiter:
                     max_generation_seconds=_VISION_GENERATION_SECONDS,
                     image=image,
                     json_response=True,
+                    operation="visual_ocr",
                 )
         except httpx.RequestError as exc:
             raise LocalModelUnavailableError(

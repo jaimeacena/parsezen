@@ -12,9 +12,11 @@ from typing import TypedDict
 from parsezen.cancellation import CancellationToken, check_cancelled
 from parsezen.domain.jobs import ReviewRecommendation
 from parsezen.domain.process_lifecycle import ProcessStage
+from parsezen.epub_builder import reconcile_generated_html_tables
 from parsezen.errors import ParsezenError, ProcessingCancelledError
 from parsezen.glossary import GlossaryEntry, glossary_fingerprint, protect_glossary
 from parsezen.improvement import (
+    MAX_INPUT_CHARACTERS,
     ImprovementMode,
     improve_markdown,
     retranslate_residual_title,
@@ -29,7 +31,12 @@ from parsezen.pipeline.contracts import (
     StageCallback,
     TransformedDocument,
 )
-from parsezen.revision import RevisionDraft, RevisionKind, build_revision_draft
+from parsezen.revision import (
+    RevisionDraft,
+    RevisionKind,
+    build_revision_draft,
+    split_markdown_blocks,
+)
 from parsezen.semantic_blocks import (
     DocumentTerm,
     SemanticBlock,
@@ -67,6 +74,7 @@ class _ImprovementArguments(TypedDict, total=False):
     save_checkpoint: Callable[[str, str], bool]
     plain_text: bool
     on_translation_preserved: Callable[[int, int], None]
+    focused_source_repair: bool
 
 
 class _OfflineTranslationArguments(TypedDict, total=False):
@@ -174,6 +182,11 @@ def transform_prepared_document(
         )
         if protected is not None:
             transformed_markdown = protected.restore(transformed_markdown)
+        if translation_source is not None:
+            transformed_markdown = reconcile_generated_html_tables(
+                translation_source,
+                transformed_markdown,
+            )
 
         check_cancelled(cancellation)
         if translation_source is not None:
@@ -226,6 +239,10 @@ def transform_prepared_document(
             **translation_arguments,
         )
         transformed_markdown = protected.restore(transformed_markdown)
+        transformed_markdown = reconcile_generated_html_tables(
+            translation_source,
+            transformed_markdown,
+        )
         announce_translation_stage()
         check_cancelled(cancellation)
         transformed_markdown = repair_translation_warnings(
@@ -282,6 +299,17 @@ def transform_prepared_document(
                     semantic_document=analyze_markdown(transformed_markdown),
                     pdf_quality_report=pdf_quality_report,
                 )
+        elif pdf_quality_report is not None:
+            transformed_markdown = improve_selected_content(
+                transformed_markdown,
+                settings,
+                request,
+                on_progress,
+                cancellation,
+                work_checkpoints,
+                semantic_document=analyze_markdown(transformed_markdown),
+                pdf_quality_report=pdf_quality_report,
+            )
         elif not selected_translation_cleanup:
             transformed_markdown = improve_with_checkpoints(
                 transformed_markdown,
@@ -308,6 +336,10 @@ def transform_prepared_document(
             work_checkpoints,
         )
         revision_kinds.add(RevisionKind.STRUCTURE)
+    transformed_markdown = reconcile_generated_html_tables(
+        revision_source,
+        transformed_markdown,
+    )
     # Quality belongs to the translation that will actually be published. A
     # bilingual or structural review can create a pending revision draft, but
     # its unaccepted proposal must never hide residual source text in the base
@@ -510,7 +542,14 @@ def improve_selected_content(
     selected = tuple(
         block
         for block in semantic_document.blocks
-        if block.role not in {SemanticRole.PROVENANCE, SemanticRole.CODE, SemanticRole.IMAGE}
+        if block.role
+        not in {
+            SemanticRole.PROVENANCE,
+            SemanticRole.CODE,
+            SemanticRole.IMAGE,
+            SemanticRole.TABLE,
+            SemanticRole.TOC,
+        }
         and natural_language_text(block.markdown).strip()
         and (block.page_number in problem_pages or contains_conversion_damage(block.markdown))
     )
@@ -520,13 +559,15 @@ def improve_selected_content(
         return markdown
 
     replacements: dict[str, str] = {}
-    total = len(selected)
-    for current, block in enumerate(selected, start=1):
+    groups = _selected_content_review_groups(selected)
+    total = len(groups)
+    for current, group in enumerate(groups, start=1):
         check_cancelled(cancellation)
         if on_progress is not None:
             on_progress(current, total)
+        source_group = "".join(block.markdown for block in group)
         improved = improve_with_checkpoints(
-            block.markdown,
+            source_group,
             ImprovementMode.REVIEW_CONTENT,
             settings,
             request,
@@ -534,11 +575,53 @@ def improve_selected_content(
             cancellation,
             checkpoints,
         )
-        if improved != block.markdown:
-            replacements[block.identifier] = improved
+        if improved == source_group:
+            continue
+        improved_blocks = split_markdown_blocks(improved)
+        if len(improved_blocks) != len(group):
+            LOGGER.warning(
+                "selected_content_review_group_preserved blocks=%d reason=alignment",
+                len(group),
+            )
+            continue
+        for block, improved_block in zip(group, improved_blocks, strict=True):
+            if improved_block.markdown != block.markdown:
+                replacements[block.identifier] = improved_block.markdown
     return "".join(
         replacements.get(block.identifier, block.markdown) for block in semantic_document.blocks
     )
+
+
+def _selected_content_review_groups(
+    selected: tuple[SemanticBlock, ...],
+) -> tuple[tuple[SemanticBlock, ...], ...]:
+    """Batch selected blocks per source page while retaining exact reassembly boundaries."""
+
+    groups: list[tuple[SemanticBlock, ...]] = []
+    pending: list[SemanticBlock] = []
+    pending_characters = 0
+    pending_page: int | None = None
+
+    def flush() -> None:
+        nonlocal pending_characters, pending_page
+        if pending:
+            groups.append(tuple(pending))
+            pending.clear()
+        pending_characters = 0
+        pending_page = None
+
+    for block in selected:
+        page_changed = bool(pending and block.page_number != pending_page)
+        exceeds_limit = bool(
+            pending and pending_characters + len(block.markdown) > MAX_INPUT_CHARACTERS
+        )
+        if page_changed or exceeds_limit:
+            flush()
+        pending.append(block)
+        pending_characters += len(block.markdown)
+        pending_page = block.page_number
+    flush()
+    return tuple(groups)
 
 
 def reviewable_semantic_blocks(document: SemanticDocument) -> tuple[SemanticBlock, ...]:
@@ -729,7 +812,10 @@ def repair_translation_warnings(
                     source_language_code=source_language_code,
                     cancellation=cancellation,
                 )
-            repair_arguments: _ImprovementArguments = {"plain_text": False}
+            repair_arguments: _ImprovementArguments = {
+                "plain_text": False,
+                "focused_source_repair": True,
+            }
             if cancellation is not None:
                 repair_arguments["cancellation"] = cancellation
             if work_checkpoints is not None:
@@ -772,7 +858,7 @@ def repair_translation_warnings(
     if on_result is not None:
         on_result(repair.attempted_segments, repair.repaired_segments)
     if source_language_code is None or source_language_code == target_language_code:
-        return repair.translated
+        return reconcile_generated_html_tables(translated, repair.translated)
     restored = restore_changed_third_language_headings(
         source,
         repair.translated,
@@ -781,8 +867,8 @@ def repair_translation_warnings(
     )
     if not numeric_tokens_are_conserved(repair.translated, restored):
         LOGGER.warning("translation_third_language_heading_restore_preserved numbers_changed=true")
-        return repair.translated
-    return restored
+        restored = repair.translated
+    return reconcile_generated_html_tables(translated, restored)
 
 
 def _preserved_translation_was_fully_repaired(

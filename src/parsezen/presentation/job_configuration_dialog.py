@@ -475,7 +475,7 @@ class JobConfigurationDialog(QDialog):
             ),
             translation=TranslationConfiguration(
                 enabled=translating,
-                method=(self._translation_method if translating else TranslationMethod.OFFLINE),
+                method=(self._translation_method if translating else TranslationMethod.LOCAL_AI),
                 target_language=self._translation_language,
                 glossary=(
                     tuple((entry.source, entry.target) for entry in glossary) if translating else ()

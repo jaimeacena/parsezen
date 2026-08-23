@@ -13,6 +13,11 @@ from html import unescape
 
 from parsezen.cancellation import CancellationToken, check_cancelled
 from parsezen.errors import TranslationError
+from parsezen.processing_metrics import (
+    record_checkpoint_lookup,
+    record_retry,
+    record_validation_rejection,
+)
 from parsezen.translation_quality import (
     ATX_HEADING_PATTERN,
     MAX_AUTOMATIC_SOURCE_TEXT_REPAIRS,
@@ -139,6 +144,8 @@ def translate_markdown_offline(
             target_code=target_code,
         )
         cached = load_checkpoint(checkpoint) if load_checkpoint is not None else None
+        if load_checkpoint is not None:
+            record_checkpoint_lookup(hit=cached is not None)
         if cached is not None and _valid_offline_translation_work_item(
             work_item,
             cached,
@@ -150,6 +157,8 @@ def translate_markdown_offline(
             if on_progress is not None and total_groups:
                 on_progress(completed_groups, total_groups)
             continue
+        if cached is not None:
+            record_validation_rejection()
 
         base_completed = completed_groups
 
@@ -178,6 +187,7 @@ def translate_markdown_offline(
             source_code=source_code,
             target_code=target_code,
         ):
+            record_validation_rejection()
             raise TranslationError("La traducciÃ³n local de un bloque no superÃ³ las guardas.")
         translated_items.append(translated)
         completed_groups += work_total
@@ -196,6 +206,7 @@ def translate_markdown_offline(
             preserve_paragraphs=True,
         )
     except TranslationQualityError as exc:
+        record_validation_rejection()
         raise TranslationError(str(exc)) from exc
     return result
 
@@ -865,6 +876,7 @@ def _translate_value_with_retries(
                 len(retry_parts),
                 max_characters,
             )
+            record_retry()
             return "".join(
                 f"{_translate_value_with_retries(translate_text, part, retry_level=next_level + 1)}"
                 f"{separator}"

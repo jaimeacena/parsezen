@@ -106,11 +106,12 @@ es Markdown o EPUB.
 
 Al elegir un idioma en **Traducción**, aparecen dos motores que funcionan dentro del equipo:
 
-- **Rápida y ligera · Argos**: opción inicial y recomendada para equipos modestos, consumo
-  predecible y traducciones repetibles. No necesita un modelo conversacional.
-- **Contextual · IA local**: usa el modelo general instalado en Ollama. Tarda más, consume más
-  memoria y el resultado depende del modelo elegido; Parsezen no afirma que sea mejor sin comparar
-  antes el modelo y el tipo de documento.
+- **Contextual · IA local**: opción inicial. Usa el modelo general instalado en Ollama; para un PC
+  estándar conviene comenzar con uno de aproximadamente 4B parámetros. El resultado depende del
+  modelo elegido y Parsezen conserva cada fragmento original que no supera sus comprobaciones.
+- **Rápida y ligera · Argos**: alternativa manual de consumo predecible. No necesita un modelo
+  conversacional, pero nunca se activa automáticamente ni se usa en pruebas sin pedirlo
+  expresamente.
 
 La ayuda situada bajo el traductor se actualiza con el motor, la revisión y el formato elegidos.
 Indica si el recorrido usa Argos u Ollama, si la comprobación bilingüe es independiente, cuántas
@@ -119,7 +120,8 @@ siendo local y gratuito; resume tiempo, cómputo y memoria relativos.
 
 La elección del traductor es independiente del nivel de revisión. Parsezen no cambia de traductor
 dentro del documento: si eliges Argos y revisión semántica, Argos traduce primero y Ollama revisa
-después. El modelo solo propone
+después. Si Ollama no está disponible, el trabajo se detiene con un diagnóstico recuperable en vez
+de degradarse silenciosamente a Argos. El modelo solo propone
 sustituciones breves: Parsezen las aplica una a una cuando conservan cifras, enlaces, nombres,
 párrafos y estructura. Una propuesta rechazada no elimina otras correcciones seguras ni permite
 reescribir el resto del documento. El idioma y el glosario se comparten entre ambos recorridos.

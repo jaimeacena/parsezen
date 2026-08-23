@@ -14,6 +14,7 @@ from parsezen.final_integrity import FinalIntegrityReport
 from parsezen.glossary import GlossaryEntry
 from parsezen.improvement import ImprovementMode
 from parsezen.pdf_conversion import PdfPageRange, PdfQualityReport
+from parsezen.processing_metrics import BatchTelemetry
 from parsezen.revision import RevisionDraft
 from parsezen.semantic_blocks import SemanticDocument
 from parsezen.translation_quality import (
@@ -38,6 +39,7 @@ class ProcessTelemetry:
 
     total_duration_ms: int
     stages: tuple[StageTelemetry, ...]
+    batches: BatchTelemetry = BatchTelemetry()
 
 
 @dataclass(frozen=True, slots=True)

@@ -29,6 +29,11 @@ from parsezen.document_model import (
     ConvertedResource,
 )
 from parsezen.errors import ConversionError
+from parsezen.processing_metrics import (
+    record_checkpoint_lookup,
+    record_retry,
+    record_validation_rejection,
+)
 from parsezen.translation_quality import (
     NUMBER_PATTERN,
     RAW_URL_PATTERN,
@@ -886,6 +891,8 @@ def _translate_epub_units(
         if on_progress is not None:
             on_progress(part_index, len(parts))
         translated_payload = load_checkpoint(part.key) if load_checkpoint is not None else None
+        if load_checkpoint is not None:
+            record_checkpoint_lookup(hit=translated_payload is not None)
         extracted: dict[int, str] | None = None
         checkpoint_needs_save = False
         retried_indexes: set[int] = set()
@@ -894,6 +901,7 @@ def _translate_epub_units(
             try:
                 extracted = _validate_translated_part(part, translated_payload)
             except ConversionError:
+                record_validation_rejection()
                 translated_payload = None
             else:
                 resumed_parts += 1
@@ -1320,6 +1328,7 @@ def _retry_invalid_translated_units(
             continue
         check_cancelled(cancellation)
         indexed_unit = ((index, unit),)
+        record_retry()
         retry_source, protected_markup = _translation_model_part_payload(
             indexed_unit,
             retry=True,
@@ -1333,7 +1342,11 @@ def _retry_invalid_translated_units(
             retried_model_payload,
             protected_markup,
         )
-        retried = _validate_translated_part(retried_part, retried_payload)
+        try:
+            retried = _validate_translated_part(retried_part, retried_payload)
+        except ConversionError:
+            record_validation_rejection()
+            raise
         extracted[index] = retried[index]
 
     rebuilt_payload = _translation_part_payload_from_values(part.indexed_units, extracted)

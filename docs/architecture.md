@@ -135,7 +135,7 @@ Mientras sea falso, el planificador no lo incluye y `PUBLISH` no participa. La p
 una página de ajustes dentro de la pila de la ventana principal. El formato se proyecta como dos
 tarjetas visuales exclusivas, la revisión automática con IA como interruptor y el resto de decisiones como una
 fila de etiqueta, valor y chevron. Los documentos nuevos presentan
-`LOCAL_AI_REVIEWED` activado; una configuración guardada conserva su plan. Argos y OCR automático
+`LOCAL_AI_REVIEWED` activado; una configuración guardada conserva su plan. IA local y OCR automático
 son valores iniciales. Traductor y glosario dependen del idioma; Páginas y OCR aparecen solo para
 PDF. El intervalo se edita en un diálogo efímero y la fila conserva únicamente su valor resumido.
 Solo Markdown y EPUB son resultados de producto. La página no incorpora scroll ni vuelve a
@@ -197,8 +197,12 @@ principio; la recomendación posterior reduce el coste y la decisión del recorr
 pretender que ambos flujos sean equivalentes.
 
 `TranslationMethod` ofrece exactamente dos motores locales: `OFFLINE` usa Argos y `LOCAL_AI` usa el
-modelo de Ollama seleccionado. Argos es la opción inicial, ligera y predecible; IA local es la opción
-contextual y dependiente del modelo. La elección del motor es independiente de `ProcessingPlan`: el
+modelo de Ollama seleccionado. IA local es la opción inicial y contextual; Argos es la alternativa
+manual, ligera y predecible. No existe degradación automática de IA local a Argos: activarlo exige
+una elección explícita. La validación real sigue la misma regla y por defecto usa el modelo local
+instalado, normalmente uno de alrededor de 4B parámetros en un PC estándar; solo prueba Argos al
+recibir expresamente `--translation-engine argos`. La elección del motor es independiente de
+`ProcessingPlan`: el
 plan revisado puede actuar después de cualquiera de los dos. `AIProfileConfiguration` es una
 instantánea de la única pareja modelo/contexto global. No hay excepciones por documento y los cambios
 generales se propagan a todos los trabajos editables. La eliminación de un modelo se bloquea mientras
@@ -213,6 +217,10 @@ los revisados semánticamente, los verificados de forma independiente y las inci
 `TranslationQualityReport` conserva además los totales de bloques de origen y salida para no ocultar
 la parte no alineada. La cobertura viaja en `ProcessResult`, las instantáneas cifradas y el resumen
 sin contenido de actividad; nunca convierte una comprobación automática en verificación semántica.
+La revisión residual toma sus unidades de las incidencias `SOURCE_TEXT` ya demostradas y no escala
+por una puntuación agregada, longitud o terminología rara. Tablas, índices, código, imágenes y
+procedencia quedan fuera de la corrección genérica; solo la prosa señalada puede generar nuevas
+peticiones bilingües.
 
 El destino funciona del mismo modo: cada documento hereda la ruta general efectiva, pero no puede
 sustituirla localmente. Cambiarla actualiza todos los trabajos editables. Páginas muestra `Todas` o
@@ -393,6 +401,8 @@ memoria, tiempo de pared, tokens de entrada/salida, carga declarada por Ollama y
 Las generaciones tienen tanto timeout de inactividad como un deadline total acotado; OCR aplica un
 deadline total por página y termina el proceso privado si lo supera. Ninguna de estas métricas incluye
 texto, prompts, respuestas o rutas y las métricas de Ollama no entran en las instantáneas.
+El validador opt-in de flujos reales registra además los ordinales de los fragmentos conservados, sin
+su texto, para localizar el punto exacto de revisión sin degradar la privacidad del informe.
 
 La pausa entra siempre por `ProcessingRunner.pause()`: marca al trabajador antes de activar su token
 de cancelación cooperativa y cierra la fase activa como `paused` en la traza del intento. La ventana
@@ -547,6 +557,28 @@ marcadores; si una respuesta agrupada no las supera, el mismo intento se degrada
 segmentos más pequeños. Así se evita una petición distinta por cada entrada breve de un índice sin
 debilitar la recuperación segura.
 
+Las tablas generadas se traducen por lotes alineados y aplican antes y después del modelo un léxico
+convencional acotado para encabezados, signos, partes y clasificaciones. La misma normalización puede
+actualizar un checkpoint válido sin repetir su petición. Los reintentos enfocados se contabilizan
+separados de los lotes normales. Una tabla Markdown conserva literalmente delimitadores, alineación
+y espaciado; la tabla XHTML intermedia conserva además cada entidad HTML byte por byte. Los códigos
+numéricos de esas entidades no cuentan como cifras visibles del documento. Un salto interno heredado
+de una celda es válido, mientras uno añadido a una celda de una sola línea se rechaza. En traducciones
+inglés→español, ordinales numéricos y abreviaturas de era copiadas literalmente se localizan de forma
+determinista fuera de código, enlaces y URL.
+
+Después del reintento alineado de una tabla, las celdas que aún repiten léxico inglés de su original
+se aíslan como microunidades bilingües. Cada una recibe como máximo una reparación enfocada con el
+original y la propuesta; solo se traslada el texto si supera las mismas guardas de cobertura, cifras,
+idioma y estructura. Si la señal continúa, se conserva la celda original y el informe registra solo
+el recuento. Así un rótulo dudoso no obliga a revisar de nuevo la tabla ni permite que el modelo
+reescriba sus filas.
+
+La identidad de caché puede incorporar el contexto jerárquico del capítulo, pero la revisión de su
+contrato se selecciona siempre a partir de la carga semántica real. De ese modo, añadir contexto no
+puede hacer que una tabla se clasifique como prosa ni ocultar una invalidación específica de tablas;
+el hash sigue ligando la respuesta tanto al contenido como a su contexto efectivo.
+
 Antes de fragmentar, `semantic_blocks.reconcile_document_evidence` contrasta el propio documento.
 Solo corrige una variante rara cuando otra grafía casi idéntica domina de forma clara, o cuando una
 entrada del índice y un encabezado único del cuerpo coinciden con distancia acotada. Código, enlaces,
@@ -563,6 +595,25 @@ vez de publicar texto inventado. La prosa no se recompone con traducciones parci
 cobertura: puede degradarse a oraciones independientes, pero el bloque completo solo se acepta si
 todas superan las guardas. Un único fallo conserva el bloque original entero para evitar resultados
 mixtos difíciles de detectar.
+
+En títulos y rótulos breves de traducciones inglés↔español, los cardinales inequívocos del dos al
+diecinueve conservan además su valor semántico cuando están escritos con palabras. La guarda separa
+los vocabularios por idioma, admite una cifra equivalente y formas como `both`/`ambos`, pero rechaza,
+por ejemplo, `PART SEVEN` → `PARTE SEIS`; no interpreta el adverbio inglés `once` como el número
+español ni bloquea reformulaciones naturales de la prosa. En esos mismos rótulos, una duración
+numérica inglesa exige una unidad española con concordancia singular/plural, de modo que `30 DAY`
+no pueda publicarse como `30 DÍA`.
+Cuando un rótulo residual se vuelve a traducir, esos cardinales se sustituyen por marcadores opacos
+con una equivalencia canónica ligada al par de idiomas. El modelo decide la redacción circundante,
+pero no puede convertir `SEVEN` en otro valor; el marcador se restaura como `SIETE` antes de validar.
+
+La degradación estructural puede bajar de párrafo a línea y después a oración cuando una subunidad
+sigue conteniendo varias listas o citas; cada nivel es transaccional y solo se incorpora si su
+reensamblado completo valida. Un marcador de lista añadido a una etiqueta que no era lista se retira
+antes de validar, pero nunca se elimina un marcador presente en el origen. Una etiqueta exacta del
+léxico establecido conserva su énfasis Markdown y se resuelve sin Ollama. En rótulos breves cargados
+de cifras, solo las islas con letras llegan al modelo; números, entidades y separadores permanecen
+opacos y se reinsertan literalmente.
 
 La organización estructural usa el índice únicamente como mapa de referencia. Las filas que el
 análisis semántico clasifica como índice no se ofrecen como candidatas editables al modelo; solo una
@@ -669,8 +720,9 @@ ortográfica rara a una edición de una forma claramente dominante. Dentro de ca
 reduce la solicitud a un máximo de cuatro líneas alineadas que conservan esa señal; si el ajuste de
 líneas difiere entre idiomas, usa en su lugar párrafos Markdown alineados por rango de caracteres.
 La instrucción enumera como foco exclusivo un máximo de ocho formas detectadas localmente en esa
-microunidad. Cada forma usa una solicitud mínima que solo admite cero o un parche; el analizador
-descarta cualquier resultado cuyo texto nuevo no reduzca su recuento. Ollama decide si existe un error
+microunidad. Todas viajan en una única solicitud JSON que admite como máximo un parche por forma; el
+analizador aplica y valida cada parche de manera independiente y descarta cualquier resultado cuyo
+texto nuevo no reduzca el recuento de al menos una forma enfocada. Ollama decide si existe un error
 objetivo y cada parche mantiene las mismas guardas de estructura,
 cobertura, cifras y enlaces. La microunidad debe reducir su señal residual sin añadir palabras del
 origen; la detección de idioma se aplaza al documento completo para que una línea breve con nombres
@@ -838,8 +890,16 @@ etiqueta y folio en celdas independientes. Conserva negrita, cursiva, sangría j
 internos de página; los folios quedan alineados a la derecha y no se confunden con decoración vertical
 ni todo el índice termina fusionado en un párrafo. El contexto de índice admite folios decimales de
 cuatro cifras sin ampliar la detección general de números de margen, que seguiría confundiendo años.
-Si un folio contiene una única letra o símbolo opaco, solo se sustituye cuando la geometría aporta su
-etiqueta, la secuencia de la columna acota el valor y la fila OCR local confirma un candidato único.
+Si la fuente omite los espacios lógicos de una entrada en mayúsculas, la geometría conservada de sus
+glifos repone solo los huecos visualmente inequívocos antes de clasificar y renderizar la fila.
+Si un folio contiene letras o símbolos opacos, se generan únicamente lecturas numéricas compatibles
+con formas habituales de fuentes dañadas. Solo se sustituye cuando la fila OCR local elige un
+candidato único o cuando los folios limpios anterior y posterior acotan una única lectura; una sola
+fila vecina únicamente permite repetir exactamente su folio.
+Una línea preliminar formada únicamente por cuatro glifos numéricos separados y deformados puede
+restaurarse como año de publicación, pero solo si el OCR local de esa página o una mención explícita
+de publicación/copyright en los preliminares aporta un único año entre 1800 y 2199. Con cero o varios
+candidatos, la capa nativa permanece intacta y se revisa.
 Después de asociar la fila, el OCR puede restaurar fronteras entre palabras aunque contenga hasta dos
 glifos distintos, pero nunca aporta ni reemplaza letras: la secuencia nativa permanece intacta.
 Antes de traducir, el texto de cada entrada queda separado de su folio para impedir que el traductor
@@ -890,6 +950,18 @@ La guarda compartida de traducción conserva en orden `table/thead/tbody/tr/th/t
 pares que representan celdas vacías. Esta comprobación es local a la estructura y se aplica también
 al reutilizar una revisión guardada; por ello dos cambios opuestos en tablas distintas no pueden
 ocultar una pérdida mediante un simple recuento global.
+
+Antes de cada borrador traducido, revisado o reparado, las tablas HTML generadas se reconcilian con
+su versión anterior validada. Si el modelo cambia atributos, clases o destinos de enlaces pero
+conserva exactamente la misma secuencia de nodos, solo se trasladan los textos alineados sobre el
+armazón XHTML original. Si también cambia esa secuencia, se conserva la tabla anterior completa. Esta
+degradación impide que una revisión tardía convierta un índice válido en HTML visible o bloquee la
+publicación del libro, sin aceptar marcado inventado ni ocultar el caso mediante una reparación
+estructural libre.
+
+La misma guarda compara en orden todas las etiquetas HTML visibles del resto del fragmento. Un
+envoltorio como `html`, una etiqueta eliminada o cualquier marcado reserializado por el modelo
+invalida la propuesta completa; el texto literal de esas etiquetas nunca puede llegar al lector.
 
 Cuando una tabla conserva una capa de texto pero sus reglas solo existen en la imagen rasterizada,
 la repetición de celdas lado a lado activa un barrido local de reglas horizontales. Los límites de
@@ -989,6 +1061,11 @@ lámina completa. La capa textual sigue siendo accesible y traducible, mientras 
 rejillas, campos vacíos y relaciones espaciales que el Markdown no puede expresar permanecen en la
 salida como referencia fiel.
 
+También se conserva como lámina, sin publicar su capa textual fragmentada, una composición gráfica
+de página completa cuya supuesta lectura consiste en muchas etiquetas cortas dispersas, pocas frases
+y una geometría no lineal. Esta decisión exige evidencia conjunta en la capa nativa y el OCR, de modo
+que una página de prosa, un índice o una tabla recuperable no se conviertan innecesariamente en imagen.
+
 La reconstrucción PDF conserva aparte el OCR crudo y puede contrastar los primeros cuatro folios con
 títulos nativos repetidos entre los doce primeros. Solo sustituye una línea cuando la página depende
 del OCR, el donante nativo es centrado o tipográficamente prominente, su calidad es alta, la similitud
@@ -1041,6 +1118,10 @@ La publicación genera EPUB 3 con:
 - navegación anidada;
 - XHTML validado;
 - imágenes y portada;
+- supresión de las imágenes extraídas de la primera página cuando esa página ya se materializa como
+  portada, para que el mismo contenido visual no reaparezca en el orden de lectura;
+- semántica `epub:type="cover"` en la página de portada y referencia OPF `guide` equivalente para
+  que lectores EPUB 3 y motores heredados reconozcan la misma página sin duplicarla;
 - referencias locales comprobadas y contenido activo o remoto rechazado;
 - estilos conservados únicamente después de retirar importaciones y URL remotas;
 - encabezados indivisibles mediante `break-inside` y su compatibilidad paginada, ajuste de palabras
@@ -1104,8 +1185,13 @@ persiste:
 - telemetría por etapa y conteos semánticos sin contenido.
 
 `ProcessTelemetry` agrega duración y número de visitas por `ProcessStage`; no almacena nombres,
-rutas, prompts, términos ni texto. La validación real usa el mismo resultado para informar tiempos,
-páginas OCR sustituidas o dudosas y conteos de preliminares, índice y memoria terminológica.
+rutas, prompts, términos ni texto. Las llamadas locales se agregan además por operación estable
+(`translation_batch`, reparación, glosario, revisión, estructura u OCR visual) con solicitudes,
+tokens y duración, de modo que un informe pueda localizar amplificación de llamadas sin observar el
+documento. La validación real usa el mismo resultado para informar tiempos, páginas OCR sustituidas o
+dudosas y conteos de preliminares, índice y memoria terminológica. Su informe privado se reemplaza
+atómicamente después de cada caso, por lo que una interrupción larga no obliga a reconstruir ni
+reprocesar las métricas de los documentos ya publicados.
 
 `OutcomeSummary` es el contrato de cierre para interfaz y actividad. Mantiene separados el control
 de integridad final, las incidencias detectadas por las etapas, la cobertura lingüística y las
