@@ -21,8 +21,8 @@ técnico permanente bajo las opciones.
 **Traducir** parte en **No traducir**. Al elegir un idioma aparecen dos filas idénticas:
 **Traductor** —Argos o IA local— y **Glosario**. La revisión automática con IA parte activada en los
 documentos nuevos. Cada elección válida se guarda inmediatamente; **Volver** y Escape solo regresan
-a la cola. Si falta la IA exigida por una elección, Parsezen mantiene la intención y abre el gestor
-local. Una configuración guardada conserva sus decisiones.
+a la cola. Si falta la IA exigida por una elección, Parsezen mantiene la intención y abre
+`Componentes de IA local`. Una configuración guardada conserva sus decisiones.
 
 **Procesamiento directo** convierte o traduce, comprueba la salida y puede recomendar después una
 revisión dirigida si encuentra señales concretas. **Revisión automática con IA** examina el
@@ -106,9 +106,9 @@ es Markdown o EPUB.
 
 Al elegir un idioma en **Traducción**, aparecen dos motores que funcionan dentro del equipo:
 
-- **Contextual · IA local**: opción inicial. Usa el modelo general instalado en Ollama; para un PC
-  estándar conviene comenzar con uno de aproximadamente 4B parámetros. El resultado depende del
-  modelo elegido y Parsezen conserva cada fragmento original que no supera sus comprobaciones.
+- **Contextual · IA local**: opción inicial. Usa el componente Hy-MT2 aprobado y verificado por
+  Parsezen. La interfaz no pide elegir un modelo y conserva cada fragmento original que no supera
+  sus comprobaciones.
 - **Rápida y ligera · Argos**: alternativa manual de consumo predecible. No necesita un modelo
   conversacional, pero nunca se activa automáticamente ni se usa en pruebas sin pedirlo
   expresamente.
@@ -159,14 +159,15 @@ romano ni un término demasiado frecuente como nombre propio solo por repetirse,
 títulos de obras siguen pudiendo traducirse. Una atribución de autor debe aparecer como tal en su
 propia línea; una palabra equivalente a «por» dentro de la prosa no protege etiquetas técnicas.
 
-`IA local`, en la cabecera, abre una única página para instalar o iniciar Ollama. `Instalados` es la
-vista inicial cuando ya existen modelos y permite elegir el predeterminado. `Añadir modelo` reúne la
-búsqueda por nombre, el enlace al catálogo y las recomendaciones apropiadas para el equipo. La
-misma página permite ajustar el contexto y explica cuántos trabajos pendientes heredan sus valores.
+`IA local`, en la cabecera, abre `Componentes de IA local`. Esa página muestra exactamente dos
+tarjetas: `Traducción IA` y `Revisión IA`. Cada una indica si está `Preparado`, `Descargable` o si el
+`Equipo es insuficiente`. No hay búsqueda, selector de tags, endpoint, recomendaciones generales ni
+eliminación arbitraria. Las comprobaciones usan solo metadatos locales de Ollama y nunca envían
+documentos.
 
-Todos los documentos usan el modelo y contexto generales. Los cambios actualizan los trabajos que
-aún se pueden editar; un trabajo iniciado conserva su instantánea. Parsezen impide eliminar un
-modelo del que todavía depende un trabajo sin terminar.
+Los trabajos conservan en su instantánea el perfil efectivo y la política de componentes. La vista
+no permite convertir un tag escrito por el usuario en un modelo seleccionado; un componente solo se
+considera preparado cuando su manifest y digest coinciden con `/api/tags` y `/api/show`.
 
 ## Revisión semántica con IA local
 
@@ -421,22 +422,19 @@ Cuando una acción requiere Ollama, sigue el botón que aparezca:
 1. `Instalar Ollama`;
 2. `Iniciar`;
 3. `Proteger y reiniciar`, si el modo local no está activo;
-4. `Elegir modelo`.
+4. `Componentes de IA local`.
 
-El gestor muestra en una lista única los modelos recomendados e instalados. Puedes filtrarlos,
-buscar o escribir directamente un nombre del catálogo, por ejemplo `qwen3:4b-instruct`, y pulsar
-`Instalar modelo`. Parsezen exige una variante dedicada a instrucciones y bloquea modelos de
-razonamiento conocidos, como `qwen3:4b`, DeepSeek R1 o QwQ, porque pueden no devolver el documento
-transformado. Si ya están instalados se muestran como no compatibles para que puedas eliminarlos.
-La ventana de contexto incluye valores habituales y una opción personalizada. No uses etiquetas
-cloud.
+La pantalla fija muestra los estados de los dos componentes aprobados. `Actualizar estados` vuelve a
+consultar la disponibilidad local. Si una tarjeta está `Descargable`, la señal de preparación contiene
+solo su capacidad (`translation` o `review`); la vista no acepta nombres de catálogo ni endpoints.
+Los tags cloud y los metadatos que no coinciden con el manifest no se consideran preparados.
 
 ## Solución de problemas
 
 ### Un documento parece detenido
 
-Comprueba la fase y la barra de progreso. Algunas operaciones iniciales descargan un modelo público
-o preparan OCR/Argos y pueden tardar más la primera vez.
+Comprueba la fase y la barra de progreso. Algunas operaciones iniciales preparan OCR/Argos y pueden
+tardar más la primera vez.
 
 ### Una revisión reaparece
 

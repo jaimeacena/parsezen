@@ -148,7 +148,13 @@ from parsezen.semantic_blocks import (
     SemanticRole,
     analyze_markdown,
 )
-from parsezen.settings import AppSettings, validate_settings
+from parsezen.settings import (
+    AppSettings,
+    has_specialized_ai_profiles,
+    settings_for_review,
+    settings_for_translation,
+    validate_settings,
+)
 from parsezen.translation_quality import (
     LinguisticReviewMode,
     TranslationQualityReport,
@@ -1036,7 +1042,7 @@ def _process_epub_translation(
             translated = improve_markdown(
                 protected.text,
                 effective_ai_mode,
-                settings,
+                settings_for_translation(settings),
                 request.target_language,
                 source_language_code=source_language_code,
                 **improvement_arguments,
@@ -1072,7 +1078,7 @@ def _process_epub_translation(
             request,
             source_payload,
             translated_payload,
-            settings=settings,
+            settings=settings_for_translation(settings) if settings is not None else None,
             cancellation=token,
             source_language_code=source_language_code,
             translation_glossary=translation_glossary,
@@ -1116,7 +1122,7 @@ def _process_epub_translation(
             effective_ai_mode,
             on_stage,
             on_progress,
-            settings,
+            settings_for_review(settings) if settings is not None else None,
             cancellation,
             work_checkpoints,
         )
@@ -1332,7 +1338,7 @@ def _pdf_visual_arbiter_factory(
         )
     ):
         return None
-    normalized = validate_settings(settings)
+    normalized = settings_for_review(validate_settings(settings))
     if normalized.model is None:
         return None
     return lambda: build_local_visual_text_arbiter(
@@ -1355,29 +1361,42 @@ def _open_general_work_checkpoints(
     """Open checkpoints only when a workflow contains expensive resumable work."""
     if not _uses_general_work_checkpoints(request):
         return None
-    model = settings.model if settings is not None else None
-    context_window = settings.context_window if settings is not None else None
     page_range = (
         (request.pdf_page_range.first_page, request.pdf_page_range.last_page)
         if request.pdf_page_range is not None
         else None
     )
-    resume_key = repr(
-        (
-            "general-work-v3",
-            request.convert_to_markdown,
-            request.improvement_mode.value if request.improvement_mode is not None else None,
-            request.review_content,
-            request.review_structure,
-            request.target_language,
-            request.offline_translation_language,
-            page_range,
-            request.force_pdf_ocr,
-            request.output_format.value,
-            model,
-            context_window,
-        )
+    common = (
+        request.convert_to_markdown,
+        request.improvement_mode.value if request.improvement_mode is not None else None,
+        request.review_content,
+        request.review_structure,
+        request.target_language,
+        request.offline_translation_language,
+        page_range,
+        request.force_pdf_ocr,
+        request.output_format.value,
     )
+    if not has_specialized_ai_profiles(settings):
+        # Keep the pre-specialized resume identity exactly stable so existing
+        # general-work checkpoints remain reusable after the profile split.
+        model = settings.model if settings is not None else None
+        context_window = settings.context_window if settings is not None else None
+        resume_key = repr(("general-work-v3", *common, model, context_window))
+    else:
+        assert settings is not None
+        translation_settings = settings_for_translation(settings)
+        review_settings = settings_for_review(settings)
+        resume_key = repr(
+            (
+                "general-work-v4-specialized",
+                *common,
+                translation_settings.model,
+                translation_settings.context_window,
+                review_settings.model,
+                review_settings.context_window,
+            )
+        )
     return open_work_checkpoints(
         request.source_path,
         resume_key,
@@ -1825,13 +1844,21 @@ def _validate_ai_settings(
         if settings is None:
             raise SettingsError("Elige un modelo de IA instalado antes de usar la IA.")
         normalized_settings = validate_settings(settings)
-        if normalized_settings.model is None:
-            raise SettingsError("Elige un modelo de IA instalado antes de usar la IA.")
-        if is_reasoning_model_id(normalized_settings.model):
-            raise SettingsError(
-                "Ese modelo prioriza el razonamiento y no es apto para transformar documentos. "
-                "Elige una variante Instruct."
-            )
+        phases: list[AppSettings] = []
+        if mode in {ImprovementMode.TRANSLATE, ImprovementMode.CLEAN_AND_TRANSLATE}:
+            phases.append(settings_for_translation(normalized_settings))
+        elif mode is not None:
+            phases.append(settings_for_review(normalized_settings))
+        if request.review_content or request.review_structure:
+            phases.append(settings_for_review(normalized_settings))
+        for phase_settings in phases:
+            if phase_settings.model is None:
+                raise SettingsError("Elige un modelo de IA instalado antes de usar la IA.")
+            if is_reasoning_model_id(phase_settings.model):
+                raise SettingsError(
+                    "Ese modelo prioriza el razonamiento y no es apto para transformar documentos. "
+                    "Elige una variante Instruct."
+                )
 
 
 def _validate_output_directory(output_directory: Path, source_path: Path) -> None:

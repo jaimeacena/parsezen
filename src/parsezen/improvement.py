@@ -9,7 +9,8 @@ import logging
 import re
 import unicodedata
 from collections import Counter
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 
 import httpx
@@ -91,8 +92,11 @@ from parsezen.improvement_contracts import (
     _ProtectedValue,
     _TranslationContext,
 )
-from parsezen.local_ai_transport import (
-    request_local_ai as _request_improvement,
+from parsezen.local_ai_adapters import (
+    release_adapted_local_ai_model,
+)
+from parsezen.local_ai_adapters import (
+    request_adapted_local_ai as _request_improvement,
 )
 from parsezen.local_models import (
     DEFAULT_CONTEXT_WINDOW,
@@ -612,6 +616,29 @@ def build_instructions(
     return f"{base}\nTarea:\n{operation}"
 
 
+@contextmanager
+def _local_ai_client(
+    timeout_seconds: float,
+    transport: httpx.BaseTransport | None,
+    model: str,
+) -> Iterator[httpx.Client]:
+    """Share a protected client and unload Parsezen-owned phase models afterwards."""
+
+    with httpx.Client(
+        timeout=timeout_seconds,
+        follow_redirects=False,
+        trust_env=False,
+        transport=transport,
+    ) as client:
+        try:
+            yield client
+        finally:
+            try:
+                release_adapted_local_ai_model(client, model)
+            except (httpx.RequestError, ImprovementError):
+                LOGGER.warning("local_ai_release_failed specialized_model=true")
+
+
 def improve_markdown(
     markdown: str,
     mode: ImprovementMode,
@@ -665,11 +692,10 @@ def improve_markdown(
             return cached
         LOGGER.info("improvement_started chunks=1 global_structure=true")
         try:
-            with httpx.Client(
-                timeout=normalized_settings.timeout_seconds,
-                follow_redirects=False,
-                trust_env=False,
-                transport=transport,
+            with _local_ai_client(
+                normalized_settings.timeout_seconds,
+                transport,
+                model,
             ) as client:
                 if on_progress is not None:
                     on_progress(1, 1)
@@ -839,11 +865,10 @@ def improve_markdown(
         return state
 
     try:
-        with httpx.Client(
-            timeout=normalized_settings.timeout_seconds,
-            follow_redirects=False,
-            trust_env=False,
-            transport=transport,
+        with _local_ai_client(
+            normalized_settings.timeout_seconds,
+            transport,
+            model,
         ) as client:
             improved_parts: list[str] = []
             preserved_translation_chunks = 0
@@ -1316,11 +1341,10 @@ def review_translation_markdown(
     context_window = normalized_settings.context_window or DEFAULT_CONTEXT_WINDOW
     reviewed_parts = [part.translated for part in parts]
     try:
-        with httpx.Client(
-            timeout=normalized_settings.timeout_seconds,
-            follow_redirects=False,
-            trust_env=False,
-            transport=transport,
+        with _local_ai_client(
+            normalized_settings.timeout_seconds,
+            transport,
+            model,
         ) as client:
             for current, part_index in enumerate(primary_review_indexes, start=1):
                 part = parts[part_index]
@@ -1642,11 +1666,10 @@ def retranslate_residual_title(
     if target_code is None:
         raise ImprovementError("El idioma de destino de la revisión no está soportado.")
     part = _TranslationReviewPart(source_markdown, translated_markdown)
-    with httpx.Client(
-        timeout=normalized_settings.timeout_seconds,
-        follow_redirects=False,
-        trust_env=False,
-        transport=transport,
+    with _local_ai_client(
+        normalized_settings.timeout_seconds,
+        transport,
+        model,
     ) as client:
         candidate, _cacheable = _retranslate_priority_title(
             client,
@@ -2231,6 +2254,8 @@ def _retranslate_exact_source_text_unit(
             cancellation,
             prediction_characters=max(64, len(part.translated) * 2),
             operation="translation_repair",
+            source_language_code=source_language,
+            target_language_code=target_language,
         )
         try:
             candidate = _exact_source_text_translation(response)
@@ -3035,6 +3060,8 @@ def _retranslate_priority_title(
             cancellation,
             prediction_characters=len(source_visible),
             operation="translation_repair",
+            source_language_code=source_language,
+            target_language_code=target_language,
         )
         restored = (
             _restore_protected_values(response, protected.values)
@@ -3891,6 +3918,8 @@ def _ground_focused_translation_terms(
             cancellation,
             prediction_characters=64,
             operation="translation_glossary",
+            source_language_code=context.source_language,
+            target_language_code=context.target_language,
         )
         try:
             equivalent = _validated_lexical_equivalent(
@@ -4156,6 +4185,8 @@ def _translate_aligned_batch(
             prediction_characters=sum(len(item.visible_source) for item in items),
             json_response=True,
             operation=operation,
+            source_language_code=context.source_language,
+            target_language_code=context.target_language,
         )
         return _aligned_translation_batch_records(response, frozenset(identifiers.values()))
 
@@ -4645,6 +4676,16 @@ def _improve_part(
         cancellation,
         prediction_characters=len(markdown),
         operation=mode.value,
+        source_language_code=(
+            active_translation_context.source_language
+            if active_translation_context is not None
+            else None
+        ),
+        target_language_code=(
+            active_translation_context.target_language
+            if active_translation_context is not None
+            else None
+        ),
     )
     try:
         content = restore_markdown_envelope(content)
@@ -4726,6 +4767,16 @@ def _improve_part(
             cancellation,
             prediction_characters=len(markdown),
             operation=mode.value,
+            source_language_code=(
+                active_translation_context.source_language
+                if active_translation_context is not None
+                else None
+            ),
+            target_language_code=(
+                active_translation_context.target_language
+                if active_translation_context is not None
+                else None
+            ),
         )
         try:
             retry_content = restore_markdown_envelope(retry_content)
@@ -5592,6 +5643,8 @@ def _translate_table_text_batch(
             cancellation,
             prediction_characters=len(request_source),
             operation="translation_table_focused" if focused else "translation_table",
+            source_language_code=context.source_language,
+            target_language_code=context.target_language,
         )
         response = _restore_protected_values(response, protected.values)
         translated_values = _aligned_table_response_values(response, len(source_values))
@@ -6287,18 +6340,20 @@ def _translation_fallback_parts(markdown: str) -> list[_MarkdownPart]:
         ]
         if body_boundaries:
             marker = emphasized.group("marker")
-            parts = [_MarkdownPart(marker, False)]
+            emphasized_parts = [_MarkdownPart(marker, False)]
             previous = 0
             for boundary in body_boundaries:
                 if boundary.start() > previous:
-                    parts.append(_MarkdownPart(body[previous : boundary.start()], True))
-                parts.append(_MarkdownPart(body[boundary.start() : boundary.end()], False))
+                    emphasized_parts.append(_MarkdownPart(body[previous : boundary.start()], True))
+                emphasized_parts.append(
+                    _MarkdownPart(body[boundary.start() : boundary.end()], False)
+                )
                 previous = boundary.end()
             if previous < len(body):
-                parts.append(_MarkdownPart(body[previous:], True))
-            parts.append(_MarkdownPart(marker, False))
-            if sum(part.should_improve for part in parts) > 1:
-                return parts
+                emphasized_parts.append(_MarkdownPart(body[previous:], True))
+            emphasized_parts.append(_MarkdownPart(marker, False))
+            if sum(part.should_improve for part in emphasized_parts) > 1:
+                return emphasized_parts
 
     boundaries = [
         match
@@ -6385,6 +6440,8 @@ def _improve_translation_with_locked_values(
             cancellation,
             prediction_characters=len(core),
             operation="translation_fallback",
+            source_language_code=context.source_language,
+            target_language_code=context.target_language,
         ).strip()
         if re.search(r"[.,;:!?…]$", core) is None:
             translated = re.sub(r"[.,;:!?…]+$", "", translated).rstrip()
@@ -6478,6 +6535,8 @@ def _repair_untranslated_titles(
             cancellation,
             prediction_characters=len(visible_title),
             operation="translation_repair",
+            source_language_code=context.source_language,
+            target_language_code=context.target_language,
         )
         focused = _restore_protected_values(focused, protected.values).strip()
         if "\n" in focused:

@@ -1113,12 +1113,17 @@ def validate_translation_quality(
     """Reject incomplete, wrong-language or structurally unsafe translations."""
     _validate_structure(source, translated, preserve_paragraphs=preserve_paragraphs)
     _validate_content_coverage(source, translated)
-    if {source_language, target_language} == {"en", "es"} and not (
-        _written_number_meaning_is_conserved(
-            source,
-            translated,
-            source_language=source_language,
-            target_language=target_language,
+    if (
+        source_language is not None
+        and target_language is not None
+        and {source_language, target_language} == {"en", "es"}
+        and not (
+            _written_number_meaning_is_conserved(
+                source,
+                translated,
+                source_language=source_language,
+                target_language=target_language,
+            )
         )
     ):
         raise TranslationQualityError(

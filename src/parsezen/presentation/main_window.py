@@ -103,6 +103,7 @@ from parsezen.domain.jobs import (
     DocumentSource,
     JobConfiguration,
     JobStatus,
+    LocalAIPolicySnapshot,
     OutputConfiguration,
     ProcessingPlan,
     TranslationConfiguration,
@@ -116,7 +117,6 @@ from parsezen.failure_recovery import ProcessingFailure, recovery_plan
 from parsezen.infrastructure.artifact_store import ArtifactStore
 from parsezen.infrastructure.result_snapshots import ResultSnapshotStore
 from parsezen.infrastructure.state_store import StateStore, StateStoreError
-from parsezen.local_models import is_reasoning_model_id
 from parsezen.pipeline.contracts import ProcessRequest, ProcessResult
 from parsezen.presentation.activity_view import ActivityView
 from parsezen.presentation.book_editor_dialog import BookEditorDialog
@@ -185,6 +185,7 @@ class ParsezenMainWindow(QMainWindow):
         history_path: Path | None = None,
         work_checkpoint_root: Path | None = None,
         state_path: Path | None = None,
+        local_ai_policy: LocalAIPolicySnapshot | None = None,
     ) -> None:
         super().__init__()
         self._settings = settings if settings is not None else AppSettings()
@@ -198,6 +199,11 @@ class ParsezenMainWindow(QMainWindow):
         self._result: ProcessResult | None = None
         self._selected_result_job_id: str | None = None
         self._auto_discover_ai = auto_discover_ai
+        # The policy is a verified, content-free application snapshot.  It is
+        # copied into every newly created job; existing jobs retain the
+        # snapshot they were created with until an explicit global update is
+        # propagated through the queue service.
+        self._local_ai_policy = local_ai_policy or LocalAIPolicySnapshot()
         self._active_configuration_dialog: JobConfigurationDialog | None = None
         self._sleep_blocker = SystemSleepBlocker()
         self._notification_tray: QSystemTrayIcon | None = None
@@ -313,11 +319,9 @@ class ParsezenMainWindow(QMainWindow):
             self._local_ai,
             self.parsezen_workspace,
             settings=lambda: self._settings,
-            apply_settings=self._apply_settings,
-            jobs=lambda: self._job_queue.jobs,
             processing_active=lambda: self._queue_session.running,
             active_editor=lambda: self._active_configuration_dialog,
-            propagate_ai_profile=self._queue_configuration.propagate_ai_profile,
+            propagate_ai_policy=self.set_local_ai_policy_snapshot,
             parent=self,
         )
         self._local_ai_workflow.state_changed.connect(self._local_ai_state_changed)
@@ -352,6 +356,24 @@ class ParsezenMainWindow(QMainWindow):
         self._ensure_configurations()
         self._sync_workspace(force_persist=True)
 
+    def set_local_ai_policy_snapshot(self, policy: LocalAIPolicySnapshot) -> None:
+        """Apply a verified component policy to future and editable jobs.
+
+        The policy itself is deliberately kept out of :class:`AppSettings`:
+        settings are user preferences, while this snapshot is an observed
+        Ollama identity that must remain tied to queued work.  Replacing it
+        updates only jobs that are still editable; a running or completed job
+        keeps the identity that produced its result.
+        """
+
+        if not isinstance(policy, LocalAIPolicySnapshot):
+            raise TypeError("La política de IA local debe ser una instantánea válida.")
+        previous = _ai_profile_from_settings(self._settings, self._local_ai_policy)
+        self._local_ai_policy = policy
+        current = _ai_profile_from_settings(self._settings, policy)
+        self._queue_configuration.propagate_ai_profile(previous, current)
+        self._sync_workspace(force_persist=True)
+
     def add_source_paths(self, paths: Sequence[str | Path]) -> None:
         candidates = _unique_paths(Path(path) for path in paths)
         known = {_path_key(job.source.path) for job in self._job_queue.jobs}
@@ -372,7 +394,11 @@ class ParsezenMainWindow(QMainWindow):
             key = _path_key(path)
             job = self._job_queue.add(
                 _source_from_path(path),
-                _default_configuration(path, self._settings),
+                _default_configuration(
+                    path,
+                    self._settings,
+                    local_ai_policy=self._local_ai_policy,
+                ),
                 job_id=uuid5(NAMESPACE_URL, key).hex,
             )
             self._queue_session.ensure_runtime(job.id)
@@ -814,7 +840,7 @@ class ParsezenMainWindow(QMainWindow):
         workspace.add_requested.connect(self._select_file)
         workspace.files_dropped.connect(self._add_dropped_paths)
         workspace.settings_requested.connect(self._show_parsezen_settings)
-        workspace.local_ai_requested.connect(self._local_ai_workflow.show_model_manager)
+        workspace.local_ai_requested.connect(self._local_ai_workflow.show_component_setup)
         workspace.output_directory_requested.connect(self._choose_global_output_directory)
         workspace.output_directory_reset_requested.connect(self._reset_global_output_directory)
         workspace.internal_back_requested.connect(self._close_internal_workflow)
@@ -837,7 +863,7 @@ class ParsezenMainWindow(QMainWindow):
         self.activity_action.triggered.connect(self._show_recent_activity)
         self.settings_menu.addAction(self.activity_action)
         self.models_settings_action = QAction("IA local", self.settings_menu)
-        self.models_settings_action.triggered.connect(self._local_ai_workflow.show_model_manager)
+        self.models_settings_action.triggered.connect(self._local_ai_workflow.show_component_setup)
         self.settings_menu.addAction(self.models_settings_action)
         self.settings_menu.addSeparator()
 
@@ -1104,7 +1130,7 @@ class ParsezenMainWindow(QMainWindow):
                 "Hace falta un modelo local",
                 "Instala o elige un modelo de IA local antes de revisar estas señales.",
             )
-            self._local_ai_workflow.show_model_manager()
+            self._local_ai_workflow.show_component_setup()
             return
         try:
             base_result = (
@@ -1162,25 +1188,13 @@ class ParsezenMainWindow(QMainWindow):
                 "Duplica o reinicia el trabajo para usar otras opciones.",
             )
             return
-        models = tuple(
-            (model.model_id, model.display_name)
-            for model in self._local_ai_workflow.models
-            if not is_reasoning_model_id(model.model_id)
-        )
-        configured_model = job.configuration.ai.model
-        if (
-            configured_model
-            and not is_reasoning_model_id(configured_model)
-            and configured_model not in {model_id for model_id, _ in models}
-        ):
-            models = ((configured_model, configured_model), *models)
         stage = requested_stage if isinstance(requested_stage, StageKind) else None
         active_dialog = self._active_configuration_dialog
         if active_dialog is not None:
             return
         dialog = JobConfigurationDialog(
             job,
-            models=models,
+            models=(),
             stage=stage,
             embedded=True,
             default_output_directory=self._settings.output_directory,
@@ -1196,8 +1210,8 @@ class ParsezenMainWindow(QMainWindow):
         dialog.finished.connect(
             lambda _result, editor=dialog: self._configuration_dialog_finished(editor)
         )
-        dialog.models_requested.connect(
-            lambda editor=dialog: self._open_models_from_configuration(editor)
+        dialog.component_setup_requested.connect(
+            lambda editor=dialog: self._open_component_setup_from_configuration(editor)
         )
         self.parsezen_workspace.set_configuring(job.id, None)
         self.parsezen_workspace.show_internal_view(
@@ -1220,32 +1234,24 @@ class ParsezenMainWindow(QMainWindow):
         self._active_configuration_dialog = None
         self.parsezen_workspace.set_configuring(None, None)
 
-    def _open_models_from_configuration(self, dialog: JobConfigurationDialog) -> None:
+    def _open_component_setup_from_configuration(self, dialog: JobConfigurationDialog) -> None:
         if self._active_configuration_dialog is not dialog:
             return
-        self._local_ai_workflow.show_model_manager()
-        manager = self._local_ai_workflow.manager
-        if manager is None:
+        self._local_ai_workflow.show_component_setup()
+        setup = self._local_ai_workflow.component_setup
+        if setup is None:
             return
-        manager.finished.connect(
+        setup.finished.connect(
             lambda _result, editor=dialog: self._resume_configuration_dialog(editor)
         )
 
     def _resume_configuration_dialog(self, dialog: JobConfigurationDialog) -> None:
         if self._active_configuration_dialog is not dialog:
             return
-        dialog.set_models(
-            tuple(
-                (model.model_id, model.display_name)
-                for model in self._local_ai_workflow.models
-                if not is_reasoning_model_id(model.model_id)
-            )
-        )
-        dialog.set_default_ai_profile(
-            self._settings.model,
-            self._settings.context_window,
-        )
-        dialog.set_ai_status(self._local_ai_workflow.status)
+        # The editor owns its immutable job snapshot.  Re-entering it after
+        # component setup only needs to persist the current visible choices;
+        # the old global-model setters could silently discard specialized
+        # component identities.
         dialog.persist_if_valid()
 
     @Slot(object)
@@ -2903,7 +2909,29 @@ def _quarantine_structurally_unreadable_state(state_path: Path) -> Path:
     return recovery
 
 
-def _default_configuration(path: Path, settings: AppSettings) -> JobConfiguration:
+def _ai_profile_from_settings(
+    settings: AppSettings,
+    local_ai_policy: LocalAIPolicySnapshot | None = None,
+) -> AIProfileConfiguration:
+    """Build the effective global profile without touching document content."""
+
+    return AIProfileConfiguration(
+        model=settings.model,
+        context_window=settings.context_window,
+        components=local_ai_policy or LocalAIPolicySnapshot(),
+        translation_model=settings.translation_model,
+        translation_context_window=settings.translation_context_window,
+        review_model=settings.review_model,
+        review_context_window=settings.review_context_window,
+    )
+
+
+def _default_configuration(
+    path: Path,
+    settings: AppSettings,
+    *,
+    local_ai_policy: LocalAIPolicySnapshot | None = None,
+) -> JobConfiguration:
     source_format = DocumentFormat.from_path(path)
     output_format = (
         DocumentFormat.EPUB if source_format is DocumentFormat.EPUB else DocumentFormat.MARKDOWN
@@ -2923,10 +2951,7 @@ def _default_configuration(path: Path, settings: AppSettings) -> JobConfiguratio
             preserve_styles=output_format in {DocumentFormat.DOCX, DocumentFormat.EPUB},
             title=path.stem if output_format is DocumentFormat.EPUB else None,
         ),
-        ai=AIProfileConfiguration(
-            model=settings.model,
-            context_window=settings.context_window,
-        ),
+        ai=_ai_profile_from_settings(settings, local_ai_policy),
         translation=TranslationConfiguration(),
         plan=ProcessingPlan.STANDARD,
     )

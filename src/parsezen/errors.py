@@ -41,10 +41,6 @@ class LocalModelUnavailableError(ParsezenError):
     """Ollama or the selected local model could not be reached."""
 
 
-class ModelRecommendationError(ParsezenError):
-    """Hardware-aware model recommendations could not be prepared safely."""
-
-
 class ImprovementError(ParsezenError):
     """A local model response was invalid or unsafe to publish."""
 

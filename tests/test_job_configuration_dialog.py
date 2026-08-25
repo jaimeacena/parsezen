@@ -11,6 +11,8 @@ from parsezen.domain.jobs import (
     DocumentJob,
     DocumentSource,
     JobConfiguration,
+    LocalAIComponentSnapshot,
+    LocalAIPolicySnapshot,
     OutputConfiguration,
     PageRangeConfiguration,
     ProcessingPlan,
@@ -75,7 +77,10 @@ def test_standard_configuration_uses_visual_format_and_compact_settings(
     assert not hasattr(dialog, "translation_enabled")
 
 
-def test_unconfigured_markdown_defaults_to_epub_and_review(qtbot, tmp_path: Path) -> None:
+def test_unconfigured_markdown_defaults_to_epub_and_direct_processing(
+    qtbot,
+    tmp_path: Path,
+) -> None:
     dialog = JobConfigurationDialog(
         _job(
             tmp_path,
@@ -87,7 +92,10 @@ def test_unconfigured_markdown_defaults_to_epub_and_review(qtbot, tmp_path: Path
     qtbot.addWidget(dialog)
 
     assert dialog.output_epub.isChecked()
-    assert dialog.plan_reviewed.isChecked()
+    assert not dialog.plan_reviewed.isChecked()
+
+    configured = dialog.configuration()
+    assert configured.plan is ProcessingPlan.STANDARD
 
 
 def test_missing_ai_is_opened_from_the_relevant_choice(qtbot, tmp_path: Path) -> None:
@@ -98,7 +106,7 @@ def test_missing_ai_is_opened_from_the_relevant_choice(qtbot, tmp_path: Path) ->
     )
     qtbot.addWidget(dialog)
 
-    with qtbot.waitSignal(dialog.models_requested):
+    with qtbot.waitSignal(dialog.component_setup_requested):
         dialog._set_review_enabled(True)  # noqa: SLF001
 
     assert dialog.plan_reviewed.isChecked()
@@ -286,7 +294,7 @@ def test_ai_translation_requires_the_global_model(qtbot, tmp_path: Path) -> None
     dialog._set_translation_language("es")  # noqa: SLF001
     dialog._set_translation_method(TranslationMethod.LOCAL_AI)  # noqa: SLF001
 
-    with pytest.raises(ValueError, match="modelo de IA local general"):
+    with pytest.raises(ValueError, match="componente de traducción local"):
         dialog.configuration()
 
 
@@ -325,6 +333,34 @@ def test_global_destination_and_ai_are_inherited_but_not_overridable(qtbot, tmp_
     assert not hasattr(dialog, "ai_model")
 
 
+def test_editing_another_option_preserves_specialized_ai_snapshot(qtbot, tmp_path: Path) -> None:
+    policy = LocalAIPolicySnapshot(
+        translation=LocalAIComponentSnapshot(
+            "local-ai-policy-v1", "translator:7b", "a" * 64, context_window=8_192
+        ),
+        review=LocalAIComponentSnapshot(
+            "local-ai-policy-v1", "reviewer:7b", "b" * 64, context_window=16_384
+        ),
+    )
+    configuration = JobConfiguration(
+        ai=AIProfileConfiguration(
+            model="general:7b",
+            context_window=4_096,
+            components=policy,
+            translation_model="translator:7b",
+            translation_context_window=8_192,
+            review_model="reviewer:7b",
+            review_context_window=16_384,
+        )
+    )
+    dialog = JobConfigurationDialog(_job(tmp_path, configuration=configuration), embedded=True)
+    qtbot.addWidget(dialog)
+
+    dialog._set_output_format(DocumentFormat.EPUB)  # noqa: SLF001
+
+    assert dialog.configuration().ai == configuration.ai
+
+
 def test_pdf_interval_and_ocr_are_values_not_permanent_controls(qtbot, tmp_path: Path) -> None:
     dialog = JobConfigurationDialog(_job(tmp_path), embedded=True)
     qtbot.addWidget(dialog)
@@ -361,7 +397,7 @@ def test_reviewed_plan_surfaces_missing_global_ai(qtbot, tmp_path: Path) -> None
     qtbot.addWidget(dialog)
     dialog._set_review_enabled(True)  # noqa: SLF001
 
-    with pytest.raises(ValueError, match="modelo de IA local general"):
+    with pytest.raises(ValueError, match="componente de revisión local"):
         dialog.configuration()
 
 

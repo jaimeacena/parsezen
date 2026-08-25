@@ -13,6 +13,8 @@ from parsezen.domain.jobs import (
     DocumentFormat,
     DocumentSource,
     JobConfiguration,
+    LocalAIComponentSnapshot,
+    LocalAIPolicySnapshot,
     OutputConfiguration,
     PageRangeConfiguration,
     ProcessingPlan,
@@ -90,6 +92,56 @@ def test_ai_translation_requires_the_global_model_even_in_standard_plan() -> Non
         and issue.message.endswith("antes de traducir con IA local.")
         for issue in issues
     )
+
+
+def test_fixed_component_snapshots_satisfy_phase_specific_models() -> None:
+    from parsezen.component_catalog import (
+        REVIEW_COMPONENT_MANIFEST,
+        TRANSLATION_COMPONENT_MANIFEST,
+    )
+
+    def snapshot(manifest):
+        return LocalAIComponentSnapshot(
+            manifest.policy_version,
+            manifest.model_name,
+            manifest.ollama_digest,
+            manifest.context_window,
+        )
+
+    configuration = JobConfiguration(
+        output=OutputConfiguration(format=DocumentFormat.EPUB),
+        ai=AIProfileConfiguration(
+            components=LocalAIPolicySnapshot(
+                translation=snapshot(TRANSLATION_COMPONENT_MANIFEST),
+                review=snapshot(REVIEW_COMPONENT_MANIFEST),
+            )
+        ),
+        translation=TranslationConfiguration(enabled=True, target_language="es"),
+        plan=ProcessingPlan.LOCAL_AI_REVIEWED,
+    )
+
+    assert configuration_issues(source(), configuration) == ()
+
+
+def test_tampered_component_snapshot_is_rejected() -> None:
+    configuration = JobConfiguration(
+        output=OutputConfiguration(format=DocumentFormat.EPUB),
+        ai=AIProfileConfiguration(
+            components=LocalAIPolicySnapshot(
+                translation=LocalAIComponentSnapshot(
+                    "local-ai-policy-v1",
+                    "parsezen/hymt-translation:Q4_K_M",
+                    "0" * 64,
+                    8_192,
+                )
+            )
+        ),
+        translation=TranslationConfiguration(enabled=True, target_language="es"),
+    )
+
+    issues = configuration_issues(source(), configuration)
+
+    assert any("identidad" in issue.message for issue in issues)
 
 
 def test_product_outputs_are_limited_to_markdown_and_epub() -> None:

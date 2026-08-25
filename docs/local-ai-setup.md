@@ -6,13 +6,14 @@ direcciones configurables: la API está fijada a `127.0.0.1:11434`.
 Ollama solo es necesario para traducción con IA, corrección o la pre-organización automática de
 capítulos. Conversión, EPUB, OCR, personalización manual y traducción con Argos pueden usarse sin él.
 La traducción nueva usa IA local por defecto; Argos permanece como elección manual y nunca actúa como
-alternativa silenciosa. Para un PC estándar, el punto de partida recomendado es un modelo instalado
-de alrededor de 4B parámetros que aparezca en `GET /api/tags`.
+alternativa silenciosa. Parsezen fija Hy-MT2 Q4_K_M para traducir y LFM Q6_K para revisar; no pide a
+la persona elegir un modelo conversacional.
 
-La cabecera comunica su estado y abre el gestor global. Allí `Instalados` permite elegir el modelo
-predeterminado y `Añadir modelo` reúne recomendaciones y descarga. Los documentos que necesitan IA
-usan una instantánea de ese modelo y contexto generales; no existen excepciones por documento. Los
-cambios globales solo alcanzan trabajos pendientes todavía editables.
+La cabecera comunica su estado y abre `Componentes de IA local`. Esa vista fija muestra exactamente
+las tarjetas `Traducción IA` y `Revisión IA`, con los estados `Preparado`, `Descargable` o `Equipo
+insuficiente`. No ofrece un selector de tags, endpoints, búsqueda, recomendaciones automáticas ni
+borrado arbitrario. Los documentos conservan una instantánea del perfil efectivo y los cambios solo
+alcanzan trabajos pendientes todavía editables.
 
 ## Recorrido guiado
 
@@ -21,48 +22,26 @@ La interfaz muestra una única acción pertinente:
 1. **Instalar Ollama**: usa WinGet o el instalador oficial verificado.
 2. **Iniciar**: abre el proceso local y espera a que responda.
 3. **Proteger y reiniciar**: activa `disable_ollama_cloud` y reinicia el servidor.
-4. **Elegir modelo**: abre el gestor integrado.
+4. **Componentes de IA local**: abre las dos tarjetas de capacidades aprobadas.
 
 El usuario no necesita abrir una consola, una aplicación de chat ni un navegador.
 
-## Modelos
+## Componentes aprobados
 
-El gestor obtiene los modelos instalados desde `GET /api/tags`. Para recomendar:
+Cada tarjeta representa una capacidad concreta, no un modelo conversacional intercambiable. La
+preparación se decide con el catálogo versionado de Parsezen y comprobaciones locales de hardware,
+configuración solo-local y metadatos de Ollama. La verificación solo consulta `GET /api/version`,
+`GET /api/tags` y `POST /api/show`; no envía documentos, prompts ni respuestas.
 
-- ejecuta localmente `llmfit`;
-- detecta RAM, GPU y VRAM;
-- solicita candidatos de chat;
-- descarta embeddings, modelos cloud y modelos que no caben;
-- verifica en el registro de Ollama los identificadores inferidos;
-- presenta un modelo equilibrado, uno más rápido y otro de mayor capacidad.
+Un componente solo aparece como `Preparado` cuando su manifest, digest, formato, familia,
+cuantización, contexto, capacidades y versión de Ollama coinciden. Si el modelo fijado no está en
+`/api/tags`, la tarjeta puede mostrar `Descargable` cuando los demás requisitos se cumplen; la vista
+emite únicamente la capacidad (`translation` o `review`) para que una capa posterior autorizada
+gestione la preparación. Nunca acepta un nombre de modelo, URL o endpoint introducido por el usuario.
 
-La recomendación se almacena temporalmente para funcionar sin conexión. Si no está disponible, la
-instalación manual por nombre sigue activa.
-
-Parsezen usa identificadores canónicos de Ollama:
-
-```text
-modelo
-modelo:tag
-autor/modelo:tag
-```
-
-Si falta el tag, Ollama interpreta `latest`. Parsezen no crea alias, perfiles ni nombres de modelo
-propios. Un modelo no queda seleccionado hasta que aparece realmente en `GET /api/tags`.
-
-Las transformaciones documentales requieren un modelo capaz de devolver directamente el documento.
-Parsezen no permite seleccionar ni restaurar variantes de razonamiento conocidas —como
-`qwen3:4b`, DeepSeek R1 o QwQ— porque pueden dedicar la respuesta al razonamiento interno y no
-devolver el texto transformado. La familia general Qwen 3.5 no se confunde con esos tags antiguos y
-puede validarse normalmente. Los modelos excluidos siguen visibles en el gestor para poder
-eliminarlos. La selección automática continúa limitada por la memoria real del equipo.
-
-El catálogo oficial puede abrirse desde el gestor:
-
-- [Catálogo de Ollama](https://ollama.com/library)
-- [API de modelos instalados](https://docs.ollama.com/api/tags)
-- [API de descarga](https://docs.ollama.com/api/pull)
-- [API de chat](https://docs.ollama.com/api/chat)
+Los tags `:cloud` y `-cloud`, las variantes no fijadas y los modelos que no cumplen los requisitos
+quedan fuera. La traducción offline con Argos permanece disponible como elección explícita y no es un
+reemplazo silencioso de un componente de IA.
 
 ## Solo local
 
@@ -84,63 +63,47 @@ activo. Si falta la configuración persistente, Parsezen exige proteger y reinic
 
 ## Ventana de contexto
 
-El valor automático usa:
+Cada manifest fija 8.192 tokens para su fase, dentro del máximo anunciado por el artefacto. Parsezen
+fragmenta los documentos largos y envía la ventana como `options.num_ctx`; la interfaz no ofrece un
+control para elevarla ni permite que una preferencia antigua sustituya el contrato especializado.
 
-- límite anunciado por el modelo;
-- tamaño de los pesos;
-- VRAM y RAM disponibles;
-- margen conservador para el sistema.
+## Preparación de componentes
 
-Normalmente elige 4.096, 8.192 o 16.384 tokens. Existe un valor personalizado entre 512 y 262.144,
-limitado por lo que el modelo admite. Parsezen fragmenta documentos largos, por lo que elegir el
-máximo rara vez mejora el resultado y sí aumenta memoria y latencia.
-
-La ventana se envía como `options.num_ctx` en cada petición.
-
-## Descarga y actualización de llmfit
-
-`llmfit` es una herramienta MIT administrada, no una dependencia importada. Parsezen:
-
-- consulta releases del repositorio oficial;
-- acepta solo el artefacto de Windows y arquitectura esperados;
-- exige HTTPS, límites de tamaño y un SHA-256 fijado en Parsezen para cada arquitectura;
-- extrae únicamente el ejecutable y su licencia;
-- verifica `--version` antes de activarlo;
-- conserva la versión anterior si una actualización falla.
-
-Una release nueva no se ejecuta hasta que su hash se incorpora y revisa en Parsezen. El subproceso
-recibe una lista mínima de variables del sistema, sin claves de API, credenciales ni proxies. Se
-guarda en `%LOCALAPPDATA%\Parsezen\llmfit`. No recibe documentos, rutas, prompts ni texto. La consulta
-opcional al registro de Ollama solo contiene identificadores públicos de modelos.
-
-Repositorio: [AlexsJones/llmfit](https://github.com/AlexsJones/llmfit).
+La interfaz no instala ni selecciona modelos arbitrarios. El instalador recibe únicamente la
+capacidad del catálogo, descarga su fuente fija mediante Ollama y vuelve a comprobar el alias final.
+Una descarga solo termina correctamente si digest, formato, familia, cuantización, contexto,
+plantilla, parámetros, licencia y capacidades coinciden con el manifest. LFM muestra sus condiciones
+de licencia y exige confirmación explícita antes de descargar.
 
 ## Privacidad de las peticiones
 
-- `POST /api/chat` se dirige únicamente a loopback.
+- `POST /api/generate` y `POST /api/chat` se dirigen únicamente a loopback.
 - Las respuestas llegan en streaming para poder cancelar entre fragmentos.
 - No se registra el prompt ni la respuesta.
 - El glosario se protege durante la petición y se cifra mientras una revisión sea recuperable.
 - Los checkpoints de fragmentos validados se cifran para la cuenta de Windows.
 
-## Preparación manual opcional
+## Diagnóstico manual opcional
 
 El recorrido normal no requiere estos comandos. Para diagnóstico:
 
 ```powershell
 winget install --id Ollama.Ollama --exact
-ollama pull qwen3:4b-instruct
 Invoke-RestMethod http://127.0.0.1:11434/api/version
 ollama list
 ollama ps
 ```
 
-Después vuelve a Parsezen y pulsa refrescar. Usa un tag concreto antes de publicar una versión si
-quieres resultados reproducibles.
+Después vuelve a Parsezen y pulsa `Actualizar estados`. La pantalla vuelve a evaluar las dos tarjetas
+sin conservar nombres de tags ni rutas del documento.
 
 ## Validación real
 
-`Validar con IA real.cmd` recorre una muestra sintética de 20 páginas mediante el modelo elegido. Los
+La política de modelos de IA local fija los manifests, adaptadores y gates de los componentes
+aprobados. La pantalla no muestra candidatos ni permite cambiar tags fuera de esa política.
+
+`Validar con IA real.cmd` recorre una muestra sintética de 20 páginas mediante los componentes
+instalados. Los
 casos que traducen usan IA local por defecto; Argos solo se prueba al añadir explícitamente
 `--translation-engine argos` y nunca se usa para recuperarse de un fallo de Ollama. El informe local
 solo contiene fases, tiempos, tamaños, contadores de calidad y revisión, y tipos de error. La
@@ -157,16 +120,15 @@ corpus especializado puedes repetir
 La misma herramienta permite comparaciones reproducibles sin documentos privados:
 
 ```powershell
-Validar con IA real.cmd --model qwen3:4b-instruct-2507-q8_0 --translation-engine local_ai --profile translation --pages 1 4
+Validar con IA real.cmd --model parsezen/hymt-translation:Q4_K_M --translation-engine local_ai --profile translation --pages 1 4
 ```
 
 `--profile critical` ejecuta traducción, corrección y estructura; `--profile translation` aísla la
 traducción para comparar modelos especializados. `--profile review` compara conversión directa y
 revisión semántica sin traducir; `--profile translation-review` compara traducción directa y
 revisada con el mismo motor. Los informes conservan únicamente recuentos, fases y tiempos, nunca
-texto documental. En la estación objetivo de 8 GB de VRAM, la muestra
-sintética de cuatro páginas del 12 de agosto de 2026 dio estos resultados, todos con control de
-calidad superado:
+texto documental. Como referencia histórica —no como opciones actuales—, en la estación objetivo de
+8 GB de VRAM la muestra sintética de cuatro páginas del 12 de agosto de 2026 dio estos resultados:
 
 | Modelo | Perfil completo tras carga | Solo traducción en caliente |
 |---|---:|---:|
@@ -174,11 +136,9 @@ calidad superado:
 | Qwen 3.5 9B | 42,3 s | 24,3 s |
 | TranslateGemma 4B Q8 | no aplicable | 15,1 s en caliente; 30,1 s con carga |
 
-La conclusión de producto es deliberadamente conservadora: Qwen 3 4B sigue siendo la referencia
-equilibrada en ese equipo; Qwen 3.5 queda permitido como opción de mayor capacidad y TranslateGemma
-como candidato especializado, pero Parsezen no cambia el modelo predeterminado ni añade un segundo
-selector basándose solo en esta muestra. Las recomendaciones generales siguen calculándose con
-`llmfit` y un modelo solo queda seleccionado después de aparecer en `/api/tags`.
+La conclusión de producto es deliberadamente conservadora: las comparaciones sirven para revisar
+manifests y adaptadores locales, no para añadir recomendaciones generales ni otro selector. Un
+componente solo queda preparado después de aparecer y verificarse en `/api/tags`.
 
 Una prueba representativa no garantiza una traducción perfecta. Mantén un corpus local privado de
 documentos y revisa cualquier actualización de Ollama o de modelo antes de usarla en trabajos

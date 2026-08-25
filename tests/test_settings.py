@@ -7,7 +7,14 @@ import pytest
 
 import parsezen.settings as settings_module
 from parsezen.errors import SettingsError
-from parsezen.settings import AppSettings, load_settings, save_settings, validate_settings
+from parsezen.settings import (
+    AppSettings,
+    load_settings,
+    save_settings,
+    settings_for_review,
+    settings_for_translation,
+    validate_settings,
+)
 
 
 def test_missing_settings_file_uses_safe_defaults(tmp_path: Path) -> None:
@@ -46,6 +53,24 @@ def test_settings_round_trip_through_atomic_json(tmp_path: Path) -> None:
         "checkpoint_retention_days",
     }
     assert list(path.parent.glob(".parsezen-settings-*.tmp")) == []
+
+
+def test_phase_settings_fall_back_to_the_legacy_global_pair() -> None:
+    settings = AppSettings(
+        model="legacy",
+        context_window=4_096,
+        translation_model="translator",
+        translation_context_window=8_192,
+        review_model="reviewer",
+        review_context_window=16_384,
+    )
+
+    translation = settings_for_translation(settings)
+    review = settings_for_review(settings)
+
+    assert (translation.model, translation.context_window) == ("translator", 8_192)
+    assert (review.model, review.context_window) == ("reviewer", 16_384)
+    assert (settings_for_translation(AppSettings(model="legacy")).model) == "legacy"
 
 
 def test_legacy_endpoint_is_ignored_during_settings_migration(tmp_path: Path) -> None:
@@ -115,6 +140,19 @@ def test_settings_reject_invalid_paths_and_normalize_optional_model() -> None:
         validate_settings(AppSettings(model="bad\nmodel"))
 
     assert validate_settings(AppSettings(model="   ")).model is None
+
+
+@pytest.mark.parametrize(
+    "field_name,model_id",
+    [
+        ("model", "example:cloud"),
+        ("translation_model", "example:fast-cloud"),
+        ("review_model", "example-cloud"),
+    ],
+)
+def test_settings_reject_cloud_model_ids(field_name: str, model_id: str) -> None:
+    with pytest.raises(SettingsError, match="cloud"):
+        validate_settings(AppSettings(**{field_name: model_id}))
 
 
 @pytest.mark.parametrize("context_window", [True, 0, 511, 262_145, "8192", 8_192.0])

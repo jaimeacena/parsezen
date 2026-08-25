@@ -32,13 +32,12 @@ from parsezen.domain.stages import StageKind, StageStatus
 from parsezen.epub_builder import EpubBookMetadata
 from parsezen.failure_recovery import RecoveryAction, RecoveryPlan
 from parsezen.infrastructure.artifact_store import ArtifactStore
-from parsezen.local_models import OllamaModel, OllamaStatus
+from parsezen.local_models import OllamaStatus
 from parsezen.presentation.activity_view import ActivityView
 from parsezen.presentation.book_editor_dialog import BookEditorDialog
 from parsezen.presentation.design_system import ThemeMode, apply_parsezen_theme
 from parsezen.presentation.job_configuration_dialog import JobConfigurationDialog
 from parsezen.presentation.main_window import ParsezenMainWindow
-from parsezen.presentation.model_manager import ModelManagerDialog
 from parsezen.presentation.phase_review_dialog import PhaseReviewDialog
 from parsezen.presentation.workspace import InternalBackButton, ParsezenWorkspace
 from parsezen.recent_activity import RecentJob, RecentJobStatus
@@ -627,46 +626,3 @@ def test_flat_option_row_remains_keyboard_operable_without_clipping(qtbot, tmp_p
 
     image = row.grab().toImage()
     assert image.size() == row.size()
-
-
-@pytest.mark.parametrize("theme", [ThemeMode.LIGHT, ThemeMode.DARK])
-def test_model_manager_reflows_its_complete_row_at_320(
-    qtbot,
-    tmp_path: Path,
-    theme: ThemeMode,
-) -> None:
-    application = QApplication.instance()
-    assert isinstance(application, QApplication)
-    apply_parsezen_theme(application, theme)
-    model = OllamaModel(
-        "qwen3:4b-instruct",
-        "Qwen3 4B Instruct Q4",
-        size_bytes=2_500_000_000,
-    )
-    manager = ModelManagerDialog(
-        (model,),
-        model.model_id,
-        context_window=None,
-        ollama_status=OllamaStatus.READY,
-        ollama_message="Ollama listo",
-    )
-    qtbot.addWidget(manager)
-    manager.resize(320, 720)
-    manager.show()
-    qtbot.waitExposed(manager)
-    QApplication.processEvents()
-
-    snapshot = manager.grab()
-    snapshot_path = tmp_path / f"models-{theme.value}-320.png"
-    assert snapshot.save(str(snapshot_path))
-    assert snapshot.size() == QSize(320, 720)
-    assert manager._compact is True  # noqa: SLF001
-    assert not manager.models_scroll.horizontalScrollBar().isVisible()
-    for control in (
-        manager.context_window,
-        manager.filter_buttons["installed"],
-        manager.filter_buttons["recommended"],
-        manager.installed_select_buttons[model.model_id],
-        manager.model_menu_buttons[model.model_id],
-    ):
-        _assert_fully_visible(control, manager)

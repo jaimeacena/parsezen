@@ -15,6 +15,8 @@ from parsezen.domain.jobs import (
     DocumentJob,
     DocumentSource,
     JobConfiguration,
+    LocalAIComponentSnapshot,
+    LocalAIPolicySnapshot,
     OutputConfiguration,
     ReviewRecommendation,
     ReviewSignal,
@@ -78,6 +80,91 @@ def test_state_store_round_trips_independent_jobs(tmp_path: Path) -> None:
     )
     assert loaded[0].configuration.translation.glossary == (("source", "destino"),)
     assert loaded[0].configuration.translation.method is TranslationMethod.LOCAL_AI
+
+
+def test_state_store_round_trips_content_free_local_ai_policy_snapshot(
+    tmp_path: Path,
+) -> None:
+    store = StateStore(tmp_path / "state.db")
+    policy = LocalAIPolicySnapshot(
+        translation=LocalAIComponentSnapshot("policy-v1", "translator:7b", "a" * 64),
+        review=LocalAIComponentSnapshot("policy-v1", "reviewer:7b", "b" * 64),
+        visual_ocr=LocalAIComponentSnapshot("policy-v1", "vision:7b", "c" * 64),
+    )
+    job = make_job("policy", 0)
+    job = replace(
+        job,
+        configuration=replace(
+            job.configuration,
+            ai=replace(job.configuration.ai, components=policy),
+        ),
+    )
+
+    store.replace_jobs((job,))
+
+    loaded = store.load_jobs()[0]
+    assert loaded.configuration.ai.components == policy
+    payload = state_store_module._job_to_json(job)
+    assert payload["configuration"]["ai"]["components"] == {
+        "translation": {
+            "policy_version": "policy-v1",
+            "model": "translator:7b",
+            "digest": "a" * 64,
+        },
+        "review": {
+            "policy_version": "policy-v1",
+            "model": "reviewer:7b",
+            "digest": "b" * 64,
+        },
+        "visual_ocr": {
+            "policy_version": "policy-v1",
+            "model": "vision:7b",
+            "digest": "c" * 64,
+        },
+    }
+
+
+def test_state_store_round_trips_component_context_windows(tmp_path: Path) -> None:
+    store = StateStore(tmp_path / "state.db")
+    policy = LocalAIPolicySnapshot(
+        translation=LocalAIComponentSnapshot(
+            "policy-v1", "translator:7b", "a" * 64, context_window=8_192
+        ),
+        review=LocalAIComponentSnapshot(
+            "policy-v1", "reviewer:7b", "b" * 64, context_window=16_384
+        ),
+    )
+    base_job = make_job("policy-context", 0)
+    job = replace(
+        base_job,
+        configuration=replace(
+            base_job.configuration,
+            ai=AIProfileConfiguration(components=policy),
+        ),
+    )
+
+    store.replace_jobs((job,))
+
+    assert store.load_jobs()[0].configuration.ai.components == policy
+
+
+def test_legacy_job_payload_without_local_ai_components_remains_readable() -> None:
+    job = make_job("legacy-components", 0)
+    payload = state_store_module._job_to_json(job)
+    payload["configuration"]["ai"].pop("components")
+
+    restored = state_store_module._job_from_json(payload)
+
+    assert restored.configuration.ai.components == LocalAIPolicySnapshot()
+
+
+def test_state_store_rejects_partial_local_ai_policy_snapshot() -> None:
+    job = make_job("partial-components", 0)
+    payload = state_store_module._job_to_json(job)
+    payload["configuration"]["ai"]["components"].pop("review")
+
+    with pytest.raises(TypeError):
+        state_store_module._job_from_json(payload)
 
 
 def test_state_store_persists_content_free_review_recommendation(tmp_path: Path) -> None:

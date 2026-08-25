@@ -3,12 +3,10 @@ from __future__ import annotations
 from PySide6.QtCore import QRunnable
 
 import parsezen.presentation.local_ai_controller as controller_module
+from parsezen.component_readiness import ReadinessStatus
 from parsezen.errors import LocalModelUnavailableError
-from parsezen.local_models import (
-    LocalAISetupCancelled,
-    OllamaConnection,
-    OllamaStatus,
-)
+from parsezen.local_ai_policy import ComponentCapability
+from parsezen.local_models import LocalAISetupCancelled, OllamaConnection, OllamaStatus
 from parsezen.presentation.local_ai_controller import LocalAIAction, LocalAIController
 
 
@@ -27,11 +25,7 @@ class HoldingPool:
 
 def test_local_ai_controller_discovers_without_a_window(monkeypatch) -> None:
     connection = OllamaConnection(OllamaStatus.MISSING_MODEL)
-    monkeypatch.setattr(
-        controller_module,
-        "discover_ollama",
-        lambda _model: connection,
-    )
+    monkeypatch.setattr(controller_module, "discover_ollama", lambda _model: connection)
     controller = LocalAIController(thread_pool=ImmediatePool())
     succeeded: list[object] = []
     finished: list[bool] = []
@@ -45,75 +39,46 @@ def test_local_ai_controller_discovers_without_a_window(monkeypatch) -> None:
     assert not controller.discovering
 
 
-def test_local_ai_controller_reports_recommendation_failures(monkeypatch) -> None:
+def test_local_ai_controller_emits_fixed_component_readiness(monkeypatch) -> None:
+    connection = OllamaConnection(OllamaStatus.READY)
+    readiness = {ComponentCapability.TRANSLATION: ReadinessStatus.PREPARED}
+    monkeypatch.setattr(controller_module, "discover_ollama", lambda _model: connection)
+    monkeypatch.setattr(controller_module, "detect_local_hardware", lambda: object())
     monkeypatch.setattr(
         controller_module,
-        "recommend_ollama_models",
-        lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("hardware failed")),
+        "inspect_component_catalog",
+        lambda _catalog, _hardware: readiness,
     )
     controller = LocalAIController(thread_pool=ImmediatePool())
-    failures: list[str] = []
-    controller.recommendations_failed.connect(failures.append)
-
-    assert controller.recommend()
-
-    assert failures
-    assert "añadir un modelo" in failures[0]
-    assert not controller.recommending
-
-
-def test_local_ai_controller_emits_setup_progress_and_completion(monkeypatch) -> None:
-    deleted: list[str] = []
-    monkeypatch.setattr(
-        controller_module,
-        "delete_ollama_model",
-        deleted.append,
-    )
-    controller = LocalAIController(thread_pool=ImmediatePool())
-    progress: list[tuple[object, str]] = []
-    completed: list[str] = []
-    controller.setup_progress.connect(lambda percent, message: progress.append((percent, message)))
-    controller.setup_succeeded.connect(completed.append)
-
-    assert controller.setup(
-        LocalAIAction.DELETE_MODEL,
-        model_id="example:latest",
-    )
-
-    assert deleted == ["example:latest"]
-    assert progress[0][0] is None
-    assert progress[-1][0] == 100
-    assert completed == ["example:latest"]
-    assert not controller.setting_up
-
-
-def test_local_ai_controller_cancels_only_model_downloads() -> None:
-    pool = HoldingPool()
-    controller = LocalAIController(thread_pool=pool)
-
-    assert controller.setup(
-        LocalAIAction.PULL_MODEL,
-        model_id="example:latest",
-    )
-    assert controller.setup_action is LocalAIAction.PULL_MODEL
-    assert controller.cancel_setup()
-    assert not controller.cancel_setup()
-    assert pool.worker is not None
-
-
-def test_local_ai_controller_rejects_overlapping_operations() -> None:
-    pool = HoldingPool()
-    controller = LocalAIController(thread_pool=pool)
+    observed: list[object] = []
+    controller.component_readiness.connect(observed.append)
 
     assert controller.discover(None)
-    assert not controller.discover(None)
-    assert not controller.recommend()
-    assert not controller.setup(LocalAIAction.START)
+
+    assert observed == [readiness]
 
 
-def test_local_ai_controller_normalizes_discovery_and_recommendation_errors(
-    monkeypatch,
-) -> None:
+def test_local_ai_controller_installs_only_a_catalogued_capability(monkeypatch) -> None:
+    capability = ComponentCapability.REVIEW
+    monkeypatch.setattr(
+        controller_module,
+        "install_product_component",
+        lambda selected, **_kwargs: capability if selected is capability else None,
+    )
+    controller = LocalAIController(thread_pool=ImmediatePool())
+    succeeded: list[object] = []
+    finished: list[object] = []
+    controller.component_succeeded.connect(succeeded.append)
+    controller.component_finished.connect(finished.append)
+
+    assert controller.install_component(capability)
+    assert not controller.install_component("review")
+    assert succeeded == [capability]
+    assert finished == [capability]
+    assert not controller.installing_component
+
+
+def test_local_ai_controller_normalizes_discovery_errors(monkeypatch) -> None:
     failures: list[str] = []
     controller = LocalAIController(thread_pool=ImmediatePool())
     controller.discovery_failed.connect(failures.append)
@@ -133,31 +98,8 @@ def test_local_ai_controller_normalizes_discovery_and_recommendation_errors(
     assert controller.discover(None)
     assert "inesperado" in failures[-1]
 
-    recommendation_failures: list[str] = []
-    controller.recommendations_failed.connect(recommendation_failures.append)
-    monkeypatch.setattr(
-        controller_module,
-        "recommend_ollama_models",
-        lambda **_kwargs: (_ for _ in ()).throw(LocalModelUnavailableError("Sin hardware")),
-    )
-    assert controller.recommend(force_refresh=True)
-    assert recommendation_failures == ["Sin hardware"]
 
-    succeeded: list[object] = []
-    controller.recommendations_succeeded.connect(succeeded.append)
-    expected = object()
-    monkeypatch.setattr(
-        controller_module,
-        "recommend_ollama_models",
-        lambda **_kwargs: expected,
-    )
-    assert controller.recommend()
-    assert succeeded == [expected]
-
-
-def test_local_ai_controller_runs_setup_actions_and_normalizes_failures(
-    monkeypatch,
-) -> None:
+def test_local_ai_controller_runs_only_ollama_setup_actions(monkeypatch) -> None:
     calls: list[str] = []
     monkeypatch.setattr(
         controller_module,
@@ -179,17 +121,14 @@ def test_local_ai_controller_runs_setup_actions_and_normalizes_failures(
         "restart_ollama_local_only",
         lambda report: (calls.append("protect"), report(100, "Protegido")),
     )
-    monkeypatch.setattr(
-        controller_module,
-        "pull_ollama_model",
-        lambda model_id, **_kwargs: calls.append(f"pull:{model_id}"),
-    )
     controller = LocalAIController(thread_pool=ImmediatePool())
+    completed: list[str] = []
+    controller.setup_succeeded.connect(completed.append)
 
     assert controller.setup(LocalAIAction.INSTALL)
     assert controller.setup(LocalAIAction.START)
     assert controller.setup(LocalAIAction.PROTECT)
-    assert controller.setup(LocalAIAction.PULL_MODEL, model_id="example:latest")
+
     assert calls == [
         "configure",
         "install",
@@ -197,16 +136,33 @@ def test_local_ai_controller_runs_setup_actions_and_normalizes_failures(
         "configure",
         "start",
         "protect",
-        "pull:example:latest",
     ]
+    assert completed == ["", "", ""]
 
+
+def test_local_ai_controller_does_not_start_arbitrary_model_operations() -> None:
+    pool = HoldingPool()
+    controller = LocalAIController(thread_pool=pool)
+
+    assert controller.cancel_setup() is False
+    assert not controller.install_component("translation")
+
+
+def test_local_ai_controller_rejects_overlapping_operations() -> None:
+    pool = HoldingPool()
+    controller = LocalAIController(thread_pool=pool)
+
+    assert controller.discover(None)
+    assert not controller.discover(None)
+    assert not controller.setup(LocalAIAction.START)
+
+
+def test_local_ai_controller_normalizes_setup_failures(monkeypatch) -> None:
     failures: list[str] = []
     cancelled: list[str] = []
+    controller = LocalAIController(thread_pool=ImmediatePool())
     controller.setup_failed.connect(failures.append)
     controller.setup_cancelled.connect(cancelled.append)
-    assert controller.setup(LocalAIAction.PULL_MODEL)
-    assert "no es válida" in failures[-1]
-
     monkeypatch.setattr(
         controller_module,
         "start_ollama",

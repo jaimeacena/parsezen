@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import StrEnum
 
+from parsezen.component_catalog import REVIEW_COMPONENT_MANIFEST, TRANSLATION_COMPONENT_MANIFEST
 from parsezen.domain.jobs import (
     CoverStrategy,
     DocumentFormat,
@@ -13,6 +14,7 @@ from parsezen.domain.jobs import (
     ProcessingPlan,
     TranslationMethod,
 )
+from parsezen.local_ai_policy import ComponentCapability, ComponentManifest
 
 # Parsezen deliberately publishes only its two canonical, reviewable formats.
 SUPPORTED_OUTPUTS: dict[DocumentFormat, frozenset[DocumentFormat]] = {
@@ -81,20 +83,51 @@ def configuration_issues(
                 "Elige el idioma al que quieres traducir.",
             )
         )
-    if requires_ai(configuration) and configuration.ai.model is None:
-        reason = (
-            "traducir con IA local"
-            if configuration.translation.enabled
-            and configuration.translation.method is TranslationMethod.LOCAL_AI
-            and configuration.plan is not ProcessingPlan.LOCAL_AI_REVIEWED
-            else "usar la revisión semántica"
-        )
+    translation_ai = (
+        configuration.translation.enabled
+        and configuration.translation.method is TranslationMethod.LOCAL_AI
+    )
+    review_ai = configuration.plan is ProcessingPlan.LOCAL_AI_REVIEWED
+    if translation_ai and configuration.ai.effective_translation_model is None:
         issues.append(
             ConfigurationIssue(
                 ConfigurationSection.AI,
-                f"Configura un modelo de IA local general antes de {reason}.",
+                "Prepara el componente de traducción local antes de traducir con IA local.",
             )
         )
+    if review_ai and configuration.ai.effective_review_model is None:
+        issues.append(
+            ConfigurationIssue(
+                ConfigurationSection.AI,
+                "Prepara el componente de revisión local antes de usar la revisión semántica.",
+            )
+        )
+    for required, capability, component, manifest in (
+        (
+            translation_ai,
+            ComponentCapability.TRANSLATION,
+            configuration.ai.components.translation,
+            TRANSLATION_COMPONENT_MANIFEST,
+        ),
+        (
+            review_ai,
+            ComponentCapability.REVIEW,
+            configuration.ai.components.review,
+            REVIEW_COMPONENT_MANIFEST,
+        ),
+    ):
+        if (
+            required
+            and component is not None
+            and not _matches_product_manifest(component, manifest)
+        ):
+            issues.append(
+                ConfigurationIssue(
+                    ConfigurationSection.AI,
+                    f"La identidad del componente de {capability.value} ya no es válida; "
+                    "actualiza sus estados.",
+                )
+            )
     if (
         not allow_noop_same_format
         and source.format is output.format
@@ -122,3 +155,12 @@ def configuration_issues(
             )
         )
     return tuple(issues)
+
+
+def _matches_product_manifest(component: object, manifest: ComponentManifest) -> bool:
+    return (
+        getattr(component, "policy_version", None) == manifest.policy_version
+        and getattr(component, "model", None) == manifest.model_name
+        and getattr(component, "digest", None) == manifest.ollama_digest
+        and getattr(component, "context_window", None) == manifest.context_window
+    )

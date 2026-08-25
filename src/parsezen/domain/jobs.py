@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, replace
 from enum import StrEnum
 from pathlib import Path
@@ -176,12 +177,166 @@ class TranslationConfiguration:
     glossary: tuple[tuple[str, str], ...] = ()
 
 
+_LOCAL_AI_POLICY_TOKEN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+_LOCAL_AI_MODEL = re.compile(
+    r"^[a-z0-9][a-z0-9._-]*(?:/[a-z0-9][a-z0-9._-]*)?(?::[a-z0-9][a-z0-9._-]*)?$",
+    flags=re.IGNORECASE,
+)
+
+
+def _is_cloud_model(model: str) -> bool:
+    normalized = model.casefold()
+    _name, separator, tag = normalized.rpartition(":")
+    return (
+        normalized.endswith("-cloud")
+        or bool(separator)
+        and (tag == "cloud" or tag.endswith("-cloud"))
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class LocalAIComponentSnapshot:
+    """Content-free identity of one approved local AI component.
+
+    A queued job stores only identifiers that can be checked against local
+    Ollama metadata later.  It deliberately does not carry prompts, output,
+    document text, or filesystem locations.
+    """
+
+    policy_version: str
+    model: str
+    digest: str
+    context_window: int | None = None
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.policy_version, str)
+            or _LOCAL_AI_POLICY_TOKEN.fullmatch(self.policy_version) is None
+        ):
+            raise ValueError("The local AI policy version is invalid.")
+        if (
+            not isinstance(self.model, str)
+            or len(self.model) > 200
+            or self.model != self.model.strip()
+            or _LOCAL_AI_MODEL.fullmatch(self.model) is None
+            or _is_cloud_model(self.model)
+        ):
+            raise ValueError("The local AI component model is invalid.")
+        if not isinstance(self.digest, str):
+            raise ValueError("The local AI component digest is invalid.")
+        candidate = self.digest.strip()
+        if candidate.casefold().startswith("sha256:"):
+            candidate = candidate[7:]
+        if not is_sha256_digest(candidate.casefold()):
+            raise ValueError("The local AI component digest must be SHA-256.")
+        if self.context_window is not None and (
+            isinstance(self.context_window, bool)
+            or not isinstance(self.context_window, int)
+            or not 512 <= self.context_window <= 262_144
+        ):
+            raise ValueError("The local AI component context window is invalid.")
+        object.__setattr__(self, "digest", candidate.casefold())
+
+    @property
+    def model_name(self) -> str:
+        """Compatibility spelling used by Ollama's model metadata."""
+
+        return self.model
+
+    @property
+    def ollama_digest(self) -> str:
+        """Compatibility spelling used by the local policy manifest."""
+
+        return self.digest
+
+
+@dataclass(frozen=True, slots=True)
+class LocalAIPolicySnapshot:
+    """Effective content-free component identities captured for one job."""
+
+    translation: LocalAIComponentSnapshot | None = None
+    review: LocalAIComponentSnapshot | None = None
+    visual_ocr: LocalAIComponentSnapshot | None = None
+
+    def __post_init__(self) -> None:
+        if any(
+            component is not None and not isinstance(component, LocalAIComponentSnapshot)
+            for component in (self.translation, self.review, self.visual_ocr)
+        ):
+            raise ValueError("The local AI policy components are invalid.")
+
+    @property
+    def visual(self) -> LocalAIComponentSnapshot | None:
+        """Short compatibility spelling for the visual/OCR component."""
+
+        return self.visual_ocr
+
+
 @dataclass(frozen=True, slots=True)
 class AIProfileConfiguration:
     """Snapshot of the global local-AI profile used by a queued document."""
 
     model: str | None = None
     context_window: int | None = None
+    components: LocalAIPolicySnapshot = LocalAIPolicySnapshot()
+    translation_model: str | None = None
+    translation_context_window: int | None = None
+    review_model: str | None = None
+    review_context_window: int | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.components, LocalAIPolicySnapshot):
+            raise ValueError("The local AI policy snapshot is invalid.")
+
+    @property
+    def policy_snapshot(self) -> LocalAIPolicySnapshot:
+        """Return the immutable specialized-component policy snapshot."""
+
+        return self.components
+
+    @property
+    def local_ai_policy(self) -> LocalAIPolicySnapshot:
+        """Compatibility spelling for callers that name the policy explicitly."""
+
+        return self.components
+
+    @property
+    def effective_translation_model(self) -> str | None:
+        component = self.components.translation
+        return (
+            (component.model if component is not None else None)
+            or self.translation_model
+            or self.model
+        )
+
+    @property
+    def effective_review_model(self) -> str | None:
+        component = self.components.review
+        return (
+            (component.model if component is not None else None) or self.review_model or self.model
+        )
+
+    @property
+    def effective_translation_context_window(self) -> int | None:
+        component = self.components.translation
+        return (
+            component.context_window
+            if component is not None and component.context_window is not None
+            else self.translation_context_window
+            if self.translation_context_window is not None
+            else self.context_window
+        )
+
+    @property
+    def effective_review_context_window(self) -> int | None:
+        component = self.components.review
+        return (
+            component.context_window
+            if component is not None and component.context_window is not None
+            else self.review_context_window
+            if self.review_context_window is not None
+            else self.context_window
+        )
 
 
 @dataclass(frozen=True, slots=True)

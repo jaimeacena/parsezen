@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from tempfile import mkstemp
 
@@ -26,6 +26,10 @@ KNOWN_FIELDS = frozenset(
     {
         "model",
         "context_window",
+        "translation_model",
+        "translation_context_window",
+        "review_model",
+        "review_context_window",
         "output_directory",
         "image_output_directory",
         "timeout_seconds",
@@ -41,6 +45,13 @@ class AppSettings:
 
     model: str | None = None
     context_window: int | None = None
+    # These phase-specific values are optional while the old global pair is
+    # still accepted for queued jobs and settings files created by older
+    # versions.
+    translation_model: str | None = None
+    translation_context_window: int | None = None
+    review_model: str | None = None
+    review_context_window: int | None = None
     output_directory: Path | None = None
     image_output_directory: Path | None = None
     timeout_seconds: float = 120.0
@@ -90,6 +101,15 @@ def save_settings(settings: AppSettings, path: Path | None = None) -> None:
         "timeout_seconds": normalized.timeout_seconds,
         "checkpoint_retention_days": normalized.checkpoint_retention_days,
     }
+    for field_name in (
+        "translation_model",
+        "translation_context_window",
+        "review_model",
+        "review_context_window",
+    ):
+        value = getattr(normalized, field_name)
+        if value is not None:
+            payload[field_name] = value
 
     temporary_path: Path | None = None
     try:
@@ -120,13 +140,15 @@ def save_settings(settings: AppSettings, path: Path | None = None) -> None:
 
 def validate_settings(settings: AppSettings) -> AppSettings:
     """Return normalized settings or raise a stable application error."""
-    model = _optional_text(settings.model, "El modelo")
-    context_window = settings.context_window
-    if context_window is not None:
-        if isinstance(context_window, bool) or not isinstance(context_window, int):
-            raise SettingsError("La ventana de contexto configurada no es válida.")
-        if not MIN_CONTEXT_WINDOW <= context_window <= MAX_CONTEXT_WINDOW:
-            raise SettingsError("La ventana de contexto no está dentro de un tamaño seguro.")
+    model = _optional_model_id(settings.model, "El modelo")
+    context_window = _validate_context_window(settings.context_window)
+    translation_model = _optional_model_id(
+        settings.translation_model,
+        "El modelo de traducción",
+    )
+    translation_context_window = _validate_context_window(settings.translation_context_window)
+    review_model = _optional_model_id(settings.review_model, "El modelo de revisión")
+    review_context_window = _validate_context_window(settings.review_context_window)
 
     output_directory = settings.output_directory
     if output_directory is not None and not isinstance(output_directory, Path):
@@ -161,6 +183,10 @@ def validate_settings(settings: AppSettings) -> AppSettings:
     return AppSettings(
         model=model,
         context_window=context_window,
+        translation_model=translation_model,
+        translation_context_window=translation_context_window,
+        review_model=review_model,
+        review_context_window=review_context_window,
         output_directory=output_directory,
         image_output_directory=image_output_directory,
         timeout_seconds=timeout,
@@ -177,13 +203,18 @@ def _settings_from_json(raw_data: object) -> AppSettings:
 
     model = raw_data.get("model")
     context_window = raw_data.get("context_window")
+    translation_model = raw_data.get("translation_model")
+    translation_context_window = raw_data.get("translation_context_window")
+    review_model = raw_data.get("review_model")
+    review_context_window = raw_data.get("review_context_window")
     output_value = raw_data.get("output_directory")
     image_output_value = raw_data.get("image_output_directory")
     timeout = raw_data.get("timeout_seconds", 120.0)
     checkpoint_retention_days = raw_data.get("checkpoint_retention_days", 30)
 
-    if model is not None and not isinstance(model, str):
-        raise TypeError
+    for value in (model, translation_model, review_model):
+        if value is not None and not isinstance(value, str):
+            raise TypeError
     if output_value is not None and not isinstance(output_value, str):
         raise TypeError
     if image_output_value is not None and not isinstance(image_output_value, str):
@@ -195,6 +226,10 @@ def _settings_from_json(raw_data: object) -> AppSettings:
         AppSettings(
             model=model,
             context_window=context_window,
+            translation_model=translation_model,
+            translation_context_window=translation_context_window,
+            review_model=review_model,
+            review_context_window=review_context_window,
             output_directory=output_directory,
             image_output_directory=image_output_directory,
             timeout_seconds=timeout,
@@ -214,3 +249,75 @@ def _optional_text(value: str | None, label: str) -> str | None:
     if any(character in normalized for character in "\r\n\0"):
         raise SettingsError(f"{label} contiene caracteres no válidos.")
     return normalized
+
+
+def _optional_model_id(value: str | None, label: str) -> str | None:
+    candidate = _optional_text(value, label)
+    if candidate is None:
+        return None
+    # Imported lazily because local_models consumes the context presets from
+    # this module during its own initialization.
+    from parsezen.errors import LocalModelUnavailableError
+    from parsezen.local_models import is_cloud_model_id, validate_ollama_model_id
+
+    if is_cloud_model_id(candidate) or candidate.casefold().endswith("-cloud"):
+        raise SettingsError(
+            f"{label} solo admite modelos almacenados localmente y no puede usar cloud."
+        )
+    try:
+        validated = validate_ollama_model_id(candidate)
+    except LocalModelUnavailableError as exc:
+        raise SettingsError(f"{label} no es un identificador local válido.") from exc
+    return validated
+
+
+def settings_for_translation(settings: AppSettings) -> AppSettings:
+    """Resolve the settings used by translation and translation repair."""
+
+    return replace(
+        settings,
+        model=settings.translation_model or settings.model,
+        context_window=(
+            settings.translation_context_window
+            if settings.translation_context_window is not None
+            else settings.context_window
+        ),
+    )
+
+
+def settings_for_review(settings: AppSettings) -> AppSettings:
+    """Resolve the settings used by every review phase."""
+
+    return replace(
+        settings,
+        model=settings.review_model or settings.model,
+        context_window=(
+            settings.review_context_window
+            if settings.review_context_window is not None
+            else settings.context_window
+        ),
+    )
+
+
+def has_specialized_ai_profiles(settings: AppSettings | None) -> bool:
+    """Return whether phase-specific AI settings alter the legacy profile."""
+
+    return settings is not None and any(
+        value is not None
+        for value in (
+            settings.translation_model,
+            settings.translation_context_window,
+            settings.review_model,
+            settings.review_context_window,
+        )
+    )
+
+
+def _validate_context_window(value: object) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise SettingsError("La ventana de contexto configurada no es válida.")
+    if not MIN_CONTEXT_WINDOW <= value <= MAX_CONTEXT_WINDOW:
+        raise SettingsError("La ventana de contexto no está dentro de un tamaño seguro.")
+    return value

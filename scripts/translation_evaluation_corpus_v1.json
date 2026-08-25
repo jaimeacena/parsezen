@@ -1,0 +1,63 @@
+{
+  "schema_version": 1,
+  "corpus_version": "parsezen-translation-en-es-v1",
+  "source_language": "en",
+  "target_language": "es",
+  "cases": [
+    {
+      "id": "negation-v1",
+      "tags": ["negation"],
+      "source": "She does not save the draft when the check fails.",
+      "expected": "Ella no guarda el borrador cuando falla la comprobación."
+    },
+    {
+      "id": "condition-v1",
+      "tags": ["condition"],
+      "source": "The export is safe if every link keeps its destination.",
+      "expected": "El exportado es seguro si cada enlace conserva su destino."
+    },
+    {
+      "id": "names-v1",
+      "tags": ["proper_names"],
+      "source": "Maria Lopez reviewed the chapter with Daniel Ortiz.",
+      "expected": "María López revisó el capítulo con Daniel Ortiz."
+    },
+    {
+      "id": "urls-v1",
+      "tags": ["urls"],
+      "source": "Visit [the project page](https://example.test/docs?v=2) before continuing.",
+      "expected": "Visita [la página del proyecto](https://example.test/docs?v=2) antes de continuar."
+    },
+    {
+      "id": "numbers-v1",
+      "tags": ["numbers"],
+      "source": "The report keeps 12 pages and 3 seconds.",
+      "expected": "El informe conserva 12 páginas y 3 segundos."
+    },
+    {
+      "id": "headings-v1",
+      "tags": ["headings"],
+      "source": "# Translation checklist\n\nThe heading remains above the paragraph.",
+      "expected": "# Lista de comprobación de traducción\n\nEl encabezado permanece sobre el párrafo."
+    },
+    {
+      "id": "lists-v1",
+      "tags": ["lists"],
+      "source": "- Keep the title.\n- Preserve each link.\n- Do not add commentary.",
+      "expected": "- Conserva el título.\n- Preserva cada enlace.\n- No añadas comentarios."
+    },
+    {
+      "id": "glossary-v1",
+      "tags": ["glossary"],
+      "source": "The local model translates the document, and the local model preserves its links.",
+      "expected": "El modelo local traduce el documento, y el modelo local conserva sus enlaces.",
+      "glossary": [{"source": "local model", "target": "modelo local"}]
+    },
+    {
+      "id": "paragraph-v1",
+      "tags": ["paragraph"],
+      "source": "Every paragraph in this public synthetic corpus is complete and faithful.",
+      "expected": "Cada párrafo de este corpus sintético público está completo y es fiel."
+    }
+  ]
+}

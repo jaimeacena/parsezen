@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -31,7 +32,6 @@ from PySide6.QtWidgets import (
 
 from parsezen.application.configuration_rules import configuration_issues
 from parsezen.domain.jobs import (
-    AIProfileConfiguration,
     DocumentFormat,
     DocumentJob,
     JobConfiguration,
@@ -312,7 +312,7 @@ class JobConfigurationDialog(QDialog):
     """Present a compact conversion configuration that is saved immediately."""
 
     configuration_changed = Signal()
-    models_requested = Signal()
+    component_setup_requested = Signal()
 
     def __init__(
         self,
@@ -469,7 +469,13 @@ class JobConfigurationDialog(QDialog):
                 cover_strategy=previous.cover_strategy,
                 cover_path=previous.cover_path,
             ),
-            ai=AIProfileConfiguration(
+            # Keep the immutable phase-specific profile captured by the job.
+            # The editor only changes the legacy/global pair; rebuilding the
+            # object from those two values used to silently discard the
+            # verified translation/review models and policy snapshot whenever
+            # an otherwise unrelated option was edited.
+            ai=replace(
+                self._job.configuration.ai,
                 model=self._default_ai_model,
                 context_window=self._default_ai_context,
             ),
@@ -507,7 +513,7 @@ class JobConfigurationDialog(QDialog):
             self.validation_label.setText(str(exc))
             self.validation_label.show()
             if open_models and self._ai_needed() and self._ai_setup_required():
-                self.models_requested.emit()
+                self.component_setup_requested.emit()
             return False
         self.validation_label.hide()
         self.configuration_changed.emit()
@@ -569,10 +575,7 @@ class JobConfigurationDialog(QDialog):
             configuration.translation.target_language if configuration.translation.enabled else None
         )
         self._translation_method = configuration.translation.method
-        self._review_enabled = (
-            configuration.plan is ProcessingPlan.LOCAL_AI_REVIEWED
-            or not configuration.output.configured
-        )
+        self._review_enabled = configuration.plan is ProcessingPlan.LOCAL_AI_REVIEWED
         self._page_range = configuration.page_range
         self._force_pdf_ocr = configuration.force_pdf_ocr
         self._glossary_values = [

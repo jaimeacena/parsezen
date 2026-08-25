@@ -1084,6 +1084,60 @@ def apply_parsezen_theme(
             background-color: {COLORS.action_primary_soft};
             border: 2px solid {COLORS.action_primary};
         }}
+        QFrame#componentSetupCard {{
+            background-color: {COLORS.surface};
+            border: 1px solid {COLORS.border};
+            border-radius: {RADIUS_MEDIUM}px;
+        }}
+        QFrame#componentSetupCard:hover {{
+            background-color: {COLORS.surface_hover};
+        }}
+        QFrame#componentSetupCard[status="prepared"] {{
+            border-color: {COLORS.success};
+        }}
+        QFrame#componentSetupCard[status="downloadable"] {{
+            border-color: {COLORS.info};
+        }}
+        QFrame#componentSetupCard[status="insufficient"] {{
+            border-color: {COLORS.border};
+        }}
+        QLabel#componentTitle {{
+            color: {COLORS.text_primary};
+            background-color: transparent;
+            font-weight: 650;
+        }}
+        QLabel#componentDescription, QLabel#componentDetail, QLabel#componentSetupHelp {{
+            color: {COLORS.text_secondary};
+            background-color: transparent;
+        }}
+        QLabel#componentStatus {{
+            color: {COLORS.text_secondary};
+            background-color: transparent;
+            font-weight: 650;
+        }}
+        QLabel#componentStatus[status="prepared"] {{
+            color: {COLORS.success};
+        }}
+        QLabel#componentStatus[status="downloadable"] {{
+            color: {COLORS.info};
+        }}
+        QLabel#componentStatus[status="insufficient"] {{
+            color: {COLORS.warning};
+        }}
+        QPushButton#componentDownloadButton,
+        QPushButton#componentRefreshButton {{
+            min-height: {CONTROLS.default_height}px;
+        }}
+        QPushButton#componentDownloadButton {{
+            color: {COLORS.text_inverse};
+            background-color: {COLORS.action_primary};
+            border-color: {COLORS.action_primary};
+            font-weight: 600;
+        }}
+        QPushButton#componentDownloadButton:hover {{
+            background-color: {COLORS.action_primary_hover};
+            border-color: {COLORS.action_primary_hover};
+        }}
         QLabel#choiceTitle {{
             color: {COLORS.text_primary};
             background-color: transparent;

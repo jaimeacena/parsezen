@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ctypes
 import json
 import os
 import re
@@ -9,7 +10,7 @@ import shutil
 import subprocess
 import sys
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
@@ -52,6 +53,74 @@ class OllamaStatus(StrEnum):
     UNAVAILABLE = "unavailable"
 
 
+class HardwareComponent(StrEnum):
+    """Local processing components whose prerequisites can be checked."""
+
+    TRANSLATION = "translation"
+    REVIEW = "review"
+    VISUAL = "visual"
+
+
+class ComponentStatus(StrEnum):
+    """Result of comparing one component's requirements with local hardware."""
+
+    READY = "ready"
+    INSTALLABLE = "installable"
+    INSUFFICIENT = "insufficient"
+    UNKNOWN = "unknown"
+
+
+@dataclass(frozen=True, slots=True)
+class LocalHardware:
+    """Numeric hardware facts collected locally; no paths or command output are retained."""
+
+    ram_total_mebibytes: int | None = None
+    ram_available_mebibytes: int | None = None
+    disk_free_bytes: int | None = None
+    nvidia_vram_total_mebibytes: int | None = None
+    nvidia_vram_available_mebibytes: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ComponentRequirements:
+    """Explicit minimum resources for one component and whether it is installed."""
+
+    min_ram_mebibytes: int | None = None
+    min_disk_free_bytes: int | None = None
+    min_vram_mebibytes: int | None = None
+    installed: bool = False
+
+    def __post_init__(self) -> None:
+        for value in (
+            self.min_ram_mebibytes,
+            self.min_disk_free_bytes,
+            self.min_vram_mebibytes,
+        ):
+            if value is not None and (
+                isinstance(value, bool) or not isinstance(value, int) or value < 0
+            ):
+                raise ValueError("Los requisitos de hardware no pueden ser negativos.")
+        if not isinstance(self.installed, bool):
+            raise ValueError("El estado de instalación debe ser booleano.")
+
+
+@dataclass(frozen=True, slots=True)
+class ComponentReadiness:
+    """Safe, UI-independent readiness result for one local component."""
+
+    component: HardwareComponent
+    status: ComponentStatus
+    reasons: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class NvidiaVram:
+    """Largest NVIDIA adapter's total and currently available memory."""
+
+    total_mebibytes: int | None = None
+    available_mebibytes: int | None = None
+
+
 @dataclass(frozen=True, slots=True)
 class OllamaModel:
     """One installed model with a friendly label and safe runtime guidance."""
@@ -64,6 +133,7 @@ class OllamaModel:
     parent_model: str | None = None
     max_context: int | None = None
     recommended_context: int = DEFAULT_CONTEXT_WINDOW
+    digest: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -777,14 +847,155 @@ def is_ollama_local_only_configured(
     return isinstance(payload, dict) and payload.get("disable_ollama_cloud") is True
 
 
+def detect_local_hardware(*, storage_path: Path | None = None) -> LocalHardware:
+    """Collect conservative local hardware facts without retaining sensitive details."""
+    ram_total, ram_available = detect_system_memory_mebibytes()
+    vram = detect_nvidia_vram_memory_mebibytes()
+    return LocalHardware(
+        ram_total_mebibytes=ram_total,
+        ram_available_mebibytes=ram_available,
+        disk_free_bytes=detect_disk_free_bytes(storage_path=storage_path),
+        nvidia_vram_total_mebibytes=vram.total_mebibytes,
+        nvidia_vram_available_mebibytes=vram.available_mebibytes,
+    )
+
+
+def detect_system_memory_mebibytes() -> tuple[int | None, int | None]:
+    """Return total and available physical RAM, preferring Windows' native API."""
+    if sys.platform == "win32":
+        windows_memory = _detect_windows_memory_mebibytes()
+        if windows_memory != (None, None):
+            return windows_memory
+
+    memory = _detect_sysconf_memory_mebibytes()
+    if memory != (None, None):
+        return memory
+    return _detect_proc_memory_mebibytes()
+
+
+def detect_disk_free_bytes(*, storage_path: Path | None = None) -> int | None:
+    """Return free bytes on the model storage volume, without exposing its path."""
+    configured = os.environ.get("OLLAMA_MODELS")
+    model_root = (
+        storage_path
+        if storage_path is not None
+        else (Path(configured) if configured else Path.home() / ".ollama" / "models")
+    )
+    existing_root = model_root
+    try:
+        while not existing_root.exists() and existing_root != existing_root.parent:
+            existing_root = existing_root.parent
+        return max(0, shutil.disk_usage(existing_root).free)
+    except (OSError, TypeError, ValueError):
+        return None
+
+
+def detect_nvidia_vram_memory_mebibytes() -> NvidiaVram:
+    """Return total/free memory for the largest NVIDIA adapter, if queryable."""
+    rows = _query_nvidia_memory("memory.total,memory.free")
+    if not rows:
+        return NvidiaVram()
+
+    usable = [(total, free) for total, free in rows if total is not None]
+    if not usable:
+        return NvidiaVram()
+    total, available = max(usable, key=lambda item: item[0])
+    if available is not None:
+        available = min(total, available)
+    return NvidiaVram(total_mebibytes=total, available_mebibytes=available)
+
+
+def detect_nvidia_vram_available_mebibytes() -> int | None:
+    """Return free memory on the largest NVIDIA adapter, or ``None``."""
+    return detect_nvidia_vram_memory_mebibytes().available_mebibytes
+
+
+def calculate_component_readiness(
+    component: HardwareComponent | str,
+    hardware: LocalHardware,
+    requirements: ComponentRequirements,
+) -> ComponentReadiness:
+    """Purely compare explicit requirements with a hardware snapshot."""
+    try:
+        normalized_component = (
+            component if isinstance(component, HardwareComponent) else HardwareComponent(component)
+        )
+    except ValueError as exc:
+        raise ValueError(f"Componente desconocido: {component!r}") from exc
+
+    missing: list[str] = []
+    insufficient: list[str] = []
+    checks = (
+        (
+            requirements.min_ram_mebibytes,
+            hardware.ram_available_mebibytes,
+            "RAM disponible",
+        ),
+        (
+            requirements.min_disk_free_bytes,
+            hardware.disk_free_bytes,
+            "espacio libre",
+        ),
+        (
+            requirements.min_vram_mebibytes,
+            hardware.nvidia_vram_available_mebibytes,
+            "VRAM NVIDIA disponible",
+        ),
+    )
+    for required, actual, label in checks:
+        if required is None or required == 0:
+            continue
+        if actual is None:
+            missing.append(label)
+        elif actual < required:
+            insufficient.append(label)
+
+    if insufficient:
+        status = ComponentStatus.INSUFFICIENT
+        reasons = tuple(f"{label} insuficiente" for label in insufficient)
+    elif missing:
+        status = ComponentStatus.UNKNOWN
+        reasons = tuple(f"{label} no disponible" for label in missing)
+    elif requirements.installed:
+        status = ComponentStatus.READY
+        reasons = ()
+    else:
+        status = ComponentStatus.INSTALLABLE
+        reasons = ("Requisitos locales compatibles; falta instalar el componente.",)
+    return ComponentReadiness(normalized_component, status, reasons)
+
+
+def calculate_hardware_readiness(
+    hardware: LocalHardware,
+    requirements: Mapping[HardwareComponent | str, ComponentRequirements],
+) -> dict[HardwareComponent, ComponentReadiness]:
+    """Calculate independent readiness for each explicitly requested component."""
+    return {
+        component
+        if isinstance(component, HardwareComponent)
+        else HardwareComponent(component): calculate_component_readiness(
+            component,
+            hardware,
+            component_requirements,
+        )
+        for component, component_requirements in requirements.items()
+    }
+
+
 def detect_nvidia_vram_mebibytes() -> int | None:
     """Return the largest NVIDIA GPU memory size, or ``None`` on unsupported systems."""
+    rows = _query_nvidia_memory("memory.total")
+    return max((total for total, _available in rows if total is not None), default=None)
+
+
+def _query_nvidia_memory(query: str) -> list[tuple[int | None, int | None]]:
+    """Query numeric NVIDIA memory values while keeping command output private."""
     creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
     try:
         completed = subprocess.run(
             [
                 "nvidia-smi",
-                "--query-gpu=memory.total",
+                f"--query-gpu={query}",
                 "--format=csv,noheader,nounits",
             ],
             check=True,
@@ -794,15 +1005,100 @@ def detect_nvidia_vram_mebibytes() -> int | None:
             creationflags=creation_flags,
         )
     except (OSError, subprocess.SubprocessError):
-        return None
+        return []
 
-    values: list[int] = []
-    for line in completed.stdout.splitlines():
-        try:
-            values.append(int(line.strip()))
-        except ValueError:
+    columns = len(query.split(","))
+    rows: list[tuple[int | None, int | None]] = []
+    stdout = completed.stdout if isinstance(completed.stdout, str) else ""
+    for line in stdout.splitlines():
+        values = [_parse_memory_mebibytes(value) for value in line.split(",")]
+        if not values or all(value is None for value in values):
             continue
-    return max(values, default=None)
+        total = values[0]
+        available = values[1] if columns > 1 and len(values) > 1 else None
+        rows.append((total, available))
+    return rows
+
+
+def _parse_memory_mebibytes(value: str) -> int | None:
+    match = re.fullmatch(r"\s*(\d+)(?:\.\d+)?\s*(?:mib)?\s*", value, flags=re.IGNORECASE)
+    if match is None:
+        return None
+    parsed = int(match.group(1))
+    return parsed if parsed > 0 else None
+
+
+class _MemoryStatusEx(ctypes.Structure):
+    _fields_ = [
+        ("dwLength", ctypes.c_ulong),
+        ("dwMemoryLoad", ctypes.c_ulong),
+        ("ullTotalPhys", ctypes.c_ulonglong),
+        ("ullAvailPhys", ctypes.c_ulonglong),
+        ("ullTotalPageFile", ctypes.c_ulonglong),
+        ("ullAvailPageFile", ctypes.c_ulonglong),
+        ("ullTotalVirtual", ctypes.c_ulonglong),
+        ("ullAvailVirtual", ctypes.c_ulonglong),
+        ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+    ]
+
+
+def _detect_windows_memory_mebibytes() -> tuple[int | None, int | None]:
+    try:
+        kernel32 = ctypes.windll.kernel32
+        status = _MemoryStatusEx()
+        status.dwLength = ctypes.sizeof(_MemoryStatusEx)
+        if not kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+            return (None, None)
+        total = _bytes_to_mebibytes(status.ullTotalPhys)
+        available = _bytes_to_mebibytes(status.ullAvailPhys)
+        if total is not None and available is not None:
+            available = min(total, available)
+        return total, available
+    except (AttributeError, OSError, TypeError, ValueError):
+        return (None, None)
+
+
+def _detect_sysconf_memory_mebibytes() -> tuple[int | None, int | None]:
+    sysconf = getattr(os, "sysconf", None)
+    if sysconf is None:
+        return (None, None)
+    try:
+        page_size = int(sysconf("SC_PAGE_SIZE"))
+        total_pages = int(sysconf("SC_PHYS_PAGES"))
+        available_pages = int(sysconf("SC_AVPHYS_PAGES"))
+    except (AttributeError, OSError, ValueError, TypeError):
+        return (None, None)
+    total = _bytes_to_mebibytes(page_size * total_pages)
+    available = _bytes_to_mebibytes(page_size * available_pages)
+    if total is not None and available is not None:
+        available = min(total, available)
+    return total, available
+
+
+def _detect_proc_memory_mebibytes() -> tuple[int | None, int | None]:
+    values: dict[str, int] = {}
+    try:
+        with open("/proc/meminfo", encoding="utf-8") as memory_info:
+            for line in memory_info:
+                key, separator, raw_value = line.partition(":")
+                if not separator:
+                    continue
+                match = re.search(r"(\d+)\s*kB", raw_value, flags=re.IGNORECASE)
+                if match is not None:
+                    values[key] = int(match.group(1)) * 1024
+    except (OSError, UnicodeError):
+        return (None, None)
+    total = _bytes_to_mebibytes(values.get("MemTotal"))
+    available = _bytes_to_mebibytes(values.get("MemAvailable", values.get("MemFree")))
+    if total is not None and available is not None:
+        available = min(total, available)
+    return total, available
+
+
+def _bytes_to_mebibytes(value: int | None) -> int | None:
+    if value is None or isinstance(value, bool) or value <= 0:
+        return None
+    return value // (1024 * 1024)
 
 
 def context_for_model(models: tuple[OllamaModel, ...], model_id: str | None) -> int:
@@ -888,6 +1184,12 @@ def _parse_model(item: object, vram_mebibytes: int | None) -> OllamaModel | None
 
     raw_details = item.get("details")
     details = raw_details if isinstance(raw_details, dict) else {}
+    raw_digest = item.get("digest")
+    digest = (
+        raw_digest.casefold()
+        if isinstance(raw_digest, str) and re.fullmatch(r"[0-9a-fA-F]{64}", raw_digest)
+        else None
+    )
     size = item.get("size")
     size_bytes = size if isinstance(size, int) and not isinstance(size, bool) and size > 0 else None
     parent = details.get("parent_model")
@@ -910,6 +1212,7 @@ def _parse_model(item: object, vram_mebibytes: int | None) -> OllamaModel | None
     return OllamaModel(
         model_id=model_id,
         display_name=friendly_model_name(model_id, details),
+        digest=digest,
         size_bytes=size_bytes,
         parameter_size=parameter_size if isinstance(parameter_size, str) else None,
         quantization=quantization if isinstance(quantization, str) else None,

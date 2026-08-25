@@ -24,7 +24,7 @@ from parsezen.errors import (
     SettingsError,
     UnexpectedProcessingError,
 )
-from parsezen.glossary import GlossaryEntry
+from parsezen.glossary import GlossaryEntry, glossary_fingerprint
 from parsezen.improvement import ImprovementMode
 from parsezen.pdf_conversion import (
     PdfPageRange,
@@ -49,6 +49,7 @@ from parsezen.semantic_blocks import (
     SemanticBlock,
     SemanticDocument,
     SemanticRole,
+    terminology_fingerprint,
 )
 from parsezen.settings import AppSettings
 from parsezen.translation_quality import (
@@ -329,6 +330,74 @@ def test_epub_translation_checkpoint_key_includes_independent_content_review() -
         LOCAL_SETTINGS,
         "es",
     )
+
+
+def test_checkpoint_key_changes_when_only_the_review_model_changes() -> None:
+    request = ProcessRequest(
+        Path("book.epub"),
+        convert_to_markdown=False,
+        output_format=OutputFormat.EPUB,
+        improvement_mode=ImprovementMode.TRANSLATE,
+        target_language="es",
+        review_content=True,
+    )
+    translation_and_first_review = AppSettings(
+        model="legacy:7b",
+        translation_model="translator:7b",
+        review_model="reviewer-a:7b",
+    )
+    second_review = AppSettings(
+        model="legacy:7b",
+        translation_model="translator:7b",
+        review_model="reviewer-b:7b",
+    )
+
+    assert transform_module.epub_translation_resume_key(
+        request, translation_and_first_review, "es"
+    ) != transform_module.epub_translation_resume_key(request, second_review, "es")
+
+
+def test_epub_checkpoint_key_keeps_the_legacy_identity_without_specialized_profiles() -> None:
+    request = ProcessRequest(
+        Path("book.epub"),
+        convert_to_markdown=False,
+        output_format=OutputFormat.EPUB,
+        improvement_mode=ImprovementMode.TRANSLATE,
+        target_language="es",
+    )
+    settings = AppSettings(model="legacy:7b", context_window=4_096)
+
+    key = transform_module.epub_translation_resume_key(request, settings, "es")
+
+    assert key == repr(
+        (
+            "epub-translation-v11",
+            "es",
+            "translate",
+            False,
+            False,
+            "legacy:7b",
+            4_096,
+            glossary_fingerprint(()),
+            terminology_fingerprint(()),
+        )
+    )
+
+
+def test_epub_checkpoint_key_marks_specialized_identity_explicitly() -> None:
+    request = ProcessRequest(
+        Path("book.epub"),
+        convert_to_markdown=False,
+        output_format=OutputFormat.EPUB,
+        improvement_mode=ImprovementMode.TRANSLATE,
+        target_language="es",
+    )
+    settings = AppSettings(model="legacy:7b", translation_model="translator:7b")
+
+    key = transform_module.epub_translation_resume_key(request, settings, "es")
+
+    assert "epub-translation-v12-specialized" in key
+    assert "translator:7b" in key
 
 
 def test_pdf_page_checkpoints_are_shared_across_sample_and_full_ranges(
@@ -2030,6 +2099,97 @@ def test_general_chunk_checkpoints_are_shared_across_glossary_variants(
 
     assert keys[0] == keys[1]
     assert "general-work-v3" in keys[0]
+
+
+def test_general_checkpoint_key_keeps_the_legacy_identity_without_specialized_profiles(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "book.pdf"
+    source.write_bytes(b"placeholder")
+    keys: list[str] = []
+
+    monkeypatch.setattr(
+        processing_module,
+        "open_work_checkpoints",
+        lambda _source, resume_key, **_kwargs: keys.append(resume_key) or SimpleNamespace(),
+    )
+
+    request = ProcessRequest(source, convert_to_markdown=True)
+    settings = AppSettings(model="legacy:7b", context_window=4_096)
+    processing_module._open_general_work_checkpoints(
+        request,
+        settings,
+        root=tmp_path / "checkpoints",
+    )
+
+    assert keys == []
+
+    request = ProcessRequest(
+        source,
+        convert_to_markdown=True,
+        improvement_mode=ImprovementMode.TRANSLATE,
+        target_language="Español",
+    )
+    processing_module._open_general_work_checkpoints(
+        request,
+        settings,
+        root=tmp_path / "checkpoints",
+    )
+
+    assert keys == [
+        repr(
+            (
+                "general-work-v3",
+                True,
+                "translate",
+                False,
+                False,
+                "Español",
+                None,
+                None,
+                False,
+                "markdown",
+                "legacy:7b",
+                4_096,
+            )
+        )
+    ]
+
+
+def test_general_checkpoint_key_marks_specialized_identity_explicitly(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "book.pdf"
+    source.write_bytes(b"placeholder")
+    keys: list[str] = []
+    monkeypatch.setattr(
+        processing_module,
+        "open_work_checkpoints",
+        lambda _source, resume_key, **_kwargs: keys.append(resume_key) or SimpleNamespace(),
+    )
+
+    processing_module._open_general_work_checkpoints(
+        ProcessRequest(
+            source,
+            convert_to_markdown=True,
+            improvement_mode=ImprovementMode.TRANSLATE,
+            target_language="Español",
+        ),
+        AppSettings(
+            model="legacy:7b",
+            context_window=4_096,
+            translation_model="translator:7b",
+            review_model="reviewer:7b",
+        ),
+        root=tmp_path / "checkpoints",
+    )
+
+    assert len(keys) == 1
+    assert "general-work-v4-specialized" in keys[0]
+    assert "translator:7b" in keys[0]
+    assert "reviewer:7b" in keys[0]
 
 
 def test_partial_pdf_improvement_uses_the_range_for_both_outputs(

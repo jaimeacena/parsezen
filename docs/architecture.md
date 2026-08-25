@@ -110,6 +110,13 @@ herramientas desplazable. El mensaje calcula su altura desde el ancho disponible
 la vigencia al trabajo que lo originó; el historial durable pertenece a Actividad. Layout, estado y
 contenido específico continúan en su pantalla.
 
+La configuración de IA local se presenta como dos capacidades fijas (`Traducción IA` y `Revisión IA`).
+`presentation/component_setup.py` solo proyecta estados evaluados por `component_readiness.py`:
+`Preparado`, `Descargable` o `Equipo insuficiente`. No lista modelos arbitrarios, no acepta tags ni
+endpoints y solo emite una solicitud de preparación; la descarga y la comprobación local pertenecen
+a los coordinadores externos. El diálogo admite un catálogo o una instantánea de estados explícitos
+para mantener la capa Qt fuera de la decisión de disponibilidad.
+
 El shell tiene composiciones de escritorio, intermedia y compacta en 960 y 640 px, y todos los
 flujos esenciales aceptan reflow hasta 320 px. Ajustes, actividad, apariencia y diagnóstico comparten
 un único menú global. Los workbenches de revisión sustituyen la cabecera general para no repetir
@@ -125,7 +132,8 @@ horizontal. El contrato, paleta y matriz de contraste están en `docs/ui-design-
 - ruta, formato, tamaño y modificación fijados al preparar el origen;
 - configuración mínima por documento;
 - el plan de producto (`STANDARD` o `LOCAL_AI_REVIEWED`);
-- una instantánea del modelo y contexto globales;
+- una instantánea compatible del modelo/contexto globales y, cuando existe política de
+  componentes, de los pares independientes de traducción y revisión;
 - revisión de configuración;
 - estado de cada fase;
 - resultado, avisos y error.
@@ -147,7 +155,8 @@ no duplica reglas del procesador.
 local, activa la revisión de texto y, únicamente para EPUB, la revisión de estructura. No existen
 combinaciones independientes de corrección y estructura. Cada elección válida reemplaza de forma
 atómica la configuración del documento y se persiste inmediatamente; una elección incompleta por
-falta de IA conserva su valor visible y dirige al gestor sin publicar una configuración inválida.
+falta de IA conserva su valor visible y dirige a `Componentes de IA local` sin publicar una
+configuración inválida.
 
 La revisión completa es el valor inicial visible para trabajos nuevos, pero sigue siendo una decisión
 reversible y nunca se aplica a configuraciones ya guardadas. Una evaluación local confirmó que puede
@@ -197,18 +206,23 @@ principio; la recomendación posterior reduce el coste y la decisión del recorr
 pretender que ambos flujos sean equivalentes.
 
 `TranslationMethod` ofrece exactamente dos motores locales: `OFFLINE` usa Argos y `LOCAL_AI` usa el
-modelo de Ollama seleccionado. IA local es la opción inicial y contextual; Argos es la alternativa
-manual, ligera y predecible. No existe degradación automática de IA local a Argos: activarlo exige
-una elección explícita. La validación real sigue la misma regla y por defecto usa el modelo local
-instalado, normalmente uno de alrededor de 4B parámetros en un PC estándar; solo prueba Argos al
-recibir expresamente `--translation-engine argos`. La elección del motor es independiente de
+componente local de traducción preparado por Parsezen. IA local es la opción inicial y contextual;
+Argos es la alternativa manual, ligera y predecible. No existe degradación automática de IA local a
+Argos: activarlo exige una elección explícita. La validación real sigue la misma regla y solo usa un
+componente que haya superado su manifest y comprobación local; prueba Argos únicamente al recibir
+expresamente `--translation-engine argos`. La elección del motor es independiente de
 `ProcessingPlan`: el
-plan revisado puede actuar después de cualquiera de los dos. `AIProfileConfiguration` es una
-instantánea de la única pareja modelo/contexto global. No hay excepciones por documento y los cambios
-generales se propagan a todos los trabajos editables. La eliminación de un modelo se bloquea mientras
-algún trabajo sin terminar dependa de él. Si el valor inicial necesita IA y falta un modelo local
-válido, la configuración conserva la intención, muestra la causa junto al control y dirige al gestor
-de modelos antes de guardar.
+plan revisado puede actuar después de cualquiera de los dos. `AIProfileConfiguration` conserva el par
+global antiguo para compatibilidad y puede llevar snapshots independientes de traducción y revisión;
+el runtime deriva de ellos los settings de cada fase y cae al par global en cargas antiguas. No hay
+excepciones editables por documento ni mutaciones de la instantánea al cambiar preferencias. Si el
+valor inicial necesita IA y falta un componente local válido, la configuración conserva la intención,
+muestra la causa junto al control y dirige a `Componentes de IA local` antes de guardar.
+
+La selección y procedencia de perfiles globales distintos para traducción y revisión se rige por
+`docs/local-ai-model-policy.md`. La política no fija tags: los snapshots solo guardan identidad sin
+contenido y el árbitro OCR visual permanece como una capacidad independiente, no asignada implícitamente
+a ninguno de los perfiles textuales.
 
 `LinguisticReviewCoverage` registra sin texto documental cómo se obtuvo la confianza lingüística:
 sin revisión semántica, corrección integrada en la traducción, verificación bilingüe independiente o
@@ -1326,6 +1340,14 @@ payload sintético: tiempos DPAPI, escritura y recuperación de snapshot v2, dis
 arranque en frío de una ventana offscreen y tamaño de la instalación; `--installer` añade el tamaño
 del instalador construido. El perfil resultante contiene solo números, no rutas ni payloads. Para que
 el tamaño instalado sea representativo se debe pasar la carpeta del paquete construido, no `src/`.
+
+La comparación optativa de traducción EN→ES vive en
+`scripts/evaluate_translation_models.py`. Solo acepta tags que ya estén anunciados por el Ollama
+local, usa un corpus sintético EN→ES versionado y llama a la misma entrada `improve_markdown` que la
+traducción de producción, con un contexto y opciones compartidos entre modelos y repeticiones. Su
+informe JSON atómico contiene únicamente IDs de caso opacos, hashes y métricas agregadas de gates,
+cobertura, residuo, números, glosario, coincidencia exacta cuando procede y telemetría disponible;
+no escribe documentos ni guarda prompts, respuestas, rutas o contenido del corpus.
 
 Estas métricas son instrumentación, no una autorización automática para optimizar. Streaming global,
 paralelismo de documentos, `mmap`, persistencia delta y pooling SQLite solo se considerarán contra una

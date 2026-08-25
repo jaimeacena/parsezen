@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import io
 import json
 import subprocess
 from collections.abc import Iterator
 from pathlib import Path
 from threading import Event
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -13,14 +15,22 @@ import parsezen.local_models as local_models_module
 from parsezen.errors import LocalModelUnavailableError
 from parsezen.local_models import (
     OLLAMA_BASE_URL,
+    ComponentRequirements,
+    ComponentStatus,
+    HardwareComponent,
     LocalAISetupCancelled,
+    LocalHardware,
     OllamaConnection,
     OllamaModel,
     OllamaStatus,
+    calculate_hardware_readiness,
     choose_ollama_model,
     configure_ollama_local_only,
     context_for_model,
     delete_ollama_model,
+    detect_local_hardware,
+    detect_nvidia_vram_memory_mebibytes,
+    detect_system_memory_mebibytes,
     discover_ollama,
     friendly_model_name,
     install_ollama,
@@ -47,6 +57,7 @@ def test_lists_native_ollama_models_with_friendly_names() -> None:
                 "models": [
                     {
                         "model": "gemma3:4b",
+                        "digest": "a" * 64,
                         "size": 4_280_418_296,
                         "details": {
                             "family": "gemma3",
@@ -75,6 +86,7 @@ def test_lists_native_ollama_models_with_friendly_names() -> None:
 
     assert len(models) == 2
     assert models[0].model_id == "gemma3:4b"
+    assert models[0].digest == "a" * 64
     assert models[0].display_name == "Gemma 3 4B Q8"
     assert models[0].recommended_context == 8_192
     assert models[1].model_id == "qwen3:4b-instruct-2507-q8_0"
@@ -787,3 +799,134 @@ def test_context_recommendation_is_conservative_and_capped_by_the_model(
 def test_friendly_name_uses_only_the_canonical_ollama_name() -> None:
     assert friendly_model_name("qwen3:latest") == "Qwen3"
     assert friendly_model_name("qwen3:4b") == "Qwen3 4B"
+
+
+def test_windows_memory_detection_uses_the_native_api_and_clamps_available_memory(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fill_memory_status(pointer: object) -> int:
+        status = local_models_module.ctypes.cast(
+            pointer,
+            local_models_module.ctypes.POINTER(local_models_module._MemoryStatusEx),
+        ).contents
+        status.ullTotalPhys = 16 * 1024**3
+        status.ullAvailPhys = 20 * 1024**3
+        return 1
+
+    monkeypatch.setattr(local_models_module.sys, "platform", "win32")
+    monkeypatch.setattr(
+        local_models_module.ctypes,
+        "windll",
+        SimpleNamespace(kernel32=SimpleNamespace(GlobalMemoryStatusEx=fill_memory_status)),
+        raising=False,
+    )
+
+    assert detect_system_memory_mebibytes() == (16 * 1024, 16 * 1024)
+
+
+def test_memory_detection_falls_back_to_proc_meminfo_when_native_sources_fail(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(local_models_module.sys, "platform", "linux")
+    monkeypatch.setattr(
+        local_models_module.os,
+        "sysconf",
+        lambda _name: (_ for _ in ()).throw(OSError("unavailable")),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        "builtins.open",
+        lambda *_args, **_kwargs: io.StringIO(
+            "MemTotal:       16384000 kB\nMemAvailable:    8192000 kB\n"
+        ),
+    )
+
+    assert detect_system_memory_mebibytes() == (16_000, 8_000)
+
+
+def test_nvidia_memory_detection_selects_largest_adapter_and_keeps_free_memory_private(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    commands: list[list[str]] = []
+
+    def run(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        commands.append(command)
+        return subprocess.CompletedProcess(
+            command,
+            0,
+            stdout="8192, 4096\n16384, 12000 MiB\n",
+            stderr="driver detail that must not be surfaced",
+        )
+
+    monkeypatch.setattr(local_models_module.subprocess, "run", run)
+
+    assert detect_nvidia_vram_memory_mebibytes().total_mebibytes == 16_384
+    assert detect_nvidia_vram_memory_mebibytes().available_mebibytes == 12_000
+    assert commands[0][1] == "--query-gpu=memory.total,memory.free"
+
+
+def test_local_hardware_snapshot_contains_only_numeric_facts(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(
+        local_models_module, "detect_system_memory_mebibytes", lambda: (32_768, 8_192)
+    )
+    monkeypatch.setattr(
+        local_models_module,
+        "detect_nvidia_vram_memory_mebibytes",
+        lambda: local_models_module.NvidiaVram(16_384, 12_288),
+    )
+    monkeypatch.setattr(
+        local_models_module.shutil,
+        "disk_usage",
+        lambda _path: SimpleNamespace(free=50_000),
+    )
+
+    hardware = detect_local_hardware(storage_path=tmp_path / "private-models")
+
+    assert hardware == LocalHardware(32_768, 8_192, 50_000, 16_384, 12_288)
+    assert not hasattr(hardware, "storage_path")
+
+
+def test_hardware_readiness_is_pure_and_independent_per_component() -> None:
+    hardware = LocalHardware(
+        ram_total_mebibytes=32_768,
+        ram_available_mebibytes=8_192,
+        disk_free_bytes=20_000_000_000,
+        nvidia_vram_total_mebibytes=16_384,
+        nvidia_vram_available_mebibytes=12_288,
+    )
+    result = calculate_hardware_readiness(
+        hardware,
+        {
+            HardwareComponent.TRANSLATION: ComponentRequirements(
+                min_ram_mebibytes=4_096,
+                min_disk_free_bytes=10_000_000_000,
+                installed=True,
+            ),
+            HardwareComponent.REVIEW: ComponentRequirements(
+                min_ram_mebibytes=4_096,
+                min_disk_free_bytes=10_000_000_000,
+            ),
+            HardwareComponent.VISUAL: ComponentRequirements(
+                min_vram_mebibytes=16_000,
+                installed=True,
+            ),
+        },
+    )
+
+    assert result[HardwareComponent.TRANSLATION].status is ComponentStatus.READY
+    assert result[HardwareComponent.REVIEW].status is ComponentStatus.INSTALLABLE
+    assert result[HardwareComponent.VISUAL].status is ComponentStatus.INSUFFICIENT
+
+
+def test_hardware_readiness_is_unknown_when_a_required_measurement_is_unavailable() -> None:
+    result = calculate_hardware_readiness(
+        LocalHardware(ram_available_mebibytes=4_096),
+        {
+            "visual": ComponentRequirements(min_vram_mebibytes=1_024, installed=True),
+        },
+    )
+
+    assert result[HardwareComponent.VISUAL].status is ComponentStatus.UNKNOWN

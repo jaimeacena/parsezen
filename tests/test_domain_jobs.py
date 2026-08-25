@@ -17,6 +17,8 @@ from parsezen.domain.jobs import (
     DocumentSource,
     JobConfiguration,
     JobStatus,
+    LocalAIComponentSnapshot,
+    LocalAIPolicySnapshot,
     OutputConfiguration,
     ProcessingPlan,
     TranslationConfiguration,
@@ -83,6 +85,7 @@ def test_reviewed_epub_enables_text_and_structure_as_one_plan() -> None:
 def test_standard_plan_disables_ai_phases() -> None:
     job = DocumentJob.create(source(), JobConfiguration(), order=0)
 
+    assert job.configuration.plan is ProcessingPlan.STANDARD
     assert job.stage(StageKind.REFINE).availability is StageAvailability.DISABLED
     assert job.stage(StageKind.STRUCTURE).availability is StageAvailability.UNAVAILABLE
 
@@ -166,6 +169,43 @@ def test_running_job_cannot_be_reconfigured() -> None:
 
     with pytest.raises(ValueError):
         job.with_configuration(replace(job.configuration, force_pdf_ocr=True))
+
+
+def test_local_ai_component_snapshot_is_content_free_and_canonical() -> None:
+    component = LocalAIComponentSnapshot(
+        policy_version="local-ai-policy-v1",
+        model="translator:7b",
+        digest="sha256:" + "A" * 64,
+    )
+
+    assert component.model_name == "translator:7b"
+    assert component.ollama_digest == "a" * 64
+    assert LocalAIPolicySnapshot(visual_ocr=component).visual is component
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("policy_version", "bad version"),
+        ("model", "https://example.invalid/model"),
+        ("model", "translator:cloud"),
+        ("model", "translator-cloud"),
+        ("digest", "not-a-digest"),
+    ),
+)
+def test_local_ai_component_snapshot_rejects_untrusted_identifiers(
+    field: str,
+    value: str,
+) -> None:
+    values = {
+        "policy_version": "local-ai-policy-v1",
+        "model": "translator:7b",
+        "digest": "a" * 64,
+    }
+    values[field] = value
+
+    with pytest.raises(ValueError):
+        LocalAIComponentSnapshot(**values)
 
 
 def test_ai_profile_is_only_a_global_snapshot() -> None:

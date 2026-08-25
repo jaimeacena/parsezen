@@ -45,7 +45,12 @@ from parsezen.semantic_blocks import (
     analyze_markdown,
     terminology_fingerprint,
 )
-from parsezen.settings import AppSettings
+from parsezen.settings import (
+    AppSettings,
+    has_specialized_ai_profiles,
+    settings_for_review,
+    settings_for_translation,
+)
 from parsezen.translation_quality import (
     LinguisticReviewCoverage,
     LinguisticReviewMode,
@@ -123,6 +128,8 @@ def transform_prepared_document(
     preserved_translation_chunks: list[int] = []
     translation_repair_attempted = 0
     translation_repair_accepted = 0
+    translation_settings = settings_for_translation(settings) if settings is not None else None
+    review_settings = settings_for_review(settings) if settings is not None else None
 
     def record_translation_repair(attempted: int, accepted: int) -> None:
         nonlocal translation_repair_attempted, translation_repair_accepted
@@ -173,10 +180,17 @@ def transform_prepared_document(
             in {ImprovementMode.TRANSLATE, ImprovementMode.CLEAN_AND_TRANSLATE}
             else None
         )
+        improvement_settings = (
+            translation_settings
+            if effective_ai_mode in {ImprovementMode.TRANSLATE, ImprovementMode.CLEAN_AND_TRANSLATE}
+            else review_settings
+        )
+        if improvement_settings is None:
+            raise AssertionError("Validated improvement requests always have phase settings.")
         transformed_markdown = improve_markdown(
             protected.text if protected is not None else transformed_markdown,
             effective_ai_mode,
-            settings,
+            improvement_settings,
             request.target_language,
             **improvement_arguments,
         )
@@ -194,7 +208,7 @@ def transform_prepared_document(
                 request,
                 translation_source,
                 transformed_markdown,
-                settings=settings,
+                settings=translation_settings,
                 cancellation=cancellation,
                 translation_glossary=translation_glossary,
                 work_checkpoints=work_checkpoints,
@@ -249,7 +263,7 @@ def transform_prepared_document(
             request,
             translation_source,
             transformed_markdown,
-            settings=settings,
+            settings=translation_settings,
             cancellation=cancellation,
             translation_glossary=translation_glossary,
             work_checkpoints=work_checkpoints,
@@ -270,6 +284,8 @@ def transform_prepared_document(
     if request.review_content:
         if settings is None:
             raise AssertionError("Validated review requests always have settings.")
+        if review_settings is None:
+            raise AssertionError("Validated review requests always have phase settings.")
         _announce(on_stage, ProcessStage.REVIEWING_CONTENT)
         selected_translation_cleanup = _uses_local_ai_translation_content_cleanup(
             request,
@@ -281,7 +297,7 @@ def transform_prepared_document(
             transformed_markdown = review_translation_with_checkpoints(
                 translation_source,
                 transformed_markdown,
-                settings,
+                review_settings,
                 request,
                 on_progress,
                 cancellation,
@@ -291,7 +307,7 @@ def transform_prepared_document(
             if selected_translation_cleanup:
                 transformed_markdown = improve_selected_content(
                     transformed_markdown,
-                    settings,
+                    review_settings,
                     request,
                     on_progress,
                     cancellation,
@@ -302,7 +318,7 @@ def transform_prepared_document(
         elif pdf_quality_report is not None:
             transformed_markdown = improve_selected_content(
                 transformed_markdown,
-                settings,
+                review_settings,
                 request,
                 on_progress,
                 cancellation,
@@ -314,7 +330,7 @@ def transform_prepared_document(
             transformed_markdown = improve_with_checkpoints(
                 transformed_markdown,
                 ImprovementMode.REVIEW_CONTENT,
-                settings,
+                review_settings,
                 request,
                 on_progress,
                 cancellation,
@@ -325,11 +341,13 @@ def transform_prepared_document(
     if request.review_structure:
         if settings is None:
             raise AssertionError("Validated review requests always have settings.")
+        if review_settings is None:
+            raise AssertionError("Validated review requests always have phase settings.")
         _announce(on_stage, ProcessStage.ORGANIZING_STRUCTURE)
         transformed_markdown = improve_with_checkpoints(
             transformed_markdown,
             ImprovementMode.REVIEW_STRUCTURE,
-            settings,
+            review_settings,
             request,
             on_progress,
             cancellation,
@@ -446,7 +464,12 @@ def improve_with_checkpoints(
     if checkpoints is not None:
         arguments["load_checkpoint"] = checkpoints.load
         arguments["save_checkpoint"] = checkpoints.save
-    return improve_markdown(markdown, mode, settings, **arguments)
+    runtime_settings = (
+        settings_for_translation(settings)
+        if mode in {ImprovementMode.TRANSLATE, ImprovementMode.CLEAN_AND_TRANSLATE}
+        else settings_for_review(settings)
+    )
+    return improve_markdown(markdown, mode, runtime_settings, **arguments)
 
 
 def review_translation_with_checkpoints(
@@ -465,10 +488,11 @@ def review_translation_with_checkpoints(
     target_language = request.offline_translation_language or request.target_language
     if target_language is None:
         return translated_markdown
+    runtime_settings = settings_for_review(settings)
     return review_translation_markdown(
         source_markdown,
         translated_markdown,
-        settings,
+        runtime_settings,
         target_language,
         on_progress=on_progress,
         cancellation=cancellation,
@@ -494,17 +518,40 @@ def epub_translation_resume_key(
     """Identify text-changing settings for resumable EPUB transformations."""
 
     effective_mode = effective_ai_improvement_mode(request)
+    common = (
+        language_code,
+        effective_mode.value if effective_mode is not None else "none",
+        request.review_content,
+        request.offline_translation_language is not None,
+    )
+    glossary = glossary_fingerprint(request.glossary)
+    terminology_digest = terminology_fingerprint(terminology)
+    if not has_specialized_ai_profiles(settings):
+        # Keep this tuple byte-for-byte compatible with pre-specialized jobs.
+        return repr(
+            (
+                "epub-translation-v11",
+                *common,
+                settings.model if settings is not None else None,
+                settings.context_window if settings is not None else None,
+                glossary,
+                terminology_digest,
+            )
+        )
+
+    assert settings is not None
+    translation_settings = settings_for_translation(settings)
+    review_settings = settings_for_review(settings)
     return repr(
         (
-            "epub-translation-v11",
-            language_code,
-            effective_mode.value if effective_mode is not None else "none",
-            request.review_content,
-            request.offline_translation_language is not None,
-            settings.model if settings is not None else None,
-            settings.context_window if settings is not None else None,
-            glossary_fingerprint(request.glossary),
-            terminology_fingerprint(terminology),
+            "epub-translation-v12-specialized",
+            *common,
+            translation_settings.model,
+            translation_settings.context_window,
+            review_settings.model,
+            review_settings.context_window,
+            glossary,
+            terminology_digest,
         )
     )
 

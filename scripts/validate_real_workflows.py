@@ -6,7 +6,9 @@ import argparse
 import hashlib
 import json
 import logging
+import os
 import re
+import secrets
 import sys
 from collections import Counter
 from collections.abc import Callable, Iterable
@@ -23,7 +25,12 @@ from parsezen.epub_conversion import inspect_epub_package
 from parsezen.errors import ParsezenError, SettingsError
 from parsezen.glossary import GlossaryEntry, validate_glossary
 from parsezen.improvement import ImprovementMode
-from parsezen.local_models import OllamaStatus, discover_ollama, is_reasoning_model_id
+from parsezen.local_models import (
+    OllamaStatus,
+    discover_ollama,
+    is_cloud_model_id,
+    is_reasoning_model_id,
+)
 from parsezen.pdf_conversion import PdfPageRange
 from parsezen.processing import (
     OutputFormat,
@@ -35,11 +42,14 @@ from parsezen.processing import (
 from parsezen.revision import RevisionDecision
 from parsezen.settings import AppSettings, load_settings
 
-REPORT_SCHEMA_VERSION = 13
+REPORT_SCHEMA_VERSION = 14
+EVALUATION_REPORT_SCHEMA_VERSION = 1
 DEFAULT_REPORT_PATH = Path("local-benchmarks") / "real-workflows" / "latest.json"
 SYNTHETIC_PAGE_COUNT = 20
 MAX_EPUB_HEADING_CHARACTERS = 320
 MAX_EPUB_HEADING_WORDS = 40
+MAX_EVALUATION_MODELS = 16
+MAX_EVALUATION_REPETITIONS = 10
 
 
 @dataclass(frozen=True, slots=True)
@@ -67,6 +77,7 @@ class LiveWorkflowResult:
     quality_gate_passed: bool = False
     output_extension: str | None = None
     output_bytes: int | None = None
+    output_sha256: str | None = None
     revision_created: bool = False
     revision_changes: int = 0
     recommended_revision_changes: int = 0
@@ -106,6 +117,17 @@ class LiveWorkflowResult:
     ai_operations: dict[str, dict[str, int]] = field(default_factory=dict)
     error_type: str | None = None
     failed_stage: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class LocalEvaluationRun:
+    """One model/repetition run, paired without exposing a source identity."""
+
+    case_id: str
+    model: str
+    context_window: int
+    repetition: int
+    result: LiveWorkflowResult
 
 
 CRITICAL_CASES = (
@@ -272,6 +294,7 @@ def run_live_workflows(
             case_output = output_root / f"source-{source_index}" / case.name
             case_output.mkdir(parents=True, exist_ok=True)
             result_path: Path | None = None
+            output_sha256: str | None = None
             revision_created = False
             revision_changes = 0
             recommended_revision_changes = 0
@@ -435,6 +458,7 @@ def run_live_workflows(
                 epub_structure_issues = (
                     _validate_generated_output(result_path, case.output_format) or 0
                 )
+                output_sha256 = _file_sha256(result_path) if result_path.is_file() else None
                 epub_structure_regressions = max(
                     0,
                     epub_structure_issues - source_epub_structure_issues,
@@ -469,6 +493,7 @@ def run_live_workflows(
                         if result_path is not None and result_path.is_file()
                         else None
                     ),
+                    output_sha256=output_sha256,
                     revision_created=revision_created,
                     revision_changes=revision_changes,
                     recommended_revision_changes=recommended_revision_changes,
@@ -530,13 +555,255 @@ def write_report(
         "results": [asdict(result) for result in results],
         "privacy": "No contiene rutas, nombres, prompts, respuestas ni texto documental.",
     }
+    _write_json_atomically(destination, payload)
+
+
+def run_local_model_evaluation(
+    sources: tuple[Path, ...],
+    output_root: Path,
+    models: tuple[str, ...],
+    *,
+    repetitions: int = 1,
+    context_window: int | None = None,
+    target_language: str = "Español",
+    full_matrix: bool = False,
+    page_range: PdfPageRange | None = None,
+    glossary: tuple[GlossaryEntry, ...] = (),
+    translation_engine: str = "local_ai",
+    workflow_profile: str = "critical",
+    evaluation_id: str | None = None,
+    on_runs: Callable[[tuple[LocalEvaluationRun, ...]], None] | None = None,
+) -> tuple[LocalEvaluationRun, ...]:
+    """Compare explicitly installed local tags with identical options and repetitions.
+
+    This function only inspects the installed model list and invokes the existing local
+    workflow.  It intentionally has no model installation or download path.
+    """
+    if not models or len(models) > MAX_EVALUATION_MODELS:
+        raise ValueError(
+            f"La evaluación necesita entre 1 y {MAX_EVALUATION_MODELS} tags explícitos."
+        )
+    if len(set(models)) != len(models):
+        raise ValueError("La evaluación no puede repetir un tag de modelo.")
+    if isinstance(repetitions, bool) or not 1 <= repetitions <= MAX_EVALUATION_REPETITIONS:
+        raise ValueError(f"Las repeticiones deben estar entre 1 y {MAX_EVALUATION_REPETITIONS}.")
+    if context_window is not None and (isinstance(context_window, bool) or context_window < 1):
+        raise ValueError("La ventana de contexto debe ser un entero positivo.")
+
+    connection = discover_ollama(None)
+    if connection.status is not OllamaStatus.READY:
+        raise RuntimeError(connection.message or "Ollama no está preparado.")
+    installed = {model.model_id: model for model in connection.models}
+    missing = tuple(model for model in models if model not in installed)
+    if missing:
+        raise RuntimeError("Todos los tags de la evaluación deben estar instalados en Ollama.")
+    if any(is_cloud_model_id(model) or model.casefold().endswith("-cloud") for model in models):
+        raise RuntimeError("Los tags cloud no participan en una evaluación local.")
+
+    # Resolve context once, then pass that exact value to every model.  This prevents
+    # per-model recommendations from changing the comparison conditions.
+    first_settings = select_live_settings(models[0], context_window=context_window)
+    shared_context = first_settings.context_window
+    settings_by_model = {models[0]: first_settings}
+    settings_by_model.update(
+        {model: select_live_settings(model, context_window=shared_context) for model in models[1:]}
+    )
+    run_id = _normalise_opaque_identity(evaluation_id)
+    runs: list[LocalEvaluationRun] = []
+    for model in models:
+        settings = settings_by_model[model]
+        for repetition in range(1, repetitions + 1):
+            repetition_root = output_root / f"model-{models.index(model) + 1}" / f"run-{repetition}"
+            results = run_live_workflows(
+                sources,
+                repetition_root,
+                settings,
+                target_language=target_language,
+                full_matrix=full_matrix,
+                page_range=page_range,
+                glossary=glossary,
+                translation_engine=translation_engine,
+                workflow_profile=workflow_profile,
+            )
+            runs.extend(
+                LocalEvaluationRun(
+                    case_id=_evaluation_case_id(run_id, result.source_index, result.case),
+                    model=model,
+                    context_window=shared_context,
+                    repetition=repetition,
+                    result=result,
+                )
+                for result in results
+            )
+            if on_runs is not None:
+                on_runs(tuple(runs))
+    return tuple(runs)
+
+
+def write_evaluation_report(
+    destination: Path,
+    runs: tuple[LocalEvaluationRun, ...],
+    *,
+    evaluation_id: str | None = None,
+    options: dict[str, object] | None = None,
+) -> None:
+    """Atomically write only paired identities, output hashes and existing metrics."""
+    run_id = _normalise_opaque_identity(evaluation_id)
+    safe_case_ids = {run.case_id: _normalise_opaque_identity(run.case_id) for run in runs}
+    safe_options = _safe_evaluation_options(options)
+    payload = {
+        "schema_version": EVALUATION_REPORT_SCHEMA_VERSION,
+        "evaluation_id": run_id,
+        "options": safe_options,
+        "runs": [
+            {
+                "case_id": safe_case_ids[run.case_id],
+                "model": run.model,
+                "context_window": run.context_window,
+                "repetition": run.repetition,
+                "metrics": _safe_result_metrics(run.result),
+            }
+            for run in runs
+        ],
+        "paired_summary": _paired_summary(runs, case_ids=safe_case_ids),
+        "repeat_summary": _repeat_summary(runs, case_ids=safe_case_ids),
+        "privacy": "No contiene rutas, nombres, títulos, prompts, respuestas ni texto documental.",
+    }
+    _write_json_atomically(destination, payload)
+
+
+def _safe_result_metrics(result: LiveWorkflowResult) -> dict[str, object]:
+    """Remove source/case identity fields from one otherwise content-free result."""
+
+    metrics = asdict(result)
+    for field_name in ("source_index", "source_extension", "case"):
+        metrics.pop(field_name, None)
+    return metrics
+
+
+def _paired_summary(
+    runs: tuple[LocalEvaluationRun, ...],
+    *,
+    case_ids: dict[str, str] | None = None,
+) -> list[dict[str, object]]:
+    grouped: dict[tuple[str, int], list[LocalEvaluationRun]] = {}
+    for run in runs:
+        grouped.setdefault((run.case_id, run.repetition), []).append(run)
+    summary: list[dict[str, object]] = []
+    for (case_id, repetition), group in sorted(grouped.items()):
+        hashes = {
+            run.model: run.result.output_sha256 for run in sorted(group, key=lambda x: x.model)
+        }
+        available_hashes = {value for value in hashes.values() if value is not None}
+        summary.append(
+            {
+                "case_id": (case_ids or {}).get(case_id, case_id),
+                "repetition": repetition,
+                "models": tuple(hashes),
+                "output_hashes": hashes,
+                "same_output": (
+                    len(hashes) >= 2
+                    and len(available_hashes) == 1
+                    and all(value is not None for value in hashes.values())
+                ),
+                "quality_gate_passed": {
+                    run.model: run.result.quality_gate_passed
+                    for run in sorted(group, key=lambda x: x.model)
+                },
+                "passed": {
+                    run.model: run.result.passed for run in sorted(group, key=lambda x: x.model)
+                },
+            }
+        )
+    return summary
+
+
+def _repeat_summary(
+    runs: tuple[LocalEvaluationRun, ...],
+    *,
+    case_ids: dict[str, str] | None = None,
+) -> list[dict[str, object]]:
+    grouped: dict[tuple[str, str], list[LocalEvaluationRun]] = {}
+    for run in runs:
+        grouped.setdefault((run.case_id, run.model), []).append(run)
+    summary: list[dict[str, object]] = []
+    for (case_id, model), group in sorted(grouped.items()):
+        ordered = sorted(group, key=lambda run: run.repetition)
+        hashes = [run.result.output_sha256 for run in ordered]
+        available_hashes = {value for value in hashes if value is not None}
+        summary.append(
+            {
+                "case_id": (case_ids or {}).get(case_id, case_id),
+                "model": model,
+                "repetitions": [run.repetition for run in ordered],
+                "output_hashes": hashes,
+                "stable_output": (
+                    len(hashes) >= 2
+                    and len(available_hashes) == 1
+                    and all(value is not None for value in hashes)
+                ),
+                "all_quality_gates_passed": all(run.result.quality_gate_passed for run in ordered),
+            }
+        )
+    return summary
+
+
+def _safe_evaluation_options(options: dict[str, object] | None) -> dict[str, object]:
+    """Keep only scalar benchmark controls; never serialize user-provided text options."""
+    if not options:
+        return {}
+    allowed = {
+        "context_window",
+        "repetitions",
+        "translation_engine",
+        "workflow_profile",
+        "full_matrix",
+        "page_start",
+        "page_end",
+    }
+    safe: dict[str, object] = {}
+    for key in sorted(allowed):
+        value = options.get(key)
+        if isinstance(value, (str, int, bool, float)) or value is None:
+            safe[key] = value
+    return safe
+
+
+def _new_opaque_identity() -> str:
+    return secrets.token_hex(16)
+
+
+def _normalise_opaque_identity(value: str | None) -> str:
+    if value is None:
+        return _new_opaque_identity()
+    if re.fullmatch(r"[0-9a-fA-F]{32}", value):
+        return value.lower()
+    digest = hashlib.sha256(value.encode("utf-8")).hexdigest()
+    return digest[:32]
+
+
+def _evaluation_case_id(evaluation_id: str, source_index: int, case: str) -> str:
+    digest = hashlib.sha256()
+    digest.update(evaluation_id.encode("ascii", "strict"))
+    digest.update(b"\0")
+    digest.update(str(source_index).encode("ascii"))
+    digest.update(b"\0")
+    digest.update(case.encode("utf-8"))
+    return digest.hexdigest()[:32]
+
+
+def _write_json_atomically(destination: Path, payload: dict[str, object]) -> None:
     destination.parent.mkdir(parents=True, exist_ok=True)
     temporary = destination.with_name(f".{destination.name}.tmp")
-    temporary.write_text(
-        json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
-    )
-    temporary.replace(destination)
+    try:
+        with temporary.open("w", encoding="utf-8", newline="\n") as stream:
+            json.dump(payload, stream, ensure_ascii=False, indent=2)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, destination)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def write_synthetic_pdf(destination: Path) -> None:
@@ -603,7 +870,12 @@ def write_synthetic_pdf(destination: Path) -> None:
                     f"A distinct reference value, {page_number * 17}, helps detect "
                     "accidental omissions."
                 ),
-                "Reviewers should be able to locate any warning in the final document.",
+                (
+                    "Warning OCR: this synthetic sentence deliberately exercises the "
+                    "targeted local review path."
+                    if page_number == 3
+                    else "Reviewers should be able to locate any warning in the final document."
+                ),
                 "A successful transformation preserves meaning before improving presentation.",
                 "Repeated work should be avoided only after the earlier result has been validated.",
                 "The published EPUB must remain usable on ordinary reading applications.",
@@ -812,6 +1084,18 @@ def _parser() -> argparse.ArgumentParser:
         help="Muestras locales; sin argumentos se crea un PDF sintético de 20 páginas.",
     )
     parser.add_argument("--model", help="Modelo instalado; por defecto usa el elegido en la app.")
+    parser.add_argument(
+        "--models",
+        nargs="+",
+        metavar="TAG",
+        help="Tags instalados que se compararán bajo las mismas opciones.",
+    )
+    parser.add_argument(
+        "--repetitions",
+        type=int,
+        default=1,
+        help="Repeticiones idénticas por modelo (1–10; el informe las empareja).",
+    )
     parser.add_argument("--context-window", type=int, help="Ventana de contexto de la prueba.")
     parser.add_argument("--target-language", default="Español")
     parser.add_argument(
@@ -855,7 +1139,8 @@ def _parser() -> argparse.ArgumentParser:
 
 
 def _run_from_arguments(arguments: argparse.Namespace) -> int:
-    settings = select_live_settings(arguments.model, context_window=arguments.context_window)
+    if arguments.models is not None and arguments.model is not None:
+        raise ValueError("Usa --model o --models, no ambos.")
     with TemporaryDirectory(prefix="parsezen-real-") as temporary_name:
         temporary = Path(temporary_name)
         if arguments.sources:
@@ -873,14 +1158,79 @@ def _run_from_arguments(arguments: argparse.Namespace) -> int:
                 model=settings.model or "none",
             )
 
+        page_range = PdfPageRange(*arguments.pages) if arguments.pages is not None else None
+        glossary = _parse_glossary_arguments(arguments.glossary)
+        if arguments.models is not None:
+            evaluation_id = _new_opaque_identity()
+
+            def persist_evaluation(partial: tuple[LocalEvaluationRun, ...]) -> None:
+                write_evaluation_report(
+                    arguments.report,
+                    partial,
+                    evaluation_id=evaluation_id,
+                    options={
+                        "context_window": partial[0].context_window if partial else None,
+                        "repetitions": arguments.repetitions,
+                        "translation_engine": arguments.translation_engine,
+                        "workflow_profile": arguments.profile,
+                        "full_matrix": arguments.full_matrix,
+                        "page_start": page_range.first_page if page_range is not None else None,
+                        "page_end": page_range.last_page if page_range is not None else None,
+                    },
+                )
+
+            runs = run_local_model_evaluation(
+                sources,
+                output_root,
+                tuple(arguments.models),
+                repetitions=arguments.repetitions,
+                context_window=arguments.context_window,
+                target_language=arguments.target_language,
+                full_matrix=arguments.full_matrix,
+                page_range=page_range,
+                glossary=glossary,
+                translation_engine=arguments.translation_engine,
+                workflow_profile=arguments.profile,
+                evaluation_id=evaluation_id,
+                on_runs=persist_evaluation,
+            )
+            write_evaluation_report(
+                arguments.report,
+                runs,
+                evaluation_id=evaluation_id,
+                options={
+                    "context_window": runs[0].context_window if runs else arguments.context_window,
+                    "repetitions": arguments.repetitions,
+                    "translation_engine": arguments.translation_engine,
+                    "workflow_profile": arguments.profile,
+                    "full_matrix": arguments.full_matrix,
+                    "page_start": page_range.first_page if page_range is not None else None,
+                    "page_end": page_range.last_page if page_range is not None else None,
+                },
+            )
+            for run in runs:
+                state = (
+                    "OK"
+                    if run.result.quality_gate_passed
+                    else ("REVISAR" if run.result.passed else "FALLO")
+                )
+                print(
+                    f"{state} modelo {run.model} · repetición {run.repetition} · "
+                    f"muestra {run.result.source_index} · {run.result.case} · "
+                    f"{run.result.elapsed_seconds:.1f} s"
+                )
+            print(f"Informe comparativo local sin contenido documental: {arguments.report}")
+            return 0 if all(run.result.quality_gate_passed for run in runs) else 1
+
+        settings = select_live_settings(arguments.model, context_window=arguments.context_window)
         results = run_live_workflows(
             sources,
             output_root,
             settings,
             target_language=arguments.target_language,
             full_matrix=arguments.full_matrix,
-            page_range=PdfPageRange(*arguments.pages) if arguments.pages is not None else None,
-            glossary=_parse_glossary_arguments(arguments.glossary),
+            page_range=page_range,
+            glossary=glossary,
             translation_engine=arguments.translation_engine,
             workflow_profile=arguments.profile,
             on_results=persist_results,

@@ -47,6 +47,9 @@ parsezen = "parsezen.__main__:main"
 [tool.setuptools.packages.find]
 where = ["src"]
 
+[tool.setuptools.package-data]
+"parsezen.licenses" = ["*.txt"]
+
 [tool.setuptools.data-files]
 "share/parsezen/assets/branding/generated" = [
     "assets/branding/generated/parsezen-logo-light.png",

@@ -20,6 +20,8 @@ from parsezen.domain.jobs import (
     DocumentJob,
     DocumentSource,
     JobConfiguration,
+    LocalAIComponentSnapshot,
+    LocalAIPolicySnapshot,
     MarkdownOrganization,
     OutputConfiguration,
     PageRangeConfiguration,
@@ -633,6 +635,72 @@ def _book_from_json(value: dict[str, Any]) -> BookDocument:
     )
 
 
+def _local_ai_component_to_json(
+    component: LocalAIComponentSnapshot | None,
+) -> dict[str, str | int] | None:
+    if component is None:
+        return None
+    return {
+        "policy_version": component.policy_version,
+        "model": component.model,
+        "digest": component.digest,
+        **(
+            {"context_window": component.context_window}
+            if component.context_window is not None
+            else {}
+        ),
+    }
+
+
+def _local_ai_policy_to_json(policy: LocalAIPolicySnapshot) -> dict[str, object]:
+    return {
+        "translation": _local_ai_component_to_json(policy.translation),
+        "review": _local_ai_component_to_json(policy.review),
+        "visual_ocr": _local_ai_component_to_json(policy.visual_ocr),
+    }
+
+
+def _local_ai_component_from_json(raw: object) -> LocalAIComponentSnapshot | None:
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise TypeError
+    context_window = raw.get("context_window")
+    if context_window is not None and (
+        isinstance(context_window, bool) or not isinstance(context_window, int)
+    ):
+        raise TypeError
+    return LocalAIComponentSnapshot(
+        policy_version=_required_text(raw, "policy_version"),
+        model=_required_text(raw, "model"),
+        digest=_required_text(raw, "digest"),
+        context_window=context_window,
+    )
+
+
+def _local_ai_policy_from_json(raw: object) -> LocalAIPolicySnapshot:
+    if raw is None:
+        return LocalAIPolicySnapshot()
+    if not isinstance(raw, dict):
+        raise TypeError
+    if not all(key in raw for key in ("translation", "review")):
+        raise TypeError
+    if "visual_ocr" not in raw and "visual" not in raw:
+        raise TypeError
+    return LocalAIPolicySnapshot(
+        translation=_local_ai_component_from_json(raw.get("translation")),
+        review=_local_ai_component_from_json(raw.get("review")),
+        visual_ocr=_local_ai_component_from_json(raw.get("visual_ocr", raw.get("visual"))),
+    )
+
+
+def _required_text(raw: dict[object, object], key: str) -> str:
+    value = raw[key]
+    if not isinstance(value, str):
+        raise TypeError
+    return value
+
+
 def _job_to_json(job: DocumentJob) -> dict[str, Any]:
     configuration = job.configuration
     return {
@@ -667,6 +735,11 @@ def _job_to_json(job: DocumentJob) -> dict[str, Any]:
             "ai": {
                 "model": configuration.ai.model,
                 "context_window": configuration.ai.context_window,
+                "translation_model": configuration.ai.translation_model,
+                "translation_context_window": configuration.ai.translation_context_window,
+                "review_model": configuration.ai.review_model,
+                "review_context_window": configuration.ai.review_context_window,
+                "components": _local_ai_policy_to_json(configuration.ai.components),
             },
             "translation": {
                 "enabled": configuration.translation.enabled,
@@ -746,8 +819,13 @@ def _job_from_json(raw: object) -> DocumentJob:
             cover_path=Path(output_raw["cover_path"]) if output_raw["cover_path"] else None,
         ),
         ai=AIProfileConfiguration(
-            model=ai_raw["model"],
-            context_window=ai_raw["context_window"],
+            model=ai_raw.get("model"),
+            context_window=ai_raw.get("context_window"),
+            translation_model=ai_raw.get("translation_model"),
+            translation_context_window=ai_raw.get("translation_context_window"),
+            review_model=ai_raw.get("review_model"),
+            review_context_window=ai_raw.get("review_context_window"),
+            components=_local_ai_policy_from_json(ai_raw.get("components")),
         ),
         translation=TranslationConfiguration(
             enabled=bool(translation_raw["enabled"]),

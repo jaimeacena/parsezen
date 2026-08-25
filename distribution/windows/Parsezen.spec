@@ -19,6 +19,7 @@ datas = [
     (str(root / "LICENSE"), "."),
     (str(notices), "."),
 ]
+datas.extend(collect_data_files("parsezen", includes=["licenses/*.txt"]))
 binaries = []
 hiddenimports = []
 

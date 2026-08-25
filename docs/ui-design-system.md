@@ -41,16 +41,16 @@ Piezas principales:
 - `presentation/components.py`: controles compartidos accesibles.
 - `presentation/main_window.py`: composición de la aplicación y proyección del estado de dominio.
 - `presentation/processing_runner.py`: ejecución física, cancelación y eventos de procesamiento.
-- `presentation/local_ai_controller.py`: descubrimiento, recomendaciones e instalación de IA local.
+- `presentation/local_ai_controller.py`: descubrimiento local e instalación/protección de Ollama.
 - `presentation/local_ai_workflow.py`: propietario del estado y de la coordinación visible de IA
   local mediante señales y callbacks explícitos.
+- `presentation/component_setup.py`: vista fija de las capacidades `Traducción IA` y `Revisión IA`.
 - `presentation/workspace.py`: layout, navegación interna, foco y reflow global.
 - `presentation/job_table.py`: proyección responsive de la cola.
 - `presentation/job_configuration_dialog.py`: transacción de configuración por documento.
 - `presentation/phase_review_dialog.py`, `presentation/revision_dialog.py` y
   `presentation/markdown_review.py`: decisiones y comparaciones.
 - `presentation/book_editor_dialog.py`: metadatos, portada, estructura y contenido EPUB.
-- `presentation/model_manager.py`: estado, búsqueda y selección de IA local.
 
 La lógica de aplicación y dominio no importa PySide6. Los widgets reciben proyecciones y emiten
 intenciones; no inventan estados de cola, revisión o publicación.
@@ -80,7 +80,7 @@ Inventario visual inicial:
 - Dos hojas globales parcialmente solapadas: el tema oliva heredado y el sistema teal.
 - Preferencia binaria claro/oscuro, sin opción de seguir Windows.
 - Anchos mínimos efectivos aproximados: ventana principal 1.120 px, workspace 829 px,
-  configuración 666 px y gestor de modelos 1.186 px.
+  configuración 666 px y componentes de IA local 620 px.
 - Contrastes insuficientes en claro: texto atenuado 3,18:1, enlace teal 3,07:1,
   texto blanco sobre acción primaria 3,22:1 y bordes cercanos a 1,67:1.
 - Errores de trabajo mostrados en modales bloqueantes y foco no restaurado de forma uniforme.
@@ -278,7 +278,7 @@ Desde 320 px:
   caso;
 - el editor EPUB conserva sus dos paneles en escritorio; en ancho reducido mueve las herramientas
   menos frecuentes a un menú único sin retirar comandos;
-- el gestor de modelos distribuye nombre, tamaño, menú y acción en filas;
+- la vista de componentes distribuye exactamente dos tarjetas y apila ambas en ancho compacto;
 - los pies pasan a grids y ninguna acción esencial queda fuera del viewport.
 
 Las barras horizontales solo aparecen dentro de tiras cuya navegación espacial lo requiere. La
@@ -312,7 +312,7 @@ La fuente de verdad continúa siendo `DocumentJob` y `StageState`. La presentaci
 - error recuperable con revisión de configuración;
 - revisión pendiente;
 - pausa y cancelación;
-- IA no disponible, sin modelos, analizando, instalando y preparada;
+- IA no disponible y estados de componente `Preparado`, `Descargable` o `Equipo insuficiente`;
 - éxito publicado.
 
 No existe un loader indefinido nuevo. Las operaciones largas conservan progreso o una acción de
@@ -334,7 +334,7 @@ cancelación y los estados terminales mantienen explicación y siguiente paso.
 
 Las pruebas automatizadas cubren tokens, contraste, tema de sistema, teclado del interruptor,
 mensajes recuperables, persistencia de tema, reflow de la cola/configuración/editor/revisiones y
-gestor de modelos. `tests/test_visual_regressions.py` renderiza la vista principal en claro y
+la vista fija de componentes. `tests/test_visual_regressions.py` renderiza la vista principal en claro y
 oscuro a 320, 768 y 1.440 px, guarda capturas temporales por ejecución y comprueba geometría,
 solapamientos, foco, hover y recorte de interruptores. Las capturas son evidencia diagnóstica del
 test, no artefactos versionados ni una fuente de verdad manual.
@@ -345,7 +345,7 @@ Estado validado el 30 de julio de 2026 tras la evolución visual ligera:
 - Mypy: correcto sobre 82 módulos de producto.
 - Pytest: 1.076 pruebas aprobadas y 3 omitidas por depender de EPUBCheck u Ollama reales.
 - Cobertura: 88,25 % sobre 22.417 sentencias, sin exclusiones nuevas.
-- Matriz visual: 12 contratos aprobados, incluidos cola y gestor de modelos en ambos temas a
+- Matriz visual: 12 contratos aprobados, incluidos cola y componentes de IA en ambos temas a
   320 px.
 - Aceptación: 27 pruebas aprobadas.
 - Arranque fuente e inspección manual: cola, Configurar e IA local comprobados en claro y oscuro.
@@ -357,7 +357,7 @@ la revisión documental:
 - Ruff check y format: correctos.
 - Mypy: correcto sobre 120 módulos de producto.
 - Pytest: 1.547 pruebas aprobadas y 4 omitidas por entorno o herramientas externas.
-- Matriz visual: cola, revisión, gestor de modelos y editor EPUB comprobados en claro y oscuro a
+- Matriz visual: cola, revisión, componentes de IA y editor EPUB comprobados en claro y oscuro a
   320, 768 y 1.440 px. La cola se verifica además a 2.160 × 1.280 px con 0, 1, 4 y 8 documentos para
   detectar altura sobrante, deriva horizontal y pérdida del scroll.
 - Arranque fuente e inspección con UI Automation: estado vacío anclado bajo la cabecera, nombres

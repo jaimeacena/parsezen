@@ -26,10 +26,11 @@ nunca envía el documento fuera del equipo. Es open source, privado y gratuito.
 
 - **Escalable y preparado para trabajos largos**. Trabaja con varios documentos, consulta el tiempo estimado, pausa el proceso y reanúdalo cuando quieras o repite solo la fase que haya fallado. Una pausa conserva los checkpoints reutilizables y no se registra como cancelación.
 
-- **Gratis, con IA local fácil de configurar**. Todo se procesa gratis en tu equipo, sin modificar los archivos originales. Instala Ollama, comprueba si tu equipo es compatible y elige un modelo adecuado mediante una configuración guiada y sin comandos.
+- **Gratis, con IA local fácil de configurar**. Todo se procesa gratis en tu equipo, sin modificar
+  los archivos originales. Instala Ollama y Parsezen comprueba el equipo y prepara sus componentes
+  aprobados mediante una configuración guiada, sin comandos ni selector de modelos.
 
-- **Dos traducciones locales.** La IA local de Ollama es el valor inicial; para un PC estándar se
-  recomienda un modelo instalado de aproximadamente 4B parámetros. Argos sigue disponible cuando
+- **Dos traducciones locales.** Hy-MT2 Q4_K_M mediante Ollama es el valor inicial. Argos sigue disponible cuando
   se elige expresamente, pero Parsezen no cambia a él ni lo usa en pruebas como alternativa
   silenciosa. Ambos recorridos usan el glosario, la memoria terminológica y las mismas guardas de
   cifras, enlaces, estructura, idioma y cobertura.
@@ -87,8 +88,8 @@ nunca envía el documento fuera del equipo. Es open source, privado y gratuito.
   llamada de IA. Un folio con un glifo dudoso solo se corrige cuando lo confirman el OCR local o la
   secuencia de páginas vecinas.
 
-- **IA local sin complicaciones.** Parsezen te ayuda a instalar Ollama, comprobar tu equipo y elegir
-  un modelo adecuado sin que tengas que utilizar comandos.
+- **IA local sin complicaciones.** Parsezen te ayuda a instalar Ollama, comprobar tu equipo y
+  preparar los componentes aprobados sin que tengas que elegir tags ni utilizar comandos.
 
 ## Cómo usar Parsezen
 
@@ -135,6 +136,16 @@ y por página, RSS, OCR y recursos de un PDF; `scripts/benchmark_runtime.py` usa
 sintético para medir DPAPI, snapshots, recuperación, arranque en frío, disco temporal y tamaños de la
 instalación/instalador indicados. La validación opcional con documentos reales actualiza su informe
 atómicamente después de cada caso, de modo que una interrupción conserva las métricas ya obtenidas.
+La selección y aprobación de componentes especializados se define en la
+[política de modelos de IA local](docs/local-ai-model-policy.md): Hy-MT2 Q4_K_M prepara la
+`Traducción IA` y LFM Q6_K prepara la `Revisión IA`, después de superar sus gates de procedencia,
+licencia, privacidad, calidad y rendimiento.
+La pantalla de IA local muestra únicamente las capacidades fijas `Traducción IA` y `Revisión IA` y
+sus estados locales; no ofrece un selector de tags, endpoints ni modelos arbitrarios.
+Para comparar traducción EN→ES de forma optativa y sin descargar modelos, ejecuta
+`python scripts/evaluate_translation_models.py --models TAG_A TAG_B --repetitions 2` con tags que ya
+aparezcan instalados en Ollama. Usa el corpus sintético versionado del script y genera un informe
+atómico de hashes e indicadores agregados, sin contenido, prompts, respuestas ni rutas.
 
 ## Licencia
 

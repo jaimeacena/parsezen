@@ -10,6 +10,7 @@ from parsezen.domain.jobs import (
     DocumentFormat,
     DocumentJob,
     JobConfiguration,
+    LocalAIPolicySnapshot,
     OutputConfiguration,
     PageRangeConfiguration,
     ProcessingPlan,
@@ -38,6 +39,8 @@ def review_stage_for_result(
 def configuration_from_request(
     request: ProcessRequest,
     settings: AppSettings,
+    *,
+    local_ai_policy: LocalAIPolicySnapshot | None = None,
 ) -> JobConfiguration:
     """Normalize a low-level request into the product's two-plan configuration."""
 
@@ -83,6 +86,33 @@ def configuration_from_request(
         ai=AIProfileConfiguration(
             model=settings.model,
             context_window=settings.context_window,
+            components=(
+                local_ai_policy if local_ai_policy is not None else LocalAIPolicySnapshot()
+            ),
+            translation_model=(
+                local_ai_policy.translation.model
+                if local_ai_policy is not None and local_ai_policy.translation is not None
+                else settings.translation_model
+            ),
+            translation_context_window=(
+                local_ai_policy.translation.context_window
+                if local_ai_policy is not None
+                and local_ai_policy.translation is not None
+                and local_ai_policy.translation.context_window is not None
+                else settings.translation_context_window
+            ),
+            review_model=(
+                local_ai_policy.review.model
+                if local_ai_policy is not None and local_ai_policy.review is not None
+                else settings.review_model
+            ),
+            review_context_window=(
+                local_ai_policy.review.context_window
+                if local_ai_policy is not None
+                and local_ai_policy.review is not None
+                and local_ai_policy.review.context_window is not None
+                else settings.review_context_window
+            ),
         ),
         translation=TranslationConfiguration(
             enabled=translation_enabled,
@@ -178,6 +208,28 @@ def request_and_settings_from_job(
     settings = AppSettings(
         model=configuration.ai.model,
         context_window=configuration.ai.context_window,
+        translation_model=(
+            configuration.ai.components.translation.model
+            if configuration.ai.components.translation is not None
+            else configuration.ai.translation_model
+        ),
+        translation_context_window=(
+            configuration.ai.components.translation.context_window
+            if configuration.ai.components.translation is not None
+            and configuration.ai.components.translation.context_window is not None
+            else configuration.ai.translation_context_window
+        ),
+        review_model=(
+            configuration.ai.components.review.model
+            if configuration.ai.components.review is not None
+            else configuration.ai.review_model
+        ),
+        review_context_window=(
+            configuration.ai.components.review.context_window
+            if configuration.ai.components.review is not None
+            and configuration.ai.components.review.context_window is not None
+            else configuration.ai.review_context_window
+        ),
         output_directory=configuration.output.directory,
         image_output_directory=configuration.output.image_directory,
         timeout_seconds=timeout_seconds,

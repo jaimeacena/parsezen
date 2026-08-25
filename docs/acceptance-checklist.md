@@ -125,7 +125,7 @@ python scripts/sync_version.py --check
   sin texto del documento, con acciones acordes a su causa.
 - `Reintentar esta fase` ejecuta solo el documento fallido aunque existan trabajos nuevos u otros
   fallos en la cola, y conserva checkpoints y decisiones anteriores válidos.
-- Un fallo de IA abre su gestor; uno de destino prioriza revisar la salida; uno de integridad
+- Un fallo de IA abre `Componentes de IA local`; uno de destino prioriza revisar la salida; uno de integridad
   explica que el resultado definitivo no fue sustituido.
 - Todo resultado completado ha superado una comprobación del temporal previa a la publicación y
   muestra `Integridad final comprobada` sin exponer texto ni rutas.
@@ -395,22 +395,16 @@ cifrado debe eliminarse.
 - Sin modo solo local, se exige proteger y reiniciar.
 - `OLLAMA_NO_CLOUD` en el proceso de Parsezen no acredita por sí solo un servidor activo; falta de
   `server.json` protegido mantiene bloqueado el envío de contenido.
-- Sin modelos, el gestor mantiene recomendación y entrada manual.
-- `IA local` abre el gestor aunque la detección aún no haya terminado.
-- Estado de Ollama, lista única, contexto e instalación manual se reúnen en esa página.
-- El gestor muestra `Instalados` y `Añadir modelo`; búsqueda, instalación por nombre, recomendaciones
-  y catálogo aparecen dentro de Añadir modelo.
-- Cambiar el predeterminado actualiza solo los trabajos pendientes heredados. Una elección
-  específica o un trabajo iniciado no se modifica.
-- El gestor indica cuántos trabajos heredan el predeterminado y bloquea la eliminación de modelos
-  usados por trabajos sin terminar.
-- Los tres recomendados tienen roles distintos y caben en el equipo.
-- `llmfit` solo se activa si versión, arquitectura y SHA-256 están fijados por Parsezen; su proceso no
-  recibe claves de API, credenciales ni proxies heredados.
-- Instalar muestra progreso y permite cancelar.
-- Un identificador canónico queda seleccionado solo tras aparecer en `/api/tags`.
-- Los modelos cloud nunca aparecen.
-- El contexto elegido se envía realmente.
+- `IA local` abre una vista fija con exactamente las tarjetas `Traducción IA` y `Revisión IA`, aunque
+  la detección aún no haya terminado.
+- Cada tarjeta muestra solo `Preparado`, `Descargable` o `Equipo insuficiente`; no hay búsqueda,
+  selector de tags, endpoint, recomendación general ni borrado arbitrario.
+- La vista no lee ni escribe documentos. La comprobación de catálogo solo usa la API local de Ollama
+  (`/api/version`, `/api/tags` y `/api/show`) y no conserva el contenido de sus respuestas.
+- Pulsar `Actualizar estados` emite una petición de refresco; pulsar `Descargar componente` emite
+  únicamente `translation` o `review`, sin iniciar una descarga genérica.
+- Un componente solo pasa a `Preparado` cuando su manifest y digest coinciden con `/api/tags` y
+  `/api/show`; los tags cloud y los ausentes no se aceptan como seleccionables.
 
 `Validar con IA real.cmd` añade un recorrido optativo. No se publica su informe local. Una ejecución
 que genera un archivo válido pero conserva fragmentos, incidencias de idioma o avisos PDF debe

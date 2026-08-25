@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from zipfile import ZipInfo
 
@@ -8,11 +9,14 @@ import scripts.validate_real_workflows as workflow_module
 from scripts.validate_real_workflows import (
     SYNTHETIC_PAGE_COUNT,
     LiveWorkflowResult,
+    LocalEvaluationRun,
     _parse_glossary_arguments,
     _validate_generated_output,
     full_matrix_cases,
     run_live_workflows,
+    run_local_model_evaluation,
     select_live_settings,
+    write_evaluation_report,
     write_report,
     write_synthetic_pdf,
 )
@@ -438,3 +442,166 @@ def test_live_workflow_applies_only_recommended_revision_changes(
     assert results[0].rejected_revision_changes == 1
     assert results[0].revision_changes_by_kind == {"content": 2}
     assert results[0].recommended_revision_changes_by_kind == {"content": 1}
+
+
+def test_local_evaluation_repeats_explicit_installed_tags_with_shared_context(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "sample.pdf"
+    source.write_bytes(b"%PDF-1.4\n")
+    models = (
+        OllamaModel("alpha:4b", "Alpha", recommended_context=4096),
+        OllamaModel("beta:4b", "Beta", recommended_context=8192),
+    )
+    monkeypatch.setattr(
+        workflow_module,
+        "discover_ollama",
+        lambda _preferred: OllamaConnection(OllamaStatus.READY, models),
+    )
+    selected: list[tuple[str, int | None]] = []
+
+    def select(model: str, *, context_window: int | None = None) -> AppSettings:
+        selected.append((model, context_window))
+        return AppSettings(model=model, context_window=context_window or 4096)
+
+    monkeypatch.setattr(workflow_module, "select_live_settings", select)
+    calls: list[tuple[str, int, Path, int]] = []
+
+    def run(
+        _sources: tuple[Path, ...],
+        output_root: Path,
+        settings: AppSettings,
+        **_kwargs: object,
+    ) -> tuple[LiveWorkflowResult, ...]:
+        calls.append((settings.model or "", settings.context_window, output_root, len(calls)))
+        return (
+            LiveWorkflowResult(
+                source_index=1,
+                source_extension=".pdf",
+                case="case",
+                passed=True,
+                elapsed_seconds=0.1,
+                stages=("completed",),
+                quality_gate_passed=True,
+                output_sha256=("a" if settings.model == "alpha:4b" else "b") * 64,
+            ),
+        )
+
+    monkeypatch.setattr(workflow_module, "run_live_workflows", run)
+
+    runs = run_local_model_evaluation(
+        (source,),
+        tmp_path / "outputs",
+        ("alpha:4b", "beta:4b"),
+        repetitions=2,
+        context_window=8192,
+    )
+
+    assert len(runs) == 4
+    assert [(run.model, run.context_window, run.repetition) for run in runs] == [
+        ("alpha:4b", 8192, 1),
+        ("alpha:4b", 8192, 2),
+        ("beta:4b", 8192, 1),
+        ("beta:4b", 8192, 2),
+    ]
+    assert selected == [("alpha:4b", 8192), ("beta:4b", 8192)]
+    assert len({call[2] for call in calls}) == 4
+
+
+def test_local_evaluation_report_is_paired_atomic_and_content_free(tmp_path: Path) -> None:
+    private_path = tmp_path / "private-title.pdf"
+    private_text = "private document text"
+    result_a = LiveWorkflowResult(
+        source_index=1,
+        source_extension=".pdf",
+        case="epub-solo-traduccion",
+        passed=True,
+        elapsed_seconds=0.1,
+        stages=("completed",),
+        quality_gate_passed=True,
+        output_sha256="a" * 64,
+    )
+    result_b = LiveWorkflowResult(
+        source_index=1,
+        source_extension=".pdf",
+        case="epub-solo-traduccion",
+        passed=True,
+        elapsed_seconds=0.1,
+        stages=("completed",),
+        quality_gate_passed=True,
+        output_sha256="b" * 64,
+    )
+    runs = (
+        LocalEvaluationRun("opaque-case", "alpha:4b", 8192, 1, result_a),
+        LocalEvaluationRun("opaque-case", "beta:4b", 8192, 1, result_b),
+    )
+    report_path = tmp_path / "evaluation.json"
+
+    write_evaluation_report(
+        report_path,
+        runs,
+        evaluation_id="opaque-evaluation",
+        options={"context_window": 8192, "repetitions": 1, "prompt": private_text},
+    )
+
+    report = report_path.read_text(encoding="utf-8")
+    assert '"model": "alpha:4b"' in report
+    assert '"context_window": 8192' in report
+    assert '"repetition": 1' in report
+    assert "a" * 64 in report and "b" * 64 in report
+    assert '"same_output": false' in report
+    assert '"stable_output": false' in report
+    assert private_path.name not in report
+    assert str(private_path) not in report
+    assert private_text not in report
+    assert "epub-solo-traduccion" not in report
+    payload = json.loads(report)
+    assert all(
+        key not in run["metrics"]
+        for run in payload["runs"]
+        for key in ("source_index", "source_extension", "case")
+    )
+    assert not (tmp_path / ".evaluation.json.tmp").exists()
+
+
+def test_local_evaluation_paired_summary_accepts_identical_output_hashes() -> None:
+    result = LiveWorkflowResult(
+        source_index=1,
+        source_extension=".pdf",
+        case="epub-solo-traduccion",
+        passed=True,
+        elapsed_seconds=0.1,
+        stages=("completed",),
+        quality_gate_passed=True,
+        output_sha256="a" * 64,
+    )
+    runs = (
+        LocalEvaluationRun("opaque-case", "alpha:4b", 8192, 1, result),
+        LocalEvaluationRun("opaque-case", "beta:4b", 8192, 1, result),
+    )
+
+    summary = workflow_module._paired_summary(runs)
+
+    assert summary[0]["same_output"] is True
+
+
+def test_local_evaluation_repeat_summary_requires_two_matching_outputs(tmp_path: Path) -> None:
+    result = LiveWorkflowResult(
+        source_index=1,
+        source_extension=".pdf",
+        case="epub-solo-traduccion",
+        passed=True,
+        elapsed_seconds=0.1,
+        stages=("completed",),
+        quality_gate_passed=True,
+        output_sha256="a" * 64,
+    )
+    runs = (
+        LocalEvaluationRun("opaque-case", "alpha:4b", 8192, 1, result),
+        LocalEvaluationRun("opaque-case", "alpha:4b", 8192, 2, result),
+    )
+
+    summary = workflow_module._repeat_summary(runs)
+
+    assert summary[0]["stable_output"] is True

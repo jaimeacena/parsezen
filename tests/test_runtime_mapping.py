@@ -12,6 +12,8 @@ from parsezen.domain.jobs import (
     DocumentJob,
     DocumentSource,
     JobConfiguration,
+    LocalAIComponentSnapshot,
+    LocalAIPolicySnapshot,
     OutputConfiguration,
     ProcessingPlan,
     TranslationConfiguration,
@@ -60,6 +62,105 @@ def test_process_request_and_settings_round_trip_independent_configuration() -> 
     assert restored_request.source_content_sha256 == job.source.content_sha256
     assert restored_settings.model == "qwen3:4b"
     assert restored_settings.context_window == 8192
+
+
+def test_default_job_maps_to_direct_runtime_without_ai_review_flags() -> None:
+    job = DocumentJob.create(
+        DocumentSource(Path("book.txt"), DocumentFormat.TEXT, 100, 1),
+        JobConfiguration(),
+        order=0,
+    )
+
+    request, _settings = request_and_settings_from_job(job)
+
+    assert job.configuration.plan is ProcessingPlan.STANDARD
+    assert not request.review_content
+    assert not request.review_structure
+
+
+def test_configuration_mapping_preserves_optional_local_ai_policy_snapshot() -> None:
+    policy = LocalAIPolicySnapshot(
+        translation=LocalAIComponentSnapshot(
+            "policy-v1", "translator:7b", "a" * 64, context_window=8_192
+        ),
+        review=LocalAIComponentSnapshot(
+            "policy-v1", "reviewer:7b", "b" * 64, context_window=16_384
+        ),
+    )
+
+    configuration = configuration_from_request(
+        ProcessRequest(Path("book.pdf"), convert_to_markdown=True, output_format=OutputFormat.EPUB),
+        AppSettings(model="general:7b", context_window=8192),
+        local_ai_policy=policy,
+    )
+
+    assert configuration.ai.components == policy
+
+
+def test_configuration_mapping_carries_specialized_settings_without_snapshot() -> None:
+    configuration = configuration_from_request(
+        ProcessRequest(Path("book.pdf"), convert_to_markdown=True),
+        AppSettings(
+            model="general:7b",
+            context_window=4_096,
+            translation_model="translator:7b",
+            translation_context_window=8_192,
+            review_model="reviewer:7b",
+            review_context_window=16_384,
+        ),
+    )
+
+    assert configuration.ai.translation_model == "translator:7b"
+    assert configuration.ai.translation_context_window == 8_192
+    assert configuration.ai.review_model == "reviewer:7b"
+    assert configuration.ai.review_context_window == 16_384
+
+
+def test_runtime_mapping_uses_snapshot_models_and_contexts_per_phase() -> None:
+    from parsezen.component_catalog import REVIEW_COMPONENT_MANIFEST, TRANSLATION_COMPONENT_MANIFEST
+
+    policy = LocalAIPolicySnapshot(
+        translation=LocalAIComponentSnapshot(
+            TRANSLATION_COMPONENT_MANIFEST.policy_version,
+            TRANSLATION_COMPONENT_MANIFEST.model_name,
+            TRANSLATION_COMPONENT_MANIFEST.ollama_digest,
+            context_window=TRANSLATION_COMPONENT_MANIFEST.context_window,
+        ),
+        review=LocalAIComponentSnapshot(
+            REVIEW_COMPONENT_MANIFEST.policy_version,
+            REVIEW_COMPONENT_MANIFEST.model_name,
+            REVIEW_COMPONENT_MANIFEST.ollama_digest,
+            context_window=REVIEW_COMPONENT_MANIFEST.context_window,
+        ),
+    )
+    request = ProcessRequest(
+        Path("book.pdf"),
+        convert_to_markdown=True,
+        target_language="es",
+        review_content=True,
+    )
+
+    configuration = configuration_from_request(
+        request,
+        AppSettings(model="legacy:7b", context_window=4_096),
+        local_ai_policy=policy,
+    )
+    job = DocumentJob.create(
+        DocumentSource(Path("book.pdf"), DocumentFormat.PDF, 100, 1),
+        configuration,
+        order=0,
+    )
+
+    _request, settings = request_and_settings_from_job(job)
+
+    assert (settings.translation_model, settings.translation_context_window) == (
+        TRANSLATION_COMPONENT_MANIFEST.model_name,
+        8_192,
+    )
+    assert (settings.review_model, settings.review_context_window) == (
+        REVIEW_COMPONENT_MANIFEST.model_name,
+        REVIEW_COMPONENT_MANIFEST.context_window,
+    )
 
 
 def test_epub_cover_removal_reaches_the_physical_request() -> None:

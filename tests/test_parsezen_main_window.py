@@ -45,6 +45,8 @@ from parsezen.domain.jobs import (
     DocumentSource,
     JobConfiguration,
     JobStatus,
+    LocalAIComponentSnapshot,
+    LocalAIPolicySnapshot,
     OutputConfiguration,
     ProcessingPlan,
     TranslationConfiguration,
@@ -56,8 +58,6 @@ from parsezen.errors import LocalModelUnavailableError
 from parsezen.failure_recovery import FailureKind, ProcessingFailure
 from parsezen.final_integrity import FinalIntegrityReport
 from parsezen.infrastructure.state_store import StateStore, StateStoreError
-from parsezen.local_models import OllamaConnection, OllamaModel, OllamaStatus
-from parsezen.model_recommendations import ModelRecommendation, ModelRecommendations
 from parsezen.pdf_conversion import PdfQualityReport, PdfReviewIssue
 from parsezen.presentation.design_system import (
     ThemeMode,
@@ -71,7 +71,6 @@ from parsezen.presentation.job_table import (
     CONFIGURING_ROLE,
     JobColumn,
 )
-from parsezen.presentation.local_ai_controller import LocalAIAction
 from parsezen.presentation.main_window import ParsezenMainWindow
 from parsezen.processing import ProcessResult, ProcessStage
 from parsezen.recent_activity import load_recent_jobs
@@ -93,6 +92,41 @@ class ProjectedStatus:
     FAILED = JobStatus.FAILED
     PAUSED = JobStatus.PAUSED
     REVIEW_PENDING = JobStatus.WAITING_REVIEW
+
+
+def test_default_job_configuration_captures_specialized_profiles_and_policy() -> None:
+    policy = LocalAIPolicySnapshot(
+        translation=LocalAIComponentSnapshot(
+            "local-ai-policy-v1", "translator:7b", "a" * 64, context_window=8_192
+        ),
+        review=LocalAIComponentSnapshot(
+            "local-ai-policy-v1", "reviewer:7b", "b" * 64, context_window=16_384
+        ),
+    )
+    settings = AppSettings(
+        model="general:7b",
+        context_window=4_096,
+        translation_model="translator:7b",
+        translation_context_window=8_192,
+        review_model="reviewer:7b",
+        review_context_window=16_384,
+    )
+
+    configuration = main_window_module._default_configuration(  # noqa: SLF001
+        Path("book.pdf"),
+        settings,
+        local_ai_policy=policy,
+    )
+
+    assert configuration.ai == AIProfileConfiguration(
+        model="general:7b",
+        context_window=4_096,
+        translation_model="translator:7b",
+        translation_context_window=8_192,
+        review_model="reviewer:7b",
+        review_context_window=16_384,
+        components=policy,
+    )
 
 
 class _RuntimeView:
@@ -465,6 +499,8 @@ def test_main_window_uses_independent_configuration_and_persists_queue(
     first_job = window._job_queue.for_source(first)  # noqa: SLF001
     second_job = window._job_queue.for_source(second)  # noqa: SLF001
     assert first_job is not None and second_job is not None
+    assert first_job.configuration.plan is ProcessingPlan.STANDARD
+    assert second_job.configuration.plan is ProcessingPlan.STANDARD
     window._job_queue.configure(  # noqa: SLF001
         first_job.id,
         replace(
@@ -501,6 +537,10 @@ def test_main_window_uses_independent_configuration_and_persists_queue(
     assert prepared is not None
     assert prepared.items[0].request.output_format.value == "markdown"
     assert prepared.items[1].request.output_format.value == "epub"
+    assert not prepared.items[0].request.review_content
+    assert not prepared.items[0].request.review_structure
+    assert not prepared.items[1].request.review_content
+    assert not prepared.items[1].request.review_structure
     assert prepared.items[0].settings is not prepared.items[1].settings
     assert all(entry.request is None and entry.settings is None for entry in entries)
 
@@ -1633,59 +1673,13 @@ def test_table_click_opens_the_compact_configuration_sheet(
     assert index.data(CONFIGURING_ROLE) is True
     assert discovery == []
 
-    window._local_ai_workflow.model_discovery_succeeded(  # noqa: SLF001
-        OllamaConnection(
-            OllamaStatus.READY,
-            (OllamaModel("qwen3:4b-instruct", "Qwen3 4B Instruct"),),
-        )
-    )
-    window._local_ai_workflow.select_model("qwen3:4b-instruct")  # noqa: SLF001
     editor._set_review_enabled(True)  # noqa: SLF001
 
-    assert editor.configuration().ai.model == "qwen3:4b-instruct"
     assert editor.plan_reviewed.isChecked()
 
     editor.reject()
 
     assert index.data(CONFIGURING_ROLE) is False
-
-
-def test_configuration_sheet_resumes_after_local_ai_settings(
-    qtbot,
-    tmp_path: Path,
-    monkeypatch,
-) -> None:
-    source = tmp_path / "notes.txt"
-    source.write_text("Original", encoding="utf-8")
-    window = ParsezenMainWindow(
-        settings=AppSettings(),
-        auto_discover_ai=False,
-        state_path=tmp_path / "workspace.sqlite3",
-    )
-    qtbot.addWidget(window)
-    workflow = window._local_ai_workflow  # noqa: SLF001
-    monkeypatch.setattr(workflow, "start_model_discovery", lambda *, automatic: None)
-    monkeypatch.setattr(workflow, "start_model_recommendations", lambda: None)
-    window.set_source_paths((source,))
-    job = window._project_jobs()[0]
-
-    window._configure_job(job.id, None)
-    editor = window._active_configuration_dialog  # noqa: SLF001
-    assert editor is not None
-
-    editor.models_requested.emit()
-
-    manager = workflow.manager
-    assert manager is not None
-    assert window.parsezen_workspace.current_internal_widget is manager
-
-    manager.reject()
-    qtbot.waitUntil(lambda: window.parsezen_workspace.current_internal_widget is editor)
-
-    assert window._active_configuration_dialog is editor  # noqa: SLF001
-    assert window.parsezen_workspace.current_internal_widget is editor
-    editor.reject()
-    assert window.parsezen_workspace.current_internal_widget is None
 
 
 def test_internal_back_closes_the_immediately_saved_configuration(
@@ -1714,66 +1708,6 @@ def test_internal_back_closes_the_immediately_saved_configuration(
     assert configured.output.format is DocumentFormat.EPUB
     assert window._active_configuration_dialog is None  # noqa: SLF001
     assert window.parsezen_workspace.current_internal_widget is None
-
-
-def test_model_manager_opens_before_discovery_and_starts_it(
-    qtbot, tmp_path: Path, monkeypatch
-) -> None:
-    window = ParsezenMainWindow(
-        settings=AppSettings(),
-        auto_discover_ai=False,
-        state_path=tmp_path / "workspace.sqlite3",
-    )
-    qtbot.addWidget(window)
-    discovery: list[bool] = []
-    workflow = window._local_ai_workflow  # noqa: SLF001
-    monkeypatch.setattr(
-        workflow,
-        "start_model_discovery",
-        lambda *, automatic: discovery.append(automatic),
-    )
-
-    workflow.show_model_manager()
-
-    assert workflow.manager is not None
-    assert window.parsezen_workspace.current_internal_widget is workflow.manager
-    assert discovery == [False]
-    workflow.manager.reject()
-
-
-def test_local_ai_page_updates_one_profile_for_all_unstarted_documents(
-    qtbot,
-    tmp_path: Path,
-    monkeypatch,
-) -> None:
-    source = tmp_path / "notes.txt"
-    source.write_text("Original", encoding="utf-8")
-    window = ParsezenMainWindow(
-        settings=AppSettings(),
-        auto_discover_ai=False,
-        state_path=tmp_path / "workspace.sqlite3",
-    )
-    qtbot.addWidget(window)
-    window.set_source_paths((source,))
-    model = OllamaModel("qwen3:4b-instruct", "Qwen3 4B Instruct")
-    workflow = window._local_ai_workflow  # noqa: SLF001
-    workflow.model_discovery_succeeded(OllamaConnection(OllamaStatus.READY, (model,)))
-    monkeypatch.setattr(workflow, "start_model_recommendations", lambda **_kwargs: None)
-
-    workflow.show_model_manager()
-    manager = workflow.manager
-    assert manager is not None
-
-    manager.select_requested.emit(model.model_id)
-    manager.context_window.setValue(16_384)
-
-    job = window._job_queue.for_source(source)  # noqa: SLF001
-    assert job is not None
-    assert window._settings.model == model.model_id  # noqa: SLF001
-    assert window._settings.context_window == 16_384  # noqa: SLF001
-    assert job.configuration.ai.model == model.model_id
-    assert job.configuration.ai.context_window == 16_384
-    manager.reject()
 
 
 def test_failed_job_inline_message_uses_the_real_failed_stage(qtbot, tmp_path: Path) -> None:
@@ -2693,206 +2627,12 @@ def test_global_ai_default_updates_every_editable_profile(
     )
     window._job_queue.replace(failed)
 
-    window._local_ai_workflow._propagate_profile(old, new)  # noqa: SLF001
+    window._queue_configuration.propagate_ai_profile(old, new)  # noqa: SLF001
 
     inherited, custom, failed = window._job_queue.jobs
     assert inherited.configuration.ai == new
     assert custom.configuration.ai == new
     assert failed.configuration.ai == new
-
-
-def test_model_in_use_by_unfinished_work_cannot_be_deleted_silently(
-    qtbot,
-    tmp_path: Path,
-    monkeypatch,
-) -> None:
-    source = tmp_path / "book.txt"
-    source.write_text("Text", encoding="utf-8")
-    window = ParsezenMainWindow(
-        settings=AppSettings(model="qwen3:4b-instruct"),
-        auto_discover_ai=False,
-        state_path=tmp_path / "workspace.sqlite3",
-    )
-    qtbot.addWidget(window)
-    window.set_source_paths((source,))
-    job = window._job_queue.jobs[0]
-    window._job_queue.replace(
-        job.with_configuration(
-            replace(
-                job.configuration,
-                ai=AIProfileConfiguration(model="qwen3:4b-instruct"),
-                plan=ProcessingPlan.LOCAL_AI_REVIEWED,
-            )
-        )
-    )
-    messages: list[tuple[str, str]] = []
-    starts: list[object] = []
-    monkeypatch.setattr(
-        QMessageBox,
-        "information",
-        lambda _parent, title, text: messages.append((title, text)),
-    )
-    workflow = window._local_ai_workflow  # noqa: SLF001
-    monkeypatch.setattr(workflow, "start_ai_setup", lambda *args, **kwargs: starts.append(args))
-
-    workflow.confirm_model_delete("qwen3:4b-instruct")
-
-    assert not starts
-    assert messages
-    assert messages[0][0] == "Modelo utilizado por trabajos pendientes"
-    assert "book.txt" in messages[0][1]
-    assert "otro modelo predeterminado" in messages[0][1]
-
-
-def test_local_ai_controller_projection_covers_every_user_visible_state(
-    qtbot,
-    tmp_path: Path,
-    monkeypatch,
-) -> None:
-    window = ParsezenMainWindow(
-        settings=AppSettings(),
-        auto_discover_ai=False,
-        state_path=tmp_path / "workspace.sqlite3",
-    )
-    qtbot.addWidget(window)
-    workflow = window._local_ai_workflow  # noqa: SLF001
-    manager = Mock()
-    workflow._manager = manager  # noqa: SLF001
-    available = OllamaModel(
-        "qwen3:4b-instruct",
-        "Qwen3 4B Instruct",
-        size_bytes=4_000_000_000,
-    )
-    reasoning = OllamaModel("deepseek-r1:7b", "DeepSeek R1")
-    workflow._pending_ai_model = available.model_id  # noqa: SLF001
-
-    workflow.model_discovery_succeeded(
-        OllamaConnection(
-            OllamaStatus.READY,
-            (reasoning, available),
-            message="Disponible",
-        )
-    )
-
-    assert workflow.models == (available,)
-    assert window._settings.model == available.model_id  # noqa: SLF001
-    assert workflow.pending_ai_model is None
-    manager.set_installed_models.assert_called()
-    manager.set_connection_status.assert_called_with(OllamaStatus.READY, "Disponible")
-
-    monkeypatch.setattr(window._local_ai, "discover", lambda _model: True)  # noqa: SLF001
-    workflow.start_model_discovery(automatic=False)
-    manager.set_connection_status.assert_called_with(None)
-
-    workflow.model_discovery_failed("Sin conexión local")
-    assert workflow.status is OllamaStatus.UNAVAILABLE
-    assert workflow.models == ()
-    workflow.model_discovery_finished()
-
-    recommendations = ModelRecommendations(
-        (),
-        "Equipo de prueba",
-        "1.0",
-        datetime.now(UTC),
-    )
-    monkeypatch.setattr(
-        window._local_ai,  # noqa: SLF001
-        "recommend",
-        lambda *, force_refresh=False: force_refresh,
-    )
-    workflow.start_model_recommendations(force_refresh=True)
-    workflow.model_recommendations_succeeded(recommendations)
-    assert workflow.recommendations is recommendations
-    workflow.model_recommendations_failed("No se pudo recomendar")
-    assert workflow.recommendations is None
-    workflow.model_recommendations_finished()
-
-    installs: list[tuple[str, int | None]] = []
-    monkeypatch.setattr(
-        workflow,
-        "start_model_install",
-        lambda model_id, *, expected_download_size_bytes=None: installs.append(
-            (model_id, expected_download_size_bytes)
-        ),
-    )
-    recommendation = ModelRecommendation(
-        "qwen3:4b-instruct",
-        "Qwen3 4B",
-        "Equilibrado",
-        4_000,
-        8_192,
-        20.0,
-        5.0,
-        0.9,
-    )
-    workflow.install_recommendation(recommendation)
-    workflow.install_custom_model("qwen3:4b-instruct")
-    workflow.install_custom_model("")
-    assert installs == [
-        ("qwen3:4b-instruct", 4_000),
-        ("qwen3:4b-instruct", None),
-    ]
-    manager.set_custom_error.assert_called()
-
-    requested_actions: list[LocalAIAction] = []
-    discoveries: list[bool] = []
-    shown: list[bool] = []
-    monkeypatch.setattr(
-        workflow,
-        "start_ai_setup",
-        lambda action, **_kwargs: requested_actions.append(action),
-    )
-    monkeypatch.setattr(
-        workflow,
-        "start_model_discovery",
-        lambda *, automatic: discoveries.append(automatic),
-    )
-    monkeypatch.setattr(workflow, "show_model_manager", lambda: shown.append(True))
-    for status in (
-        OllamaStatus.NOT_INSTALLED,
-        OllamaStatus.STOPPED,
-        OllamaStatus.LOCAL_ONLY_REQUIRED,
-    ):
-        workflow._status = status  # noqa: SLF001
-        workflow.handle_primary_action()
-    workflow._status = OllamaStatus.MISSING_MODEL  # noqa: SLF001
-    workflow.handle_primary_action()
-    workflow._status = OllamaStatus.READY  # noqa: SLF001
-    workflow.handle_primary_action()
-    assert requested_actions == [
-        LocalAIAction.INSTALL,
-        LocalAIAction.START,
-        LocalAIAction.PROTECT,
-    ]
-    assert shown == [True]
-    assert discoveries == [False]
-
-    monkeypatch.setattr(window._local_ai, "setup", lambda *_args, **_kwargs: True)  # noqa: SLF001
-    type(workflow).start_ai_setup(
-        workflow,
-        LocalAIAction.PULL_MODEL,
-        model_id=available.model_id,
-        expected_download_size_bytes=4_000,
-    )
-    assert workflow.setup_action is LocalAIAction.PULL_MODEL
-    workflow.ai_setup_progress_changed(35, "Descargando")
-    manager.set_operation.assert_called_with(
-        "Descargando",
-        percent=35,
-        cancellable=True,
-    )
-    workflow.ai_setup_succeeded(available.model_id)
-    assert workflow.pending_ai_model == available.model_id
-    workflow.ai_setup_finished()
-    assert workflow.setup_action is None
-    assert discoveries[-1] is False
-
-    monkeypatch.setattr(window._local_ai, "cancel_setup", lambda: True)  # noqa: SLF001
-    workflow.cancel_setup()
-    manager.cancel_button.setEnabled.assert_called_with(False)
-    workflow.ai_setup_cancelled("Cancelado")
-    workflow.ai_setup_failed("Falló")
-    manager.finish_operation.assert_called_with("Falló")
 
 
 def test_processing_controller_projects_progress_success_failure_and_pause(
@@ -3718,7 +3458,7 @@ def test_primary_action_reports_each_non_runnable_queue_state(
     assert notices[-1][0] == "No se pudo iniciar"
 
 
-def test_model_and_destination_commands_cover_safe_recovery_paths(
+def test_destination_commands_cover_safe_recovery_paths(
     qtbot,
     tmp_path: Path,
     monkeypatch,
@@ -3738,40 +3478,6 @@ def test_model_and_destination_commands_cover_safe_recovery_paths(
     )
     qtbot.addWidget(window)
     window.set_source_paths((source,))
-    workflow = window._local_ai_workflow  # noqa: SLF001
-    manager = Mock()
-    workflow._manager = manager  # noqa: SLF001
-    model = OllamaModel(
-        "qwen3:4b-instruct",
-        "Qwen3 4B Instruct",
-        size_bytes=4_000_000_000,
-    )
-    workflow.model_discovery_succeeded(OllamaConnection(OllamaStatus.READY, (model,)))
-    setup_requests: list[tuple[LocalAIAction, str | None]] = []
-    monkeypatch.setattr(
-        workflow,
-        "start_ai_setup",
-        lambda action, *, model_id=None, **_kwargs: setup_requests.append((action, model_id)),
-    )
-    monkeypatch.setattr(
-        QMessageBox,
-        "question",
-        lambda *_args, **_kwargs: QMessageBox.StandardButton.Yes,
-    )
-
-    workflow.confirm_model_delete(model.model_id)
-    workflow.confirm_model_delete("missing:model")
-    assert setup_requests == [(LocalAIAction.DELETE_MODEL, model.model_id)]
-
-    workflow.select_model("missing:model")
-    manager.set_custom_error.assert_called()
-    workflow.select_model(model.model_id)
-    assert window._settings.model == model.model_id  # noqa: SLF001
-    workflow.select_context_window(True)
-    assert window._settings.context_window is None  # noqa: SLF001
-    workflow.select_context_window(8_192)
-    assert window._settings.context_window == 8_192  # noqa: SLF001
-
     window._reset_global_output_directory()  # noqa: SLF001
     assert window._settings.output_directory is None  # noqa: SLF001
     window._reset_global_output_directory()  # noqa: SLF001
@@ -3782,31 +3488,6 @@ def test_model_and_destination_commands_cover_safe_recovery_paths(
         lambda *_args, **_kwargs: "",
     )
     window._select_output_directory()  # noqa: SLF001
-
-    warnings: list[str] = []
-    monkeypatch.setattr(
-        QMessageBox,
-        "warning",
-        lambda _parent, _title, text, *_args, **_kwargs: warnings.append(str(text)),
-    )
-    monkeypatch.setattr(main_window_module.QDesktopServices, "openUrl", lambda _url: False)
-    workflow.open_ollama_library()
-    assert warnings
-
-    monkeypatch.setattr(window._local_ai, "setup", lambda *_args, **_kwargs: True)  # noqa: SLF001
-    window._settings = replace(  # noqa: SLF001
-        window._settings,
-        model=model.model_id,
-        context_window=8_192,
-    )
-    type(workflow).start_ai_setup(
-        workflow,
-        LocalAIAction.DELETE_MODEL,
-        model_id=model.model_id,
-    )
-    workflow.ai_setup_succeeded("")
-    assert window._settings.model is None  # noqa: SLF001
-    assert workflow.pending_deleted_model == model.model_id
 
 
 def test_review_surfaces_preserve_work_across_editor_and_storage_failures(
@@ -3946,12 +3627,7 @@ def test_workspace_commands_route_through_the_active_surface(
     window._configure_job(job.id, None)  # noqa: SLF001
     editor = window._active_configuration_dialog  # noqa: SLF001
     assert editor is not None
-    model = OllamaModel("qwen3:4b-instruct", "Qwen3 4B Instruct")
-    workflow = window._local_ai_workflow  # noqa: SLF001
-    workflow.model_discovery_succeeded(OllamaConnection(OllamaStatus.READY, (model,)))
-    workflow.select_model(model.model_id)
     editor._set_review_enabled(True)  # noqa: SLF001
-    assert editor.configuration().ai.model == model.model_id
     assert editor.plan_reviewed.isChecked()
     editor.reject()
 

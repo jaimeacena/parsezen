@@ -28,30 +28,17 @@ Referencias primarias:
 - [Corrección publicada en Stanza 1.12.2](https://github.com/stanfordnlp/stanza/releases/tag/v1.12.2)
 - [Argos Translate 1.11.0 en PyPI](https://pypi.org/project/argostranslate/)
 
-## Componente administrado llmfit
+## Componentes de IA local
 
-`llmfit` no es una dependencia importada ni forma parte de los lockfiles: Parsezen descarga el
-binario MIT de Windows desde las releases de `AlexsJones/llmfit` cuando el usuario solicita una
-recomendación. Consulta como máximo una vez cada siete días y puede actualizar ese componente sin
-reinstalar la aplicación.
+Parsezen ya no descarga, actualiza ni ejecuta herramientas de recomendación de modelos. La interfaz
+activa muestra únicamente las capacidades fijadas por el catálogo de Parsezen. Sus comprobaciones
+usan el transporte de loopback y solo leen `/api/version`, `/api/tags` y `/api/show`; no reciben
+documentos ni aceptan endpoints configurables.
 
-La descarga fija repositorio, arquitectura, nombre, esquema HTTPS y hosts de redirección; limita
-metadatos, archivo y ejecutable; exige el digest SHA-256 comunicado por GitHub; extrae una única
-entrada `llmfit.exe`; ejecuta `--version` antes de activarla atómicamente y conserva el hash para
-verificar cada uso posterior. También conserva y verifica el texto MIT incluido en la release junto
-al ejecutable. Ante cualquier fallo se usa la copia anterior ya verificada. El
-artefacto 1.1.4 comprobado el 21 de julio de 2026 no presentaba firma Authenticode aunque el README
-del proyecto afirme que los binarios de Windows se firman, por lo que el código no considera esa
-firma una garantía disponible. El SHA-256 evita corrupción o sustituciones fuera del canal fijado,
-pero una cuenta o release upstream comprometida sigue siendo un riesgo residual propio de cualquier
-autoactualización. Por ello no se aceptan forks, URLs configurables ni versiones preliminares.
-
-El comando de recomendación se ejecuta localmente con el dashboard desactivado y sin heredar una
-clave de LocalMaxxing. No recibe documentos. La comprobación de releases contacta GitHub. Para una
-variante inferida, Parsezen consulta como máximo tres manifiestos pequeños en
-`registry.ollama.ai`: exige HTTPS, bloquea redirecciones, limita la respuesta, valida esquema,
-digests y capas, y usa su suma como tamaño real. Solo transmite el identificador público del modelo;
-no transmite hardware, documentos, rutas ni preferencias.
+Un componente se considera preparado únicamente cuando el manifest local y el digest anunciado por
+Ollama coinciden. Los estados `Descargable` e `Insuficiente` son decisiones fail-closed de la
+evaluación y no autorizan descargar un tag arbitrario. Cualquier futuro instalador deberá recibir
+solo una capacidad del catálogo y volver a comprobar `/api/tags` antes de publicar el estado.
 
 ## Revisión
 
