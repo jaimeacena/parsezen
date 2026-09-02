@@ -77,6 +77,24 @@ def test_standard_configuration_uses_visual_format_and_compact_settings(
     assert not hasattr(dialog, "translation_enabled")
 
 
+def test_compatible_batch_action_is_explicit_and_reports_its_scope(qtbot, tmp_path: Path) -> None:
+    dialog = JobConfigurationDialog(_job(tmp_path), embedded=True, compatible_count=2)
+    qtbot.addWidget(dialog)
+    dialog.show()
+
+    assert dialog.apply_compatible_button.text() == "Aplicar a 2 compatibles"
+    assert not dialog.apply_compatible_button.isHidden()
+    with qtbot.waitSignal(dialog.apply_compatible_requested):
+        qtbot.mouseClick(dialog.apply_compatible_button, Qt.MouseButton.LeftButton)
+
+
+def test_compatible_batch_action_is_hidden_without_candidates(qtbot, tmp_path: Path) -> None:
+    dialog = JobConfigurationDialog(_job(tmp_path), embedded=True)
+    qtbot.addWidget(dialog)
+
+    assert dialog.apply_compatible_button.isHidden()
+
+
 def test_unconfigured_markdown_defaults_to_epub_and_direct_processing(
     qtbot,
     tmp_path: Path,
@@ -128,12 +146,13 @@ def test_translation_choice_reveals_only_translator_and_glossary(
     assert not dialog.glossary_row.isHidden()
     assert dialog.glossary_row.value.text() == "Ninguno"
     assert not hasattr(dialog, "translation_route")
-    assert "corrección se integra" in dialog.plan_reviewed.accessibleDescription()
+    assert "compara de nuevo" in dialog.plan_reviewed.accessibleDescription()
+    assert "queda como propuesta" in dialog.plan_reviewed.accessibleDescription()
     assert dialog.plan_reviewed.toolTip() == dialog.plan_reviewed.accessibleDescription()
 
     dialog._set_review_enabled(True)  # noqa: SLF001
 
-    assert "corrección se integra" in dialog.plan_reviewed.accessibleDescription()
+    assert "compara de nuevo" in dialog.plan_reviewed.accessibleDescription()
 
 
 def test_translation_menu_contains_no_translation_and_every_supported_language(
@@ -278,14 +297,14 @@ def test_translation_can_use_the_global_local_ai_model(qtbot, tmp_path: Path) ->
         target_language="es",
     )
     assert dialog.translator_row.value.text() == "IA local · contextual"
-    assert "corrección se integra" in dialog.plan_reviewed.accessibleDescription()
+    assert "compara de nuevo" in dialog.plan_reviewed.accessibleDescription()
     assert request.target_language == "es"
     assert request.offline_translation_language is None
     assert request.improvement_mode is not None
 
     dialog._set_review_enabled(True)  # noqa: SLF001
 
-    assert "corrección se integra" in dialog.plan_reviewed.accessibleDescription()
+    assert "compara de nuevo" in dialog.plan_reviewed.accessibleDescription()
 
 
 def test_ai_translation_requires_the_global_model(qtbot, tmp_path: Path) -> None:

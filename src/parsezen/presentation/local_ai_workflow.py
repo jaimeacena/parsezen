@@ -112,7 +112,7 @@ class LocalAIWorkflow(QObject):
         dialog.finished.connect(
             lambda _result, setup=dialog: self._workspace.close_internal_view(setup)
         )
-        self._workspace.show_internal_view(dialog, "IA local", replace_app_header=True)
+        self._workspace.show_internal_view(dialog, "IA local")
 
     @Slot()
     def show_component_setup(self) -> None:

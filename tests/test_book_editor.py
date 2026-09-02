@@ -420,6 +420,99 @@ def test_markdown_book_nests_two_explicit_chapters_and_uses_preorder_spine(
     assert book.spine == ("section-0001", "section-0002", "section-0003", "section-0004")
 
 
+def test_final_book_navigation_preserves_sections_below_parts_and_chapters(
+    tmp_path: Path,
+) -> None:
+    store = ArtifactStore(tmp_path / "artifacts", protect=reversible, unprotect=reversible)
+    markdown = (
+        "# Part I — Origins\n\nContainer text.\n\n"
+        f"{EPUB_CHAPTER_MARKER}\n\n"
+        "# Chapter 1 — Roots\n\nBody.\n\n"
+        "## First section\n\nSection body.\n\n"
+        "### Detail\n\nDetail body.\n\n"
+        f"{EPUB_CHAPTER_MARKER}\n\n"
+        "# Chapter 2 — Branches\n\nSecond body.\n"
+    )
+    book = create_book_from_markdown(
+        markdown,
+        (),
+        EpubBookMetadata("Book", "en", "Author"),
+        store,
+        job_id="job",
+    )
+
+    content = publish_book(book, store, job_id="job")
+
+    with ZipFile(BytesIO(content)) as archive:
+        navigation = archive.read("EPUB/nav.xhtml").decode("utf-8")
+        chapter = archive.read("EPUB/text/chapter-0002.xhtml").decode("utf-8")
+    assert '<a href="text/chapter-0001.xhtml">Part I — Origins</a><ol>' in navigation
+    assert '<a href="text/chapter-0002.xhtml">Chapter 1 — Roots</a><ol>' in navigation
+    assert '<a href="text/chapter-0002.xhtml#section-0002-0002">First section</a><ol>' in navigation
+    assert '<a href="text/chapter-0002.xhtml#section-0002-0003">Detail</a>' in navigation
+    assert '<a href="text/chapter-0003.xhtml">Chapter 2 — Branches</a>' in navigation
+    assert 'id="section-0002-0002"' in chapter
+    assert 'id="section-0002-0003"' in chapter
+    assert "data-parsezen-navigation" not in chapter
+
+
+def test_final_book_navigation_deduplicates_a_bare_marker_from_a_combined_chapter_title(
+    tmp_path: Path,
+) -> None:
+    store = ArtifactStore(tmp_path / "artifacts", protect=reversible, unprotect=reversible)
+    book = create_book_from_markdown(
+        "# CHAPTER 1\n\n## The Hierarchy of the Cosmos\n\nBody.\n",
+        (),
+        EpubBookMetadata("Book", "en", "Author"),
+        store,
+        job_id="job",
+    )
+
+    content = publish_book(book, store, job_id="job")
+
+    with ZipFile(BytesIO(content)) as archive:
+        navigation = archive.read("EPUB/nav.xhtml").decode("utf-8")
+    assert ">CHAPTER 1 — The Hierarchy of the Cosmos</a>" in navigation
+    assert ">CHAPTER 1</a>" not in navigation
+
+
+def test_final_book_navigation_adds_safe_targets_to_new_editor_headings(
+    tmp_path: Path,
+) -> None:
+    store = ArtifactStore(tmp_path / "artifacts", protect=reversible, unprotect=reversible)
+    book = make_book(store)
+    first_id = book.spine[0]
+    edited = BookEditor(book, store, job_id="job").update_content(
+        first_id,
+        "<h1>First</h1><p>Body.</p><h2>Added section</h2><p>More.</p>",
+    )
+
+    content = publish_book(edited, store, job_id="job")
+
+    with ZipFile(BytesIO(content)) as archive:
+        navigation = archive.read("EPUB/nav.xhtml").decode("utf-8")
+        chapter = archive.read("EPUB/text/chapter-0001.xhtml").decode("utf-8")
+    assert '<a href="text/chapter-0001.xhtml#nav-heading-0002">Added section</a>' in navigation
+    assert '<h2 id="nav-heading-0002">Added section</h2>' in chapter
+
+
+def test_final_book_navigation_does_not_repeat_a_running_heading(tmp_path: Path) -> None:
+    store = ArtifactStore(tmp_path / "artifacts", protect=reversible, unprotect=reversible)
+    book = create_book_from_markdown(
+        "# Chapter\n\nBody.\n\n## Running title\n\nOne.\n\n## Running title\n\nTwo.\n",
+        (),
+        EpubBookMetadata("Book", "en"),
+        store,
+        job_id="job",
+    )
+
+    content = publish_book(book, store, job_id="job")
+
+    with ZipFile(BytesIO(content)) as archive:
+        navigation = archive.read("EPUB/nav.xhtml").decode("utf-8")
+    assert navigation.count(">Running title</a>") == 1
+
+
 def test_markdown_book_leaves_an_ambiguous_container_flat(tmp_path: Path) -> None:
     store = ArtifactStore(tmp_path / "artifacts", protect=reversible, unprotect=reversible)
     markdown = (
@@ -437,3 +530,160 @@ def test_markdown_book_leaves_an_ambiguous_container_flat(tmp_path: Path) -> Non
     assert [section.title for section in book.sections] == ["Parte I", "Chapter 1"]
     assert book.sections[0].children == ()
     assert book.spine == ("section-0001", "section-0002")
+
+
+def test_markdown_book_uses_confirmed_contents_depth_for_unnumbered_sections(
+    tmp_path: Path,
+) -> None:
+    store = ArtifactStore(tmp_path / "artifacts", protect=reversible, unprotect=reversible)
+    markdown = (
+        '<table class="document-toc">\n'
+        '<thead><tr><th class="toc-label">Entry</th>'
+        '<th class="toc-folio">Page</th></tr></thead>\n<tbody>\n'
+        '<tr><td class="toc-label toc-level-0">Foundations</td>'
+        '<td class="toc-folio">1</td></tr>\n'
+        '<tr><td class="toc-label toc-level-1">First lesson</td>'
+        '<td class="toc-folio">3</td></tr>\n'
+        '<tr><td class="toc-label toc-level-0">Closing</td>'
+        '<td class="toc-folio">9</td></tr>\n'
+        "</tbody>\n</table>\n\n"
+        "# Foundations\n\nBody.\n\n"
+        f"{EPUB_CHAPTER_MARKER}\n\n# First lesson\n\nLesson.\n\n"
+        f"{EPUB_CHAPTER_MARKER}\n\n# Closing\n\nEnd.\n"
+    )
+
+    book = create_book_from_markdown(
+        markdown,
+        (),
+        EpubBookMetadata("Book", "en"),
+        store,
+        job_id="job",
+    )
+
+    assert [section.title for section in book.sections] == ["Foundations", "Closing"]
+    assert [section.title for section in book.sections[0].children] == ["First lesson"]
+    assert book.spine == ("section-0001", "section-0002", "section-0003")
+
+
+def test_markdown_book_recovers_containers_from_a_styled_flat_contents_table(
+    tmp_path: Path,
+) -> None:
+    store = ArtifactStore(tmp_path / "artifacts", protect=reversible, unprotect=reversible)
+    toc = (
+        '<table class="document-toc"><thead><tr><th class="toc-label">Entry</th>'
+        '<th class="toc-folio">Page</th></tr></thead><tbody>'
+        '<tr><td class="toc-label toc-level-0"><strong>Introduction</strong></td>'
+        '<td class="toc-folio">1</td></tr>'
+        '<tr><td class="toc-label toc-level-0">I - Foundations</td>'
+        '<td class="toc-folio">2</td></tr>'
+        '<tr><td class="toc-label toc-level-0">First practice</td>'
+        '<td class="toc-folio">3</td></tr>'
+        '<tr><td class="toc-label toc-level-0">Second practice</td>'
+        '<td class="toc-folio">4</td></tr>'
+        '<tr><td class="toc-label toc-level-0">II - Application</td>'
+        '<td class="toc-folio">5</td></tr>'
+        '<tr><td class="toc-label toc-level-0">Third practice</td>'
+        '<td class="toc-folio">6</td></tr>'
+        '<tr><td class="toc-label toc-level-0">Fourth practice</td>'
+        '<td class="toc-folio">7</td></tr>'
+        '<tr><td class="toc-label toc-level-0"><strong>Afterword</strong></td>'
+        '<td class="toc-folio">8</td></tr>'
+        "</tbody></table>\n\n"
+    )
+    chapters = (
+        "# Introduction\n\nOpening.",
+        "# I - Foundations\n\nGroup.",
+        "# First practice\n\nFirst.",
+        "# Second practice\n\nSecond.",
+        "# II - Application\n\nGroup.",
+        "# Third practice\n\nThird.",
+        "# Fourth practice\n\nFourth.",
+        "# Afterword\n\nClosing.",
+    )
+    markdown = toc + f"\n\n{EPUB_CHAPTER_MARKER}\n\n".join(chapters)
+
+    book = create_book_from_markdown(
+        markdown,
+        (),
+        EpubBookMetadata("Book", "en"),
+        store,
+        job_id="job",
+    )
+
+    assert [section.title for section in book.sections] == [
+        "Introduction",
+        "I - Foundations",
+        "II - Application",
+        "Afterword",
+    ]
+    assert [section.title for section in book.sections[1].children] == [
+        "First practice",
+        "Second practice",
+    ]
+    assert [section.title for section in book.sections[2].children] == [
+        "Third practice",
+        "Fourth practice",
+    ]
+    assert len(book.spine) == 8
+
+
+def test_final_navigation_uses_printed_contents_depth_despite_body_heading_levels(
+    tmp_path: Path,
+) -> None:
+    store = ArtifactStore(tmp_path / "artifacts", protect=reversible, unprotect=reversible)
+    markdown = (
+        '<table class="document-toc">\n'
+        '<thead><tr><th class="toc-label">Entry</th>'
+        '<th class="toc-folio">Page</th></tr></thead>\n<tbody>\n'
+        '<tr><td class="toc-label toc-level-0">Chapter 1 — Main</td>'
+        '<td class="toc-folio">1</td></tr>\n'
+        '<tr><td class="toc-label toc-level-1">FirstSection</td>'
+        '<td class="toc-folio">2</td></tr>\n'
+        '<tr><td class="toc-label toc-level-1">Second Section</td>'
+        '<td class="toc-folio">3</td></tr>\n'
+        "</tbody>\n</table>\n\n"
+        "# Chapter 1 — Main\n\nBody.\n\n"
+        "## First Section\n\nFirst.\n\n"
+        "### Second Section\n\nSecond.\n"
+    )
+    book = create_book_from_markdown(
+        markdown,
+        (),
+        EpubBookMetadata("Book", "en"),
+        store,
+        job_id="job",
+    )
+
+    content = publish_book(book, store, job_id="job")
+
+    with ZipFile(BytesIO(content)) as archive:
+        navigation = archive.read("EPUB/nav.xhtml").decode("utf-8")
+    assert ">First Section</a></li><li>" in navigation
+    assert ">Second Section</a></li>" in navigation
+    assert ">First Section</a><ol>" not in navigation
+
+
+def test_final_navigation_omits_cover_headings_but_keeps_the_first_body_section(
+    tmp_path: Path,
+) -> None:
+    store = ArtifactStore(tmp_path / "artifacts", protect=reversible, unprotect=reversible)
+    markdown = (
+        "# THE BOOK\n\n## A subtitle\n\nCopyright 2026 Example Press.\n\n"
+        "# Contents\n\nChapter One ........ 1\n\nChapter Two ........ 9\n\n"
+        f"{EPUB_CHAPTER_MARKER}\n\n# Chapter One\n\nOpening body.\n"
+    )
+    book = create_book_from_markdown(
+        markdown,
+        (),
+        EpubBookMetadata("The Book", "en"),
+        store,
+        job_id="job",
+    )
+
+    content = publish_book(book, store, job_id="job")
+
+    with ZipFile(BytesIO(content)) as archive:
+        navigation = archive.read("EPUB/nav.xhtml").decode("utf-8")
+    assert ">THE BOOK</a>" not in navigation
+    assert ">A subtitle</a>" not in navigation
+    assert ">Chapter One</a>" in navigation

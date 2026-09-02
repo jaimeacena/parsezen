@@ -4,9 +4,12 @@ from __future__ import annotations
 
 import logging
 import re
+import unicodedata
+from collections import Counter
 from collections.abc import Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
+from difflib import SequenceMatcher
 from hashlib import sha256
 from html import escape, unescape
 from io import BytesIO
@@ -40,6 +43,10 @@ _PDF_PAGE_MARKER_PATTERN = re.compile(
     r"<!--\s*PZDOC PDF PAGE \d+\s*-->",
     re.IGNORECASE,
 )
+_PDF_OUTLINE_MARKER_PATTERN = re.compile(
+    r"<!--\s*PZDOC PDF OUTLINE (?P<level>[1-6])\s*-->",
+    re.IGNORECASE,
+)
 _EXPLICIT_CHAPTER_PATTERN = re.compile(
     r"(?m)^\s*<!--\s*PZDOC EPUB CHAPTER\s*-->\s*$",
     re.IGNORECASE,
@@ -69,6 +76,11 @@ _DOCUMENT_TOC_OPENING_PATTERN = re.compile(
     r'^\s*<table\s+class=["\']document-toc["\']\s*>',
     re.IGNORECASE,
 )
+_DOCUMENT_TOC_LABEL_PATTERN = re.compile(
+    r'<td\s+class=["\']toc-label toc-level-(?P<level>[0-2])["\']\s*>'
+    r"(?P<label>.*?)</td>",
+    re.IGNORECASE | re.DOTALL,
+)
 _BARE_XML_AMPERSAND_PATTERN = re.compile(
     r"&(?!amp;|lt;|gt;|apos;|quot;|#\d+;|#x[0-9a-f]+;)",
     re.IGNORECASE,
@@ -76,10 +88,12 @@ _BARE_XML_AMPERSAND_PATTERN = re.compile(
 _SAFE_TABLE_TAGS = frozenset(
     {"table", "thead", "tbody", "tr", "th", "td", "br", "strong", "em", "a"}
 )
-_MAX_CHAPTER_CHARACTERS = 120_000
+_MAX_CHAPTER_CHARACTERS = 500_000
 _MIN_CHAPTER_CHARACTERS = 1_500
 _MIN_STRONG_CHAPTER_CHARACTERS = 240
 _MAX_CHAPTERS = 250
+_MAX_AUTOMATIC_CHAPTER_HEADINGS = 128
+_MAX_AUTOMATIC_NAVIGATION_HEADINGS = 250
 _ORDINAL_HEADING_PATTERN = (
     r"(?:\d+|[ivxlcdm]+|one|two|three|four|five|six|seven|eight|nine|ten|"
     r"uno|dos|tres|cuatro|cinco|seis|siete|ocho|nueve|diez)"
@@ -94,13 +108,6 @@ _CHAPTER_TITLE_PATTERN = re.compile(
     r"^\s*(?:chapter|cap(?:\u00ed|i)tulo|chapitre|cap\.)\s+"
     + _ORDINAL_HEADING_PATTERN
     + r"(?:\b|[.:\u2013\u2014-])",
-    re.IGNORECASE,
-)
-_STRONG_CHAPTER_TITLE_PATTERN = re.compile(
-    r"^(?:(?:chapter|cap[ií]tulo|part|parte|book|libro)\s+"
-    r"(?:\d+|[ivxlcdm]+|one|two|three|four|five|six|seven|eight|nine|ten)"
-    r"(?:\b|[.:—-])|introduction|introducci[oó]n|preface|pr[oó]logo|"
-    r"foreword|appendix|ap[eé]ndice)\b",
     re.IGNORECASE,
 )
 _ALLOWED_IMAGE_MEDIA_TYPES = frozenset(
@@ -148,6 +155,7 @@ class EpubChapterPlan:
     title: str
     markdown: str
     role: str | None = None
+    toc_level: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -158,6 +166,8 @@ class EpubOutlineEntry:
     title: str
     chapter_number: int
     starts_chapter: bool
+    include_in_navigation: bool = True
+    navigation_level: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -176,17 +186,90 @@ class EpubNavigationNode:
     title: str
     filename: str
     children: tuple[EpubNavigationNode, ...] = ()
+    fragment: str | None = None
+
+
+@dataclass(slots=True)
+class _MutableNavigationNode:
+    """Internal outline node while heading levels are being nested."""
+
+    title: str
+    filename: str
+    fragment: str
+    children: list[_MutableNavigationNode]
+
+
+@dataclass(slots=True)
+class _ChapterNavigationGroup:
+    """One chapter-level navigation item before cross-chapter nesting."""
+
+    chapter: EpubChapterPlan | None
+    nodes: tuple[EpubNavigationNode, ...]
+    children: list[_ChapterNavigationGroup]
 
 
 def classify_heading_role(title: str) -> str | None:
     """Classify only explicit, numbered container or chapter titles."""
 
     cleaned = re.sub(r"[*_`~\[\]]", "", title).strip()
-    if _CONTAINER_TITLE_PATTERN.match(cleaned):
+    if _CONTAINER_TITLE_PATTERN.match(cleaned) and _structural_heading_is_explicit(
+        cleaned,
+        _CONTAINER_TITLE_PATTERN,
+    ):
         return "container"
-    if _CHAPTER_TITLE_PATTERN.match(cleaned):
+    if _CHAPTER_TITLE_PATTERN.match(cleaned) and _structural_heading_is_explicit(
+        cleaned,
+        _CHAPTER_TITLE_PATTERN,
+    ):
         return "chapter"
     return None
+
+
+def _structural_heading_is_explicit(title: str, pattern: re.Pattern[str]) -> bool:
+    """Reject prose sentences that merely begin with a numbered Part or Chapter."""
+
+    match = pattern.match(title)
+    if match is None:
+        return False
+    tail = title[match.end() :].strip()
+    if not tail:
+        return True
+    if tail[0] in ",;!?":
+        return False
+    if tail[0] in ":\u2013\u2014-":
+        candidate = tail[1:].strip()
+        return bool(candidate) and len(candidate.split()) <= 24
+    if tail[0] == ".":
+        candidate = tail[1:].strip()
+        words = re.findall(r"[^\W\d_]+", candidate, re.UNICODE)
+        if not candidate or len(words) > 12 or re.search(r"[.!?;]", candidate):
+            return False
+        significant = [word for word in words if len(word) > 2]
+        title_words = sum(word[:1].isupper() for word in significant)
+        return len(words) <= 4 or bool(significant) and title_words / len(significant) >= 0.6
+    words = re.findall(r"[^\W\d_]+", tail, re.UNICODE)
+    significant = [word for word in words if len(word) > 2]
+    title_words = sum(word[:1].isupper() for word in significant)
+    return (
+        bool(words)
+        and len(words) <= 16
+        and not re.search(r"[,;.!?]", tail)
+        and bool(significant)
+        and title_words / len(significant) >= 0.6
+    )
+
+
+def _is_strong_chapter_title(title: str) -> bool:
+    return (
+        classify_heading_role(title) is not None
+        or re.match(
+            r"^(?:introduction|introducci[o\u00f3]n|preface|pr[o\u00f3]logo|foreword|"
+            r"append(?:ix|ices)|ap[e\u00e9]ndic(?:e|es))\b",
+            title,
+            re.IGNORECASE,
+        )
+        is not None
+    )
 
 
 def _markdown_heading_role(markdown: str) -> str | None:
@@ -254,6 +337,7 @@ def build_epub(
         cover_resource=cover_resource,
         modified=modified,
         cancellation=cancellation,
+        navigation=_navigation_from_plan(plan),
     )
     integrity_report = verify_epub_payload(
         content,
@@ -428,17 +512,39 @@ def build_epub_from_xhtml(
 
 def plan_epub(markdown: str, fallback_title: str) -> EpubPlan:
     """Return the exact chapter split and a complete heading outline."""
+    markdown = _separate_adjacent_markdown_headings(markdown)
+    semantic_document = analyze_markdown(markdown)
     explicit_chapters = _explicit_chapters(markdown)
     if explicit_chapters is None:
         blocks = _markdown_blocks(markdown)
-        semantic_document = analyze_markdown(markdown)
         preferred_level = _preferred_heading_level(blocks, semantic_document)
-        strong_headings = _strong_chapter_headings(blocks, semantic_document)
+        toc_titles = _toc_titles(semantic_document)
+        toc_is_reliable = _toc_evidence_is_reliable(
+            blocks,
+            semantic_document,
+            toc_titles,
+            preferred_level,
+        )
+        strong_headings = _strong_chapter_headings(
+            blocks,
+            semantic_document,
+            preferred_level,
+            toc_is_reliable=toc_is_reliable,
+        )
+        forced_headings = _forced_chapter_headings(blocks, semantic_document)
+        preferred_headings = _preferred_chapter_headings(
+            blocks,
+            semantic_document,
+            preferred_level,
+            toc_titles,
+            toc_is_reliable=toc_is_reliable,
+        )
         chapters = _chapters_from_blocks(
             blocks,
             fallback_title,
-            preferred_level,
+            preferred_headings,
             strong_headings,
+            forced_headings,
         )
     else:
         preferred_level = None
@@ -457,27 +563,337 @@ def plan_epub(markdown: str, fallback_title: str) -> EpubPlan:
             title=chapter.title,
             markdown=_normalize_heading_hierarchy(chapter.markdown),
             role=chapter.role,
+            toc_level=chapter.toc_level,
         )
         for chapter in chapters
     )
+    toc_heading_levels = _toc_heading_levels(semantic_document)
+    chapters = tuple(
+        EpubChapterPlan(
+            filename=chapter.filename,
+            title=chapter.title,
+            markdown=chapter.markdown,
+            role=(
+                chapter.role
+                or (
+                    "chapter"
+                    if _is_numbered_toc_chapter_title(
+                        chapter.title,
+                        _toc_heading_level(chapter.title, toc_heading_levels),
+                    )
+                    else None
+                )
+            ),
+            toc_level=_toc_heading_level(chapter.title, toc_heading_levels),
+        )
+        for chapter in chapters
+    )
+    chapters = _infer_toc_chapter_roles(chapters)
+    headings_by_chapter = tuple(_markdown_headings(chapter.markdown) for chapter in chapters)
+    automatic_navigation_level = min(4, (preferred_level or 1) + 2)
+    automatic_navigation_count = sum(
+        1
+        for headings in headings_by_chapter
+        for level, _title, _outline_level in headings
+        if level <= automatic_navigation_level
+    )
+    expose_shallow_hierarchy = automatic_navigation_count <= _MAX_AUTOMATIC_NAVIGATION_HEADINGS
     outline: list[EpubOutlineEntry] = []
-    for chapter_number, chapter in enumerate(chapters, start=1):
+    toc_titles = _toc_titles(semantic_document)
+    toc_navigation_matches = sum(
+        1
+        for headings in headings_by_chapter
+        for level, title, _outline_level in headings
+        if level <= automatic_navigation_level and _heading_matches_toc(title, toc_titles)
+    )
+    required_toc_navigation_matches = min(
+        8,
+        max(2, (automatic_navigation_count + 19) // 20),
+    )
+    toc_navigation_is_reliable = (
+        bool(toc_titles) and toc_navigation_matches >= required_toc_navigation_matches
+    )
+    outline_navigation_matches = sum(
+        1
+        for headings in headings_by_chapter
+        for level, _title, outline_level in headings
+        if outline_level is not None and level <= automatic_navigation_level
+    )
+    outline_navigation_is_reliable = outline_navigation_matches >= required_toc_navigation_matches
+    front_toc_end = _front_structured_toc_end_position(semantic_document)
+    semantic_heading_evidence = iter(
+        (block.role, block.position)
+        for block in semantic_document.blocks
+        for _heading in _markdown_headings(block.markdown)
+    )
+    for chapter_number, (chapter, chapter_headings) in enumerate(
+        zip(chapters, headings_by_chapter, strict=True),
+        start=1,
+    ):
         first_heading = True
-        for match in _HEADING_PATTERN.finditer(chapter.markdown):
-            title = re.sub(r"[*_`~\[\]]", "", match.group(2)).strip()
+        combined_subtitle = _combined_numbered_chapter_subtitle(chapter.markdown)
+        chapter_marker = _chapter_marker_key(chapter.title)
+        step_navigation_level: int | None = None
+        for level, raw_title, outline_level in chapter_headings:
+            semantic_role, semantic_position = next(
+                semantic_heading_evidence,
+                (SemanticRole.BODY, len(semantic_document.blocks)),
+            )
+            title = re.sub(r"[*_`~\[\]]", "", raw_title).strip()
             if not title:
                 continue
-            level = len(match.group(1))
+            starts_chapter = first_heading
+            toc_level = _toc_heading_level(title, toc_heading_levels)
+            navigation_level = toc_level + 1 if toc_level is not None else outline_level
+            if _step_heading_key(title) is not None:
+                if step_navigation_level is None:
+                    step_navigation_level = navigation_level or level
+                navigation_level = step_navigation_level
+            title_component = combined_subtitle is not None and _normalized_heading_title(
+                title
+            ) == _normalized_heading_title(combined_subtitle)
+            repeated_bare_chapter_marker = (
+                not starts_chapter
+                and _bare_chapter_marker_key(title) is not None
+                and _bare_chapter_marker_key(title) == chapter_marker
+            )
+            semantic_navigation_allowed = (
+                semantic_role is not SemanticRole.TOC
+                and semantic_role is not SemanticRole.PROVENANCE
+                and (front_toc_end is None or semantic_position > front_toc_end)
+                and not (
+                    semantic_role is SemanticRole.FRONT_MATTER and semantic_document.toc_blocks > 0
+                )
+            )
             outline.append(
                 EpubOutlineEntry(
                     level=level,
                     title=title[:160],
                     chapter_number=chapter_number,
-                    starts_chapter=first_heading and title == chapter.title,
+                    starts_chapter=starts_chapter,
+                    include_in_navigation=(
+                        semantic_navigation_allowed
+                        and not title_component
+                        and not repeated_bare_chapter_marker
+                        and (
+                            starts_chapter
+                            or outline_level is not None
+                            or (
+                                expose_shallow_hierarchy
+                                and not toc_navigation_is_reliable
+                                and not outline_navigation_is_reliable
+                                and level <= automatic_navigation_level
+                            )
+                            or _heading_matches_toc(title, toc_titles)
+                            or _is_strong_chapter_title(title)
+                        )
+                    ),
+                    navigation_level=navigation_level,
                 )
             )
             first_heading = False
     return EpubPlan(chapters, tuple(outline), preferred_level)
+
+
+def _separate_adjacent_markdown_headings(markdown: str) -> str:
+    """Expose valid ATX headings that directly follow a paragraph to block analysis."""
+
+    lines = markdown.splitlines(keepends=True)
+    separated: list[str] = []
+    fence: str | None = None
+    for line in lines:
+        fence_match = _FENCE_PATTERN.match(line)
+        if fence_match is not None:
+            marker = fence_match.group(1)
+            if fence is None:
+                fence = marker
+            elif marker == fence:
+                fence = None
+        content = line.rstrip("\r\n")
+        if (
+            fence is None
+            and _HEADING_PATTERN.fullmatch(content) is not None
+            and separated
+            and separated[-1].strip()
+        ):
+            separated.append("\r\n" if line.endswith("\r\n") else "\n")
+        separated.append(line)
+    return "".join(separated)
+
+
+def _markdown_headings(markdown: str) -> tuple[tuple[int, str, int | None], ...]:
+    """Return actual Markdown headings while ignoring examples inside fenced code."""
+
+    headings: list[tuple[int, str, int | None]] = []
+    fence: str | None = None
+    pending_outline_level: int | None = None
+    for line in markdown.splitlines():
+        fence_match = _FENCE_PATTERN.match(line)
+        if fence_match is not None:
+            marker = fence_match.group(1)
+            if fence is None:
+                fence = marker
+            elif marker == fence:
+                fence = None
+            continue
+        if fence is not None:
+            continue
+        outline_marker = _PDF_OUTLINE_MARKER_PATTERN.fullmatch(line.strip())
+        if outline_marker is not None:
+            pending_outline_level = int(outline_marker.group("level"))
+            continue
+        heading = _HEADING_PATTERN.fullmatch(line)
+        if heading is not None:
+            headings.append((len(heading.group(1)), heading.group(2), pending_outline_level))
+            pending_outline_level = None
+        elif line.strip():
+            pending_outline_level = None
+    return tuple(headings)
+
+
+def _heading_fragment(chapter_number: int, heading_number: int) -> str:
+    return f"section-{chapter_number:04d}-{heading_number:04d}"
+
+
+def _navigation_from_plan(plan: EpubPlan) -> tuple[EpubNavigationNode, ...]:
+    """Expose the reviewed heading hierarchy without inventing new chapter boundaries."""
+
+    entries_by_chapter: dict[int, list[EpubOutlineEntry]] = {}
+    for entry in plan.outline:
+        entries_by_chapter.setdefault(entry.chapter_number, []).append(entry)
+
+    chapter_groups: list[_ChapterNavigationGroup] = []
+    for chapter_number, chapter in enumerate(plan.chapters, start=1):
+        roots: list[_MutableNavigationNode] = []
+        stack: list[tuple[int, _MutableNavigationNode]] = []
+        seen_titles = {_normalized_heading_title(chapter.title)}
+        chapter_is_in_navigation = True
+        for heading_number, entry in enumerate(
+            entries_by_chapter.get(chapter_number, ()),
+            start=1,
+        ):
+            normalized_title = _normalized_heading_title(entry.title)
+            if entry.starts_chapter:
+                chapter_is_in_navigation = entry.include_in_navigation
+                continue
+            if not entry.include_in_navigation or normalized_title in seen_titles:
+                continue
+            seen_titles.add(normalized_title)
+            node = _MutableNavigationNode(
+                entry.title,
+                chapter.filename,
+                _heading_fragment(chapter_number, heading_number),
+                [],
+            )
+            navigation_level = entry.navigation_level or entry.level
+            while stack and stack[-1][0] >= navigation_level:
+                stack.pop()
+            if stack:
+                stack[-1][1].children.append(node)
+            else:
+                roots.append(node)
+            stack.append((navigation_level, node))
+
+        def freeze(node: _MutableNavigationNode) -> EpubNavigationNode:
+            return EpubNavigationNode(
+                node.title,
+                node.filename,
+                tuple(freeze(child) for child in node.children),
+                node.fragment,
+            )
+
+        frozen_roots = tuple(freeze(node) for node in roots)
+        if chapter_is_in_navigation:
+            chapter_groups.append(
+                _ChapterNavigationGroup(
+                    chapter,
+                    (
+                        EpubNavigationNode(
+                            chapter.title,
+                            chapter.filename,
+                            frozen_roots,
+                        ),
+                    ),
+                    [],
+                )
+            )
+        else:
+            chapter_groups.append(_ChapterNavigationGroup(None, frozen_roots, []))
+
+    nested_groups = _nest_explicit_chapter_navigation(
+        _nest_toc_chapter_navigation(tuple(chapter_groups))
+    )
+    return tuple(
+        node for group in nested_groups for node in _freeze_chapter_navigation_group(group)
+    )
+
+
+def _nest_toc_chapter_navigation(
+    groups: tuple[_ChapterNavigationGroup, ...],
+) -> tuple[_ChapterNavigationGroup, ...]:
+    """Apply only exact printed-contents depth to consecutive chapter entries."""
+
+    roots: list[_ChapterNavigationGroup] = []
+    stack: list[tuple[int, _ChapterNavigationGroup]] = []
+    for group in groups:
+        level = group.chapter.toc_level if group.chapter is not None else None
+        if level is None:
+            roots.append(group)
+            stack.clear()
+            continue
+        while stack and stack[-1][0] >= level:
+            stack.pop()
+        if stack:
+            stack[-1][1].children.append(group)
+        else:
+            roots.append(group)
+        stack.append((level, group))
+    return tuple(roots)
+
+
+def _nest_explicit_chapter_navigation(
+    groups: tuple[_ChapterNavigationGroup, ...],
+) -> tuple[_ChapterNavigationGroup, ...]:
+    """Nest a part around two or more explicit chapter siblings as a safe fallback."""
+
+    for group in groups:
+        group.children = list(_nest_explicit_chapter_navigation(tuple(group.children)))
+
+    roots: list[_ChapterNavigationGroup] = []
+    index = 0
+    while index < len(groups):
+        group = groups[index]
+        if group.chapter is None or group.chapter.role != "container" or group.children:
+            roots.append(group)
+            index += 1
+            continue
+        end = index + 1
+        while (
+            end < len(groups)
+            and groups[end].chapter is not None
+            and groups[end].chapter.role == "chapter"
+        ):
+            end += 1
+        if end - index - 1 >= 2:
+            group.children = list(groups[index + 1 : end])
+            roots.append(group)
+            index = end
+            continue
+        roots.append(group)
+        index += 1
+    return tuple(roots)
+
+
+def _freeze_chapter_navigation_group(
+    group: _ChapterNavigationGroup,
+) -> tuple[EpubNavigationNode, ...]:
+    nested = tuple(
+        node for child in group.children for node in _freeze_chapter_navigation_group(child)
+    )
+    if group.chapter is None or len(group.nodes) != 1:
+        return (*group.nodes, *nested)
+    node = group.nodes[0]
+    return (replace(node, children=(*node.children, *nested)),)
 
 
 def compose_explicit_epub_chapters(chapters: Iterable[str]) -> str:
@@ -543,21 +959,19 @@ def _chapters(markdown: str, fallback_title: str) -> tuple[EpubChapterPlan, ...]
 def _chapters_from_blocks(
     blocks: list[str],
     fallback_title: str,
-    preferred_level: int | None,
+    preferred_heading_positions: frozenset[int],
     strong_heading_positions: frozenset[int] = frozenset(),
+    forced_heading_positions: frozenset[int] = frozenset(),
 ) -> tuple[EpubChapterPlan, ...]:
     chunks: list[str] = []
     current: list[str] = []
     current_size = 0
     for position, block in enumerate(blocks):
-        heading_level = _block_heading_level(block)
-        should_split_for_heading = (
-            preferred_level is not None
-            and heading_level == preferred_level
-            and current_size >= _MIN_CHAPTER_CHARACTERS
+        should_split_for_heading = position in preferred_heading_positions and (
+            current_size >= _MIN_CHAPTER_CHARACTERS
         )
-        should_split_for_strong_heading = (
-            position in strong_heading_positions and current_size >= _MIN_STRONG_CHAPTER_CHARACTERS
+        should_split_for_strong_heading = position in strong_heading_positions and (
+            position in forced_heading_positions or current_size >= _MIN_STRONG_CHAPTER_CHARACTERS
         )
         should_split_for_size = current_size >= _MAX_CHAPTER_CHARACTERS
         if current and (
@@ -655,26 +1069,122 @@ def _preferred_heading_level(
             counts[level] = counts.get(level, 0) + 1
             title = _block_heading_title(block)
             score = 1.0
-            if title is not None and _STRONG_CHAPTER_TITLE_PATTERN.match(title):
+            if title is not None and _is_strong_chapter_title(title):
                 score += 5.0
-            if title is not None and _normalized_heading_title(title) in toc_titles:
+            if title is not None and _heading_matches_toc(title, toc_titles):
                 score += 3.0
             scores[level] = scores.get(level, 0.0) + score
     candidates = {
         level: scores.get(level, 0.0) / count
         for level, count in counts.items()
-        if 2 <= count <= _MAX_CHAPTERS
+        if level <= 2 and 2 <= count <= _MAX_AUTOMATIC_CHAPTER_HEADINGS
     }
     if candidates:
-        strong_candidates = {
-            level: score for level, score in candidates.items() if level <= 2 or score >= 2.0
-        }
-        if strong_candidates:
-            return min(
-                strong_candidates,
-                key=lambda level: (-strong_candidates[level], level),
-            )
+        # Level-three and deeper headings are normally sections, even when the printed contents
+        # lists them. Explicit Chapter/Part labels still split independently through the strong
+        # heading path below, so choosing only the two shallowest levels protects long manuals from
+        # becoming one XHTML file per subsection.
+        return min(candidates, key=lambda level: (-candidates[level], level))
     return None
+
+
+def _preferred_chapter_headings(
+    blocks: list[str],
+    semantic_document: SemanticDocument,
+    preferred_level: int | None,
+    toc_titles: frozenset[str],
+    *,
+    toc_is_reliable: bool,
+) -> frozenset[int]:
+    """Select safe automatic splits without turning front matter or callouts into chapters."""
+
+    if preferred_level is None:
+        return frozenset()
+    front_toc_end = _front_structured_toc_end_position(semantic_document)
+    selected: set[int] = set()
+    for position, block in enumerate(blocks):
+        if position >= len(semantic_document.blocks):
+            continue
+        semantic_role = semantic_document.blocks[position].role
+        if semantic_role in {
+            SemanticRole.FRONT_MATTER,
+            SemanticRole.PROVENANCE,
+            SemanticRole.TOC,
+        }:
+            continue
+        if front_toc_end is not None and position <= front_toc_end:
+            continue
+        if _block_heading_level(block) != preferred_level:
+            continue
+        title = _block_heading_title(block)
+        if title is None:
+            continue
+        if toc_is_reliable and not _heading_matches_toc(title, toc_titles):
+            continue
+        selected.add(position)
+    return frozenset(selected)
+
+
+def _toc_evidence_is_reliable(
+    blocks: list[str],
+    semantic_document: SemanticDocument,
+    toc_titles: frozenset[str],
+    preferred_level: int | None,
+) -> bool:
+    """Require several independent body matches before the printed index controls splitting."""
+
+    if not toc_titles:
+        return False
+    front_toc_end = _front_structured_toc_end_position(semantic_document)
+    body_headings = [
+        title
+        for position, block in enumerate(blocks)
+        if position < len(semantic_document.blocks)
+        and (front_toc_end is None or position > front_toc_end)
+        and semantic_document.blocks[position].role
+        not in {
+            SemanticRole.FRONT_MATTER,
+            SemanticRole.PROVENANCE,
+            SemanticRole.TOC,
+        }
+        and (
+            preferred_level is None
+            or (level := _block_heading_level(block)) is not None
+            and level <= preferred_level
+        )
+        and (title := _block_heading_title(block)) is not None
+    ]
+    matches = sum(_heading_matches_toc(title, toc_titles) for title in body_headings)
+    required = min(8, max(2, (len(body_headings) + 19) // 20))
+    return matches >= required
+
+
+def _front_structured_toc_end_position(
+    semantic_document: SemanticDocument,
+) -> int | None:
+    """Bound a front index without treating a later in-book contents list as front matter."""
+
+    structured = [
+        block
+        for block in semantic_document.blocks
+        if _DOCUMENT_TOC_OPENING_PATTERN.search(block.markdown) is not None
+    ]
+    if not structured:
+        return None
+    first = structured[0]
+    if first.page_number is not None:
+        if first.page_number > 12:
+            return None
+        eligible = [
+            block
+            for block in structured
+            if block.page_number is not None and block.page_number <= 12
+        ]
+    else:
+        if first.position > 40:
+            return None
+        eligible = [block for block in structured if block.position <= 80]
+    return max((block.position for block in eligible), default=None)
 
 
 def _block_heading_level(block: str) -> int | None:
@@ -694,11 +1204,18 @@ def _block_heading_title(block: str) -> str | None:
 def _strong_chapter_headings(
     blocks: list[str],
     semantic_document: SemanticDocument,
+    preferred_level: int | None,
+    *,
+    toc_is_reliable: bool = False,
 ) -> frozenset[int]:
     toc_titles = _toc_titles(semantic_document)
+    toc_heading_levels = _toc_heading_levels(semantic_document)
+    toc_container_titles = _toc_container_titles(semantic_document)
     selected: set[int] = set()
     had_front_matter = semantic_document.front_matter_blocks > 0
     first_body_heading_added = False
+    selected_titles: set[str] = set()
+    front_toc_end = _front_structured_toc_end_position(semantic_document)
     for position, block in enumerate(blocks):
         title = _block_heading_title(block)
         if title is None or position >= len(semantic_document.blocks):
@@ -710,14 +1227,81 @@ def _strong_chapter_headings(
             SemanticRole.TOC,
         }:
             continue
+        if front_toc_end is not None and position <= front_toc_end:
+            continue
         normalized = _normalized_heading_title(title)
+        level = _block_heading_level(block)
+        series_key = _toc_series_key(title)
+        toc_container = bool(_toc_match_keys(title).intersection(toc_container_titles))
+        toc_backed_boundary = (
+            (
+                preferred_level is not None
+                and level is not None
+                and _heading_matches_toc(title, toc_titles)
+                and (level <= preferred_level or series_key in toc_titles)
+            )
+            or _is_numbered_toc_chapter_title(
+                title,
+                _toc_heading_level(title, toc_heading_levels),
+            )
+            or toc_container
+        )
+        is_boundary = (
+            _is_strong_chapter_title(title)
+            or toc_backed_boundary
+            or (had_front_matter and not first_body_heading_added and not toc_is_reliable)
+        )
+        if is_boundary and normalized not in selected_titles:
+            selected.add(position)
+            selected_titles.add(normalized)
+        first_body_heading_added = True
+    return frozenset(selected)
+
+
+def _forced_chapter_headings(
+    blocks: list[str],
+    semantic_document: SemanticDocument,
+) -> frozenset[int]:
+    """Split index-backed numbered chapters even after a deliberately short part page."""
+
+    toc_heading_levels = _toc_heading_levels(semantic_document)
+    toc_titles = _toc_titles(semantic_document)
+    toc_container_titles = _toc_container_titles(semantic_document)
+    front_toc_end = _front_structured_toc_end_position(semantic_document)
+    selected: set[int] = set()
+    previous_toc_level: int | None = None
+    previous_was_container = False
+    for position, block in enumerate(blocks):
+        title = _block_heading_title(block)
+        if title is None or position >= len(semantic_document.blocks):
+            continue
+        if semantic_document.blocks[position].role in {
+            SemanticRole.FRONT_MATTER,
+            SemanticRole.PROVENANCE,
+            SemanticRole.TOC,
+        }:
+            continue
+        if front_toc_end is not None and position <= front_toc_end:
+            continue
+        toc_level = _toc_heading_level(title, toc_heading_levels)
+        toc_container = bool(_toc_match_keys(title).intersection(toc_container_titles))
+        follows_short_container = bool(
+            previous_was_container
+            and previous_toc_level is not None
+            and toc_level is not None
+            and toc_level > previous_toc_level
+            and _heading_matches_toc(title, toc_titles)
+        )
         if (
-            _STRONG_CHAPTER_TITLE_PATTERN.match(title)
-            or normalized in toc_titles
-            or (had_front_matter and not first_body_heading_added)
+            _is_numbered_toc_chapter_title(title, toc_level)
+            or follows_short_container
+            or toc_container
+            or (_flat_toc_container_title(title) and _heading_matches_toc(title, toc_titles))
         ):
             selected.add(position)
-        first_body_heading_added = True
+        if toc_level is not None and _heading_matches_toc(title, toc_titles):
+            previous_toc_level = toc_level
+            previous_was_container = _flat_toc_container_title(title)
     return frozenset(selected)
 
 
@@ -725,10 +1309,28 @@ def _toc_titles(semantic_document: SemanticDocument | None) -> frozenset[str]:
     if semantic_document is None:
         return frozenset()
     titles: set[str] = set()
+    series_counts: Counter[str] = Counter()
+
+    def add_title(value: str) -> None:
+        for key in _toc_match_keys(value):
+            if key.startswith("series:"):
+                series_counts[key] += 1
+            else:
+                titles.add(key)
+
     for block in semantic_document.blocks:
-        if block.role is not SemanticRole.TOC:
+        if (
+            block.role is not SemanticRole.TOC
+            and _DOCUMENT_TOC_OPENING_PATTERN.search(block.markdown) is None
+        ):
             continue
-        for line in block.markdown.splitlines():
+        table_labels = [
+            unescape(re.sub(r"<[^>]+>", " ", match.group("label")))
+            for match in _DOCUMENT_TOC_LABEL_PATTERN.finditer(block.markdown)
+        ]
+        for label in table_labels:
+            add_title(" ".join(label.split()))
+        for line in block.markdown.splitlines() if not table_labels else ():
             visible = re.sub(r"\]\([^)]+\)", "]", line)
             visible = re.sub(r"[*_`~#\[\]|]", " ", visible)
             visible = re.sub(r"(?:\.{2,}|\s{2,})\s*\d+\s*$", "", visible)
@@ -740,12 +1342,340 @@ def _toc_titles(semantic_document: SemanticDocument | None) -> frozenset[str]:
                 "indice",
                 "sumario",
             }:
-                titles.add(normalized)
+                add_title(normalized)
+    titles.update(key for key, count in series_counts.items() if count >= 2)
     return frozenset(titles)
 
 
+def _toc_heading_levels(semantic_document: SemanticDocument) -> dict[str, int]:
+    """Return only unambiguous title levels preserved by Parsezen's printed contents table."""
+
+    records: list[tuple[str, str, int]] = []
+    for block in semantic_document.blocks:
+        if (
+            block.role is not SemanticRole.TOC
+            and _DOCUMENT_TOC_OPENING_PATTERN.search(block.markdown) is None
+        ):
+            continue
+        for match in _DOCUMENT_TOC_LABEL_PATTERN.finditer(block.markdown):
+            raw_label = match.group("label")
+            visible = unescape(re.sub(r"<[^>]+>", " ", raw_label))
+            label = " ".join(visible.split())
+            if label:
+                records.append((label, raw_label, int(match.group("level"))))
+    resolved_levels = _resolved_toc_record_levels(records)
+    candidates: dict[str, list[int]] = {}
+    for (label, _raw_label, _source_level), level in zip(
+        records,
+        resolved_levels,
+        strict=True,
+    ):
+        for key in _toc_match_keys(label):
+            candidates.setdefault(key, []).append(level)
+    return {
+        title: levels[0]
+        for title, levels in candidates.items()
+        if len(set(levels)) == 1 and (not title.startswith("series:") or len(levels) >= 2)
+    }
+
+
+def _toc_container_titles(semantic_document: SemanticDocument) -> frozenset[str]:
+    """Return index entries that own at least one immediately deeper following entry."""
+
+    records: list[tuple[str, str, int]] = []
+    for block in semantic_document.blocks:
+        if (
+            block.role is not SemanticRole.TOC
+            and _DOCUMENT_TOC_OPENING_PATTERN.search(block.markdown) is None
+        ):
+            continue
+        for match in _DOCUMENT_TOC_LABEL_PATTERN.finditer(block.markdown):
+            raw_label = match.group("label")
+            visible = unescape(re.sub(r"<[^>]+>", " ", raw_label))
+            label = " ".join(visible.split())
+            if label:
+                records.append((label, raw_label, int(match.group("level"))))
+    levels = _resolved_toc_record_levels(records)
+    keys: set[str] = set()
+    for index, ((label, _raw, _source_level), level) in enumerate(
+        zip(records, levels, strict=True)
+    ):
+        next_level = levels[index + 1] if index + 1 < len(levels) else None
+        if next_level is not None and next_level > level:
+            keys.update(_toc_match_keys(label))
+    return frozenset(keys)
+
+
+def _resolved_toc_record_levels(records: list[tuple[str, str, int]]) -> tuple[int, ...]:
+    """Recover a conservative two-level hierarchy from a visually styled index."""
+
+    source_levels = tuple(level for _label, _raw, level in records)
+    if not records:
+        return source_levels
+    container_flags = tuple(_flat_toc_container_title(label) for label, _raw, _ in records)
+    if sum(container_flags) < 2 or len(records) - sum(container_flags) < 4:
+        return source_levels
+    all_source_levels_are_flat = all(level == 0 for level in source_levels)
+    root_flags = tuple(
+        _flat_toc_root_title(label)
+        or (all_source_levels_are_flat and _toc_label_is_fully_emphasized(raw_label))
+        for label, raw_label, _level in records
+    )
+    levels: list[int] = []
+    inside_container = False
+    for source_level, is_root, is_container in zip(
+        source_levels,
+        root_flags,
+        container_flags,
+        strict=True,
+    ):
+        if is_root:
+            levels.append(0)
+            inside_container = is_container
+        else:
+            levels.append(max(1, source_level) if inside_container else source_level)
+    return tuple(levels)
+
+
+def _flat_toc_container_title(title: str) -> bool:
+    cleaned = re.sub(r"[*_`~\[\]]", "", title).strip()
+    return bool(
+        classify_heading_role(cleaned) == "container"
+        or re.match(r"^[IVXLCDM]{1,8}\s*[-.:]\s*\S", cleaned)
+        or re.match(
+            r"^(?:(?:appendices|ap[eé]ndices)|"
+            r"(?:appendix|ap[eé]ndice)\s+(?:\d{1,3}|[IVXLCDM]{1,8})\b)",
+            cleaned,
+            re.IGNORECASE,
+        )
+        or re.match(
+            r"^(?:tables?(?:\s+of\s+.+)?|tablas?(?:\s+de\s+.+)?)$",
+            cleaned,
+            re.IGNORECASE,
+        )
+    )
+
+
+def _toc_label_is_fully_emphasized(raw_label: str) -> bool:
+    cleaned = raw_label.strip()
+    anchor = re.fullmatch(r"<a\b[^>]*>(?P<label>.*)</a>", cleaned, re.IGNORECASE)
+    if anchor is not None:
+        cleaned = anchor.group("label").strip()
+    return bool(
+        re.fullmatch(
+            r"<(?:strong|b)\b[^>]*>.*</(?:strong|b)>",
+            cleaned,
+            re.IGNORECASE,
+        )
+    )
+
+
+def _flat_toc_root_title(title: str) -> bool:
+    cleaned = re.sub(r"[*_`~\[\]]", "", title).strip()
+    return bool(
+        _flat_toc_container_title(cleaned)
+        or re.fullmatch(
+            r"(?:bibliography|bibliograf[ií]a|references|referencias|"
+            r"glossary|glosario|index|[ií]ndice)",
+            cleaned,
+            re.IGNORECASE,
+        )
+    )
+
+
+def _toc_match_keys(title: str) -> frozenset[str]:
+    normalized = _normalized_heading_title(title)
+    if not normalized:
+        return frozenset()
+    compact = re.sub(r"[^\w]+", "", normalized, flags=re.UNICODE)
+    structural = re.sub(
+        r"^(?:chapter|cap[i\u00ed]tulo|chapitre|cap)\s+",
+        "",
+        normalized,
+        flags=re.IGNORECASE,
+    )
+    structural_compact = re.sub(r"[^\w]+", "", structural, flags=re.UNICODE)
+    keys = {
+        normalized,
+        f"compact:{compact}",
+        f"structural:{structural_compact}",
+    }
+    keys.update(_toc_numbered_marker_keys(title))
+    if series_key := _toc_series_key(title):
+        keys.add(series_key)
+    keys.update(_toc_container_subtitle_keys(title))
+    return frozenset(keys)
+
+
+def _toc_series_key(title: str) -> str | None:
+    """Return a family key for compact numbered series such as ``Topic II: ...``."""
+
+    plain = unescape(re.sub(r"<[^>]+>", " ", title))
+    plain = re.sub(r"[*_`~\[\]]", "", plain).strip()
+    structural = re.sub(
+        r"^(?:chapter|cap[ií]tulo|chapitre|cap\.)\s+",
+        "chapter ",
+        plain,
+        flags=re.IGNORECASE,
+    )
+    prefix = re.split(r"\s*[:\u2013\u2014]\s*", structural, maxsplit=1)[0]
+    normalized = _normalized_heading_title(prefix)
+    tokens = normalized.split()
+    if len(tokens) < 2:
+        return None
+    ordinal = tokens[-1]
+    ordinal_pattern = r"(?:\d{1,3}|[ivxlcdm1lhke]{1,4})"
+    if re.fullmatch(ordinal_pattern, ordinal, re.IGNORECASE) is not None:
+        family_tokens = tokens[:-1]
+    elif re.fullmatch(ordinal_pattern, tokens[1], re.IGNORECASE) is not None:
+        family_tokens = tokens[:1]
+    else:
+        return None
+    family = re.sub(r"[^\w]+", "", " ".join(family_tokens), flags=re.UNICODE)
+    return f"series:{family}" if 2 <= len(family) <= 60 else None
+
+
+def _toc_container_subtitle_keys(title: str) -> frozenset[str]:
+    """Let a uniquely indexed container match a decorative subtitle-only body heading."""
+
+    plain = unescape(re.sub(r"<[^>]+>", " ", title))
+    plain = re.sub(r"[*_`~\[\]]", "", plain).strip()
+    normalized = _normalized_heading_title(plain)
+    compact = re.sub(r"[^\w]+", "", normalized, flags=re.UNICODE)
+    keys = {f"container-subtitle:{compact}"}
+    match = re.match(
+        r"^(?:part|parte|book|libro|volume|volumen|tomo)\s+"
+        r"(?:\d{1,3}|[ivxlcdm]+)\s*[:\u2013\u2014-]\s*(?P<subtitle>\S.*)$",
+        plain,
+        re.IGNORECASE,
+    )
+    if match is not None:
+        subtitle = re.sub(
+            r"[^\w]+",
+            "",
+            _normalized_heading_title(match.group("subtitle")),
+            flags=re.UNICODE,
+        )
+        keys.add(f"container-subtitle:{subtitle}")
+    return frozenset(key for key in keys if len(key.removeprefix("container-subtitle:")) >= 6)
+
+
+def _toc_numbered_marker_keys(title: str) -> frozenset[str]:
+    """Match a numbered body title to a longer index label without using loose substrings."""
+
+    plain = unescape(re.sub(r"<[^>]+>", " ", title))
+    plain = re.sub(r"[*_`~\[\]]", "", plain).strip()
+    structural = re.sub(
+        r"^(?:chapter|cap[ií]tulo|chapitre|cap\.)\s+",
+        "",
+        plain,
+        flags=re.IGNORECASE,
+    )
+    normalized = _normalized_heading_title(structural)
+    if not normalized:
+        return frozenset()
+    candidates: set[str] = set()
+    starts_with_number = re.match(r"^\d{1,3}\b", normalized) is not None
+    if starts_with_number and len(normalized.split()) <= 8:
+        candidates.add(normalized)
+    segments = re.split(r"\s*[:\u2013\u2014]\s*", structural)
+    if len(segments) >= 2:
+        prefix = _normalized_heading_title(": ".join(segments[:-1]))
+        if prefix and (
+            re.match(r"^\d{1,3}\b", prefix)
+            or re.search(r"\b[ivxlcdm]{1,8}$", prefix, re.IGNORECASE)
+        ):
+            candidates.add(prefix)
+    if re.search(r"\b[ivxlcdm]{1,8}$", normalized, re.IGNORECASE):
+        candidates.add(normalized)
+    return frozenset(
+        "marker:" + re.sub(r"[^\w]+", "", candidate, flags=re.UNICODE)
+        for candidate in candidates
+        if len(re.sub(r"[^\w]+", "", candidate, flags=re.UNICODE)) >= 2
+    )
+
+
+def _infer_toc_chapter_roles(
+    chapters: tuple[EpubChapterPlan, ...],
+) -> tuple[EpubChapterPlan, ...]:
+    """Use confirmed index depth to distinguish containers from reading chapters."""
+
+    roles: list[str | None] = []
+    for index, chapter in enumerate(chapters):
+        if chapter.role is not None or chapter.toc_level is None:
+            roles.append(chapter.role)
+            continue
+        next_level = next(
+            (
+                candidate.toc_level
+                for candidate in chapters[index + 1 :]
+                if candidate.toc_level is not None
+            ),
+            None,
+        )
+        roles.append(
+            "container" if next_level is not None and next_level > chapter.toc_level else "chapter"
+        )
+    return tuple(
+        EpubChapterPlan(
+            filename=chapter.filename,
+            title=chapter.title,
+            markdown=chapter.markdown,
+            role=role,
+            toc_level=chapter.toc_level,
+        )
+        for chapter, role in zip(chapters, roles, strict=True)
+    )
+
+
+def _heading_matches_toc(title: str, toc_titles: frozenset[str]) -> bool:
+    return bool(_toc_match_keys(title).intersection(toc_titles))
+
+
+def _toc_heading_level(title: str, levels: dict[str, int]) -> int | None:
+    matched = {levels[key] for key in _toc_match_keys(title) if key in levels}
+    if len(matched) == 1:
+        return matched.pop()
+    normalized = _normalized_heading_title(title)
+    number = re.match(r"^(\d{1,3})\b", normalized)
+    compact = re.sub(r"[^\w]+", "", normalized, flags=re.UNICODE)
+    if number is None or len(compact) < 8:
+        return None
+    candidates = sorted(
+        (
+            SequenceMatcher(None, compact, key.removeprefix("compact:"), autojunk=False).ratio(),
+            level,
+        )
+        for key, level in levels.items()
+        if key.startswith("compact:")
+        and re.match(r"^(\d{1,3})", key.removeprefix("compact:")) is not None
+        and re.match(r"^(\d{1,3})", key.removeprefix("compact:")).group(1) == number.group(1)
+    )
+    if not candidates or candidates[-1][0] < 0.92:
+        return None
+    best_score, best_level = candidates[-1]
+    if len(candidates) > 1 and candidates[-2][0] >= best_score - 0.02:
+        return None
+    return best_level
+
+
+def _is_numbered_toc_chapter_title(title: str, toc_level: int | None) -> bool:
+    if toc_level != 0:
+        return False
+    cleaned = re.sub(r"[*_`~\[\]]", "", title).strip()
+    return (
+        re.match(
+            r"^\d{1,3}\s*[.)]\s*[\"'“”‘’(\[]*\s*[^\W\d_]",
+            cleaned,
+            re.UNICODE,
+        )
+        is not None
+    )
+
+
 def _normalized_heading_title(title: str) -> str:
-    return re.sub(r"[^\w]+", " ", title, flags=re.UNICODE).strip().casefold()
+    normalized = unicodedata.normalize("NFKC", title)
+    return re.sub(r"[^\w]+", " ", normalized, flags=re.UNICODE).strip().casefold()
 
 
 def _merge_excess_chapters(chunks: list[str]) -> list[str]:
@@ -761,10 +1691,59 @@ def _chapter_title(markdown: str, fallback: str, index: int, total: int) -> str:
     if heading:
         text = re.sub(r"[*_`~\[\]]", "", heading.group(2)).strip()
         if text:
+            subtitle = _combined_numbered_chapter_subtitle(markdown)
+            if subtitle is not None:
+                return f"{text} \u2014 {subtitle}"[:160]
             return text[:160]
     if total == 1:
         return fallback
     return f"Parte {index}"
+
+
+def _combined_numbered_chapter_subtitle(markdown: str) -> str | None:
+    """Use an adjacent subtitle to name a chapter whose first heading is only its number."""
+
+    headings = tuple(_HEADING_PATTERN.finditer(markdown))
+    if len(headings) < 2:
+        return None
+    first, second = headings[:2]
+    first_title = re.sub(r"[*_`~\[\]]", "", first.group(2)).strip()
+    if classify_heading_role(first_title) != "chapter":
+        return None
+    match = _CHAPTER_TITLE_PATTERN.match(first_title)
+    if match is None or first_title[match.end() :].strip():
+        return None
+    between = markdown[first.end() : second.start()]
+    between = _PDF_PAGE_MARKER_PATTERN.sub("", between)
+    between = _PDF_OUTLINE_MARKER_PATTERN.sub("", between)
+    between = _EPUB_ANCHOR_COMMENT_PATTERN.sub("", between)
+    between = _SAFE_ANCHOR_PATTERN.sub("", between)
+    if between.strip() or len(second.group(1)) <= len(first.group(1)):
+        return None
+    subtitle = re.sub(r"[*_`~\[\]]", "", second.group(2)).strip()
+    if not subtitle or len(subtitle.split()) > 24 or re.search(r"[.!?](?:\s|$)", subtitle):
+        return None
+    return subtitle
+
+
+def _chapter_marker_key(title: str) -> str | None:
+    cleaned = re.sub(r"[*_`~\[\]]", "", title).strip()
+    match = _CHAPTER_TITLE_PATTERN.match(cleaned)
+    if match is None:
+        return None
+    marker = cleaned[: match.end()].rstrip(" .:\u2013\u2014-")
+    return _normalized_heading_title(marker)
+
+
+def _bare_chapter_marker_key(title: str) -> str | None:
+    marker = _chapter_marker_key(title)
+    return marker if marker is not None and marker == _normalized_heading_title(title) else None
+
+
+def _step_heading_key(title: str) -> str | None:
+    normalized = _normalized_heading_title(title)
+    match = re.match(r"^step\s+(" + _ORDINAL_HEADING_PATTERN + r")\b", normalized)
+    return match.group(1) if match is not None else None
 
 
 def _render_chapters(
@@ -786,7 +1765,10 @@ def _render_chapters(
             anchors_by_chapter.setdefault(anchor, chapter.filename)
 
     rendered: list[str] = []
-    for chapter, source in zip(chapters, prepared, strict=True):
+    for chapter_number, (chapter, source) in enumerate(
+        zip(chapters, prepared, strict=True),
+        start=1,
+    ):
         check_cancelled(cancellation)
         protected_source, safe_tables = _protect_safe_table_blocks(source)
         body = renderer.render(protected_source)
@@ -804,9 +1786,31 @@ def _render_chapters(
                 _anchor_sentinel(anchor),
                 f'<span id="{escape(anchor, quote=True)}"></span>',
             )
+        body = _add_generated_heading_ids(body, chapter_number)
         body = _rewrite_internal_links(body, chapter.filename, anchors_by_chapter)
         rendered.append(_xhtml_document(chapter.title, body, language))
     return tuple(rendered)
+
+
+def _add_generated_heading_ids(html: str, chapter_number: int) -> str:
+    """Give every rendered heading a stable target for nested EPUB navigation."""
+
+    heading_number = 0
+
+    def replace(match: re.Match[str]) -> str:
+        nonlocal heading_number
+        heading_number += 1
+        return (
+            f'<h{match.group("level")} id="'
+            f'{_heading_fragment(chapter_number, heading_number)}"{match.group("attributes")}'
+            ">"
+        )
+
+    return re.sub(
+        r"<h(?P<level>[1-6])(?P<attributes>(?:\s+[^>]*)?)>",
+        replace,
+        html,
+    )
 
 
 def _protect_safe_table_blocks(markdown: str) -> tuple[str, tuple[tuple[str, str], ...]]:
@@ -928,6 +1932,7 @@ def _prepare_markdown(
         prepared,
     )
     prepared = _PDF_PAGE_MARKER_PATTERN.sub("", prepared)
+    prepared = _PDF_OUTLINE_MARKER_PATTERN.sub("", prepared)
     prepared = _escape_numeric_reference_list_markers(prepared)
     for path in resources:
         target = quote(f"../images/{path}", safe="/._-~")
@@ -1128,11 +2133,16 @@ def _nested_navigation_document(
     language: str,
 ) -> str:
     def render(nodes: tuple[EpubNavigationNode, ...]) -> str:
+        def href(node: EpubNavigationNode) -> str:
+            filename = quote(node.filename, safe="._-~")
+            fragment = f"#{quote(node.fragment, safe='._-~')}" if node.fragment is not None else ""
+            return escape(f"text/{filename}{fragment}", quote=True)
+
         return (
             "<ol>"
             + "".join(
                 "<li>"
-                f'<a href="text/{escape(quote(node.filename, safe="._-~"), quote=True)}">'
+                f'<a href="{href(node)}">'
                 f"{escape(node.title)}</a>"
                 f"{render(node.children) if node.children else ''}"
                 "</li>"
@@ -1569,8 +2579,8 @@ def _validate_navigation_document(
     expected = {
         path for path in spine_paths if PurePosixPath(path).name.casefold() != "cover.xhtml"
     }
-    if not expected or not expected.issubset(targets):
-        raise ConversionError("La tabla de contenidos del EPUB no incluye todos los capítulos.")
+    if not expected or not targets or not targets.issubset(expected):
+        raise ConversionError("La tabla de contenidos del EPUB no enlaza capítulos válidos.")
 
 
 def _document_ids(root: SafeElementTree.Element, path: str) -> frozenset[str]:

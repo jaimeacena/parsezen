@@ -45,18 +45,19 @@ from parsezen.application.processing_explanation import linguistic_review_summar
 from parsezen.application.quality_review_adapter import (
     apply_pdf_review,
     apply_translation_review,
-    ensure_quality_reviews_applied,
 )
 from parsezen.application.queue_configuration import QueueConfigurationService
 from parsezen.application.queue_persistence import (
     QueuePersistenceCoordinator,
     QueuePersistenceStatus,
 )
+from parsezen.application.queue_run_coordinator import QueueRunCoordinator
 from parsezen.application.queue_session import QueueSession, SessionTermination
 from parsezen.application.review_finalization import (
     ReviewFinalizationCoordinator,
     ReviewFinalizationWarning,
 )
+from parsezen.application.review_flow import ReviewFlowCoordinator
 from parsezen.application.review_materialization import (
     ReviewMaterializationService,
 )
@@ -73,11 +74,7 @@ from parsezen.application.review_recommendation import (
     recommendation_summary,
     reconstruct_completed_result,
 )
-from parsezen.application.revision_materializer import (
-    render_revision_reviews,
-)
 from parsezen.application.run_preparation import PreparedQueueRun
-from parsezen.application.run_validation import BatchValidationIssue
 from parsezen.application.runtime_mapping import (
     request_and_settings_from_job,
 )
@@ -86,17 +83,19 @@ from parsezen.application.workspace_recovery import (
     SOURCE_CHANGED_MESSAGE as _SOURCE_CHANGED_MESSAGE,
 )
 from parsezen.application.workspace_recovery import (
-    recover_workspace,
+    SOURCE_UNAVAILABLE_MESSAGE as _SOURCE_UNAVAILABLE_MESSAGE,
 )
 from parsezen.application.workspace_recovery import (
     source_is_unchanged as _source_is_unchanged,
 )
+from parsezen.application.workspace_recovery_controller import WorkspaceRecoveryController
 from parsezen.branding import APP_ICON_PATH
 from parsezen.diagnostics import build_diagnostic_report
 from parsezen.domain.attempt_activity import AttemptTimeline, FailureSnapshot
 from parsezen.domain.books import BookDocument
 from parsezen.domain.estimates import ProcessingMetric
 from parsezen.domain.jobs import (
+    AIPhase,
     AIProfileConfiguration,
     DocumentFormat,
     DocumentJob,
@@ -107,17 +106,23 @@ from parsezen.domain.jobs import (
     OutputConfiguration,
     ProcessingPlan,
     TranslationConfiguration,
+    resolve_ai_profile,
 )
 from parsezen.domain.outcomes import EarlyCheckReport, OutcomeSummary
 from parsezen.domain.process_lifecycle import ProcessStage, stage_kind_from_process_stage
 from parsezen.domain.reviews import ReviewChoice, ReviewKind, ReviewSession, ReviewStatus
+from parsezen.domain.source_identity import SourceIdentity
 from parsezen.domain.stages import StageKind, StageStatus
 from parsezen.errors import ParsezenError
 from parsezen.failure_recovery import ProcessingFailure, recovery_plan
 from parsezen.infrastructure.artifact_store import ArtifactStore
 from parsezen.infrastructure.result_snapshots import ResultSnapshotStore
-from parsezen.infrastructure.state_store import StateStore, StateStoreError
-from parsezen.pipeline.contracts import ProcessRequest, ProcessResult
+from parsezen.infrastructure.state_store import (
+    StateStore,
+    StateStoreCorruptionError,
+    StateStoreError,
+)
+from parsezen.pipeline.contracts import ProcessResult
 from parsezen.presentation.activity_view import ActivityView
 from parsezen.presentation.book_editor_dialog import BookEditorDialog
 from parsezen.presentation.design_system import (
@@ -194,6 +199,7 @@ class ParsezenMainWindow(QMainWindow):
         self._history_path = history_path
         self._work_checkpoint_root = work_checkpoint_root
         self._queue_session = QueueSession()
+        self._queue_run = QueueRunCoordinator(self._queue_session)
         self._job_queue = self._queue_session.queue
         self._job_execution = self._queue_session.execution
         self._result: ProcessResult | None = None
@@ -239,12 +245,13 @@ class ParsezenMainWindow(QMainWindow):
         self._last_projection: tuple[DocumentJob, ...] = ()
         self._finished_batch_job_ids: tuple[str, ...] = ()
         self._state_recovery_notice: str | None = startup_message
+        self._state_initialization_failed = False
         state_destination = (
             state_path or user_data_path(APP_STORAGE_NAME, appauthor=False) / _STATE_FILENAME
         )
         try:
             self._state_store = StateStore(state_destination)
-        except StateStoreError:
+        except StateStoreCorruptionError:
             recovery_directory = _quarantine_structurally_unreadable_state(state_destination)
             self._state_recovery_notice = (
                 "El estado anterior estaba dañado. Se conservó una copia local segura "
@@ -252,10 +259,20 @@ class ParsezenMainWindow(QMainWindow):
             )
             LOGGER.warning("structurally_unreadable_state_preserved")
             self._state_store = StateStore(state_destination)
+        except StateStoreError:
+            self._state_initialization_failed = True
+            self._state_recovery_notice = (
+                "No se pudo actualizar el estado guardado. La base de datos y sus artefactos "
+                "siguen intactos; la persistencia queda desactivada hasta resolver el problema."
+            )
+            LOGGER.warning("state_initialization_failed_preserved=true")
+            self._state_store = StateStore.unavailable(state_destination)
         self._queue_persistence = QueuePersistenceCoordinator(
             self._state_store,
             interval_seconds=_PERSIST_INTERVAL_SECONDS,
         )
+        if self._state_initialization_failed:
+            self._queue_persistence.mark_unavailable()
         self._processing_metrics: tuple[ProcessingMetric, ...] = ()
         try:
             self._processing_metrics = self._state_store.load_processing_metrics()
@@ -280,6 +297,15 @@ class ParsezenMainWindow(QMainWindow):
             self._state_store,
             self._artifact_store,
         )
+        self._workspace_recovery = WorkspaceRecoveryController(
+            self._state_store,
+            self._artifact_store,
+            self._result_snapshots,
+            self._job_queue,
+            self._job_execution,
+            self._queue_session,
+            self._settings,
+        )
         self._job_outcomes = JobOutcomeCoordinator(
             self._job_queue,
             self._job_execution,
@@ -291,18 +317,24 @@ class ParsezenMainWindow(QMainWindow):
             self._state_store,
             self._artifact_store,
         )
-        self._review_publication = ReviewPublicationCoordinator(
+        review_publication = ReviewPublicationCoordinator(
             self._state_store,
             self._artifact_store,
             self._review_finalization,
         )
-        self._phase_reviews = PhaseReviewSequenceCoordinator(
+        phase_reviews = PhaseReviewSequenceCoordinator(
             self._job_queue,
             self._job_execution,
             self._state_store,
         )
-        self._review_materialization = ReviewMaterializationService(
+        review_materialization = ReviewMaterializationService(
             self._state_store,
+            self._artifact_store,
+        )
+        self._review_flow = ReviewFlowCoordinator(
+            review_materialization,
+            phase_reviews,
+            review_publication,
             self._artifact_store,
         )
 
@@ -329,9 +361,16 @@ class ParsezenMainWindow(QMainWindow):
         self.resize(1440, 860)
         self._connect_workspace()
         self._install_settings_actions()
-        retained_artifact_jobs = self._restore_workspace()
-        if retained_artifact_jobs is not None:
-            self._prune_orphaned_review_artifacts(retained_artifact_jobs)
+        if not self._state_initialization_failed:
+            recovery = self._workspace_recovery.restore()
+            if recovery.notice is not None:
+                self._state_recovery_notice = recovery.notice
+            if recovery.persistence_unavailable:
+                self._queue_persistence.mark_unavailable()
+            if recovery.retained_artifact_job_ids is not None:
+                self._workspace_recovery.prune_orphaned_review_artifacts(
+                    recovery.retained_artifact_job_ids
+                )
         self._temporal_timer = QTimer(self)
         self._temporal_timer.setInterval(1_000)
         self._temporal_timer.timeout.connect(self._refresh_temporal_projection)
@@ -436,82 +475,24 @@ class ParsezenMainWindow(QMainWindow):
             self.parsezen_workspace.set_preparing_jobs(())
             return
         try:
-            self._queue_session.begin_prepared_run()
+            self._queue_run.begin()
         except (RuntimeError, ValueError):
             self.parsezen_workspace.set_preparing_jobs(())
-            self._queue_session.finish(SessionTermination.CANCELLED)
+            self._queue_run.finish(SessionTermination.CANCELLED)
             return
         self._clear_batch_summary()
         self._sleep_blocker.start()
         self._start_next_batch_entry()
 
-    def _validate_pending_requests(
-        self,
-        items: tuple[tuple[ProcessRequest, AppSettings], ...],
-    ) -> tuple[BatchValidationIssue, ...]:
-        del items
-        prepared = self._queue_session.prepared_run
-        return prepared.issues if prepared is not None else ()
-
-    def _pending_runtime_items(
-        self,
-        settings: AppSettings,
-    ) -> tuple[tuple[ProcessRequest, AppSettings], ...]:
-        del settings
-        prepared = self._queue_session.prepared_run
-        return (
-            tuple((item.request, item.settings) for item in prepared.items)
-            if prepared is not None
-            else ()
-        )
-
-    def _runtime_for_entry(
-        self,
-        job_id: str,
-    ) -> tuple[ProcessRequest, AppSettings] | None:
-        prepared = self._queue_session.prepared_run
-        job = self._job_queue.get(job_id)
-        if prepared is not None and job is not None:
-            item = prepared.item(job_id)
-            if item is not None:
-                return item.request, item.settings
-        if job is None:
-            return None
-        return request_and_settings_from_job(
-            job,
-            timeout_seconds=self._settings.timeout_seconds,
-            checkpoint_retention_days=self._settings.checkpoint_retention_days,
-        )
-
-    def _processing_run_flags(self) -> tuple[bool, bool]:
-        mode = self._queue_session.run_mode
-        return mode is RunMode.RESUME, mode is RunMode.RETRY
-
-    def _local_ai_required(self) -> bool:
-        return any(
-            job.status is JobStatus.QUEUED and requires_ai(job.configuration)
-            for job in self._job_queue.jobs
-        )
-
     def _start_next_batch_entry(self) -> None:
-        claimed = self._queue_session.claim_next()
+        claimed = self._queue_run.claim_next(self._settings)
         if claimed is None:
             self._finish_batch()
             return
-        job, runtime = claimed
-        physical = self._runtime_for_entry(job.id)
-        if physical is None:
-            self._job_execution.fail(
-                job.id,
-                next(stage.kind for stage in job.stages if stage.status is StageStatus.RUNNING),
-                error_code="missing_runtime",
-                error_message="No se pudo reconstruir la configuración del documento.",
-            )
-            self._finish_batch()
-            return
-        request, settings = physical
-        prepared = self._queue_session.prepared_run
-        prepared_item = prepared.item(job.id) if prepared is not None else None
+        job = claimed.job
+        request = claimed.request
+        settings = claimed.settings
+        prepared_item = claimed.prepared
         early_check = (
             run_early_check
             if prepared_item is not None
@@ -538,7 +519,7 @@ class ParsezenMainWindow(QMainWindow):
         )
 
     def _finish_batch(self) -> None:
-        active_ids = self._queue_session.finish()
+        active_ids = self._queue_run.finish()
         self._sleep_blocker.stop()
         self.parsezen_workspace.set_preparing_jobs(())
         self._show_finished_batch_summary(active_ids)
@@ -809,7 +790,11 @@ class ParsezenMainWindow(QMainWindow):
             runtime.stage_started_at = None
             if not pause_requested:
                 try:
-                    physical = self._runtime_for_entry(job.id) if job is not None else None
+                    physical = (
+                        self._queue_run.runtime_for(job.id, self._settings)
+                        if job is not None
+                        else None
+                    )
                     if physical is not None:
                         request, settings = physical
                         clear_document_work_checkpoints(
@@ -845,6 +830,7 @@ class ParsezenMainWindow(QMainWindow):
         workspace.output_directory_reset_requested.connect(self._reset_global_output_directory)
         workspace.internal_back_requested.connect(self._close_internal_workflow)
         workspace.configure_requested.connect(self._configure_job)
+        workspace.source_requested.connect(self._locate_job_source)
         workspace.review_requested.connect(self._review_job)
         workspace.ai_review_requested.connect(self._start_targeted_ai_review)
         workspace.error_requested.connect(self._show_job_error)
@@ -980,7 +966,7 @@ class ParsezenMainWindow(QMainWindow):
     @Slot()
     def _toggle_theme(self) -> None:
         menu_size = self.appearance_menu.sizeHint()
-        button = self.parsezen_workspace.settings_button
+        button = self.parsezen_workspace.settings_anchor()
         bottom_right = button.mapToGlobal(QPoint(button.width(), button.height()))
         self.appearance_menu.popup(
             QPoint(bottom_right.x() - menu_size.width(), bottom_right.y() + 4)
@@ -1015,7 +1001,7 @@ class ParsezenMainWindow(QMainWindow):
     @Slot()
     def _show_parsezen_settings(self) -> None:
         menu_size = self.settings_menu.sizeHint()
-        button = self.parsezen_workspace.settings_button
+        button = self.parsezen_workspace.settings_anchor()
         bottom_right = button.mapToGlobal(QPoint(button.width(), button.height()))
         self.settings_menu.popup(QPoint(bottom_right.x() - menu_size.width(), bottom_right.y() + 4))
 
@@ -1120,11 +1106,14 @@ class ParsezenMainWindow(QMainWindow):
             or job.review_recommendation is None
         ):
             return
+        if not job.source.path.is_file():
+            QMessageBox.warning(self, "Original no disponible", _SOURCE_UNAVAILABLE_MESSAGE)
+            return
         if not _source_is_unchanged(job.source):
             QMessageBox.warning(self, "El original ha cambiado", _SOURCE_CHANGED_MESSAGE)
             return
-        model = self._settings.model or job.configuration.ai.model
-        if model is None:
+        review_profile = resolve_ai_profile(job.configuration.ai, AIPhase.REVIEW)
+        if review_profile.model is None:
             QMessageBox.information(
                 self,
                 "Hace falta un modelo local",
@@ -1145,8 +1134,10 @@ class ParsezenMainWindow(QMainWindow):
             )
             runtime_settings = replace(
                 runtime_settings,
-                model=model,
-                context_window=self._settings.context_window or job.configuration.ai.context_window,
+                model=review_profile.model,
+                context_window=review_profile.context_window,
+                review_model=review_profile.model,
+                review_context_window=review_profile.context_window,
             )
             validate_settings(runtime_settings)
             entry = self._queue_session.begin_targeted_review(job.id)
@@ -1174,6 +1165,88 @@ class ParsezenMainWindow(QMainWindow):
             ),
         )
 
+    @Slot(str)
+    def _locate_job_source(self, job_id: str) -> None:
+        """Relink a recovered job only after proving that source bytes are compatible."""
+
+        job = self._job_for_id(job_id)
+        if job is None or _SOURCE_UNAVAILABLE_MESSAGE not in job.warnings:
+            return
+        filename, _selected_filter = QFileDialog.getOpenFileName(
+            self,
+            "Buscar el original",
+            str(job.source.path.parent),
+            f"{job.source.format.value.upper()} (*.{job.source.format.value})",
+        )
+        if not filename:
+            return
+        try:
+            candidate = DocumentSource.inspect(Path(filename))
+        except (OSError, ValueError) as exc:
+            QMessageBox.warning(self, "Original no válido", str(exc))
+            return
+        if candidate.format is not job.source.format:
+            QMessageBox.warning(
+                self,
+                "Formato diferente",
+                "Selecciona el mismo tipo de documento que estaba en la cola.",
+            )
+            return
+        candidate_digest = candidate.content_sha256
+        if candidate_digest is None:
+            QMessageBox.warning(
+                self,
+                "No se puede verificar el original",
+                "No se pudo calcular una huella completa del archivo seleccionado.",
+            )
+            return
+        expected_digest = job.source.content_sha256
+        if expected_digest is not None and candidate_digest != expected_digest:
+            QMessageBox.warning(self, "El original no coincide", _SOURCE_CHANGED_MESSAGE)
+            return
+        if expected_digest is None and job.status is not JobStatus.QUEUED:
+            QMessageBox.warning(
+                self,
+                "No se puede verificar el original",
+                "Este trabajo antiguo no conserva una huella completa. Quítalo y vuelve a añadirlo "
+                "para evitar mezclar versiones.",
+            )
+            return
+
+        restored = replace(
+            job,
+            source=candidate,
+            warnings=tuple(
+                warning for warning in job.warnings if warning != _SOURCE_UNAVAILABLE_MESSAGE
+            ),
+        )
+        self._job_queue.replace(restored)
+        if restored.status is JobStatus.WAITING_REVIEW:
+            try:
+                result = self._result_snapshots.load(
+                    restored.id,
+                    source_identity=SourceIdentity(
+                        candidate.size_bytes,
+                        candidate.modified_ns,
+                        candidate_digest,
+                    ),
+                )
+            except (OSError, RuntimeError, ValueError):
+                result = None
+            entry = self._entry_for_job_id(restored.id)
+            if entry is not None:
+                entry.result = result
+            if result is None:
+                paused = self._job_execution.reset_paused(restored.id)
+                self._job_queue.replace(paused)
+                QMessageBox.warning(
+                    self,
+                    "Revisión no recuperable",
+                    "Se encontró el original, pero la revisión guardada ya no está completa. "
+                    "El documento puede volver a procesarse.",
+                )
+        self._sync_workspace(force_persist=True)
+
     @Slot(str, object)
     def _configure_job(self, job_id: str, requested_stage: object) -> None:
         entry = self._entry_for_job_id(job_id)
@@ -1197,6 +1270,7 @@ class ParsezenMainWindow(QMainWindow):
             models=(),
             stage=stage,
             embedded=True,
+            compatible_count=self._queue_configuration.compatible_job_count(job),
             default_output_directory=self._settings.output_directory,
             default_ai_model=self._settings.model,
             default_ai_context=self._settings.context_window,
@@ -1212,6 +1286,12 @@ class ParsezenMainWindow(QMainWindow):
         )
         dialog.component_setup_requested.connect(
             lambda editor=dialog: self._open_component_setup_from_configuration(editor)
+        )
+        dialog.apply_compatible_requested.connect(
+            lambda job_id=job.id, editor=dialog: self._apply_saved_configuration_to_compatible_jobs(
+                job_id,
+                editor,
+            )
         )
         self.parsezen_workspace.set_configuring(job.id, None)
         self.parsezen_workspace.show_internal_view(
@@ -1279,16 +1359,11 @@ class ParsezenMainWindow(QMainWindow):
         elif isinstance(dialog, BookEditorDialog):
             title = "Revisión final del EPUB"
             dialog.set_embedded_mode(True)
-        replace_app_header = isinstance(dialog, (BookEditorDialog, PhaseReviewDialog))
         dialog.setModal(False)
         dialog.setWindowFlags(Qt.WindowType.Widget)
         loop = QEventLoop(self)
         dialog.finished.connect(loop.quit)
-        self.parsezen_workspace.show_internal_view(
-            dialog,
-            title,
-            replace_app_header=replace_app_header,
-        )
+        self.parsezen_workspace.show_internal_view(dialog, title)
         loop.exec()
         result = dialog.result()
         self.parsezen_workspace.close_internal_view(dialog)
@@ -1395,6 +1470,23 @@ class ParsezenMainWindow(QMainWindow):
                 continue
             entry.pdf_page_range = update.pdf_page_range
             entry.result = None
+        if updates:
+            self._sync_workspace(force_persist=True)
+
+    def _apply_saved_configuration_to_compatible_jobs(
+        self,
+        job_id: str,
+        dialog: JobConfigurationDialog,
+    ) -> None:
+        source_job = self._job_for_id(job_id)
+        if source_job is None:
+            return
+        try:
+            configuration = dialog.configuration()
+        except ValueError as exc:
+            QMessageBox.warning(self, "Configuración no válida", str(exc))
+            return
+        self._apply_configuration_to_compatible_jobs(source_job, configuration)
 
     @Slot(str, object)
     def _show_job_error(self, job_id: str, requested_stage: object) -> None:
@@ -1429,8 +1521,11 @@ class ParsezenMainWindow(QMainWindow):
         job = self._job_for_id(job_id)
         if entry is None or job is None or entry.result is None:
             return
+        if not job.source.path.is_file():
+            QMessageBox.warning(self, "Original no disponible", _SOURCE_UNAVAILABLE_MESSAGE)
+            return
         if not _source_is_unchanged(job.source):
-            self._invalidate_changed_source_review(entry, job)
+            self._workspace_recovery.invalidate_changed_source_review(entry, job)
             QMessageBox.warning(self, "El original ha cambiado", _SOURCE_CHANGED_MESSAGE)
             self._sync_workspace(force_persist=True)
             return
@@ -1537,7 +1632,7 @@ class ParsezenMainWindow(QMainWindow):
             return
         self._sync_workspace(force_persist=True)
         try:
-            book = self._review_publication.prepare_book(job.id, result, reviewed_text)
+            book = self._review_flow.prepare_book(job.id, result, reviewed_text)
         except (ParsezenError, StateStoreError, ValueError, OSError) as exc:
             self._keep_review_pending(entry, result)
             QMessageBox.warning(self, "No se pudo preparar el editor", str(exc))
@@ -1555,7 +1650,7 @@ class ParsezenMainWindow(QMainWindow):
         if publishable_book is None:
             if saved_draft is not None:
                 try:
-                    self._review_publication.save_book(job.id, saved_draft)
+                    self._review_flow.save_book(job.id, saved_draft)
                 except (StateStoreError, ValueError, OSError) as exc:
                     QMessageBox.warning(
                         self,
@@ -1565,7 +1660,7 @@ class ParsezenMainWindow(QMainWindow):
             self._keep_review_pending(entry, result)
             return
         try:
-            published = self._review_publication.publish_book(
+            published = self._review_flow.publish_book(
                 job.id,
                 result,
                 reviewed_text,
@@ -1593,10 +1688,9 @@ class ParsezenMainWindow(QMainWindow):
         if text is None:
             return ("", ())
         try:
-            preparation = self._review_materialization.materialize_quality(
+            preparation = self._review_flow.materialize_quality(
                 job,
                 result,
-                job.source.path,
                 text,
             )
         except (ParsezenError, StateStoreError, OSError, ValueError) as exc:
@@ -1609,9 +1703,12 @@ class ParsezenMainWindow(QMainWindow):
         # A pending quality dialog leaves ``reviewed_text`` at an intermediate boundary;
         # later candidates must wait for the final rebuilt draft after that dialog applies.
         if preparation.complete:
-            post_quality_draft = self._rebuild_revision_draft_after_quality(result, reviewed_text)
+            post_quality_draft = self._review_flow.rebuild_revision_draft(
+                result,
+                reviewed_text,
+            )
             try:
-                self._review_materialization.ensure_revision_candidates(
+                self._review_flow.ensure_revision_candidates(
                     post_quality_draft,
                     job,
                     saved,
@@ -1621,7 +1718,7 @@ class ParsezenMainWindow(QMainWindow):
                 return None
 
         try:
-            self._phase_reviews.reconcile(job.id, result)
+            self._review_flow.reconcile(job.id, result)
         except (KeyError, StateStoreError, ValueError) as exc:
             QMessageBox.warning(self, "No se pudo recuperar la revisión", str(exc))
             return None
@@ -1635,7 +1732,7 @@ class ParsezenMainWindow(QMainWindow):
                 completed.append(review)
                 continue
             try:
-                self._phase_reviews.prepare(job.id, result, review)
+                self._review_flow.prepare(job.id, result, review)
             except (StateStoreError, ValueError) as exc:
                 QMessageBox.warning(self, "No se pudo preparar la revisión", str(exc))
                 return None
@@ -1647,7 +1744,7 @@ class ParsezenMainWindow(QMainWindow):
                 if previous_kind is None:
                     return False
                 try:
-                    self._phase_reviews.reopen_review(
+                    self._review_flow.reopen_review(
                         job.id,
                         result,
                         kind=previous_kind,
@@ -1678,7 +1775,7 @@ class ParsezenMainWindow(QMainWindow):
                 if previous_requested:
                     return self._review_quality_phases(entry, job)
                 try:
-                    self._phase_reviews.prepare(job.id, result, dialog.review)
+                    self._review_flow.prepare(job.id, result, dialog.review)
                 except (StateStoreError, ValueError) as exc:
                     QMessageBox.warning(self, "No se pudo guardar la revisión", str(exc))
                 return None
@@ -1689,7 +1786,7 @@ class ParsezenMainWindow(QMainWindow):
                     if kind is ReviewKind.OCR
                     else apply_translation_review(reviewed_text, review, self._artifact_store)
                 )
-                progress = self._phase_reviews.apply(job.id, result, review)
+                progress = self._review_flow.apply(job.id, result, review)
             except (StateStoreError, OSError, ValueError) as exc:
                 QMessageBox.warning(self, "No se pudo aplicar la revisión", str(exc))
                 return None
@@ -1704,20 +1801,6 @@ class ParsezenMainWindow(QMainWindow):
             completed.append(review)
         return reviewed_text, tuple(completed)
 
-    @staticmethod
-    def _rebuild_revision_draft_after_quality(
-        result: ProcessResult,
-        reviewed_text: str,
-    ) -> RevisionDraft | None:
-        draft = result.revision_draft
-        if draft is None:
-            return None
-        return build_revision_draft(
-            draft.original_markdown,
-            reviewed_text,
-            kinds=draft.kinds,
-        )
-
     def _review_revision_by_phase(
         self,
         entry: JobRuntime,
@@ -1730,7 +1813,7 @@ class ParsezenMainWindow(QMainWindow):
         if result is None:
             return
         try:
-            preparation = self._review_materialization.materialize_revisions(
+            preparation = self._review_flow.materialize_revisions(
                 job,
                 result,
                 draft,
@@ -1744,7 +1827,7 @@ class ParsezenMainWindow(QMainWindow):
         phase_plan = preparation.phase_plan
 
         try:
-            self._phase_reviews.reconcile(job.id, result)
+            self._review_flow.reconcile(job.id, result)
         except (KeyError, StateStoreError, ValueError) as exc:
             QMessageBox.warning(self, "No se pudo recuperar la revisión", str(exc))
             return
@@ -1757,7 +1840,7 @@ class ParsezenMainWindow(QMainWindow):
                 reviews.append(review)
                 continue
             try:
-                self._phase_reviews.prepare(job.id, result, review)
+                self._review_flow.prepare(job.id, result, review)
             except (StateStoreError, ValueError) as exc:
                 QMessageBox.warning(self, "No se pudo preparar la revisión", str(exc))
                 return
@@ -1776,7 +1859,7 @@ class ParsezenMainWindow(QMainWindow):
                     if previous_kind is None:
                         return False
                     try:
-                        self._phase_reviews.reopen_review(
+                        self._review_flow.reopen_review(
                             job.id,
                             result,
                             kind=previous_kind,
@@ -1814,13 +1897,13 @@ class ParsezenMainWindow(QMainWindow):
                         self._review_job(job.id, None)
                         return
                     try:
-                        self._phase_reviews.prepare(job.id, result, dialog.review)
+                        self._review_flow.prepare(job.id, result, dialog.review)
                     except (StateStoreError, ValueError) as exc:
                         QMessageBox.warning(self, "No se pudo guardar la revisión", str(exc))
                     return
                 review = dialog.review
             try:
-                progress = self._phase_reviews.apply(job.id, result, review)
+                progress = self._review_flow.apply(job.id, result, review)
             except (StateStoreError, ValueError) as exc:
                 QMessageBox.warning(self, "No se pudo aplicar la revisión", str(exc))
                 return
@@ -1833,15 +1916,10 @@ class ParsezenMainWindow(QMainWindow):
                 return
             reviews.append(progress.applied_review)
         try:
-            reviewed_text = render_revision_reviews(
+            reviewed_text = self._review_flow.render_revision(
                 draft,
                 tuple(reviews),
-                self._artifact_store,
-            )
-            reviewed_text = ensure_quality_reviews_applied(
-                reviewed_text,
                 preceding_reviews,
-                self._artifact_store,
             )
         except ValueError as exc:
             self._keep_review_pending(entry, result)
@@ -1854,7 +1932,7 @@ class ParsezenMainWindow(QMainWindow):
             and result.revision_epub_metadata is not None
         ):
             try:
-                book = self._review_publication.prepare_book(
+                book = self._review_flow.prepare_book(
                     job.id,
                     result,
                     reviewed_text,
@@ -1876,7 +1954,7 @@ class ParsezenMainWindow(QMainWindow):
             if publishable_book is None:
                 if saved_draft is not None:
                     try:
-                        self._review_publication.save_book(job.id, saved_draft)
+                        self._review_flow.save_book(job.id, saved_draft)
                     except (StateStoreError, ValueError, OSError) as exc:
                         QMessageBox.warning(
                             self,
@@ -1886,7 +1964,7 @@ class ParsezenMainWindow(QMainWindow):
                 self._keep_review_pending(entry, result)
                 return
             try:
-                published = self._review_publication.publish_book(
+                published = self._review_flow.publish_book(
                     job.id,
                     result,
                     reviewed_text,
@@ -1925,7 +2003,7 @@ class ParsezenMainWindow(QMainWindow):
         if job is None:
             return
         try:
-            published = self._review_publication.publish_text(
+            published = self._review_flow.publish_text(
                 job.id,
                 result,
                 reviewed_text,
@@ -2206,7 +2284,7 @@ class ParsezenMainWindow(QMainWindow):
         if job is None:
             return
         try:
-            self._phase_reviews.reopen_last_review(job.id, result)
+            self._review_flow.reopen_last_review(job.id, result)
         except (KeyError, StateStoreError, ValueError):
             LOGGER.warning("review_gate_restore_failed")
         self._sync_workspace(force_persist=True)
@@ -2378,14 +2456,6 @@ class ParsezenMainWindow(QMainWindow):
                 self._select_result_card(str(job.source.path))
                 self._open_result_folder()
             return
-        if mode == "configure_result":
-            job = next(
-                (candidate for candidate in self._job_queue.jobs if not candidate.is_configured),
-                None,
-            )
-            if job is not None:
-                self._configure_job(job.id, StageKind.PUBLISH)
-            return
         self._start_after_preparation = True
         try:
             self._prepare_independent_requests()
@@ -2471,6 +2541,8 @@ class ParsezenMainWindow(QMainWindow):
             for job_id in plan.job_ids:
                 job = self._job_queue.get(job_id)
                 if job is not None:
+                    if not job.source.path.is_file():
+                        raise ValueError(_SOURCE_UNAVAILABLE_MESSAGE)
                     current_source = _source_from_path(job.source.path)
                     if (
                         current_source.size_bytes != job.source.size_bytes
@@ -2517,7 +2589,6 @@ class ParsezenMainWindow(QMainWindow):
                 if job is not None:
                     key = forecast_cache_key(
                         job,
-                        item.settings.model,
                         self._metrics_generation,
                     )
                     self._forecast_cache[key] = item.preflight
@@ -2566,7 +2637,7 @@ class ParsezenMainWindow(QMainWindow):
                     timeout_seconds=self._settings.timeout_seconds,
                     checkpoint_retention_days=self._settings.checkpoint_retention_days,
                 )
-                key = forecast_cache_key(job, settings.model, self._metrics_generation)
+                key = forecast_cache_key(job, self._metrics_generation)
                 forecast = self._forecast_cache.get(key)
                 if forecast is not None:
                     forecasts[job.id] = forecast
@@ -2576,7 +2647,7 @@ class ParsezenMainWindow(QMainWindow):
                 ):
                     pending = True
             except (OSError, ParsezenError, ValueError):
-                fallback_key = forecast_cache_key(job, None, self._metrics_generation)
+                fallback_key = forecast_cache_key(job, self._metrics_generation)
                 if fallback_key not in self._forecast_unavailable:
                     pending = True
         queue_preflight = combine_preflights(tuple(forecasts.values())) if forecasts else None
@@ -2634,7 +2705,7 @@ class ParsezenMainWindow(QMainWindow):
                 )
             except (OSError, ParsezenError, ValueError):
                 continue
-            key = forecast_cache_key(job, settings.model, self._metrics_generation)
+            key = forecast_cache_key(job, self._metrics_generation)
             forecast = self._forecast_cache.get(key)
             if forecast is not None:
                 forecasts[job.id] = forecast
@@ -2683,7 +2754,7 @@ class ParsezenMainWindow(QMainWindow):
             if self._current_runtime() is None:
                 return
             try:
-                runtime = self._runtime_for_entry(job.id)
+                runtime = self._queue_run.runtime_for(job.id, self._settings)
                 if runtime is None:
                     return
                 request, settings = runtime
@@ -2759,9 +2830,22 @@ class ParsezenMainWindow(QMainWindow):
         *,
         force: bool = False,
     ) -> bool:
-        persistence = self._queue_persistence.persist(jobs, force=force)
+        current_job = self._current_job()
+        attempt_id = self._processing_runner.attempt_id
+        attempt_ids = (
+            {current_job.id: attempt_id}
+            if current_job is not None and attempt_id is not None
+            else {}
+        )
+        persistence = self._queue_persistence.persist(
+            jobs,
+            force=force,
+            attempt_ids=attempt_ids,
+        )
         if persistence.status is QueuePersistenceStatus.UNAVAILABLE:
-            self.parsezen_workspace.set_recovery_warning(_RECOVERY_READ_WARNING)
+            self.parsezen_workspace.set_recovery_warning(
+                self._state_recovery_notice or _RECOVERY_READ_WARNING
+            )
             return False
         if persistence.status is QueuePersistenceStatus.FAILED:
             self.parsezen_workspace.set_recovery_warning(_RECOVERY_WRITE_WARNING)
@@ -2770,93 +2854,11 @@ class ParsezenMainWindow(QMainWindow):
             self.parsezen_workspace.set_recovery_warning(self._state_recovery_notice)
         return True
 
-    def _restore_workspace(self) -> frozenset[str] | None:
-        try:
-            saved_jobs = self._state_store.load_jobs()
-        except StateStoreError:
-            if self._backup_and_reset_unreadable_state():
-                return None
-            self._queue_persistence.mark_unavailable()
-            return None
-        recovered = recover_workspace(saved_jobs, self._result_snapshots, self._settings)
-        if recovered.jobs:
-            self._job_queue.restore(recovered.jobs)
-            for job_id in recovered.reset_paused_job_ids:
-                paused = self._job_execution.reset_paused(job_id)
-                if job_id in recovered.source_changed_job_ids:
-                    self._job_queue.replace(
-                        replace(
-                            paused,
-                            warnings=(*paused.warnings, _SOURCE_CHANGED_MESSAGE),
-                        )
-                    )
-            for job_id in recovered.interrupted_job_ids:
-                self._job_execution.recover_interrupted(job_id)
-            self._queue_session.replace_runtime(dict(recovered.runtime))
-        return recovered.retained_artifact_job_ids
-
-    def _backup_and_reset_unreadable_state(self) -> bool:
-        timestamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%S-%f")
-        source = self._state_store.path
-        backup = source.with_name(f"{source.stem}.unreadable-{timestamp}{source.suffix}")
-        artifact_source = self._artifact_store.root
-        artifact_backup = artifact_source.with_name(
-            f"{artifact_source.name}.unreadable-{timestamp}"
-        )
-        try:
-            self._state_store.backup_to(backup)
-            if artifact_source.exists():
-                if artifact_backup.exists():
-                    raise FileExistsError("The artifact backup already exists.")
-                artifact_source.replace(artifact_backup)
-            self._state_store.reset_queue()
-        except (FileExistsError, OSError, StateStoreError, ValueError):
-            LOGGER.warning("unreadable_state_preservation_failed")
-            return False
-        preserved = backup.name
-        if artifact_backup.exists():
-            preserved = f"{backup.name} y {artifact_backup.name}"
-        self._state_recovery_notice = (
-            "No se pudo recuperar la cola anterior. Se conservó una copia local "
-            f"segura ({preserved})."
-        )
-        LOGGER.warning(
-            "unreadable_state_preserved backup_created=true artifacts_preserved=%s",
-            artifact_backup.exists(),
-        )
-        return True
-
-    def _invalidate_changed_source_review(
-        self,
-        entry: JobRuntime,
-        job: DocumentJob,
-    ) -> None:
-        entry.result = None
-        paused = self._job_execution.reset_paused(job.id)
-        if _SOURCE_CHANGED_MESSAGE not in paused.warnings:
-            self._job_queue.replace(
-                replace(paused, warnings=(*paused.warnings, _SOURCE_CHANGED_MESSAGE))
-            )
-        try:
-            self._state_store.delete_review_material(job.id)
-            self._artifact_store.remove_job(job.id)
-        except (StateStoreError, OSError, ValueError):
-            LOGGER.warning("changed_source_review_cleanup_failed")
-
     def _has_unfinished_jobs(self) -> bool:
         return any(
             job.status not in {JobStatus.COMPLETED, JobStatus.CANCELLED}
             for job in self._job_queue.jobs
         )
-
-    def _prune_orphaned_review_artifacts(self, retained_job_ids: frozenset[str]) -> None:
-        try:
-            removed = self._artifact_store.prune_orphaned_jobs(retained_job_ids)
-        except (OSError, ValueError):
-            LOGGER.warning("orphaned_review_artifact_cleanup_failed")
-            return
-        if removed:
-            LOGGER.info("orphaned_review_artifacts_removed count=%d", len(removed))
 
     def _entry_for_job_id(self, job_id: str) -> JobRuntime | None:
         return (

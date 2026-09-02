@@ -342,7 +342,7 @@ def merge_integrity_reports(
 
 def markdown_ledger(markdown: str) -> IntegrityLedger:
     canonical = _canonical_markdown(markdown)
-    blocks = split_markdown_blocks(canonical)
+    blocks = split_markdown_blocks(canonical, enforce_review_limit=False)
     return IntegrityLedger(
         blocks=len(blocks),
         paragraphs=sum(int(bool(block.markdown.strip())) for block in blocks),

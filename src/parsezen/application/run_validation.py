@@ -36,13 +36,14 @@ def validate_independent_batch_requests(
     issues: list[BatchValidationIssue] = []
     valid_requests: list[tuple[int, ProcessRequest]] = []
     for index, (request, settings) in enumerate(items, start=1):
+        source = request.source
         try:
             validate_process_request(request, settings)
         except (ParsezenError, OSError, ValueError) as exc:
             issues.append(
                 BatchValidationIssue(
                     index,
-                    request.source_path.name,
+                    source.path.name,
                     str(exc) or "La solicitud no es válida.",
                 )
             )
@@ -59,14 +60,16 @@ def _validate_aggregate_output_space(
     issues: list[BatchValidationIssue] = []
     required_by_directory: dict[Path, int] = {}
     for index, request in valid_requests:
-        output_directory = request.output_directory or request.source_path.parent
+        source = request.source
+        publication = request.publication
+        output_directory = publication.output_directory or source.path.parent
         try:
-            source_size = request.source_path.stat().st_size
+            source_size = source.path.stat().st_size
         except OSError:
             issues.append(
                 BatchValidationIssue(
                     index,
-                    request.source_path.name,
+                    source.path.name,
                     "No se pudo comprobar el tamaño del documento.",
                 )
             )

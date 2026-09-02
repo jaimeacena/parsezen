@@ -10,6 +10,7 @@ from collections.abc import Callable
 from typing import TypedDict
 
 from parsezen.cancellation import CancellationToken, check_cancelled
+from parsezen.domain.execution_plan import ExecutionStep
 from parsezen.domain.jobs import ReviewRecommendation
 from parsezen.domain.process_lifecycle import ProcessStage
 from parsezen.epub_builder import reconcile_generated_html_tables
@@ -22,8 +23,15 @@ from parsezen.improvement import (
     retranslate_residual_title,
     review_translation_markdown,
 )
-from parsezen.offline_translation import translate_markdown_offline
-from parsezen.pdf_conversion import PdfQualityReport, strip_pdf_page_markers
+from parsezen.offline_translation import (
+    is_offline_translation_pair_installed,
+    translate_markdown_offline,
+)
+from parsezen.pdf_conversion import (
+    PdfQualityReport,
+    strip_pdf_page_markers,
+    strip_pdf_public_markers,
+)
 from parsezen.pipeline.contracts import (
     PreparedDocument,
     ProcessRequest,
@@ -130,6 +138,27 @@ def transform_prepared_document(
     translation_repair_accepted = 0
     translation_settings = settings_for_translation(settings) if settings is not None else None
     review_settings = settings_for_review(settings) if settings is not None else None
+    execution_plan = request.execution_plan
+    ai_translation_planned = (
+        execution_plan.includes(ExecutionStep.TRANSLATE_AI)
+        if execution_plan is not None
+        else request.improvement_mode is not None
+    )
+    offline_translation_planned = (
+        execution_plan.includes(ExecutionStep.TRANSLATE_OFFLINE)
+        if execution_plan is not None
+        else request.offline_translation_language is not None
+    )
+    content_review_planned = (
+        execution_plan.includes(ExecutionStep.REVIEW_CONTENT)
+        if execution_plan is not None
+        else request.review_content
+    )
+    structure_review_planned = (
+        execution_plan.includes(ExecutionStep.REVIEW_STRUCTURE)
+        if execution_plan is not None
+        else request.review_structure
+    )
 
     def record_translation_repair(attempted: int, accepted: int) -> None:
         nonlocal translation_repair_attempted, translation_repair_accepted
@@ -138,13 +167,14 @@ def transform_prepared_document(
 
     effective_ai_mode = effective_ai_improvement_mode(request)
     ai_translation_is_redundant = (
-        request.improvement_mode is ImprovementMode.TRANSLATE
+        ai_translation_planned
+        and request.improvement_mode is ImprovementMode.TRANSLATE
         and translation_is_redundant(
             transformed_markdown,
             request.target_language,
         )
     )
-    if request.improvement_mode is not None and not ai_translation_is_redundant:
+    if ai_translation_planned and not ai_translation_is_redundant:
         if settings is None:
             raise AssertionError("Validated improvement requests always have settings.")
         if effective_ai_mode is None:
@@ -218,13 +248,15 @@ def transform_prepared_document(
         LOGGER.info("translation_skipped already_in_target_language=true engine=ai")
 
     offline_translation_is_redundant = (
-        request.offline_translation_language is not None
+        offline_translation_planned
+        and request.offline_translation_language is not None
         and translation_is_redundant(
             transformed_markdown,
             request.offline_translation_language,
         )
     )
-    if request.offline_translation_language is not None and not offline_translation_is_redundant:
+    if offline_translation_planned and not offline_translation_is_redundant:
+        assert request.offline_translation_language is not None
         _announce(on_stage, ProcessStage.PREPARING_TRANSLATION)
         translation_source = transformed_markdown
         translation_stage_announced = False
@@ -281,7 +313,13 @@ def transform_prepared_document(
     revision_kinds: set[RevisionKind] = set()
     translation_review_source: str | None = None
     linguistic_review_mode = LinguisticReviewMode.NOT_REVIEWED
-    if request.review_content:
+    bilingual_reviewed_blocks = 0
+
+    def record_bilingual_review_coverage(reviewed_blocks: int) -> None:
+        nonlocal bilingual_reviewed_blocks
+        bilingual_reviewed_blocks = max(0, reviewed_blocks)
+
+    if content_review_planned:
         if settings is None:
             raise AssertionError("Validated review requests always have settings.")
         if review_settings is None:
@@ -292,7 +330,6 @@ def transform_prepared_document(
             translation_source,
         )
         if translation_source is not None:
-            linguistic_review_mode = LinguisticReviewMode.INDEPENDENT_BILINGUAL
             translation_review_source = translation_source
             transformed_markdown = review_translation_with_checkpoints(
                 translation_source,
@@ -303,7 +340,19 @@ def transform_prepared_document(
                 cancellation,
                 work_checkpoints,
                 quality_report=translation_quality,
+                on_reviewed_segments=record_bilingual_review_coverage,
             )
+            translated_blocks = (
+                max(translation_quality.checked_segments, translation_quality.translated_blocks)
+                if translation_quality is not None
+                else 0
+            )
+            if bilingual_reviewed_blocks:
+                linguistic_review_mode = (
+                    LinguisticReviewMode.INDEPENDENT_BILINGUAL
+                    if translated_blocks and bilingual_reviewed_blocks >= translated_blocks
+                    else LinguisticReviewMode.TARGETED_BILINGUAL
+                )
             if selected_translation_cleanup:
                 transformed_markdown = improve_selected_content(
                     transformed_markdown,
@@ -338,7 +387,7 @@ def transform_prepared_document(
             )
         if transformed_markdown != revision_source:
             revision_kinds.add(RevisionKind.CONTENT)
-    if request.review_structure:
+    if structure_review_planned:
         if settings is None:
             raise AssertionError("Validated review requests always have settings.")
         if review_settings is None:
@@ -392,6 +441,8 @@ def transform_prepared_document(
     linguistic_coverage = linguistic_review_coverage(
         review_translation_quality,
         mode=linguistic_review_mode,
+        reviewed_blocks=bilingual_reviewed_blocks,
+        independently_verified_blocks=bilingual_reviewed_blocks,
     )
 
     if preserved_translation_chunks and _preserved_translation_was_fully_repaired(
@@ -418,7 +469,7 @@ def transform_prepared_document(
         or generated_epub
     )
     public_markdown = (
-        strip_pdf_page_markers(published_markdown)
+        strip_pdf_public_markers(published_markdown)
         if source_path.suffix.lower() == ".pdf"
         and not review_required
         and not (
@@ -482,6 +533,7 @@ def review_translation_with_checkpoints(
     checkpoints: WorkCheckpoints | None,
     *,
     quality_report: TranslationQualityReport | None = None,
+    on_reviewed_segments: Callable[[int], None] | None = None,
 ) -> str:
     """Review a translation against its aligned source using only local Ollama."""
 
@@ -500,6 +552,7 @@ def review_translation_with_checkpoints(
         save_checkpoint=checkpoints.save if checkpoints is not None else None,
         priority_block_count=max(analyze_markdown(source_markdown).front_matter_blocks, 8),
         quality_report=quality_report,
+        on_reviewed_segments=on_reviewed_segments,
     )
 
 
@@ -514,6 +567,8 @@ def epub_translation_resume_key(
     settings: AppSettings | None,
     language_code: str,
     terminology: tuple[DocumentTerm, ...] = (),
+    *,
+    translation_glossary: tuple[GlossaryEntry, ...] | None = None,
 ) -> str:
     """Identify text-changing settings for resumable EPUB transformations."""
 
@@ -524,13 +579,15 @@ def epub_translation_resume_key(
         request.review_content,
         request.offline_translation_language is not None,
     )
-    glossary = glossary_fingerprint(request.glossary)
+    glossary = glossary_fingerprint(
+        request.glossary if translation_glossary is None else translation_glossary
+    )
     terminology_digest = terminology_fingerprint(terminology)
     if not has_specialized_ai_profiles(settings):
         # Keep this tuple byte-for-byte compatible with pre-specialized jobs.
         return repr(
             (
-                "epub-translation-v11",
+                "epub-translation-v12",
                 *common,
                 settings.model if settings is not None else None,
                 settings.context_window if settings is not None else None,
@@ -544,7 +601,7 @@ def epub_translation_resume_key(
     review_settings = settings_for_review(settings)
     return repr(
         (
-            "epub-translation-v12-specialized",
+            "epub-translation-v13-specialized",
             *common,
             translation_settings.model,
             translation_settings.context_window,
@@ -772,11 +829,9 @@ def linguistic_review_coverage(
         return None
     translated_blocks = max(0, report.checked_segments, report.translated_blocks)
     if reviewed_blocks is None:
-        reviewed_blocks = translated_blocks if mode is not LinguisticReviewMode.NOT_REVIEWED else 0
+        reviewed_blocks = 0
     if independently_verified_blocks is None:
-        independently_verified_blocks = (
-            translated_blocks if mode is LinguisticReviewMode.INDEPENDENT_BILINGUAL else 0
-        )
+        independently_verified_blocks = 0
     return LinguisticReviewCoverage(
         mode=mode,
         translated_blocks=translated_blocks,
@@ -851,7 +906,7 @@ def repair_translation_warnings(
                 )
             )
             if has_title_residue and source_language_code is not None:
-                return retranslate_residual_title(
+                repaired_title = retranslate_residual_title(
                     source_segment,
                     current_segment,
                     settings,
@@ -859,6 +914,50 @@ def repair_translation_warnings(
                     source_language_code=source_language_code,
                     cancellation=cancellation,
                 )
+                remaining_title_residue = bool(
+                    find_untranslated_title_lines(
+                        source_segment,
+                        repaired_title,
+                        source_language_code,
+                    )
+                    or find_titles_with_source_language_residue(
+                        source_segment,
+                        repaired_title,
+                        source_language_code,
+                    )
+                )
+                if (
+                    remaining_title_residue
+                    and "\n" not in source_segment.strip()
+                    and is_offline_translation_pair_installed(
+                        source_language_code,
+                        target_language_code,
+                    )
+                ):
+                    try:
+                        offline_title = translate_markdown_offline(
+                            source_segment,
+                            target_language,
+                            source_language_code=source_language_code,
+                            cancellation=cancellation,
+                        )
+                    except ParsezenError:
+                        return repaired_title
+                    if not (
+                        find_untranslated_title_lines(
+                            source_segment,
+                            offline_title,
+                            source_language_code,
+                        )
+                        or find_titles_with_source_language_residue(
+                            source_segment,
+                            offline_title,
+                            source_language_code,
+                        )
+                    ):
+                        LOGGER.info("translation_title_offline_fallback accepted=true")
+                        return offline_title
+                return repaired_title
             repair_arguments: _ImprovementArguments = {
                 "plain_text": False,
                 "focused_source_repair": True,

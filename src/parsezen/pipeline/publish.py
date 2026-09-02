@@ -10,6 +10,7 @@ from pathlib import Path, PurePosixPath
 from parsezen.cancellation import CancellationToken, check_cancelled
 from parsezen.conversion import CONVERSION_REQUIRED_EXTENSIONS, materialize_converted_markdown
 from parsezen.document_model import ConvertedResource
+from parsezen.domain.execution_plan import ExecutionStep
 from parsezen.domain.process_lifecycle import ProcessStage
 from parsezen.epub_builder import EpubBookMetadata, build_epub, validate_epub_file
 from parsezen.errors import RequestValidationError
@@ -112,7 +113,11 @@ def publish_transformed_document(
     published_markdown = transformed.published_markdown
     review_required = transformed.review_required
     public_markdown = transformed.public_markdown
-    generated_epub = request.output_format is OutputFormat.EPUB
+    generated_epub = (
+        request.execution_plan.includes(ExecutionStep.BUILD_EPUB)
+        if request.execution_plan is not None
+        else request.output_format is OutputFormat.EPUB
+    )
 
     if generated_epub:
         check_cancelled(cancellation)

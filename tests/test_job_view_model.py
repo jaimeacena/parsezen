@@ -2,6 +2,7 @@ from dataclasses import replace
 from pathlib import Path
 
 from parsezen.application.planner import activate_next_stage
+from parsezen.application.workspace_recovery import SOURCE_UNAVAILABLE_MESSAGE
 from parsezen.domain.jobs import (
     DocumentFormat,
     DocumentJob,
@@ -75,6 +76,20 @@ def test_next_step_keeps_missing_configuration_distinct_from_review() -> None:
         JobAction.REVIEW,
     )
     assert review.action_label == "Revisar y publicar"
+
+
+def test_unavailable_source_is_explicit_and_not_runnable() -> None:
+    missing = replace(make_job("missing"), warnings=(SOURCE_UNAVAILABLE_MESSAGE,))
+
+    presentation = next_step_view(missing)
+    header = queue_header_view((missing,))
+
+    assert (presentation.label, presentation.action) == (
+        "Original no disponible",
+        JobAction.RESTORE_SOURCE,
+    )
+    assert presentation.action_label == "Buscar original"
+    assert header.primary_mode is None
 
 
 def test_review_action_names_the_human_decision_for_editable_output() -> None:

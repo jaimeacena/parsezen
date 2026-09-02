@@ -9,6 +9,7 @@ from typing import TypedDict
 from parsezen.cancellation import CancellationToken, check_cancelled
 from parsezen.conversion import CONVERSION_REQUIRED_EXTENSIONS, convert_document
 from parsezen.document_model import ConvertedDocument, ConvertedResource
+from parsezen.domain.execution_plan import ExecutionStep
 from parsezen.domain.process_lifecycle import ProcessStage
 from parsezen.epub_conversion import inspect_epub_package
 from parsezen.glossary import MAX_GLOSSARY_ENTRIES, GlossaryEntry, validate_glossary
@@ -29,12 +30,59 @@ from parsezen.pipeline.contracts import (
     StageCallback,
 )
 from parsezen.semantic_blocks import DocumentTerm, analyze_markdown, reconcile_document_evidence
+from parsezen.translation_quality import detect_language_code, resolve_language_code
 from parsezen.work_checkpoints import WorkCheckpoints, checkpoint_key
 from parsezen.workflow import OutputFormat
 
 _PDF_OCR_CHECKPOINT_PREFIX = "\x1eParsezen PDF OCR "
 _PDF_OCR_CHECKPOINT_HEADER = f"{_PDF_OCR_CHECKPOINT_PREFIX}v4\x1f"
 _MAX_INFERRED_TERMINOLOGY_OCCURRENCES = 64
+_MIN_ASTROLOGY_DOMAIN_SIGNALS = 3
+_ASTROLOGY_DOMAIN_SIGNALS = (
+    "birth chart",
+    "decan",
+    "domicile lord",
+    "exaltation",
+    "triplicity lord",
+    "sect light",
+    "rulers of the nativity",
+    "void of course",
+    "whole-sign trine aspect",
+    "succedent houses",
+    "cadent houses",
+    "zodiac",
+)
+_ASTROLOGY_PHRASE_GLOSSARY = (
+    GlossaryEntry(
+        "the triplicity lords of the sect light",
+        "los señores de la triplicidad de la luminaria de la secta",
+        adapt_source_case=True,
+    ),
+    GlossaryEntry(
+        "whole-sign trine aspect",
+        "aspecto de trígono de signo completo",
+        adapt_source_case=True,
+    ),
+    GlossaryEntry("rulers of the nativity", "regentes de la natividad", adapt_source_case=True),
+    GlossaryEntry("of the triplicity lord", "del señor de la triplicidad", adapt_source_case=True),
+    GlossaryEntry(
+        "the triplicity lords",
+        "los señores de la triplicidad",
+        adapt_source_case=True,
+    ),
+    GlossaryEntry("the triplicity lord", "el señor de la triplicidad", adapt_source_case=True),
+    GlossaryEntry("the domicile lords", "los regentes domiciliarios", adapt_source_case=True),
+    GlossaryEntry("the domicile lord", "el regente domiciliario", adapt_source_case=True),
+    GlossaryEntry("its domicile lord", "su regente domiciliario", adapt_source_case=True),
+    GlossaryEntry("the birth chart", "la carta natal", adapt_source_case=True),
+    GlossaryEntry("the sect light", "la luminaria de la secta", adapt_source_case=True),
+    GlossaryEntry("their sect light", "su luminaria de la secta", adapt_source_case=True),
+    GlossaryEntry("succedent houses", "casas sucedentes", adapt_source_case=True),
+    GlossaryEntry("cadent houses", "casas cadentes", adapt_source_case=True),
+    GlossaryEntry("decan", "decano", adapt_source_case=True),
+    GlossaryEntry("exaltation", "exaltación", adapt_source_case=True),
+    GlossaryEntry("Void of Course", "Vacío de Curso", adapt_source_case=True),
+)
 
 DocumentConverter = Callable[..., ConvertedDocument]
 PageRangeResolver = Callable[[Path, PdfPageRange], PdfPageRange]
@@ -75,11 +123,26 @@ def decode_pdf_ocr_checkpoint(payload: str | None) -> str | None:
 def combined_translation_glossary(
     glossary: tuple[GlossaryEntry, ...],
     terminology: tuple[DocumentTerm, ...],
+    *,
+    source_markdown: str | None = None,
+    source_language_code: str | None = None,
+    target_language_code: str | None = None,
 ) -> tuple[GlossaryEntry, ...]:
-    """Keep repeated proper terms stable while preserving explicit user choices."""
+    """Combine explicit, high-confidence domain and proper-name terminology."""
 
     normalized = list(validate_glossary(glossary))
     seen = {entry.source.casefold() for entry in normalized}
+    if source_markdown and source_language_code == "en" and target_language_code == "es":
+        compact_source = " ".join(source_markdown.casefold().split())
+        signal_count = sum(signal in compact_source for signal in _ASTROLOGY_DOMAIN_SIGNALS)
+        if signal_count >= _MIN_ASTROLOGY_DOMAIN_SIGNALS:
+            for entry in _ASTROLOGY_PHRASE_GLOSSARY:
+                if len(normalized) >= MAX_GLOSSARY_ENTRIES:
+                    break
+                key = entry.source.casefold()
+                if key not in seen and key in compact_source:
+                    normalized.append(entry)
+                    seen.add(key)
     inferred_occurrences = 0
     for term in terminology:
         if len(normalized) >= MAX_GLOSSARY_ENTRIES:
@@ -193,7 +256,11 @@ def prepare_document_input(
             conversion_arguments["pdf_visual_arbiter_factory"] = pdf_visual_arbiter_factory
     if cancellation is not None:
         conversion_arguments["cancellation"] = cancellation
-    generated_epub = request.output_format is OutputFormat.EPUB
+    generated_epub = (
+        request.execution_plan.includes(ExecutionStep.BUILD_EPUB)
+        if request.execution_plan is not None
+        else request.output_format is OutputFormat.EPUB
+    )
     source_cover_path: PurePosixPath | None = None
     if source_path.suffix.lower() == ".epub" and generated_epub:
         source_cover_path = inspect_epub_package(source_path).cover_path
@@ -244,9 +311,13 @@ def prepare_document_input(
         else ()
     )
     semantic_document = analyze_markdown(markdown)
+    target_language = request.offline_translation_language or request.target_language
     translation_glossary = combined_translation_glossary(
         request.glossary,
         semantic_document.terms,
+        source_markdown=markdown,
+        source_language_code=detect_language_code(markdown),
+        target_language_code=resolve_language_code(target_language),
     )
 
     return PreparedDocument(

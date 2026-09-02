@@ -149,6 +149,59 @@ def test_accepts_a_complete_translation_with_preserved_markdown() -> None:
     )
 
 
+def test_translation_preserves_semantic_markdown_emphasis_with_equivalent_delimiters() -> None:
+    validate_translation_quality(
+        "Keep *italics*, **bold** and ***both*** in this paragraph.",
+        "Conserva _cursiva_, __negrita__ y ___ambas___ en este párrafo.",
+        source_language="en",
+        target_language="es",
+        preserve_paragraphs=True,
+    )
+
+
+@pytest.mark.parametrize(
+    "translated",
+    (
+        "Conserva cursiva y **negrita** en este párrafo.",
+        "Conserva *cursiva* y negrita en este párrafo.",
+        "Conserva **cursiva** y *negrita* en este párrafo.",
+        "Conserva ***cursiva*** y *negrita* en este párrafo.",
+    ),
+)
+def test_translation_rejects_removed_changed_or_nested_markdown_emphasis(
+    translated: str,
+) -> None:
+    with pytest.raises(TranslationQualityError, match="énfasis Markdown"):
+        validate_translation_quality(
+            "Keep *italics* and **bold** in this paragraph.",
+            translated,
+            source_language="en",
+            target_language="es",
+            preserve_paragraphs=True,
+        )
+
+
+def test_translation_rejects_emphasis_moved_to_another_paragraph() -> None:
+    with pytest.raises(TranslationQualityError, match="énfasis Markdown"):
+        validate_translation_quality(
+            "The *first* paragraph is complete.\n\nThe second paragraph is complete.",
+            "El primer párrafo está completo.\n\nEl *segundo* párrafo está completo.",
+            source_language="en",
+            target_language="es",
+            preserve_paragraphs=True,
+        )
+
+
+def test_translation_does_not_treat_literal_asterisks_or_word_underscores_as_emphasis() -> None:
+    validate_translation_quality(
+        r"Use escaped \* characters and the account_id value.",
+        r"Usa caracteres \* escapados y el valor account_id.",
+        source_language="en",
+        target_language="es",
+        preserve_paragraphs=True,
+    )
+
+
 def test_rejects_a_raw_html_table_that_drops_an_empty_cell_and_its_column() -> None:
     source = (
         "<table><thead><tr><th>DECAN</th><th>QUALITY</th><th>IMAGE</th></tr></thead>"
@@ -451,6 +504,25 @@ def test_reports_a_partially_untranslated_short_title() -> None:
     assert report.total_issues > 0
 
 
+def test_reports_two_compact_english_words_left_inside_a_translated_heading() -> None:
+    source = "## A. CONJUNCTION (sunodos), LYING HIDDEN"
+    translated = "## A. CONJUNCIÓN (sunodos), LYING HIDDEN"
+
+    report = build_translation_quality_report(
+        source,
+        translated,
+        source_language="en",
+        target_language="es",
+    )
+
+    assert report.issues_by_kind[TranslationIssueKind.SOURCE_TEXT] >= 1
+    assert translation_quality_module.find_titles_with_source_language_residue(
+        source,
+        translated,
+        "en",
+    ) == ((source, translated),)
+
+
 def test_reports_partially_untranslated_short_titles_in_a_dense_index() -> None:
     source = "SCORPIO III 186\nSAGITTARIUS I 192\nPISCES I 244\nAPPENDICES 258"
     translated = "SCORPION III 186\n\nSAGITARIO I 192\nPISCIS I 244\nAPÉNDICES 258"
@@ -579,6 +651,29 @@ def test_does_not_treat_a_prefixed_translation_as_an_unchanged_sentence() -> Non
     )
 
 
+def test_checks_generated_html_toc_cells_instead_of_the_whole_table_wrapper() -> None:
+    source = (
+        '<table class="document-toc"><thead><tr>'
+        '<th class="toc-label">Entrada</th><th class="toc-folio">Página</th>'
+        '</tr></thead><tbody><tr><td class="toc-label">VIRGO III</td>'
+        '<td class="toc-folio">150</td></tr></tbody></table>'
+    )
+
+    assert find_untranslated_source_sentences(source, source, "en") == ()
+
+
+def test_an_english_html_toc_cell_can_still_be_reported_as_untranslated() -> None:
+    source = (
+        '<table class="document-toc"><tbody><tr>'
+        '<td class="toc-label">The hidden chapter remains unchanged</td>'
+        '<td class="toc-folio">150</td></tr></tbody></table>'
+    )
+
+    assert find_untranslated_source_sentences(source, source, "en") == (
+        "The hidden chapter remains unchanged",
+    )
+
+
 def test_accepts_a_written_number_converted_to_digits_without_duplication() -> None:
     assert numeric_tokens_are_conserved("ten and ten", "diez y 10")
     assert numeric_tokens_are_conserved(
@@ -652,6 +747,89 @@ def test_accepts_reordered_plural_spanish_duration() -> None:
 def test_rejects_an_ungrounded_or_duplicated_new_digit() -> None:
     assert not numeric_tokens_are_conserved("ordinary text", "texto ordinario 10")
     assert not numeric_tokens_are_conserved("ten", "diez 10")
+
+
+def test_conserves_superscript_footnote_numbers() -> None:
+    assert numeric_tokens_are_conserved("A sourced statement.⁶", "Una afirmación documentada.⁶")
+    assert not numeric_tokens_are_conserved("A sourced statement.⁶", "Una afirmación documentada.")
+
+
+def test_translation_conserves_currency_and_percentage_symbols() -> None:
+    validate_translation_quality(
+        "Earn $50k and keep 100% of unlimited money $$$.",
+        "Gana 50k $ y conserva el 100 % de dinero ilimitado $$$.",
+        source_language="en",
+        target_language="es",
+        preserve_paragraphs=True,
+    )
+
+    validate_translation_quality(
+        "Keep 100&#37; of the value.",
+        "Conserva el 100 % del valor.",
+        source_language="en",
+        target_language="es",
+        preserve_paragraphs=True,
+    )
+
+
+@pytest.mark.parametrize(
+    "translated",
+    (
+        "Gana 50k y conserva el 100 % de dinero ilimitado $$$.",
+        "Gana 50k $ y conserva el 100 de dinero ilimitado $$$.",
+        "Gana 50k $ y conserva el 100 % de dinero ilimitado $.",
+    ),
+)
+def test_translation_rejects_lost_currency_or_percentage_symbols(translated: str) -> None:
+    with pytest.raises(TranslationQualityError, match="moneda o porcentaje"):
+        validate_translation_quality(
+            "Earn $50k and keep 100% of unlimited money $$$.",
+            translated,
+            source_language="en",
+            target_language="es",
+            preserve_paragraphs=True,
+        )
+
+
+def test_translation_report_flags_a_clear_loss_of_strong_register() -> None:
+    report = build_translation_quality_report(
+        "Stop believing that bullshit and do the work you promised yourself.",
+        "Deja de creer ese concepto absurdo y haz el trabajo que te prometiste.",
+        source_language="en",
+        target_language="es",
+    )
+
+    assert report.total_issues == 1
+    assert report.issues[0].kind is TranslationIssueKind.FIDELITY
+    assert "registro" in report.issues[0].message
+
+
+def test_translation_report_accepts_equally_strong_natural_register() -> None:
+    report = build_translation_quality_report(
+        "Stop believing that bullshit and do the work you promised yourself.",
+        "Deja de creer esa gilipollez y haz el trabajo que te prometiste.",
+        source_language="en",
+        target_language="es",
+    )
+
+    assert report.total_issues == 0
+
+
+def test_translation_report_does_not_treat_a_person_name_as_strong_register() -> None:
+    report = build_translation_quality_report(
+        "Dick explained the complete method to every student in the workshop.",
+        "Dick explicó el método completo a todos los alumnos del taller.",
+        source_language="en",
+        target_language="es",
+    )
+
+    assert not any("registro" in issue.message for issue in report.issues)
+
+
+def test_does_not_treat_a_mojibake_superscript_character_as_a_number() -> None:
+    assert not translation_quality_module.numeric_token_counts(
+        "tradici\u00c3\u00b3n acad\u00c3\u00a9mica"
+    )
 
 
 def test_rejects_local_paragraph_duplication_hidden_by_a_long_document() -> None:
@@ -1641,6 +1819,37 @@ def test_translation_report_bounds_excerpts_and_visible_issue_count() -> None:
     )
 
 
+def test_translation_report_keeps_a_late_fidelity_issue_inside_the_excerpt_cap() -> None:
+    copied_sources = [
+        f"The unchanged source sentence number {index} remains in the translated document."
+        for index in range(25)
+    ]
+    source = "\n\n".join(
+        [
+            *copied_sources,
+            "Stop believing that bullshit and do the work you promised yourself.",
+        ]
+    )
+    translated = "\n\n".join(
+        [
+            *copied_sources,
+            "Deja de creer ese concepto absurdo y haz el trabajo que te prometiste.",
+        ]
+    )
+
+    report = build_translation_quality_report(
+        source,
+        translated,
+        source_language="en",
+        target_language="es",
+    )
+
+    assert len(report.issues) == 20
+    assert report.total_issues > len(report.issues)
+    assert any(issue.kind is TranslationIssueKind.FIDELITY for issue in report.issues)
+    assert report.issues_by_kind[TranslationIssueKind.SOURCE_TEXT] >= 20
+
+
 def test_aligned_translation_report_does_not_shift_after_an_internal_blank_line() -> None:
     source_segments = (
         "The first substantial source segment contains enough language for a reliable review.",
@@ -1958,6 +2167,98 @@ def test_pdf_repair_can_target_one_residual_sentence_inside_a_mixed_page() -> No
     assert "Una segunda frase ya se tradujo" in repair.translated
 
 
+def test_pdf_repair_can_target_one_unchanged_emphasized_list_item() -> None:
+    residual = "- Important condition: The **method**"
+    source = (
+        "<!-- PZDOC PDF PAGE 1 -->\n\n"
+        f"{residual}\n\nA second source paragraph contains useful context."
+    )
+    translated = (
+        "<!-- PZDOC PDF PAGE 1 -->\n\n"
+        f"{residual}\n\nUn segundo párrafo ya está traducido correctamente."
+    )
+    calls: list[tuple[str, str]] = []
+
+    repair = repair_untranslated_source_text(
+        source,
+        translated,
+        source_language="en",
+        target_language="es",
+        translate_segment=lambda source_fragment, current_fragment: (
+            calls.append((source_fragment, current_fragment))
+            or "- Condición importante: El **método**"
+        ),
+    )
+
+    assert calls == [(residual, residual)]
+    assert repair.repaired_segments == 1
+    assert residual not in repair.translated
+    assert "- Condición importante: El **método**" in repair.translated
+
+
+def test_pdf_repair_can_target_the_first_sentence_of_an_indented_list_item() -> None:
+    residual = "- Follow the complete method."
+    source = (
+        "<!-- PZDOC PDF PAGE 1 -->\n\n"
+        "  - Follow the complete method. Keep the original sequence.\n\n"
+        "A second source paragraph contains useful context."
+    )
+    translated = (
+        "<!-- PZDOC PDF PAGE 1 -->\n\n"
+        "  - Follow the complete method. Conserva la secuencia original.\n\n"
+        "Un segundo párrafo ya está traducido correctamente."
+    )
+    calls: list[tuple[str, str]] = []
+
+    def translate(source_fragment: str, current_fragment: str) -> str:
+        calls.append((source_fragment, current_fragment))
+        return "- Sigue el método completo." if source_fragment == residual else current_fragment
+
+    repair = repair_untranslated_source_text(
+        source,
+        translated,
+        source_language="en",
+        target_language="es",
+        translate_segment=translate,
+    )
+
+    assert calls[-1] == (residual, residual)
+    assert repair.repaired_segments == 1
+    assert "  - Sigue el método completo. Conserva la secuencia original." in repair.translated
+
+
+def test_unchanged_bare_email_address_is_not_reported_as_source_text() -> None:
+    address = "reader@example.com"
+
+    assert natural_language_text(f"**{address}**") == ""
+    assert find_untranslated_source_sentences(f"**{address}**", f"**{address}**", "en") == ()
+
+
+def test_automatic_source_repair_does_not_target_an_organization_name() -> None:
+    name = "The Example Reader Foundation Ltd."
+    source = (
+        "<!-- PZDOC PDF PAGE 1 -->\n\n"
+        f"{name}\n\nA complete source sentence explains the practice clearly."
+    )
+    translated = (
+        f"<!-- PZDOC PDF PAGE 1 -->\n\n{name}\n\nUna frase completa explica claramente la práctica."
+    )
+
+    repair = repair_untranslated_source_text(
+        source,
+        translated,
+        source_language="en",
+        target_language="es",
+        translate_segment=lambda _source, _current: pytest.fail(
+            "An organization name must not trigger automatic retranslation."
+        ),
+    )
+
+    assert repair.attempted_segments == 0
+    assert repair.repaired_segments == 0
+    assert repair.translated == translated
+
+
 def test_repairs_a_short_unchanged_source_sentence() -> None:
     calls: list[tuple[str, str]] = []
 
@@ -2151,10 +2452,54 @@ def test_finds_high_confidence_source_words_before_translation() -> None:
     )
 
 
+def test_finds_common_english_residue_inside_a_mixed_spanish_translation() -> None:
+    source = "In this exercise, you will determine a value for each planet."
+    translated = "In this ejercicio, you will determinar un valor para cada planeta."
+
+    assert translation_quality_module.source_language_word_residues(
+        source,
+        translated,
+        "en",
+    ) == ("in", "this", "you", "will")
+
+
+def test_finds_compact_semantic_english_residue_before_and_after_translation() -> None:
+    source = "A. CONJUNCTION (sunodos), LYING HIDDEN"
+    translated = "A. CONJUNCIÓN (sunodos), LYING HIDDEN"
+
+    assert translation_quality_module.source_words_requiring_translation(source, "en") == (
+        "lying",
+        "hidden",
+    )
+    assert translation_quality_module.source_language_word_residues(
+        source,
+        translated,
+        "en",
+    ) == ("lying", "hidden")
+
+
+def test_recognizes_a_translated_html_table_as_a_short_label_collection() -> None:
+    source = (
+        "<table><tbody><tr><td>ancestors</td><td>angels</td>"
+        "<td>anger</td><td>anguish</td></tr></tbody></table>"
+    )
+    translated = (
+        "<table><tbody><tr><td>antepasados</td><td>ángeles</td>"
+        "<td>ira</td><td>angustia</td></tr></tbody></table>"
+    )
+
+    assert translation_quality_module._is_translated_short_label_collection(
+        source,
+        translated,
+        source_language="en",
+    )
+
+
 def test_source_word_preflight_does_not_classify_capitalized_names_by_suffix() -> None:
     source = "A note from Fellowship Press accompanies the chart."
 
-    assert translation_quality_module.source_words_requiring_translation(source, "en") == ()
+    assert translation_quality_module.source_words_requiring_translation(source, "en") == ("from",)
+    assert translation_quality_module.source_words_requiring_focused_translation(source, "en") == ()
 
 
 def test_established_term_translation_is_available_before_document_generation() -> None:
@@ -2269,6 +2614,15 @@ def test_established_term_translation_is_available_before_document_generation() 
             "es",
         )
         == "el ciclo sinódico"
+    )
+    assert (
+        translation_quality_module.replace_established_term_residues(
+            "A. CONJUNCTION (sunodos), LYING HIDDEN",
+            "A. CONJUNCIÓN (sunodos), LYING HIDDEN",
+            "en",
+            "es",
+        )
+        == "A. CONJUNCIÓN (sunodos), OCULTO"
     )
     assert (
         translation_quality_module.established_term_translation(

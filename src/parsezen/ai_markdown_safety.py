@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import re
+import unicodedata
 from collections import Counter
 from collections.abc import Callable
 from difflib import SequenceMatcher
@@ -30,6 +31,7 @@ from parsezen.translation_quality import (
     HTML_TAG_PATTERN,
     INLINE_CODE_PATTERN,
     MARKDOWN_LINK_PATTERN,
+    MEANINGFUL_SYMBOL_PATTERN,
     NUMBER_PATTERN,
     TABLE_DIVIDER_PATTERN,
     TITLE_LANGUAGE_HINTS,
@@ -39,6 +41,7 @@ from parsezen.translation_quality import (
     is_probable_organization_name_line,
     is_unmarked_title_line,
     link_destination_spans,
+    markdown_emphasis_structure,
     markdown_heading_levels,
     markdown_link_destinations,
     markdown_table_shapes,
@@ -58,15 +61,135 @@ MAX_TRANSLATION_PROTECTED_VALUES_PER_CHUNK = 8
 LOGGER = logging.getLogger(__name__)
 
 RAW_URL_PATTERN = re.compile(r"(?:https?://|mailto:)[^\s<>)\]]+")
+EMAIL_ADDRESS_PATTERN = re.compile(
+    r"(?<![\w.+-])[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,63}(?![\w.-])",
+    re.IGNORECASE,
+)
+ENGLISH_DIGIT_ORDINAL_PATTERN = re.compile(
+    r"(?<![\w/])\d{1,4}(?:st|nd|rd|th)\b",
+    re.IGNORECASE,
+)
+_ENGLISH_ASTROLOGICAL_PLANETS = {
+    "sun": "Sol",
+    "moon": "Luna",
+    "mercury": "Mercurio",
+    "venus": "Venus",
+    "mars": "Marte",
+    "jupiter": "Júpiter",
+    "saturn": "Saturno",
+}
+_ENGLISH_ZODIAC_SIGNS = {
+    "aries": "Aries",
+    "taurus": "Tauro",
+    "gemini": "Géminis",
+    "cancer": "Cáncer",
+    "leo": "Leo",
+    "virgo": "Virgo",
+    "libra": "Libra",
+    "scorpio": "Escorpio",
+    "sagittarius": "Sagitario",
+    "capricorn": "Capricornio",
+    "aquarius": "Acuario",
+    "pisces": "Piscis",
+}
+_ASTROLOGICAL_PLANETS_TO_SPANISH = {
+    **_ENGLISH_ASTROLOGICAL_PLANETS,
+    **{value.casefold(): value for value in _ENGLISH_ASTROLOGICAL_PLANETS.values()},
+}
+_ZODIAC_SIGNS_TO_SPANISH = {
+    **_ENGLISH_ZODIAC_SIGNS,
+    **{value.casefold(): value for value in _ENGLISH_ZODIAC_SIGNS.values()},
+}
+_ASTROLOGICAL_PLANET_ALIASES = "|".join(
+    re.escape(value) for value in sorted(_ASTROLOGICAL_PLANETS_TO_SPANISH, key=len, reverse=True)
+)
+_ZODIAC_SIGN_ALIASES = "|".join(
+    re.escape(value) for value in sorted(_ZODIAC_SIGNS_TO_SPANISH, key=len, reverse=True)
+)
+_ENGLISH_ASTROLOGICAL_SERIES_LABEL_PATTERN = re.compile(
+    r"(?<!\w)(?P<planet>" + "|".join(_ENGLISH_ASTROLOGICAL_PLANETS) + r")"
+    r"[ \t]+in[ \t]+"
+    r"(?P<sign>" + "|".join(_ENGLISH_ZODIAC_SIGNS) + r")"
+    r"[ \t]+(?P<roman>[IVXLCDM]{1,8})(?!\w)",
+    re.IGNORECASE,
+)
+_TRANSLATED_ASTROLOGICAL_SERIES_LABEL_PATTERN = re.compile(
+    rf"(?<!\w)(?P<planet>{_ASTROLOGICAL_PLANET_ALIASES})"
+    r"[ \t]+(?:in|en)[ \t]+"
+    rf"(?P<sign>{_ZODIAC_SIGN_ALIASES})"
+    r"[ \t]+(?P<roman>[IVXLCDM]{1,8})(?!\w)",
+    re.IGNORECASE,
+)
+_SPLIT_EMPHASIS_ASTROLOGICAL_SERIES_LABEL_PATTERN = re.compile(
+    r"(?<!\w)(?P<marker>\*\*|__|\*|_)"
+    r"(?P<planet>" + "|".join(_ENGLISH_ASTROLOGICAL_PLANETS) + r")"
+    r"[ \t]+in[ \t]+"
+    r"(?P<sign>" + "|".join(_ENGLISH_ZODIAC_SIGNS) + r")"
+    r"(?P=marker)[ \t]+(?P<roman>[IVXLCDM]{1,8})(?!\w)",
+    re.IGNORECASE,
+)
+_TRANSLATED_SPLIT_EMPHASIS_ASTROLOGICAL_SERIES_LABEL_PATTERN = re.compile(
+    rf"(?<!\w)(?P<marker>\*\*|__|\*|_)(?P<planet>{_ASTROLOGICAL_PLANET_ALIASES})"
+    r"[ \t]+(?:in|en)[ \t]+"
+    rf"(?P<sign>{_ZODIAC_SIGN_ALIASES})"
+    r"(?P=marker)[ \t]+(?P<roman>[IVXLCDM]{1,8})(?!\w)",
+    re.IGNORECASE,
+)
+_SEPARATELY_EMPHASIZED_ASTROLOGICAL_SERIES_LABEL_PATTERN = re.compile(
+    r"(?<!\w)(?P<marker>\*\*|__|\*|_)"
+    r"(?P<planet>" + "|".join(_ENGLISH_ASTROLOGICAL_PLANETS) + r")"
+    r"[ \t]+in[ \t]+"
+    r"(?P<sign>" + "|".join(_ENGLISH_ZODIAC_SIGNS) + r")"
+    r"(?P=marker)[ \t]+(?P<roman_marker>\*\*|__)"
+    r"(?P<roman>[IVXLCDM]{1,8})(?P=roman_marker)(?!\w)",
+    re.IGNORECASE,
+)
+_TRANSLATED_SEPARATELY_EMPHASIZED_ASTROLOGICAL_SERIES_LABEL_PATTERN = re.compile(
+    rf"(?<!\w)(?P<marker>\*\*|__|\*|_)(?P<planet>{_ASTROLOGICAL_PLANET_ALIASES})"
+    r"[ \t]+(?:in|en)[ \t]+"
+    rf"(?P<sign>{_ZODIAC_SIGN_ALIASES})"
+    r"(?P=marker)[ \t]+(?P<roman_marker>\*\*|__)"
+    r"(?P<roman>[IVXLCDM]{1,8})(?P=roman_marker)(?!\w)",
+    re.IGNORECASE,
+)
+_LEADING_EMPHASIZED_ASTROLOGICAL_PLACEMENT_PATTERN = re.compile(
+    r"(?m)(?P<prefix>^[ \t]*(?:#{1,6}[ \t]+)?|(?<=-->)[ \t]+)"
+    r"(?P<marker>\*\*|__|\*|_)"
+    r"(?P<planet>" + "|".join(_ENGLISH_ASTROLOGICAL_PLANETS) + r")"
+    r"[ \t]+in[ \t]+"
+    r"(?P<sign>" + "|".join(_ENGLISH_ZODIAC_SIGNS) + r")"
+    r"(?P=marker)",
+    re.IGNORECASE,
+)
+_TRANSLATED_LEADING_EMPHASIZED_ASTROLOGICAL_PLACEMENT_PATTERN = re.compile(
+    r"(?m)(?P<prefix>^[ \t]*(?:#{1,6}[ \t]+)?|(?<=-->)[ \t]+)"
+    rf"(?P<marker>\*\*|__|\*|_)(?P<planet>{_ASTROLOGICAL_PLANET_ALIASES})"
+    r"[ \t]+(?:in|en)[ \t]+"
+    rf"(?P<sign>{_ZODIAC_SIGN_ALIASES})(?P=marker)",
+    re.IGNORECASE,
+)
+BRACED_PLACEHOLDER_PATTERN = re.compile(
+    r"(?<!\\)(?:\{\{[A-Za-z][A-Za-z0-9_ .-]{0,79}\}\}"
+    r"|\{[A-Za-z][A-Za-z0-9_ .-]{0,79}\})"
+)
 EMPHASIZED_TEXT_PATTERN = re.compile(
     r"(?<![*_])(?P<marker>[*_])(?P<body>[^*_\r\n]{2,100})(?P=marker)(?![*_])"
+)
+SIMPLE_MARKDOWN_EMPHASIS_PATTERNS = (
+    ("***", re.compile(r"(?<![\\*])\*\*\*(?P<body>[^*\r\n]{1,500}?)\*\*\*(?!\*)")),
+    ("___", re.compile(r"(?<![\\_])___(?P<body>[^_\r\n]{1,500}?)___(?!_)")),
+    ("**", re.compile(r"(?<![\\*])\*\*(?P<body>[^*\r\n]{1,500}?)\*\*(?!\*)")),
+    ("__", re.compile(r"(?<![\\_])__(?P<body>[^_\r\n]{1,500}?)__(?!_)")),
+    ("~~", re.compile(r"(?<![\\~])~~(?P<body>[^~\r\n]{1,500}?)~~(?!~)")),
+    ("*", re.compile(r"(?<![\\*])\*(?P<body>[^*\r\n]{1,500}?)\*(?!\*)")),
+    ("_", re.compile(r"(?<![\\_])_(?P<body>[^_\r\n]{1,500}?)_(?!_)")),
 )
 FOREIGN_MACRON_WORD_PATTERN = re.compile(
     r"(?<!\w)[A-Za-zĀāĒēĪīŌōŪūȲȳ]*[ĀāĒēĪīŌōŪūȲȳ]"
     r"[A-Za-zĀāĒēĪīŌōŪūȲȳ]{1,47}(?!\w)"
 )
 FORMULA_PATTERN = re.compile(
-    r"(?<!\\)\$(?=[^\r\n$]{1,200}\$)[^\r\n$]+\$"
+    r"(?<![\\$])\$(?![$\d])(?=[^\r\n$]{1,200}\$(?!\$))[^\r\n$]+\$(?!\$)"
     r"|\\\([^\r\n]{1,200}\\\)"
     r"|\\\[[^\r\n]{1,500}\\\]"
     r"|(?<!\w)(?:[A-Za-zΑ-ω]\w*|\d+(?:[.,]\d+)?)"
@@ -186,16 +309,56 @@ def _localize_copied_english_conventions(
     def outside_literal(spans: tuple[tuple[int, int], ...], position: int) -> bool:
         return not any(start <= position < end for start, end in spans)
 
+    def localized_astrological_placement(match: re.Match[str]) -> str:
+        source_planet = match.group("planet")
+        source_sign = match.group("sign")
+        planet = _ASTROLOGICAL_PLANETS_TO_SPANISH[source_planet.casefold()]
+        sign = _ZODIAC_SIGNS_TO_SPANISH[source_sign.casefold()]
+        if source_planet.isupper():
+            planet = planet.upper()
+        elif source_planet.islower():
+            planet = planet.lower()
+        if source_sign.isupper():
+            sign = sign.upper()
+        elif source_sign.islower():
+            sign = sign.lower()
+        preposition = "EN" if source_planet.isupper() and source_sign.isupper() else "en"
+        return f"{planet} {preposition} {sign}"
+
+    def localized_astrological_series_label(match: re.Match[str]) -> str:
+        return f"{localized_astrological_placement(match)} {match.group('roman')}"
+
+    def localized_split_astrological_series_label(match: re.Match[str]) -> str:
+        marker = match.group("marker")
+        return f"{marker}{localized_astrological_series_label(match)}{marker}"
+
+    def localized_separately_emphasized_astrological_series_label(
+        match: re.Match[str],
+    ) -> str:
+        marker = match.group("marker")
+        roman_marker = match.group("roman_marker")
+        return (
+            f"{marker}{localized_astrological_placement(match)}{marker} "
+            f"{roman_marker}{match.group('roman')}{roman_marker}"
+        )
+
+    def localized_leading_astrological_placement(match: re.Match[str]) -> str:
+        marker = match.group("marker")
+        return f"{match.group('prefix')}{marker}{localized_astrological_placement(match)}{marker}"
+
     patterns = (
         (
+            re.compile(r"(?<![\w/])(?P<number>\d{1,4})(?:st|nd|rd|th)\b", re.IGNORECASE),
             re.compile(r"(?<![\w/])(?P<number>\d{1,4})(?:st|nd|rd|th)\b", re.IGNORECASE),
             lambda match: f"{match.group('number')}.º",
         ),
         (
             re.compile(r"(?<![\w/])BCE\b\.?", re.IGNORECASE),
+            re.compile(r"(?<![\w/])BCE\b\.?", re.IGNORECASE),
             lambda _match: "a. e. c.",
         ),
         (
+            re.compile(r"(?<![\w/])BC\b\.?", re.IGNORECASE),
             re.compile(r"(?<![\w/])BC\b\.?", re.IGNORECASE),
             lambda _match: "a. C.",
         ),
@@ -204,14 +367,48 @@ def _localize_copied_english_conventions(
                 r"(?<!\w)PART[ \t]+(?P<roman>[IVXLCDM]{1,8})(?!\w)",
                 re.IGNORECASE,
             ),
+            re.compile(
+                r"(?<!\w)PART[ \t]+(?P<roman>[IVXLCDM]{1,8})(?!\w)",
+                re.IGNORECASE,
+            ),
             lambda match: f"PARTE {match.group('roman').upper()}",
+        ),
+        (
+            _SEPARATELY_EMPHASIZED_ASTROLOGICAL_SERIES_LABEL_PATTERN,
+            _TRANSLATED_SEPARATELY_EMPHASIZED_ASTROLOGICAL_SERIES_LABEL_PATTERN,
+            localized_separately_emphasized_astrological_series_label,
+        ),
+        (
+            _ENGLISH_ASTROLOGICAL_SERIES_LABEL_PATTERN,
+            _TRANSLATED_SPLIT_EMPHASIS_ASTROLOGICAL_SERIES_LABEL_PATTERN,
+            localized_split_astrological_series_label,
+        ),
+        (
+            _SPLIT_EMPHASIS_ASTROLOGICAL_SERIES_LABEL_PATTERN,
+            _TRANSLATED_SPLIT_EMPHASIS_ASTROLOGICAL_SERIES_LABEL_PATTERN,
+            localized_split_astrological_series_label,
+        ),
+        (
+            _ENGLISH_ASTROLOGICAL_SERIES_LABEL_PATTERN,
+            _TRANSLATED_ASTROLOGICAL_SERIES_LABEL_PATTERN,
+            localized_astrological_series_label,
+        ),
+        (
+            _LEADING_EMPHASIZED_ASTROLOGICAL_PLACEMENT_PATTERN,
+            _TRANSLATED_LEADING_EMPHASIZED_ASTROLOGICAL_PLACEMENT_PATTERN,
+            localized_leading_astrological_placement,
         ),
     )
     result = translated
-    for pattern, replacement in patterns:
-        source_count = sum(
-            outside_literal(source_spans, match.start()) for match in pattern.finditer(source)
-        )
+    source_budgets: dict[tuple[str, int], int] = {}
+    for source_pattern, translated_pattern, replacement in patterns:
+        source_key = (source_pattern.pattern, source_pattern.flags)
+        if source_key not in source_budgets:
+            source_budgets[source_key] = sum(
+                outside_literal(source_spans, match.start())
+                for match in source_pattern.finditer(source)
+            )
+        source_count = source_budgets[source_key]
         if source_count == 0:
             continue
         replaced = 0
@@ -228,7 +425,8 @@ def _localize_copied_english_conventions(
             replaced += 1
             return replace_value(match)
 
-        result = pattern.sub(replace_copied, result)
+        result = translated_pattern.sub(replace_copied, result)
+        source_budgets[source_key] -= replaced
         translated_spans = _literal_markdown_spans(result)
     source_visible = _text_outside_literal_spans(source, source_spans)
     return _replace_outside_literal_spans(
@@ -239,16 +437,18 @@ def _localize_copied_english_conventions(
             value,
             context.source_language or "",
             context.target_language,
+            preserve_source_case=True,
         ),
     )
 
 
 def _literal_markdown_spans(markdown: str) -> tuple[tuple[int, int], ...]:
-    """Return code, URL, destination and private-comment spans excluded from post-editing."""
+    """Return literal spans excluded from deterministic post-editing."""
 
     spans = [
         *((match.start(), match.end()) for match in INLINE_CODE_PATTERN.finditer(markdown)),
         *((match.start(), match.end()) for match in RAW_URL_PATTERN.finditer(markdown)),
+        *((match.start(), match.end()) for match in EMAIL_ADDRESS_PATTERN.finditer(markdown)),
         *((start, end) for start, end, _value in link_destination_spans(markdown)),
         *((match.start(), match.end()) for match in HTML_COMMENT_PATTERN.finditer(markdown)),
     ]
@@ -452,12 +652,31 @@ def _protect_translation_values(
     protect_numbers: bool = True,
     protect_headings: bool = True,
     protect_paragraphs: bool = True,
+    protect_emphasis: bool = False,
     foreign_emphasis_languages: tuple[str, str] | None = None,
 ) -> _ProtectedMarkdown:
-    spans = (
-        [(match.start(), match.end(), False) for match in NUMBER_PATTERN.finditer(markdown)]
-        if protect_numbers
-        else []
+    spans = []
+    emphasis_pairs = _markdown_emphasis_delimiter_pairs(markdown) if protect_emphasis else ()
+    if protect_numbers:
+        # Protect the complete English ordinal before its bare number.  Hiding only ``13`` from
+        # ``13th`` leaves the suffix exposed to the model and can restore malformed values such as
+        # ``13astrologo``.  The copied convention is localized after marker restoration.
+        spans.extend(
+            (match.start(), match.end(), False)
+            for match in ENGLISH_DIGIT_ORDINAL_PATTERN.finditer(markdown)
+        )
+        spans.extend(
+            (match.start(), match.end(), False) for match in NUMBER_PATTERN.finditer(markdown)
+        )
+        spans.extend(
+            (match.start(), match.end(), False)
+            for match in MEANINGFUL_SYMBOL_PATTERN.finditer(markdown)
+        )
+    # Template fields are user data, not prose.  Preserve common single- and double-braced forms
+    # exactly instead of letting a translation omit or rewrite values such as ``{your name}``.
+    spans.extend(
+        (match.start(), match.end(), False)
+        for match in BRACED_PLACEHOLDER_PATTERN.finditer(markdown)
     )
     spans.extend(
         (match.start(), match.end(), False) for match in INLINE_CODE_PATTERN.finditer(markdown)
@@ -480,8 +699,13 @@ def _protect_translation_values(
         (match.start(), match.end(), False) for match in RAW_URL_PATTERN.finditer(markdown)
     )
     spans.extend(
+        (match.start(), match.end(), False) for match in EMAIL_ADDRESS_PATTERN.finditer(markdown)
+    )
+    spans.extend(
         (match.start(), match.end(), False) for match in HTML_COMMENT_PATTERN.finditer(markdown)
     )
+    if protect_emphasis:
+        spans.extend((start, end, False) for pair in emphasis_pairs for start, end in pair)
     if foreign_emphasis_languages is not None:
         source_language, target_language = foreign_emphasis_languages
         spans.extend(
@@ -518,11 +742,23 @@ def _protect_translation_values(
     prefix = "PZDOC"
     while prefix in markdown:
         prefix = f"Z{prefix}"
+    emphasis_roles = {
+        span: (pair_index, position == 1)
+        for pair_index, pair in enumerate(emphasis_pairs)
+        for position, span in enumerate(pair)
+    }
     protected = markdown
     values: list[_ProtectedValue] = []
     for index, (start, end, is_paragraph) in reversed(list(enumerate(non_overlapping))):
         value = markdown[start:end]
-        if is_paragraph:
+        emphasis_role = emphasis_roles.get((start, end))
+        if emphasis_role is not None:
+            pair_index, closing = emphasis_role
+            tag_name = f"{prefix}E{_alphabetic_index(pair_index)}XZQ"
+            token = f"</{tag_name}>" if closing else f"<{tag_name}>"
+            values.append(_ProtectedValue(token, value))
+            replacement = token
+        elif is_paragraph:
             marker = f"{prefix}P{_alphabetic_index(index)}XZQ"
             token = f"<!-- {marker} -->"
             values.append(_ProtectedValue(token, value, paragraph=True))
@@ -534,6 +770,186 @@ def _protect_translation_values(
         protected = protected[:start] + replacement + protected[end:]
     values.reverse()
     return _ProtectedMarkdown(protected, tuple(values))
+
+
+def _markdown_emphasis_delimiter_spans(markdown: str) -> tuple[tuple[int, int], ...]:
+    """Return unambiguous inline emphasis delimiters while leaving their words translatable."""
+
+    return tuple(span for pair in _markdown_emphasis_delimiter_pairs(markdown) for span in pair)
+
+
+def _markdown_emphasis_delimiter_pairs(
+    markdown: str,
+) -> tuple[tuple[tuple[int, int], tuple[int, int]], ...]:
+    """Return paired simple emphasis delimiters outside literal Markdown spans."""
+
+    literal_spans = _literal_markdown_spans(markdown)
+    openers: dict[str, list[tuple[int, int]]] = {
+        "*": [],
+        "**": [],
+        "***": [],
+        "_": [],
+        "__": [],
+        "___": [],
+        "~~": [],
+    }
+    delimiters: list[tuple[tuple[int, int], tuple[int, int]]] = []
+    for match in re.finditer(r"(?<!\\)(\*+|_+|~+)", markdown):
+        start, end = match.span()
+        if any(
+            start < literal_end and end > literal_start
+            for literal_start, literal_end in literal_spans
+        ):
+            continue
+        run = match.group(0)
+        if run not in openers:
+            continue
+        before = markdown[start - 1] if start else ""
+        after = markdown[end] if end < len(markdown) else ""
+        before_space = not before or before.isspace()
+        after_space = not after or after.isspace()
+        before_punctuation = bool(before) and unicodedata.category(before).startswith("P")
+        after_punctuation = bool(after) and unicodedata.category(after).startswith("P")
+        left_flanking = not after_space and (
+            not after_punctuation or before_space or before_punctuation
+        )
+        right_flanking = not before_space and (
+            not before_punctuation or after_space or after_punctuation
+        )
+        if run.startswith("_"):
+            can_open = left_flanking and (not right_flanking or before_punctuation)
+            can_close = right_flanking and (not left_flanking or after_punctuation)
+        else:
+            can_open = left_flanking
+            can_close = right_flanking
+
+        if can_close and openers[run]:
+            delimiters.append((openers[run].pop(), (start, end)))
+            continue
+        if can_open:
+            openers[run].append((start, end))
+    return tuple(sorted(delimiters))
+
+
+def _simple_markdown_emphasis_spans(
+    markdown: str,
+    *,
+    require_standalone_semantics: bool = False,
+) -> tuple[tuple[int, int, str, int, int], ...]:
+    """Locate non-nested emphasis spans without crossing another same-kind delimiter."""
+
+    literal_spans = _literal_markdown_spans(markdown)
+    candidates: list[tuple[int, int, str, int, int]] = []
+    for marker, pattern in SIMPLE_MARKDOWN_EMPHASIS_PATTERNS:
+        for match in pattern.finditer(markdown):
+            start, end = match.span()
+            if any(
+                start < literal_end and end > literal_start
+                for literal_start, literal_end in literal_spans
+            ):
+                continue
+            if marker.startswith("_") and (
+                (start > 0 and markdown[start - 1].isalnum())
+                or (end < len(markdown) and markdown[end].isalnum())
+            ):
+                continue
+            body_start, body_end = match.span("body")
+            if not match.group("body").strip():
+                continue
+            if require_standalone_semantics and not markdown_emphasis_structure(
+                markdown[start:end], preserve_inline_positions=False
+            ):
+                continue
+            candidates.append((start, end, marker, body_start, body_end))
+
+    selected: list[tuple[int, int, str, int, int]] = []
+    for candidate in sorted(candidates, key=lambda item: (item[0], -(item[1] - item[0]))):
+        if selected and candidate[0] < selected[-1][1]:
+            continue
+        selected.append(candidate)
+    return tuple(selected)
+
+
+def _remove_added_simple_translation_emphasis(
+    protected_source: str,
+    response: str,
+) -> str:
+    """Remove model-added simple emphasis only when the protected source has none left."""
+
+    if markdown_emphasis_structure(
+        protected_source,
+        preserve_inline_positions=False,
+    ) or not markdown_emphasis_structure(response, preserve_inline_positions=False):
+        return response
+
+    rebuilt: list[str] = []
+    cursor = 0
+    changed = False
+    for start, end, _marker, body_start, body_end in _simple_markdown_emphasis_spans(
+        response,
+        require_standalone_semantics=True,
+    ):
+        rebuilt.append(response[cursor:start])
+        rebuilt.append(response[body_start:body_end])
+        cursor = end
+        changed = True
+    if not changed:
+        return response
+    rebuilt.append(response[cursor:])
+    candidate = "".join(rebuilt)
+    return (
+        candidate
+        if not markdown_emphasis_structure(candidate, preserve_inline_positions=False)
+        else response
+    )
+
+
+def _reconcile_protected_emphasis_spacing(
+    protected_source: str,
+    response: str,
+    values: tuple[_ProtectedValue, ...],
+) -> str:
+    """Restore whitespace immediately around opaque emphasis delimiters from the source."""
+
+    reconciled = response
+    emphasis_markers = {"*", "**", "***", "_", "__", "___", "~~"}
+    for value in values:
+        if value.value not in emphasis_markers or value.expected_count != 1:
+            continue
+        source_position = protected_source.find(value.token)
+        if source_position < 0 or reconciled.count(value.token) != 1:
+            continue
+        source_before = protected_source[:source_position]
+        source_after = protected_source[source_position + len(value.token) :]
+        response_position = reconciled.find(value.token)
+        response_before = reconciled[:response_position]
+        response_after = reconciled[response_position + len(value.token) :]
+        source_has_space_before = bool(source_before and source_before[-1].isspace())
+        response_has_space_before = bool(response_before and response_before[-1].isspace())
+        if source_has_space_before and response_before and not response_has_space_before:
+            reconciled = reconciled.replace(value.token, f" {value.token}", 1)
+        elif source_before and not source_has_space_before and response_has_space_before:
+            reconciled = re.sub(
+                rf"[ \t]+{re.escape(value.token)}",
+                value.token,
+                reconciled,
+                count=1,
+            )
+
+        response_position = reconciled.find(value.token)
+        response_after = reconciled[response_position + len(value.token) :]
+        source_has_space_after = bool(source_after and source_after[0].isspace())
+        response_has_space_after = bool(response_after and response_after[0].isspace())
+        if source_has_space_after and response_after and not response_has_space_after:
+            reconciled = reconciled.replace(value.token, f"{value.token} ", 1)
+        elif source_after and not source_has_space_after and response_has_space_after:
+            reconciled = re.sub(
+                rf"{re.escape(value.token)}[ \t]+",
+                value.token,
+                reconciled,
+                count=1,
+            )
+    return reconciled
 
 
 def _foreign_emphasis_value_spans(
@@ -589,7 +1005,7 @@ def _restore_protected_values(
                 rf"[ \t]*\r?\n[ \t]*{re.escape(protected_value.token)}[ \t]*\r?\n"
             )
             restored, replacements = paragraph_pattern.subn(
-                protected_value.value,
+                lambda _match, value=protected_value.value: value,
                 restored,
             )
             if replacements != protected_value.expected_count:
@@ -599,7 +1015,7 @@ def _restore_protected_values(
         else:
             wrapped_pattern = re.compile(rf"<!--[ \t]*{re.escape(protected_value.token)}[ \t]*-->")
             restored, wrapped_replacements = wrapped_pattern.subn(
-                protected_value.value,
+                lambda _match, value=protected_value.value: value,
                 restored,
             )
             if wrapped_replacements == 0:
@@ -935,6 +1351,9 @@ def _conserved_value_count(markdown: str) -> int:
 
 def _conserved_value_spans(markdown: str) -> list[tuple[int, int]]:
     spans = [(match.start(), match.end()) for match in NUMBER_PATTERN.finditer(markdown)]
+    spans.extend(
+        (match.start(), match.end()) for match in MEANINGFUL_SYMBOL_PATTERN.finditer(markdown)
+    )
     spans.extend(_title_roman_reference_spans(markdown))
     spans.extend((match.start(), match.end()) for match in INLINE_CODE_PATTERN.finditer(markdown))
     spans.extend((start, end) for start, end, _value in link_destination_spans(markdown))
@@ -953,7 +1372,7 @@ def _title_roman_reference_values(markdown: str) -> Counter[str]:
 
 
 def _is_safe_markdown_boundary(text: str, position: int) -> bool:
-    protected_spans = (
+    protected_spans = [
         (match.start(), match.end())
         for pattern in (
             INLINE_CODE_PATTERN,
@@ -963,6 +1382,9 @@ def _is_safe_markdown_boundary(text: str, position: int) -> bool:
             FORMULA_PATTERN,
         )
         for match in pattern.finditer(text)
+    ]
+    protected_spans.extend(
+        (opening[0], closing[1]) for opening, closing in _markdown_emphasis_delimiter_pairs(text)
     )
     return not any(start < position < end for start, end in protected_spans)
 
@@ -1373,6 +1795,14 @@ def _validate_translation(
     translated: str,
     context: _TranslationContext,
 ) -> None:
+    for pattern, label in (
+        (RAW_URL_PATTERN, "las URL protegidas"),
+        (EMAIL_ADDRESS_PATTERN, "los correos electrónicos protegidos"),
+    ):
+        source_values = Counter(match.group(0) for match in pattern.finditer(source))
+        translated_values = Counter(match.group(0) for match in pattern.finditer(translated))
+        if source_values != translated_values:
+            raise ImprovementError(f"La traducción alteró {label}.")
     try:
         validate_translation_quality(
             source,

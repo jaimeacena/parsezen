@@ -12,21 +12,21 @@ Cada documento ocupa una fila. Las columnas muestran el recorrido real:
 - **Estado**: fase actual, avance y acción necesaria.
 
 Al añadir un documento, **Salida** abre una página breve dentro de la aplicación. **Markdown** y
-**EPUB** se eligen con dos tarjetas visuales; **Revisión automática con IA** usa un interruptor. **Traducir** y,
+**EPUB** se eligen con dos tarjetas visuales; **Revisión adicional con IA** usa un interruptor. **Traducir** y,
 para PDF, **Páginas** y **OCR** mantienen el patrón `Etiqueta — Valor actual — ›`. No hay secciones
 avanzadas, pie de botones ni scroll en el tamaño normal. Cuando hay traducción, una única línea tras
 la interfaz mantiene los detalles de funcionamiento en la ayuda contextual, sin añadir un resumen
 técnico permanente bajo las opciones.
 
 **Traducir** parte en **No traducir**. Al elegir un idioma aparecen dos filas idénticas:
-**Traductor** —Argos o IA local— y **Glosario**. La revisión automática con IA parte activada en los
+**Traductor** —Argos o IA local— y **Glosario**. La revisión adicional con IA parte desactivada en los
 documentos nuevos. Cada elección válida se guarda inmediatamente; **Volver** y Escape solo regresan
 a la cola. Si falta la IA exigida por una elección, Parsezen mantiene la intención y abre
 `Componentes de IA local`. Una configuración guardada conserva sus decisiones.
 
 **Procesamiento directo** convierte o traduce, comprueba la salida y puede recomendar después una
-revisión dirigida si encuentra señales concretas. **Revisión automática con IA** examina el
-texto completo y, si el resultado es EPUB, también su estructura. No se pueden combinar corrección
+revisión dirigida si encuentra señales concretas. **Revisión adicional con IA** compara de nuevo una
+selección adaptativa de la traducción y, si el resultado es EPUB, también propone su estructura. No se pueden combinar corrección
 y estructura por separado.
 
 En **Flujo**, `→` separa fases y `y` une acciones realizadas en la misma pasada. La IA traduce,
@@ -38,9 +38,10 @@ Cada acción se encuentra en la celda a la que pertenece: configurar el flujo o 
 ver un error o abrir el archivo. La pantalla principal no añade un inspector lateral ni repite la
 información de la fila.
 
-`Destino ·` en la cabecera define el único destino general y lo recuerda. Cada documento lo hereda;
-para cambiarlo usa los ajustes generales. No existen excepciones por documento ni otro selector de
-destino en la página de configuración.
+`Guardar en ·` en la cabecera define el destino general y lo recuerda. `Junto al original` indica
+que cada resultado se publicará al lado de su documento de entrada. El cambio se propaga a trabajos
+editables; los que ya se están procesando o han terminado conservan su plan. No existen excepciones
+por documento ni otro selector de destino en la página de configuración.
 
 Cuando una fila termina, pulsa `Abrir resultado` en **Estado**. Su menú secundario permite abrir
 el archivo o su carpeta concreta. Las fases omitidas no ocupan columnas ni ofrecen acciones
@@ -49,8 +50,8 @@ imposibles.
 ## Añadir y ordenar documentos
 
 - En vacío, arrastra TXT, Markdown, DOCX, PDF o EPUB a la zona situada bajo la cabecera o pulsa
-  `Seleccionar archivos`. Después aparece como `Añadir` en la barra situada sobre la tabla, junto a
-  la acción principal del lote. La cola crece hasta seis filas visibles antes de usar desplazamiento.
+  `Seleccionar archivos`. Después, `Añadir` y la acción principal aparecen en la misma cabecera que
+  el destino y Ajustes. La cola crece hasta seis filas visibles antes de usar desplazamiento.
 - Arrastra una fila para cambiar el orden.
 - La configuración, las acciones de estado y el resultado responden al pasar el puntero; el asa de
   ordenación muestra un cursor de arrastre.
@@ -133,7 +134,9 @@ necesaria. Cuando la coincidencia es segura no muestra una fase de traducción n
 calidad ficticio.
 
 Cada motor trabaja en fragmentos verificables. Si una propuesta pierde contenido, cambia
-valores protegidos o no parece estar en el idioma solicitado, Parsezen vuelve a intentar solo
+valores protegidos —incluidos cifras y símbolos de moneda o porcentaje—, altera cursivas o negritas
+de Markdown o no parece estar en el
+idioma solicitado, Parsezen vuelve a intentar solo
 las partes necesarias. Cuando ninguna alternativa es segura, conserva ese fragmento original y lo
 incluye en la revisión en vez de publicar silenciosamente una transformación dudosa. El informe de
 traducción se vuelve a calcular sobre la propuesta final para que sus incidencias pendientes no
@@ -143,6 +146,10 @@ idioma puede permanecer intacta si el resto de su frase se ha traducido. Si un e
 claramente a un tercer idioma y el modelo lo deforma, Parsezen recupera automáticamente el texto
 original sin deshacer su nivel. Si un mismo término aparece traducido de formas parecidas pero
 incompatibles, lo muestra en la revisión en lugar de elegir una por semejanza.
+
+En traducciones de inglés a español, Parsezen también avisa cuando detecta que una expresión
+claramente vulgar o enfática se ha neutralizado por completo. No inventa una alternativa ni cambia el
+texto por su cuenta: presenta el original y la traducción de ese fragmento para confirmar el registro.
 
 Las descripciones visibles de las imágenes también se traducen. La ruta privada y el papel de cada
 recurso permanecen protegidos, por lo que cambiar `Cover` por `Portada` no puede romper ni sustituir
@@ -192,13 +199,18 @@ pasada. Las guardas de contenido siguen siendo las mismas.
 Parsezen conserva esta diferencia en el propio resultado y la muestra al revisar y en Actividad
 reciente. El resumen separa bloques comprobados automáticamente, bloques revisados semánticamente,
 bloques con verificación bilingüe independiente, bloques sin revisión semántica e incidencias que
-siguen pendientes. Las comprobaciones heurísticas nunca se presentan como una certificación.
+siguen pendientes. En libros largos, la revisión puede concentrarse de forma adaptativa en los
+bloques con señales y en una muestra distribuida: el resumen cuenta únicamente los bloques para los
+que el revisor devolvió una respuesta válida y deja visibles los demás como no revisados. Si el
+modelo responde en un formato inválido o su propuesta no supera las protecciones, Parsezen conserva
+la traducción anterior y no cuenta ese intento como revisión semántica. Las comprobaciones
+heurísticas nunca se presentan como una certificación.
 
-La revisión completa aparece activada en documentos nuevos, pero sigue siendo una elección visible:
-puede tardar varias veces más y una propuesta segura no demuestra por sí sola que el texto sea mejor.
-Desactívala para un recorrido directo con comprobaciones locales y revisión dirigida solo si aparecen
-señales concretas. La fila de la cola resume el flujo elegido sin añadir decisiones técnicas a la
-página de configuración.
+La revisión adicional aparece desactivada en documentos nuevos: puede tardar varias veces más y una
+propuesta segura no demuestra por sí sola que el texto sea mejor. Actívala cuando quieras comparar
+propuestas manualmente; el recorrido directo mantiene las comprobaciones locales y recomienda una
+revisión dirigida si aparecen señales concretas. La fila de la cola resume el flujo elegido sin
+añadir decisiones técnicas a la página de configuración.
 
 ### Revisión recomendada después del modo directo
 
@@ -232,9 +244,55 @@ bloqueo impide publicar. EPUB→EPUB también sigue esta misma ruta.
 
 La planificación inicial distingue portada editorial, preliminares, índice y cuerpo. Para decidir
 los capítulos combina los títulos encontrados en el índice con los niveles derivados de la
-geometría del PDF; el índice no se confunde con un capítulo del cuerpo. Cuando existe una propuesta
-estructural, la revisión muestra arriba el árbol actual y el propuesto antes de presentar las
-decisiones concretas de encabezado.
+geometría del PDF y, cuando existen, con los marcadores internos del propio archivo. Un marcador solo
+cuenta si su título puede localizarse de forma única en la página indicada; una entrada ambigua no se
+inventa. El índice no se confunde con un capítulo del cuerpo. Cuando existe una propuesta estructural,
+la revisión muestra arriba el árbol actual y el propuesto antes de presentar las decisiones concretas
+de encabezado.
+
+Si el índice parece plano o mezcla sangrías, Parsezen puede recuperar una jerarquía de dos niveles
+cuando encuentra varias partes, libros o apéndices explícitos y suficientes entradas consecutivas.
+La negrita parcial de una fila no basta para elevarla. Los rótulos de grupo que no muestran folio —por
+ejemplo, `PARTE II` o `TABLAS`— solo entran en el índice refluible cuando aparecen en la misma página y
+junto a entradas paginadas; el propio título `Índice` permanece fuera de la tabla.
+
+La exportación conserva como secciones navegables los encabezados situados dentro de un capítulo,
+pero no convierte automáticamente los niveles profundos en archivos independientes. Una cabecera
+corrida repetida tampoco crea decenas de capítulos iguales. Cuando el libro contiene un índice
+impreso, este sirve para mantener compacto el menú del lector; los encabezados menores continúan
+visibles en el texto aunque no aparezcan en ese menú. Si el PDF no ofrece un índice o marcadores
+fiables y su estructura admite más de una interpretación, la confirmación final permite comprobar
+el número de capítulos y abrir el editor completo antes de publicar.
+
+Una `Parte` es un contenedor superior: agrupa los capítulos consecutivos que la siguen, y cada
+capítulo puede conservar secciones y subsecciones navegables sin convertirlas en archivos separados.
+Los capítulos numerados que el índice confirma abren siempre una sección propia, incluso cuando la
+página de la parte anterior contiene muy poco texto. Si el diseño ornamental separa las letras de
+`Part/Parte`, Parsezen solo recompone el rótulo cuando el propio índice o la combinación exacta de
+sus fragmentos aporta una única lectura. Una errata menor del índice también puede emparejarse con
+el cuerpo, pero únicamente dentro del mismo número de capítulo y con un solo candidato próximo. Un
+encabezado Markdown pegado a la línea anterior sigue contando como frontera si el índice lo confirma.
+Si la extracción no conserva ningún encabezado corporal recuperable, Parsezen mantiene el contenido
+en el capítulo contiguo y deja la corrección de navegación al editor en vez de inventar un destino.
+
+Los cortes técnicos por tamaño se retrasan para respetar el capítulo semántico completo. Por ello,
+una subsección no aparece como una falsa `Parte N` en el menú; los capítulos excepcionalmente grandes
+siguen siendo XHTML válidos y refluibles. Un `CHAPTER N` aislado seguido inmediatamente de su
+subtítulo se muestra una sola vez como `CHAPTER N — Subtítulo`, sin duplicar el marcador desnudo.
+
+En libros muy extensos, un nivel con más de 128 rótulos se considera normalmente una capa de
+secciones. Parsezen usa el nivel superior para los archivos de lectura y conserva los rótulos como
+destinos del índice. Si el índice impreso o los marcadores internos solo coinciden de forma aislada,
+no se usan para ocultar el resto de la jerarquía; un conjunto coherente sí mantiene compacto el menú.
+Esta decisión no elimina ni reescribe ningún encabezado del cuerpo.
+
+La sangría del índice también puede confirmar relaciones como `Parte → Capítulo → Sección`, aunque
+los títulos no estén numerados. Parsezen solo aplica esa relación cuando cada título es único, aparece
+en el cuerpo y mantiene el mismo orden; una duda deja esos elementos al mismo nivel. Las secciones y
+subsecciones seleccionadas siguen apuntando al interior del capítulo después de guardar, reabrir o
+publicar desde el editor, sin añadir archivos ni información técnica visible al EPUB. Publicar desde
+la confirmación ligera usa exactamente el mismo árbol: abrir el editor no es necesario para conservar
+la jerarquía detectada.
 
 ## Procesamiento y cola
 
@@ -292,7 +350,7 @@ Al terminar, `Ver resumen` separa cuatro conceptos que no deben confundirse:
   una garantía de calidad literaria.
 - **Revisión manual**: decisiones que una persona realizó o que todavía se esperan.
 
-La barra sobre la cola resume también el lote completo. Si Parsezen está minimizado o en segundo
+El encabezado sobre la tabla resume el lote completo. Si Parsezen está minimizado o en segundo
 plano, Windows muestra un aviso al terminar o al requerir atención; no duplica ese aviso mientras la
 ventana está activa.
 
@@ -424,10 +482,18 @@ Cuando una acción requiere Ollama, sigue el botón que aparezca:
 3. `Proteger y reiniciar`, si el modo local no está activo;
 4. `Componentes de IA local`.
 
-La pantalla fija muestra los estados de los dos componentes aprobados. `Actualizar estados` vuelve a
-consultar la disponibilidad local. Si una tarjeta está `Descargable`, la señal de preparación contiene
+La pantalla fija, accesible desde Ajustes y desde los avisos que requieren IA, comprueba al abrirse
+los dos componentes fijados por Parsezen. `Comprobar de nuevo` permite repetir manualmente la
+consulta local.
+Si una fila está `Descargable`, la señal de preparación contiene
 solo su capacidad (`translation` o `review`); la vista no acepta nombres de catálogo ni endpoints.
 Los tags cloud y los metadatos que no coinciden con el manifest no se consideran preparados.
+Que una fila esté `Preparada` confirma su instalación e identidad local; las propuestas de revisión
+siguen necesitando tus decisiones y no equivalen a una garantía semántica automática.
+
+En traducciones de inglés a español, Parsezen puede mantener automáticamente frases técnicas de
+astrología cuando el libro aporta varias señales claras de ese dominio. No se activa por una palabra
+aislada y nunca sustituye tus elecciones: cualquier término que añadas al glosario tiene prioridad.
 
 ## Solución de problemas
 
@@ -465,16 +531,23 @@ Compara la página original. Las tablas sencillas se publican como Markdown y la
 fidelidad como HTML compatible. Si una tabla es demasiado compleja para reconstruirla con seguridad,
 Parsezen conserva sus celdas como texto estructurado, la marca para revisión y, cuando incluyes
 imágenes, añade también un recorte visual de respaldo. Los títulos, notas y unidades situados junto
-a la tabla permanecen en el orden de lectura. Tipografía decorativa, rotación y manuscritos pueden
+a la tabla permanecen en el orden de lectura. Si la tabla nativa ya ofrece filas, columnas y celdas
+fiables, Parsezen la mantiene con sus saltos internos aunque exista una lectura OCR de toda la página.
+Tipografía decorativa, rotación y manuscritos pueden
 necesitar edición manual. Un OCR vacío en una página visual es un resultado válido, no un bloqueo del
 documento completo. En una página formada por una imagen completa, Parsezen puede retirar del texto
 una marca aislada mucho más pequeña que la tipografía reconocida, pero la imagen original siempre se
-mantiene y las etiquetas cortas de tamaño uniforme no se filtran. Si el OCR pega el rótulo de una
-tabla a su primera fila, Parsezen lo separa automáticamente para conservar ambos y publicar una tabla
-real. Si las líneas de una tabla están dibujadas dentro de la imagen pero el texto sigue siendo
-seleccionable, Parsezen combina ambas capas localmente y solo publica la cuadrícula cuando todas las
-letras, cifras y signos quedan conservados. Al reanudar, una caché OCR de una versión anterior se
-recalcula sin mostrar sus marcadores
+mantiene y las etiquetas cortas de tamaño uniforme no se filtran. Si un escaneo denso incluye un
+rótulo inequívoco de figura numerada, Parsezen conserva la página completa como referencia visual
+además del texto refluido; una mención corriente dentro de la prosa no activa este respaldo. Si el OCR
+pega el rótulo de una tabla a su primera fila, Parsezen lo separa automáticamente para conservar ambos
+y publicar una tabla real. Si las líneas de una tabla están dibujadas dentro de la imagen pero el
+texto sigue siendo seleccionable, Parsezen combina ambas capas localmente y solo publica la cuadrícula
+cuando todas las letras, cifras y signos quedan conservados. Las tablas abiertas que solo tienen bordes
+horizontales pueden reconstruirse mediante sus huecos de cabecera, rótulos de fila y espacios verticales;
+aparecen como HTML traducible, incluyen un recorte del original y quedan marcadas para comprobar las
+asociaciones. Una página de prosa a dos columnas no activa esta recuperación. Al reanudar, una caché OCR
+de una versión anterior se recalcula sin mostrar sus marcadores
 técnicos como parte del libro. En una portada gráfica, un título repetido en una página preliminar
 nativa puede corregir un único término corto introducido por OCR, pero solo si la coincidencia es
 inequívoca; si existen variantes, la aplicación mantiene el texto reconocido para revisión.
@@ -486,6 +559,24 @@ agrupar primero todos los títulos y después todos los números. También recon
 cifras en libros largos. Si el texto nativo pega dos palabras o confunde un carácter de un folio,
 solo aplica el espacio o la cifra que corroboren la fila visual, sus números vecinos y el OCR local;
 una lectura ambigua permanece visible para revisión.
+
+En la prosa PDF, la negrita y la cursiva se conservan aunque afecten solo a unas palabras dentro de
+una línea. Si una palabra en cursiva o negrita queda partida entre dos líneas, Parsezen vuelve a
+unirla sin crear dos fragmentos de formato ni conservar el guion tipográfico de final de línea. Una
+frase que empieza en versalitas y continúa en minúscula con el mismo espaciado se mantiene como un
+solo párrafo. Los símbolos pequeños y elevados se corrigen únicamente cuando la geometría del PDF
+demuestra que no son cifras normales.
+
+Si una fuente incrustada está dañada de forma repetida, Parsezen puede contrastar localmente las cajas
+exactas de sus líneas con una segunda lectura nativa. Solo activa esta reparación para un patrón
+sistémico y conserva los espacios, la puntuación y las cifras de la capa principal; si las dos lecturas
+no bastan, mantiene el caso para OCR o revisión en vez de adivinarlo.
+
+Un libro muy largo puede superar el tamaño que el editor Markdown interno admite cómodamente sin
+impedir la conversión a EPUB. Parsezen sigue analizando, estructurando y validando el documento
+completo; en ese caso mantiene la revisión final ligera y permite abrir el resultado con una
+aplicación externa si necesitas inspeccionar todo el texto seguido.
+
 Durante la traducción y la corrección, cada folio sigue unido al final de su entrada y una propuesta
 que lo desplace se descarta sin perder las demás correcciones seguras. Los rótulos internos que no
 tienen página propia aparecen separados de la entrada anterior.

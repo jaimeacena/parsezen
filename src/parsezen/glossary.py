@@ -28,6 +28,7 @@ class GlossaryEntry:
 
     source: str
     target: str
+    adapt_source_case: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -75,7 +76,7 @@ def validate_glossary(entries: tuple[GlossaryEntry, ...]) -> tuple[GlossaryEntry
         if key in seen:
             raise RequestValidationError(f'El término "{source}" está repetido en el glosario.')
         seen.add(key)
-        normalized.append(GlossaryEntry(source, target))
+        normalized.append(GlossaryEntry(source, target, entry.adapt_source_case))
     return tuple(normalized)
 
 
@@ -92,7 +93,7 @@ def protect_glossary(
     if not normalized or not text:
         return ProtectedGlossaryText(text, ())
     terms = sorted(normalized, key=lambda item: len(item.source), reverse=True)
-    by_source = {entry.source.casefold(): entry.target for entry in terms}
+    by_source = {entry.source.casefold(): entry for entry in terms}
     alternatives = "|".join(re.escape(entry.source) for entry in terms)
     term_pattern = re.compile(rf"(?<!\w)(?:{alternatives})(?!\w)", re.IGNORECASE)
     replacements: list[tuple[str, str]] = []
@@ -103,7 +104,13 @@ def protect_glossary(
                 raise RequestValidationError(
                     "El glosario coincide demasiadas veces en este documento."
                 )
-            target = by_source[match.group(0).casefold()]
+            entry = by_source[match.group(0).casefold()]
+            target = entry.target
+            if entry.adapt_source_case:
+                if match.group(0).isupper():
+                    target = target.upper()
+                elif match.group(0)[:1].isupper():
+                    target = f"{target[:1].upper()}{target[1:]}"
             marker = f"<!-- {marker_prefix}{len(replacements):05d}XZQ -->"
             replacements.append((marker, target))
             return marker
@@ -136,9 +143,14 @@ def glossary_fingerprint(entries: tuple[GlossaryEntry, ...]) -> str:
     """Identify glossary options without exposing their text in cache keys or logs."""
     normalized = validate_glossary(entries)
     digest = hashlib.sha256()
+    case_aware = any(entry.adapt_source_case for entry in normalized)
+    if case_aware:
+        digest.update(b"parsezen-glossary-case-v1\0")
     for entry in normalized:
         digest.update(entry.source.encode("utf-8"))
         digest.update(b"\0")
         digest.update(entry.target.encode("utf-8"))
         digest.update(b"\0")
+        if case_aware:
+            digest.update(b"source-case\0" if entry.adapt_source_case else b"exact\0")
     return digest.hexdigest()

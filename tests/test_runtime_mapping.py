@@ -6,6 +6,7 @@ from parsezen.application.runtime_mapping import (
     configuration_from_request,
     request_and_settings_from_job,
 )
+from parsezen.domain.execution_plan import ExecutionStep, compile_execution_plan
 from parsezen.domain.jobs import (
     CoverStrategy,
     DocumentFormat,
@@ -76,6 +77,11 @@ def test_default_job_maps_to_direct_runtime_without_ai_review_flags() -> None:
     assert job.configuration.plan is ProcessingPlan.STANDARD
     assert not request.review_content
     assert not request.review_structure
+    assert request.execution_plan == compile_execution_plan(job.source, job.configuration)
+    assert request.execution_plan.steps == (
+        ExecutionStep.CONVERT,
+        ExecutionStep.WRITE_MARKDOWN,
+    )
 
 
 def test_configuration_mapping_preserves_optional_local_ai_policy_snapshot() -> None:

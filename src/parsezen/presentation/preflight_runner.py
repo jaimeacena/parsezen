@@ -12,7 +12,7 @@ from parsezen.application.runtime_mapping import request_and_settings_from_job
 from parsezen.application.scheduler import QueueRunPlan
 from parsezen.cancellation import CancellationToken
 from parsezen.domain.estimates import ProcessingMetric
-from parsezen.domain.jobs import DocumentFormat, DocumentJob
+from parsezen.domain.jobs import AIPhase, DocumentFormat, DocumentJob, resolve_ai_profile
 from parsezen.errors import ParsezenError, ProcessingCancelledError
 
 ForecastCacheKey = tuple[object, ...]
@@ -112,14 +112,14 @@ class _ForecastWorker(QRunnable):
                 or job.source.format is DocumentFormat.PDF
             ):
                 continue
-            key = forecast_cache_key(job, None, self._metrics_generation)
+            key = forecast_cache_key(job, self._metrics_generation)
             try:
                 request, settings = request_and_settings_from_job(
                     job,
                     timeout_seconds=self._timeout_seconds,
                     checkpoint_retention_days=self._checkpoint_retention_days,
                 )
-                key = forecast_cache_key(job, settings.model, self._metrics_generation)
+                key = forecast_cache_key(job, self._metrics_generation)
                 if key in self._excluded_keys:
                     continue
                 forecast, _profile = analyze_preflight(
@@ -144,15 +144,17 @@ class _ForecastWorker(QRunnable):
 
 def forecast_cache_key(
     job: DocumentJob,
-    model: str | None,
     metrics_generation: int,
 ) -> ForecastCacheKey:
+    ai_identity = tuple(
+        resolve_ai_profile(job.configuration.ai, phase).identity for phase in AIPhase
+    )
     return (
         job.id,
         job.configuration_revision,
         job.source.size_bytes,
         job.source.modified_ns,
-        model,
+        ai_identity,
         metrics_generation,
     )
 

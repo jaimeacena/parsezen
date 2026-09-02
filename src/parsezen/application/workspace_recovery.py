@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from collections.abc import Callable
+from dataclasses import dataclass, replace
+from pathlib import Path
 from typing import Protocol
 
 from parsezen.application.job_runtime import JobRuntime
@@ -15,6 +17,9 @@ from parsezen.settings import AppSettings
 SOURCE_CHANGED_MESSAGE = (
     "El original cambió desde que se añadió a la cola. Para evitar mezclar versiones, "
     "quítalo y vuelve a añadirlo antes de procesarlo."
+)
+SOURCE_UNAVAILABLE_MESSAGE = (
+    "El original no está disponible. Vuelve a localizar el mismo archivo para poder continuar."
 )
 
 
@@ -35,12 +40,15 @@ class RecoveredWorkspace:
     reset_paused_job_ids: frozenset[str]
     interrupted_job_ids: frozenset[str]
     source_changed_job_ids: frozenset[str]
+    source_unavailable_job_ids: frozenset[str]
 
 
 def recover_workspace(
     saved_jobs: tuple[DocumentJob, ...],
     snapshots: ResultSnapshotLoader,
     settings: AppSettings,
+    *,
+    hasher: Callable[[Path], str] = sha256_file,
 ) -> RecoveredWorkspace:
     runtime: list[tuple[str, JobRuntime]] = []
     restored_jobs: list[DocumentJob] = []
@@ -48,11 +56,22 @@ def recover_workspace(
     reset_paused: set[str] = set()
     interrupted: set[str] = set()
     source_changed: set[str] = set()
+    source_unavailable: set[str] = set()
 
     for job in saved_jobs:
-        if not job.source.path.is_file():
-            continue
+        source_available = job.source.path.is_file()
+        if not source_available:
+            source_unavailable.add(job.id)
+            if SOURCE_UNAVAILABLE_MESSAGE not in job.warnings:
+                job = replace(job, warnings=(*job.warnings, SOURCE_UNAVAILABLE_MESSAGE))
         restored_jobs.append(job)
+        if not source_available:
+            if job.status is JobStatus.WAITING_REVIEW:
+                retained_artifacts.add(job.id)
+            if job.status is JobStatus.RUNNING:
+                interrupted.add(job.id)
+            runtime.append((job.id, JobRuntime()))
+            continue
         request = None
         configuration_unavailable = False
         if job.is_configured:
@@ -65,13 +84,15 @@ def recover_workspace(
             except (OSError, ValueError):
                 configuration_unavailable = True
 
-        source_unchanged = source_is_unchanged(job.source)
         result = None
         if configuration_unavailable:
             reset_paused.add(job.id)
         elif job.status is JobStatus.COMPLETED and job.result_path and job.result_path.is_file():
             result = ProcessResult(final_path=job.result_path)
-        elif job.status is JobStatus.WAITING_REVIEW and source_unchanged:
+        elif job.status is JobStatus.WAITING_REVIEW and source_is_unchanged(
+            job.source,
+            hasher=hasher,
+        ):
             try:
                 result = snapshots.load(
                     job.id,
@@ -115,10 +136,15 @@ def recover_workspace(
         frozenset(reset_paused),
         frozenset(interrupted),
         frozenset(source_changed),
+        frozenset(source_unavailable),
     )
 
 
-def source_is_unchanged(source: DocumentSource) -> bool:
+def source_is_unchanged(
+    source: DocumentSource,
+    *,
+    hasher: Callable[[Path], str] = sha256_file,
+) -> bool:
     try:
         statistics = source.path.stat()
     except OSError:
@@ -128,6 +154,6 @@ def source_is_unchanged(source: DocumentSource) -> bool:
     if source.content_sha256 is None:
         return True
     try:
-        return sha256_file(source.path) == source.content_sha256
+        return hasher(source.path) == source.content_sha256
     except OSError:
         return False

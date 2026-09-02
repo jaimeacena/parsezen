@@ -117,6 +117,9 @@ def test_revision_input_limits_and_empty_documents_are_safe(monkeypatch) -> None
     monkeypatch.setattr("parsezen.revision._MAX_REVIEW_MARKDOWN_CHARACTERS", 3)
     with pytest.raises(ImprovementError, match="demasiado grande"):
         split_markdown_blocks("four")
+    assert [
+        block.markdown for block in split_markdown_blocks("four", enforce_review_limit=False)
+    ] == ["four"]
 
 
 def test_revision_summarizes_insertions_and_deletions() -> None:

@@ -313,6 +313,7 @@ class JobConfigurationDialog(QDialog):
 
     configuration_changed = Signal()
     component_setup_requested = Signal()
+    apply_compatible_requested = Signal()
 
     def __init__(
         self,
@@ -321,6 +322,7 @@ class JobConfigurationDialog(QDialog):
         models: tuple[tuple[str, str], ...] = (),
         stage: StageKind | None = None,
         embedded: bool = False,
+        compatible_count: int = 0,
         default_output_directory: Path | None = None,
         default_ai_model: str | None | object = _AI_DEFAULT_UNSET,
         default_ai_context: int | None | object = _AI_DEFAULT_UNSET,
@@ -403,12 +405,12 @@ class JobConfigurationDialog(QDialog):
         review_layout = QHBoxLayout(self.review_row)
         review_layout.setContentsMargins(SPACING.sm, SPACING.sm, SPACING.sm, SPACING.sm)
         review_layout.setSpacing(SPACING.sm)
-        self.review_label = QLabel("Revisión automática con IA", self.review_row)
+        self.review_label = QLabel("Revisión adicional con IA", self.review_row)
         self.review_label.setObjectName("configurationOptionLabel")
         review_layout.addWidget(self.review_label)
         review_layout.addStretch(1)
         self.plan_reviewed = Switch(self.review_row)
-        self.plan_reviewed.setAccessibleName("Revisión automática con IA")
+        self.plan_reviewed.setAccessibleName("Revisión adicional con IA")
         review_layout.addWidget(self.plan_reviewed)
         self.pages_row = _OptionRow("Páginas", "", parent=self.content)
         self.ocr_row = _OptionRow("OCR", "", parent=self.content)
@@ -429,6 +431,16 @@ class JobConfigurationDialog(QDialog):
         self.validation_label.hide()
         self.options_layout.addWidget(self.validation_label)
 
+        self.apply_compatible_button = QPushButton(
+            f"Aplicar a {compatible_count} compatibles",
+            self.content,
+        )
+        self.apply_compatible_button.setAccessibleName(
+            f"Aplicar configuración a {compatible_count} documentos compatibles"
+        )
+        self.apply_compatible_button.setVisible(compatible_count > 0)
+        self.options_layout.addWidget(self.apply_compatible_button)
+
         root.addWidget(
             self.content,
             0,
@@ -444,6 +456,7 @@ class JobConfigurationDialog(QDialog):
         self.plan_reviewed.toggled.connect(self._set_review_enabled)
         self.pages_row.activated.connect(self._open_pages_menu)
         self.ocr_row.activated.connect(self._open_ocr_menu)
+        self.apply_compatible_button.clicked.connect(self._request_compatible_application)
         self._refresh()
         self._focus_stage(stage)
 
@@ -518,6 +531,10 @@ class JobConfigurationDialog(QDialog):
         self.validation_label.hide()
         self.configuration_changed.emit()
         return True
+
+    def _request_compatible_application(self) -> None:
+        if self.persist_if_valid():
+            self.apply_compatible_requested.emit()
 
     def mark_persisted(self, job: DocumentJob) -> None:
         """Keep later immediate updates based on the last committed configuration."""
@@ -613,12 +630,13 @@ class JobConfigurationDialog(QDialog):
             if glossary_count == 0
             else f"{glossary_count} término{'s' if glossary_count != 1 else ''}"
         )
-        if translating and self._translation_method is TranslationMethod.LOCAL_AI:
-            review_description = "La corrección se integra en la traducción."
-        elif translating:
-            review_description = "La IA verifica la traducción en una pasada posterior."
+        if translating:
+            review_description = (
+                "La IA compara de nuevo bloques de la traducción con el original. "
+                "Cualquier cambio queda como propuesta."
+            )
         else:
-            review_description = "La IA propone correcciones del contenido."
+            review_description = "La IA propone correcciones del contenido para que las confirmes."
         if self._output_format is DocumentFormat.EPUB:
             review_description += " También propone la estructura del EPUB."
         self.plan_reviewed.setAccessibleDescription(review_description)

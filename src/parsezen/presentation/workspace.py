@@ -59,7 +59,6 @@ from parsezen.presentation.design_system import (
     back_icon,
     current_theme_mode,
     folder_icon,
-    local_ai_icon,
     pause_icon,
     play_icon,
     settings_icon,
@@ -278,6 +277,7 @@ class ParsezenWorkspace(QWidget):
     settings_requested = Signal()
     local_ai_requested = Signal()
     configure_requested = Signal(str, object)
+    source_requested = Signal(str)
     review_requested = Signal(str, object)
     ai_review_requested = Signal(str)
     error_requested = Signal(str, object)
@@ -341,17 +341,9 @@ class ParsezenWorkspace(QWidget):
         header_layout.addWidget(self.logo, 0, 0)
         header_layout.setColumnStretch(1, 1)
 
-        self.local_ai_button = QPushButton("IA local", self.app_header)
-        self.local_ai_button.setObjectName("localAiSettings")
-        self.local_ai_button.setAccessibleName("Configurar la IA local")
-        self.local_ai_button.setIcon(local_ai_icon())
-        self.local_ai_button.setIconSize(QSize(19, 19))
-        self.local_ai_button.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.local_ai_button.setFocusPolicy(Qt.FocusPolicy.TabFocus)
-        self.local_ai_button.clicked.connect(self.local_ai_requested)
-        header_layout.addWidget(self.local_ai_button, 0, 2)
-
-        self.output_directory_button = QPushButton("Destino · Original", self.app_header)
+        self.output_directory_button = QPushButton(
+            "Guardar en · Junto al original", self.app_header
+        )
         self.output_directory_button.setObjectName("globalOutputDirectory")
         self.output_directory_button.setAccessibleName("Cambiar la carpeta de destino")
         self.output_directory_button.setIcon(folder_icon())
@@ -359,7 +351,28 @@ class ParsezenWorkspace(QWidget):
         self.output_directory_button.setCursor(Qt.CursorShape.PointingHandCursor)
         self.output_directory_button.setFocusPolicy(Qt.FocusPolicy.TabFocus)
         self.output_directory_button.clicked.connect(self._show_output_directory_menu)
-        header_layout.addWidget(self.output_directory_button, 0, 3)
+        header_layout.addWidget(self.output_directory_button, 0, 2)
+
+        self.add_button = QPushButton("Añadir", self.app_header)
+        self.add_button.setObjectName("queueAddAction")
+        self.add_button.setAccessibleName("Añadir más documentos")
+        self.add_button.setToolTip("Añadir documentos")
+        self.add_button.setIcon(add_documents_icon())
+        self.add_button.setIconSize(QSize(18, 18))
+        self.add_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.add_button.setFocusPolicy(Qt.FocusPolicy.TabFocus)
+        self.add_button.clicked.connect(self.add_requested)
+        header_layout.addWidget(self.add_button, 0, 3)
+
+        self.primary_button = QPushButton(self.app_header)
+        self.primary_button.setObjectName("primaryAction")
+        self.primary_button.setMinimumWidth(156)
+        self.primary_button.setIconSize(QSize(18, 18))
+        self.primary_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.primary_button.setFocusPolicy(Qt.FocusPolicy.TabFocus)
+        self.primary_button.clicked.connect(self._emit_primary_action)
+        self.primary_button.hide()
+        header_layout.addWidget(self.primary_button, 0, 4)
 
         self.settings_button = QPushButton(self.app_header)
         self.settings_button.setObjectName("globalMenu")
@@ -371,7 +384,7 @@ class ParsezenWorkspace(QWidget):
         self.settings_button.setCursor(Qt.CursorShape.PointingHandCursor)
         self.settings_button.setFocusPolicy(Qt.FocusPolicy.TabFocus)
         self.settings_button.clicked.connect(self.settings_requested)
-        header_layout.addWidget(self.settings_button, 0, 4)
+        header_layout.addWidget(self.settings_button, 0, 5)
         layout.addWidget(self.app_header, 0, Qt.AlignmentFlag.AlignHCenter)
 
         self.content_stack = QStackedWidget(self)
@@ -382,47 +395,17 @@ class ParsezenWorkspace(QWidget):
         self.queue_layout = queue_layout
         queue_layout.setContentsMargins(0, 0, 0, 0)
         queue_layout.setSpacing(10)
-        self.queue_toolbar = QWidget(self.queue_pane)
-        self.queue_toolbar.setObjectName("queueToolbar")
-        self.queue_toolbar.setMaximumWidth(_CONTENT_RAIL_MAX_WIDTH)
-        self.queue_toolbar.setSizePolicy(
-            QSizePolicy.Policy.Expanding,
-            QSizePolicy.Policy.Fixed,
-        )
-        queue_toolbar_layout = QGridLayout(self.queue_toolbar)
-        self.queue_toolbar_layout = queue_toolbar_layout
-        queue_toolbar_layout.setContentsMargins(0, 0, 0, 0)
-        queue_toolbar_layout.setHorizontalSpacing(SPACING.sm)
-        queue_toolbar_layout.setVerticalSpacing(SPACING.xs)
-        self.queue_summary = QLabel("0 documentos", self.queue_toolbar)
+        self.queue_summary = QLabel("0 documentos", self.queue_pane)
         self.queue_summary.setObjectName("queueSummary")
         self.queue_summary.setWordWrap(False)
         self.queue_summary.setMinimumWidth(0)
+        self.queue_summary.setMaximumWidth(_CONTENT_RAIL_MAX_WIDTH)
         self.queue_summary.setSizePolicy(
             QSizePolicy.Policy.Expanding,
             QSizePolicy.Policy.Fixed,
         )
-        queue_toolbar_layout.addWidget(self.queue_summary, 0, 0, 1, 2)
-        queue_toolbar_layout.setColumnStretch(1, 1)
-        self.add_button = QPushButton("Añadir", self.queue_toolbar)
-        self.add_button.setObjectName("queueAddAction")
-        self.add_button.setAccessibleName("Añadir más documentos")
-        self.add_button.setIcon(add_documents_icon())
-        self.add_button.setIconSize(QSize(18, 18))
-        self.add_button.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.add_button.setFocusPolicy(Qt.FocusPolicy.TabFocus)
-        self.add_button.clicked.connect(self.add_requested)
-        queue_toolbar_layout.addWidget(self.add_button, 0, 2)
-        self.primary_button = QPushButton(self.queue_toolbar)
-        self.primary_button.setObjectName("primaryAction")
-        self.primary_button.setMinimumWidth(156)
-        self.primary_button.setIconSize(QSize(18, 18))
-        self.primary_button.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.primary_button.clicked.connect(self._emit_primary_action)
-        self.primary_button.hide()
-        queue_toolbar_layout.addWidget(self.primary_button, 0, 3)
-        queue_layout.addWidget(self.queue_toolbar)
-        queue_layout.setAlignment(self.queue_toolbar, Qt.AlignmentFlag.AlignHCenter)
+        queue_layout.addWidget(self.queue_summary)
+        queue_layout.setAlignment(self.queue_summary, Qt.AlignmentFlag.AlignHCenter)
         self.table_panel = RoundedTablePanel(self.queue_pane)
         self.table_panel.setObjectName("jobTablePanel")
         self.table_panel.setMaximumWidth(_CONTENT_RAIL_MAX_WIDTH)
@@ -435,6 +418,7 @@ class ParsezenWorkspace(QWidget):
         table_layout.setSpacing(0)
         self.job_table = JobTableView(self.table_panel)
         self.job_table.configure_requested.connect(self.configure_requested)
+        self.job_table.source_requested.connect(self.source_requested)
         self.job_table.review_requested.connect(self.review_requested)
         self.job_table.ai_review_requested.connect(self.ai_review_requested)
         self.job_table.error_requested.connect(self.error_requested)
@@ -471,8 +455,9 @@ class ParsezenWorkspace(QWidget):
         self.content_stack.setCurrentWidget(self.queue_pane)
         self._internal_pages: dict[
             QWidget,
-            tuple[QWidget, QWidget, bool, QWidget | None],
+            tuple[QWidget, QWidget, QWidget | None],
         ] = {}
+        self._internal_settings_buttons: dict[QWidget, QPushButton] = {}
         self.current_internal_widget: QWidget | None = None
         layout.addWidget(self.content_stack, 1)
 
@@ -483,7 +468,6 @@ class ParsezenWorkspace(QWidget):
         """Refresh controls whose colors or assets are created at runtime."""
 
         self._apply_logo()
-        self.local_ai_button.setIcon(local_ai_icon())
         self.output_directory_button.setIcon(folder_icon())
         self._refresh_settings_attention()
         self.add_button.setIcon(add_documents_icon())
@@ -503,7 +487,9 @@ class ParsezenWorkspace(QWidget):
         else:
             self.logo.setText("")
             self.logo.setPixmap(logo.scaledToWidth(132, Qt.TransformationMode.SmoothTransformation))
-        target_width = 96 if self._layout_mode == "compact" else 132
+        target_width = (
+            80 if self._layout_mode == "compact" else 108 if self._layout_mode == "medium" else 132
+        )
         self.logo.setStyleSheet("background: transparent; padding: 4px 2px;")
         if not logo.isNull():
             self.logo.setPixmap(
@@ -523,7 +509,8 @@ class ParsezenWorkspace(QWidget):
         self._reconcile_contextual_messages()
         self.job_table.set_jobs(self._jobs)
         self.table_panel.setVisible(bool(self._jobs))
-        self.queue_toolbar.setVisible(bool(self._jobs))
+        self.queue_summary.setVisible(bool(self._jobs))
+        self.add_button.setVisible(bool(self._jobs))
         self.drop_area.setVisible(not self._jobs)
         self.table_panel.setFixedHeight(self.job_table.height() + 2)
         self._apply_queue_state_layout()
@@ -535,15 +522,18 @@ class ParsezenWorkspace(QWidget):
             or job.review_recommendation is not None
             for job in self._jobs
         )
-        self.settings_button.setIcon(settings_icon(attention=attention))
-        self.settings_button.setAccessibleName(
-            "Abrir ajustes y actividad. Hay acciones pendientes."
-            if attention
-            else "Abrir ajustes y actividad"
-        )
-        self.settings_button.setToolTip(
-            "Ajustes y actividad · Hay acciones pendientes" if attention else "Ajustes y actividad"
-        )
+        for button in (self.settings_button, *self._internal_settings_buttons.values()):
+            button.setIcon(settings_icon(attention=attention))
+            button.setAccessibleName(
+                "Abrir ajustes y actividad. Hay acciones pendientes."
+                if attention
+                else "Abrir ajustes y actividad"
+            )
+            button.setToolTip(
+                "Ajustes y actividad · Hay acciones pendientes"
+                if attention
+                else "Ajustes y actividad"
+            )
 
     def _apply_queue_state_layout(self) -> None:
         empty = not self._jobs
@@ -557,7 +547,7 @@ class ParsezenWorkspace(QWidget):
         )
         rail_width = min(_CONTENT_RAIL_MAX_WIDTH, available_width)
         self.app_header.setFixedWidth(rail_width)
-        self.queue_toolbar.setFixedWidth(rail_width)
+        self.queue_summary.setFixedWidth(rail_width)
         self.table_panel.setFixedWidth(rail_width)
         self.recovery_warning.setFixedWidth(rail_width)
         self.batch_message.setFixedWidth(rail_width)
@@ -611,14 +601,35 @@ class ParsezenWorkspace(QWidget):
 
         self._output_directory = directory
         if directory is None:
-            label = "Original"
+            label = "Junto al original"
             tooltip = "Cada resultado se guardará junto a su documento original."
         else:
             label = directory.name or str(directory)
             tooltip = str(directory)
-        condensed = self._layout_mode in {"compact", "medium"}
-        self.output_directory_button.setText(label if condensed else f"Destino · {label}")
+        mode = self._layout_mode or "wide"
+        if mode == "compact":
+            text = ""
+            self.output_directory_button.setFixedSize(38, 38)
+            self.output_directory_button.setMaximumWidth(38)
+        else:
+            text = (
+                self.output_directory_button.fontMetrics().elidedText(
+                    label,
+                    Qt.TextElideMode.ElideMiddle,
+                    150,
+                )
+                if mode == "medium"
+                else f"Guardar en · {label}"
+            )
+            self.output_directory_button.setMinimumWidth(0)
+            self.output_directory_button.setMaximumWidth(180 if mode == "medium" else 300)
+            self.output_directory_button.setMinimumHeight(38)
+            self.output_directory_button.setMaximumHeight(38)
+        self.output_directory_button.setText(text)
         self.output_directory_button.setToolTip(tooltip)
+        self.output_directory_button.setAccessibleName(
+            f"Cambiar dónde se guardan los resultados. {tooltip}"
+        )
 
     def set_local_ai_status(
         self,
@@ -629,22 +640,6 @@ class ParsezenWorkspace(QWidget):
 
         self._local_ai_status = status
         self._local_ai_model = model
-        label = {
-            None: "Revisar",
-            OllamaStatus.READY: "Lista",
-            OllamaStatus.NOT_INSTALLED: "No configurada",
-            OllamaStatus.STOPPED: "Detenida",
-            OllamaStatus.MISSING_MODEL: "Sin modelo",
-            OllamaStatus.LOCAL_ONLY_REQUIRED: "Revisar privacidad",
-            OllamaStatus.UNAVAILABLE: "No disponible",
-        }[status]
-        compact_text = "IA"
-        full_text = f"IA local · {label}"
-        condensed = self._layout_mode in {"compact", "medium"}
-        self.local_ai_button.setText(compact_text if condensed else full_text)
-        details = f"Modelo predeterminado: {model}." if model else "Sin modelo predeterminado."
-        self.local_ai_button.setToolTip(f"IA local: {label}. {details}")
-        self.local_ai_button.setAccessibleName(f"Abrir IA local. Estado: {label}. {details}")
 
     def _show_output_directory_menu(self) -> None:
         menu = QMenu(self)
@@ -751,7 +746,6 @@ class ParsezenWorkspace(QWidget):
         title: str,
         *,
         scroll: bool = False,
-        replace_app_header: bool = False,
     ) -> None:
         """Present a workflow inside the main window."""
 
@@ -778,6 +772,17 @@ class ParsezenWorkspace(QWidget):
         heading.setObjectName("internalPageTitle")
         header_layout.addWidget(heading)
         header_layout.addStretch(1)
+        settings = QPushButton(header)
+        settings.setObjectName("globalMenu")
+        settings.setAccessibleName("Abrir ajustes y actividad")
+        settings.setToolTip("Ajustes y actividad")
+        settings.setIcon(settings_icon())
+        settings.setIconSize(QSize(20, 20))
+        settings.setFixedSize(42, 42)
+        settings.setCursor(Qt.CursorShape.PointingHandCursor)
+        settings.setFocusPolicy(Qt.FocusPolicy.TabFocus)
+        settings.clicked.connect(self.settings_requested)
+        header_layout.addWidget(settings)
         root_margins = self.root_layout.contentsMargins()
         header.setFixedWidth(
             min(
@@ -801,12 +806,13 @@ class ParsezenWorkspace(QWidget):
         self._internal_pages[widget] = (
             page,
             previous,
-            replace_app_header,
             focus_target,
         )
+        self._internal_settings_buttons[widget] = settings
+        self._refresh_settings_attention()
         self.current_internal_widget = widget
         self.content_stack.setCurrentWidget(page)
-        self.app_header.setVisible(not replace_app_header)
+        self.app_header.hide()
         self.primary_button.hide()
         widget.show()
         if hasattr(widget, "set_compact_mode"):
@@ -819,15 +825,18 @@ class ParsezenWorkspace(QWidget):
         record = self._internal_pages.pop(widget, None)
         if record is None:
             return
-        page, previous, replaced_header, focus_target = record
+        page, previous, focus_target = record
+        self._internal_settings_buttons.pop(widget, None)
         if self.content_stack.currentWidget() is page:
             self.content_stack.setCurrentWidget(previous)
         self.content_stack.removeWidget(page)
         widget.hide()
         widget.setParent(self)
         page.deleteLater()
-        if replaced_header:
+        if previous is self.queue_pane:
             self.app_header.show()
+        else:
+            self.app_header.hide()
         if previous is self.queue_pane:
             self._refresh_queue_commands()
         else:
@@ -842,6 +851,16 @@ class ParsezenWorkspace(QWidget):
         )
         self.current_internal_widget = previous_internal
         self._restore_workflow_focus(focus_target)
+
+    def settings_anchor(self) -> QPushButton:
+        """Return the settings control visible in the current page header."""
+
+        current = self.current_internal_widget
+        if current is not None:
+            button = self._internal_settings_buttons.get(current)
+            if button is not None:
+                return button
+        return self.settings_button
 
     def _restore_workflow_focus(self, target: QWidget | None) -> None:
         if target is None or not target.isVisible():
@@ -903,12 +922,13 @@ class ParsezenWorkspace(QWidget):
         self._compact_layout = compact
         for widget in (
             self.logo,
-            self.local_ai_button,
             self.output_directory_button,
+            self.add_button,
+            self.primary_button,
             self.settings_button,
         ):
             self.header_layout.removeWidget(widget)
-        for column in range(5):
+        for column in range(7):
             self.header_layout.setColumnStretch(column, 0)
         if compact:
             self.root_layout.setContentsMargins(
@@ -918,13 +938,14 @@ class ParsezenWorkspace(QWidget):
                 SPACING.md,
             )
             self.header_layout.setContentsMargins(0, SPACING.xs, 0, SPACING.xs)
-            self.header_layout.setHorizontalSpacing(SPACING.sm)
-            self.header_layout.setVerticalSpacing(SPACING.sm)
+            self.header_layout.setHorizontalSpacing(SPACING.xs)
+            self.header_layout.setVerticalSpacing(0)
             self.header_layout.addWidget(self.logo, 0, 0)
-            self.header_layout.addWidget(self.settings_button, 0, 2)
-            self.header_layout.addWidget(self.local_ai_button, 1, 0)
-            self.header_layout.addWidget(self.output_directory_button, 1, 1, 1, 2)
             self.header_layout.setColumnStretch(1, 1)
+            self.header_layout.addWidget(self.output_directory_button, 0, 2)
+            self.header_layout.addWidget(self.add_button, 0, 3)
+            self.header_layout.addWidget(self.primary_button, 0, 4)
+            self.header_layout.addWidget(self.settings_button, 0, 5)
         elif medium:
             self.root_layout.setContentsMargins(
                 SPACING.lg,
@@ -934,25 +955,27 @@ class ParsezenWorkspace(QWidget):
             )
             self.header_layout.setContentsMargins(0, SPACING.xs, 0, SPACING.xs)
             self.header_layout.setHorizontalSpacing(SPACING.sm)
-            self.header_layout.setVerticalSpacing(SPACING.sm)
+            self.header_layout.setVerticalSpacing(0)
             self.header_layout.addWidget(self.logo, 0, 0)
-            self.header_layout.addWidget(self.settings_button, 0, 3)
-            self.header_layout.addWidget(self.local_ai_button, 1, 0)
-            self.header_layout.addWidget(self.output_directory_button, 1, 1, 1, 3)
             self.header_layout.setColumnStretch(1, 1)
+            self.header_layout.addWidget(self.output_directory_button, 0, 2)
+            self.header_layout.addWidget(self.add_button, 0, 3)
+            self.header_layout.addWidget(self.primary_button, 0, 4)
+            self.header_layout.addWidget(self.settings_button, 0, 5)
         else:
             self.root_layout.setContentsMargins(24, 16, 24, 20)
             self.header_layout.setContentsMargins(8, 2, 0, 2)
             self.header_layout.setSpacing(8)
             self.header_layout.addWidget(self.logo, 0, 0)
-            self.header_layout.addWidget(self.local_ai_button, 0, 2)
-            self.header_layout.addWidget(self.output_directory_button, 0, 3)
-            self.header_layout.addWidget(self.settings_button, 0, 4)
+            self.header_layout.addWidget(self.output_directory_button, 0, 2)
             self.header_layout.setColumnStretch(1, 1)
-        self.set_local_ai_status(self._local_ai_status, self._local_ai_model)
+            self.header_layout.addWidget(self.add_button, 0, 3)
+            self.header_layout.addWidget(self.primary_button, 0, 4)
+            self.header_layout.addWidget(self.settings_button, 0, 5)
         self._apply_logo()
         self.set_output_directory(self._output_directory)
-        self._apply_queue_toolbar_layout(compact=compact)
+        self._apply_header_action_layout(compact=compact)
+        self._refresh_queue_commands()
         self.job_table.set_compact_mode(compact or medium)
         self._apply_queue_state_layout()
         self.batch_message.set_compact_mode(compact)
@@ -961,27 +984,20 @@ class ParsezenWorkspace(QWidget):
         if current is not None and hasattr(current, "set_compact_mode"):
             current.set_compact_mode(compact)
 
-    def _apply_queue_toolbar_layout(self, *, compact: bool) -> None:
-        for widget in (self.queue_summary, self.add_button, self.primary_button):
-            self.queue_toolbar_layout.removeWidget(widget)
-        for column in range(4):
-            self.queue_toolbar_layout.setColumnStretch(column, 0)
+    def _apply_header_action_layout(self, *, compact: bool) -> None:
         if compact:
-            self.queue_toolbar_layout.addWidget(self.queue_summary, 0, 0, 1, 2)
-            self.queue_toolbar_layout.addWidget(self.add_button, 1, 0)
-            self.queue_toolbar_layout.addWidget(self.primary_button, 1, 1)
-            self.queue_toolbar_layout.setColumnStretch(1, 1)
-            self.primary_button.setMinimumWidth(0)
-            self.primary_button.setSizePolicy(
-                QSizePolicy.Policy.Expanding,
-                QSizePolicy.Policy.Fixed,
-            )
+            self.add_button.setText("")
+            self.primary_button.setText("")
+            self.add_button.setFixedSize(38, 38)
+            self.primary_button.setFixedSize(38, 38)
             return
-        self.queue_toolbar_layout.addWidget(self.queue_summary, 0, 0, 1, 2)
-        self.queue_toolbar_layout.addWidget(self.add_button, 0, 2)
-        self.queue_toolbar_layout.addWidget(self.primary_button, 0, 3)
-        self.queue_toolbar_layout.setColumnStretch(1, 1)
+        self.add_button.setText("Añadir")
+        self.add_button.setMinimumWidth(0)
+        self.add_button.setMaximumWidth(16777215)
+        self.add_button.setFixedHeight(38)
         self.primary_button.setMinimumWidth(156)
+        self.primary_button.setMaximumWidth(16777215)
+        self.primary_button.setFixedHeight(38)
         self.primary_button.setSizePolicy(
             QSizePolicy.Policy.Preferred,
             QSizePolicy.Policy.Fixed,
@@ -1003,7 +1019,10 @@ class ParsezenWorkspace(QWidget):
             self._pause_feedback_pending = False
             self.primary_button.setVisible(True)
             self.primary_button.setEnabled(self._preparing_can_pause)
-            self.primary_button.setText("Pausar" if self._preparing_can_pause else "Preparando…")
+            label = "Pausar" if self._preparing_can_pause else "Preparando…"
+            self.primary_button.setText("" if self._compact_layout else label)
+            self.primary_button.setToolTip(label)
+            self.primary_button.setAccessibleName(label)
             self.primary_button.setIcon(pause_icon() if self._preparing_can_pause else QIcon())
             return
         self._primary_mode = view.primary_mode
@@ -1013,11 +1032,14 @@ class ParsezenWorkspace(QWidget):
         self.primary_button.setEnabled(
             view.primary_mode is not None and not self._pause_feedback_pending
         )
-        self.primary_button.setText(
+        label = (
             "Pausando…"
             if view.primary_mode == "pause" and self._pause_feedback_pending
             else view.primary_label or ""
         )
+        self.primary_button.setText("" if self._compact_layout else label)
+        self.primary_button.setToolTip(label)
+        self.primary_button.setAccessibleName(label)
         self.primary_button.setIcon(
             play_icon()
             if view.primary_mode == "process"
@@ -1031,7 +1053,9 @@ class ParsezenWorkspace(QWidget):
             if self._primary_mode == "pause":
                 self._pause_feedback_pending = True
                 self.primary_button.setEnabled(False)
-                self.primary_button.setText("Pausando…")
+                self.primary_button.setText("" if self._compact_layout else "Pausando…")
+                self.primary_button.setToolTip("Pausando…")
+                self.primary_button.setAccessibleName("Pausando…")
                 QTimer.singleShot(2500, self._clear_pause_feedback)
             self.primary_requested.emit(self._primary_mode)
 
@@ -1044,9 +1068,6 @@ class ParsezenWorkspace(QWidget):
         self.setStyleSheet(
             f"""
             QWidget#appHeader {{
-                background-color: transparent;
-            }}
-            QWidget#queueToolbar {{
                 background-color: transparent;
             }}
             QLabel#queueSummary {{
@@ -1138,8 +1159,7 @@ class ParsezenWorkspace(QWidget):
                 background-color: transparent;
                 border: none;
             }}
-            QPushButton#globalOutputDirectory,
-            QPushButton#localAiSettings {{
+            QPushButton#globalOutputDirectory {{
                 min-height: 38px;
                 max-height: 38px;
                 color: {COLORS.text_secondary};
@@ -1147,14 +1167,12 @@ class ParsezenWorkspace(QWidget):
                 border-color: transparent;
             }}
             QPushButton#globalOutputDirectory:hover,
-            QPushButton#localAiSettings:hover,
             QPushButton#globalMenu:hover {{
                 color: {COLORS.text_primary};
                 background-color: {COLORS.surface_hover};
                 border-color: transparent;
             }}
             QPushButton#globalOutputDirectory:focus,
-            QPushButton#localAiSettings:focus,
             QPushButton#globalMenu:focus {{
                 background-color: {COLORS.surface_hover};
                 border-color: transparent;

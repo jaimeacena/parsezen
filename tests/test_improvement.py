@@ -77,6 +77,258 @@ def test_translation_does_not_localize_ordinals_inside_urls_or_code() -> None:
     assert translated == "Usa `3rd` y https://example.test/3rd antes del 3.º intento."
 
 
+def test_translation_localizes_copied_astrological_series_labels() -> None:
+    context = improvement_module._TranslationContext(
+        source_language="en",
+        target_language="es",
+        preserve_paragraphs=True,
+    )
+    source = "Compare *Venus in Aries I* with *Sun in Taurus II* before continuing."
+    proposed = "Compara *Venus in Aries I* con *Sun in Taurus II* antes de continuar."
+
+    translated = markdown_safety_module._localize_copied_english_conventions(
+        source,
+        proposed,
+        context,
+    )
+
+    assert translated == "Compara *Venus en Aries I* con *Sol en Tauro II* antes de continuar."
+
+
+def test_translation_finishes_partially_localized_astrological_series_labels() -> None:
+    context = improvement_module._TranslationContext(
+        source_language="en",
+        target_language="es",
+        preserve_paragraphs=True,
+    )
+    source = "Compare *Jupiter in Gemini III* with *Mars in Capricorn I*."
+    proposed = "Compara *Jupiter in Géminis III* con *Mars in Capricornio I*."
+
+    translated = markdown_safety_module._localize_copied_english_conventions(
+        source,
+        proposed,
+        context,
+    )
+
+    assert translated == "Compara *Júpiter en Géminis III* con *Marte en Capricornio I*."
+
+
+def test_translation_restores_a_split_emphasis_astrological_series_label() -> None:
+    context = improvement_module._TranslationContext(
+        source_language="en",
+        target_language="es",
+        preserve_paragraphs=True,
+    )
+    source = "The paired image is *Sun in Aries II* and remains part of the same series."
+    proposed = "La imagen emparejada es *Sun in Aries* II y sigue formando parte de la misma serie."
+
+    translated = markdown_safety_module._localize_copied_english_conventions(
+        source,
+        proposed,
+        context,
+    )
+
+    assert translated == (
+        "La imagen emparejada es *Sol en Aries II* y sigue formando parte de la misma serie."
+    )
+
+
+def test_translation_treats_a_following_roman_as_part_of_an_astrological_series_label() -> None:
+    context = improvement_module._TranslationContext(
+        source_language="en",
+        target_language="es",
+        preserve_paragraphs=True,
+    )
+    source = "The paired image is *Sun in Aries* II and remains part of the same series."
+    proposed = "La imagen emparejada es *Sun in Aries* II y sigue formando parte de la misma serie."
+
+    translated = markdown_safety_module._localize_copied_english_conventions(
+        source,
+        proposed,
+        context,
+    )
+
+    assert translated == (
+        "La imagen emparejada es *Sol en Aries II* y sigue formando parte de la misma serie."
+    )
+
+
+def test_translation_localizes_an_astrological_series_with_separate_roman_emphasis() -> None:
+    context = improvement_module._TranslationContext(
+        source_language="en",
+        target_language="es",
+        preserve_paragraphs=True,
+    )
+    source = "<!-- PZDOC PDF PAGE 65 --> *Sun in Aries* **III** The Sun is strong here."
+
+    translated = markdown_safety_module._localize_copied_english_conventions(
+        source,
+        "<!-- PZDOC PDF PAGE 65 --> *Sun in Aries* **III** El Sol es fuerte aquí.",
+        context,
+    )
+
+    assert translated == (
+        "<!-- PZDOC PDF PAGE 65 --> *Sol en Aries* **III** El Sol es fuerte aquí."
+    )
+
+
+def test_translation_localizes_a_leading_emphasized_astrological_placement() -> None:
+    context = improvement_module._TranslationContext(
+        source_language="en",
+        target_language="es",
+        preserve_paragraphs=True,
+    )
+    source = "<!-- PZDOC PDF PAGE 152 --> *Venus in Virgo* n Venus is in her fall."
+
+    translated = markdown_safety_module._localize_copied_english_conventions(
+        source,
+        "<!-- PZDOC PDF PAGE 152 --> *Venus in Virgo* en Venus está en caída.",
+        context,
+    )
+
+    assert translated == ("<!-- PZDOC PDF PAGE 152 --> *Venus en Virgo* en Venus está en caída.")
+
+
+def test_translation_keeps_unsequenced_astrological_or_literal_labels() -> None:
+    context = improvement_module._TranslationContext(
+        source_language="en",
+        target_language="es",
+        preserve_paragraphs=True,
+    )
+    source = "Compare *Sun in Aries* with `Venus in Aries I` and the linked reference."
+    proposed = (
+        "Compara *Sun in Aries* con `Venus in Aries I` y https://example.test/Sun-in-Aries-II."
+    )
+
+    translated = markdown_safety_module._localize_copied_english_conventions(
+        source,
+        proposed,
+        context,
+    )
+
+    assert translated == proposed
+
+
+def test_translation_postprocessing_preserves_a_bare_email_address() -> None:
+    context = improvement_module._TranslationContext(
+        source_language="en",
+        target_language="es",
+        preserve_paragraphs=True,
+    )
+    source = "Email mainstream@example.com when you need careful assistance."
+    response = "Escribe a mainstream@example.com cuando necesites ayuda especializada."
+
+    translated = markdown_safety_module._prepare_and_validate_response(
+        source,
+        response,
+        context,
+        ImprovementMode.TRANSLATE,
+    )
+
+    assert translated == response
+
+
+def test_translation_validation_rejects_a_mutated_bare_email_address() -> None:
+    context = improvement_module._TranslationContext(
+        source_language="en",
+        target_language="es",
+        preserve_paragraphs=True,
+    )
+
+    with pytest.raises(ImprovementError, match="correos electrónicos"):
+        markdown_safety_module._prepare_and_validate_response(
+            "Email author@example.com when you need careful assistance.",
+            "Escribe a hacker@example.net cuando necesites ayuda especializada.",
+            context,
+            ImprovementMode.TRANSLATE,
+        )
+
+
+def test_translation_protects_a_complete_english_ordinal_before_localizing_it() -> None:
+    source = "Plan your 13th trip."
+    protected = improvement_module._protect_translation_values(
+        source,
+        protect_headings=False,
+        protect_paragraphs=False,
+    )
+
+    assert {value.value for value in protected.values} == {"13th"}
+    assert "13" not in protected.text
+    assert "th" not in protected.text
+
+    restored = improvement_module._restore_protected_values(
+        protected.text.replace("Plan your", "Planifica tu").replace("trip", "viaje"),
+        protected.values,
+    )
+    context = improvement_module._TranslationContext(
+        source_language="en",
+        target_language="es",
+        preserve_paragraphs=True,
+    )
+
+    assert (
+        markdown_safety_module._localize_copied_english_conventions(
+            source,
+            restored,
+            context,
+        )
+        == "Planifica tu 13.º viaje."
+    )
+
+
+def test_translation_preserves_braced_template_fields_exactly() -> None:
+    source = "Write {your name} and {{account_id}} here."
+
+    protected = improvement_module._protect_translation_values(
+        source,
+        protect_headings=False,
+        protect_paragraphs=False,
+    )
+
+    assert {value.value for value in protected.values} == {
+        "{your name}",
+        "{{account_id}}",
+    }
+    assert improvement_module._restore_protected_values(protected.text, protected.values) == source
+
+
+@pytest.mark.parametrize("paragraph", (False, True))
+def test_restores_backslashes_in_protected_values_as_literal_text(paragraph: bool) -> None:
+    token = "PZDOCSAFEVALUEXZQ"
+    value = "C:\\Archive\\"
+    protected = improvement_module._ProtectedValue(token, value, paragraph=paragraph)
+    response = f"\n{token}\n" if paragraph else f"<!-- {token} -->"
+
+    assert improvement_module._restore_protected_values(response, (protected,)) == value
+
+
+def test_translation_protects_currency_without_mistaking_prose_for_a_formula() -> None:
+    source = "Create a $50k/year salary and unlimited money $$$."
+
+    protected = improvement_module._protect_translation_values(
+        source,
+        protect_headings=False,
+        protect_paragraphs=False,
+    )
+
+    assert {value.value for value in protected.values} == {"$", "50", "$$$"}
+    assert "salary and unlimited money" in protected.text
+    assert improvement_module._restore_protected_values(protected.text, protected.values) == source
+
+
+def test_translation_still_protects_inline_math_next_to_currency() -> None:
+    source = "Use $x = 2$ before paying $50."
+
+    protected = improvement_module._protect_translation_values(
+        source,
+        protect_headings=False,
+        protect_paragraphs=False,
+    )
+
+    assert {value.value for value in protected.values} == {"$x = 2$", "$", "50"}
+    assert improvement_module._restore_protected_values(protected.text, protected.values) == source
+
+
 def test_translation_localizes_copied_established_terms_but_not_literal_values() -> None:
     source = (
         "PartOne says Taurus and Gemini remained important in the mainstream. "
@@ -327,6 +579,69 @@ def test_bilingual_review_corrects_a_mistranslated_title_from_its_source() -> No
     )
 
     assert result == corrected
+
+
+def test_bilingual_review_uses_only_closed_semantic_focus_instructions() -> None:
+    source = "You should preserve the force of every claim.\n"
+    translated = "Debe conservar la fuerza de cada afirmación.\n"
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        instructions = payload["messages"][0]["content"]
+        assert "falsos sentidos" in instructions
+        assert "grado formal, coloquial, vulgar" in instructions
+        assert "calcos inequívocos" not in instructions
+        return httpx.Response(200, json={"message": {"content": "[]"}})
+
+    result = review_translation_markdown(
+        source,
+        translated,
+        LOCAL_SETTINGS,
+        "es",
+        transport=httpx.MockTransport(respond),
+        review_focus=frozenset(
+            {
+                improvement_module.TranslationReviewFocus.MEANING,
+                improvement_module.TranslationReviewFocus.REGISTER,
+            }
+        ),
+    )
+
+    assert result == translated
+
+
+def test_bilingual_review_rejects_free_text_as_semantic_focus() -> None:
+    with pytest.raises(ImprovementError, match="foco de revisión semántica"):
+        review_translation_markdown(
+            "Source statement.\n",
+            "Afirmación traducida.\n",
+            LOCAL_SETTINGS,
+            "es",
+            review_focus=frozenset({"meaning from document"}),  # type: ignore[arg-type]
+        )
+
+
+def test_focused_bilingual_review_has_an_isolated_checkpoint_identity() -> None:
+    part = improvement_module._TranslationReviewPart(
+        "Source statement.",
+        "Afirmación traducida.",
+    )
+    expected_default = hashlib.sha256(
+        b"ollama-translation-review-v3\nSource statement.\n\0\nAfirmaci\xc3\xb3n traducida."
+    ).hexdigest()
+
+    default_key = improvement_module._translation_review_checkpoint_key(part)
+    meaning_key = improvement_module._translation_review_checkpoint_key(
+        part,
+        review_focus=frozenset({improvement_module.TranslationReviewFocus.MEANING}),
+    )
+    register_key = improvement_module._translation_review_checkpoint_key(
+        part,
+        review_focus=frozenset({improvement_module.TranslationReviewFocus.REGISTER}),
+    )
+
+    assert default_key == expected_default
+    assert len({default_key, meaning_key, register_key}) == 3
 
 
 def test_bilingual_review_minimizes_verbose_patch_and_preserves_byline_layout() -> None:
@@ -1017,10 +1332,11 @@ def test_bilingual_review_resumes_an_unchanged_validated_chunk() -> None:
     assert cache
 
 
-def test_bilingual_review_caches_safe_preservation_after_two_unsafe_responses() -> None:
+def test_bilingual_review_does_not_count_or_cache_two_unsafe_responses() -> None:
     source = "The document keeps two complete paragraphs.\n"
     translated = "El documento conserva dos párrafos completos.\n"
     cache: dict[str, str] = {}
+    reviewed_segments: list[int] = []
     calls = 0
 
     def respond(_request: httpx.Request) -> httpx.Response:
@@ -1040,22 +1356,47 @@ def test_bilingual_review_caches_safe_preservation_after_two_unsafe_responses() 
         transport=httpx.MockTransport(respond),
         load_checkpoint=cache.get,
         save_checkpoint=save_checkpoint,
+        on_reviewed_segments=reviewed_segments.append,
     )
 
-    resumed = review_translation_markdown(
+    assert first == translated
+    assert calls == 2
+    assert cache == {}
+    assert reviewed_segments == [0]
+
+
+def test_bilingual_review_stops_after_three_consecutive_invalid_json_contracts(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    source = "\n\n".join(
+        f"Source paragraph {index} explains one complete technical point in sufficient detail."
+        for index in range(1, 81)
+    )
+    translated = "\n\n".join(
+        f"El párrafo {index} explica un punto técnico completo con suficiente detalle."
+        for index in range(1, 81)
+    )
+    calls = 0
+    reviewed_segments: list[int] = []
+
+    def respond(_request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(200, json={"message": {"content": "respuesta no JSON"}})
+
+    result = review_translation_markdown(
         source,
         translated,
         LOCAL_SETTINGS,
         "es",
-        transport=httpx.MockTransport(
-            lambda _request: pytest.fail("La preservación segura debe reanudarse desde caché.")
-        ),
-        load_checkpoint=cache.get,
+        transport=httpx.MockTransport(respond),
+        on_reviewed_segments=reviewed_segments.append,
     )
 
-    assert first == resumed == translated
-    assert calls == 2
-    assert cache
+    assert result == translated
+    assert calls == 6
+    assert reviewed_segments == [0]
+    assert "translation_review_stopped consecutive_invalid_contracts=3" in caplog.text
 
 
 def test_bilingual_review_recognizes_an_explicit_cached_preservation(
@@ -1065,6 +1406,7 @@ def test_bilingual_review_recognizes_an_explicit_cached_preservation(
     translated = "El fragmento conservado permanece intencionadamente sin cambios.\n"
     part = improvement_module._TranslationReviewPart(source, translated)
     cache = {improvement_module._translation_review_checkpoint_key(part): translated}
+    reviewed_segments: list[int] = []
 
     monkeypatch.setattr(
         improvement_module,
@@ -1083,9 +1425,11 @@ def test_bilingual_review_recognizes_an_explicit_cached_preservation(
             lambda _request: pytest.fail("La preservación explícita debe reanudarse sin red.")
         ),
         load_checkpoint=cache.get,
+        on_reviewed_segments=reviewed_segments.append,
     )
 
     assert result == translated
+    assert reviewed_segments and reviewed_segments[0] > 0
 
 
 def test_residual_review_caches_safe_preservation_after_rejected_cleanup() -> None:
@@ -1162,6 +1506,7 @@ def test_bilingual_review_logs_a_private_document_validation_reason(
 
 def test_bilingual_review_safely_skips_unaligned_source_and_translation(caplog) -> None:
     translated = "Primero y segundo en un solo bloque.\n"
+    reviewed_segments: list[int] = []
 
     result = review_translation_markdown(
         "First.\n\nSecond.\n",
@@ -1169,10 +1514,61 @@ def test_bilingual_review_safely_skips_unaligned_source_and_translation(caplog) 
         LOCAL_SETTINGS,
         "es",
         transport=httpx.MockTransport(lambda _request: pytest.fail("Unexpected request")),
+        on_reviewed_segments=reviewed_segments.append,
     )
 
     assert result == translated
+    assert reviewed_segments == [0]
     assert "translation_review_skipped alignment_unavailable=true" in caplog.text
+
+
+def test_bilingual_review_reports_only_the_segments_selected_by_its_adaptive_plan() -> None:
+    source_blocks = [
+        (
+            f"This source paragraph {index} explains one complete point in enough detail to "
+            "exercise the adaptive bilingual review without introducing a quality warning."
+        )
+        for index in range(1, 21)
+    ]
+    translated_blocks = [
+        (
+            f"Este párrafo traducido {index} explica un punto completo con suficiente detalle "
+            "para ejercitar la revisión bilingüe adaptativa sin introducir una incidencia."
+        )
+        for index in range(1, 21)
+    ]
+    source = "\n\n".join(source_blocks)
+    translated = "\n\n".join(translated_blocks)
+    report = TranslationQualityReport(
+        "en",
+        "es",
+        "es",
+        checked_segments=20,
+        source_characters=len(source),
+        translated_characters=len(translated),
+        total_issues=0,
+        issues=(),
+        source_blocks=20,
+        translated_blocks=20,
+    )
+    reviewed_segments: list[int] = []
+
+    result = review_translation_markdown(
+        source,
+        translated,
+        LOCAL_SETTINGS,
+        "es",
+        transport=httpx.MockTransport(
+            lambda _request: httpx.Response(200, json={"message": {"content": "[]"}})
+        ),
+        priority_block_count=0,
+        quality_report=report,
+        on_reviewed_segments=reviewed_segments.append,
+    )
+
+    assert result == translated
+    assert len(reviewed_segments) == 1
+    assert 0 < reviewed_segments[0] < report.translated_blocks
 
 
 def test_bilingual_review_splits_aligned_long_line_sequences_without_loss() -> None:
@@ -1217,6 +1613,37 @@ def test_bilingual_review_keeps_safe_patches_when_another_patch_changes_a_number
     assert result == translated.replace("inexacto", "exacto")
     assert "42" in result
     assert "43" not in result
+
+
+def test_bilingual_review_rejects_email_and_url_mutations_but_keeps_a_safe_patch() -> None:
+    source = "Write to author@example.com and read https://example.com for the accurate title.\n"
+    translated = (
+        "Escribe a author@example.com y consulta https://example.com para ver el título inexacto.\n"
+    )
+    patches = [
+        {"old": "author@example.com", "new": "hacker@example.net"},
+        {"old": "https://example.com", "new": "https://evil.example"},
+        {"old": "título inexacto", "new": "título exacto"},
+    ]
+
+    result = review_translation_markdown(
+        source,
+        translated,
+        LOCAL_SETTINGS,
+        "es",
+        transport=httpx.MockTransport(
+            lambda _request: httpx.Response(
+                200,
+                json={"message": {"content": json.dumps(patches)}},
+            )
+        ),
+    )
+
+    assert result == translated.replace("inexacto", "exacto")
+    assert "author@example.com" in result
+    assert "https://example.com" in result
+    assert "hacker@example.net" not in result
+    assert "https://evil.example" not in result
 
 
 def test_bilingual_review_rejects_a_moved_toc_folio_but_keeps_safe_patches() -> None:
@@ -2027,6 +2454,43 @@ def test_initial_translation_request_omits_lexical_attention_without_candidates(
     assert "Condición léxica de aceptación" not in prompts[0]
 
 
+def test_regular_prose_does_not_lock_a_common_established_term_before_translation() -> None:
+    source = (
+        "Each pair provides equal amounts of day and night, and rises and sets from the same "
+        "part of the horizon."
+    )
+    fragments: list[str] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        fragment = payload["messages"][1]["content"]
+        fragments.append(fragment)
+        return httpx.Response(
+            200,
+            json={
+                "message": {
+                    "content": (
+                        "Cada par proporciona cantidades iguales de día y noche, y sale y se pone "
+                        "desde la misma parte del horizonte."
+                    )
+                }
+            },
+        )
+
+    result = improve_markdown(
+        source,
+        ImprovementMode.TRANSLATE,
+        LOCAL_SETTINGS,
+        "Español",
+        transport=httpx.MockTransport(respond),
+        source_language_code="en",
+    )
+
+    assert result.startswith("Cada par proporciona")
+    assert fragments == [source]
+    assert "PZDOCLEX" not in fragments[0]
+
+
 def test_focused_source_repair_explicitly_forbids_copying_residual_prose() -> None:
     prompts: list[str] = []
 
@@ -2405,7 +2869,7 @@ def test_translation_segment_fallback_preserves_list_prefixes_locally() -> None:
         payload = json.loads(request.content)
         fragment = payload["messages"][1]["content"]
         if "\n" in fragment:
-            translated = "Lee la guía completa.\nConserva cada detalle útil."
+            translated = "- Lee la guía completa.\n\n- Conserva cada detalle útil."
         elif "Read" in fragment:
             translated = "Lee la guía completa."
         else:
@@ -2807,6 +3271,104 @@ def test_bilingual_title_retranslation_protects_written_cardinals_semantically()
     assert "SEVEN" not in requests[0]
 
 
+def test_bilingual_title_retranslation_accepts_one_soft_wrapped_title() -> None:
+    def respond(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)["messages"][1]["content"]
+        delimiter = re.search(r"<<<PZDOC_TITLE_[A-F0-9]+>>>", payload)
+        assert delimiter is not None
+        return httpx.Response(
+            200,
+            json={
+                "message": {
+                    "content": (
+                        f"{delimiter.group(0)}\nEL MAPA DEL TESORO:\n"
+                        f"UN PROGRAMA DE TRANSFORMACIÓN DE 30 DÍAS\n{delimiter.group(0)}"
+                    ),
+                }
+            },
+        )
+
+    result = improvement_module.retranslate_residual_title(
+        "THE TREASURE MAP: A 30 DAY TRANSFORMATION PROGRAM",
+        "THE TREASURE MAP: A 30 DAY TRANSFORMATION PROGRAM",
+        LOCAL_SETTINGS,
+        "Español",
+        source_language_code="en",
+        transport=httpx.MockTransport(respond),
+    )
+
+    assert result == "EL MAPA DEL TESORO: UN PROGRAMA DE TRANSFORMACIÓN DE 30 DÍAS"
+
+
+def test_bilingual_title_retranslation_preserves_combined_emphasis() -> None:
+    requests: list[str] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)["messages"][1]["content"]
+        requests.append(payload)
+        return httpx.Response(200, json={"message": {"content": "EL MAPA DEL TESORO"}})
+
+    result = improvement_module.retranslate_residual_title(
+        "***THE TREASURE MAP***",
+        "***THE TREASURE MAP***",
+        LOCAL_SETTINGS,
+        "Español",
+        source_language_code="en",
+        transport=httpx.MockTransport(respond),
+    )
+
+    assert result == "***EL MAPA DEL TESORO***"
+    assert all("***" not in request for request in requests)
+
+
+def test_bilingual_title_retranslation_rejects_an_explanatory_second_line() -> None:
+    def respond(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "message": {
+                    "content": "EL MAPA DEL TESORO\nEsta es la traducción solicitada.",
+                }
+            },
+        )
+
+    source = "THE TREASURE MAP"
+    result = improvement_module.retranslate_residual_title(
+        source,
+        source,
+        LOCAL_SETTINGS,
+        "Español",
+        source_language_code="en",
+        transport=httpx.MockTransport(respond),
+    )
+
+    assert result == source
+
+
+def test_bilingual_title_retranslation_rejects_an_explanation_after_a_colon() -> None:
+    def respond(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "message": {
+                    "content": "EL MAPA DEL TESORO:\nEsta es la traducción solicitada.",
+                }
+            },
+        )
+
+    source = "THE TREASURE MAP: A PRACTICAL GUIDE"
+    result = improvement_module.retranslate_residual_title(
+        source,
+        source,
+        LOCAL_SETTINGS,
+        "Español",
+        source_language_code="en",
+        transport=httpx.MockTransport(respond),
+    )
+
+    assert result == source
+
+
 def test_focused_title_repair_detaches_a_list_prefix_and_protects_its_folio(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2847,6 +3409,67 @@ def test_focused_title_repair_detaches_a_list_prefix_and_protects_its_folio(
     assert not requests[0].startswith("-")
     assert "307" not in requests[0]
     assert "PZDOC" in requests[0]
+
+
+def test_focused_title_repair_translates_only_one_proven_multiword_residue(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    requests: list[str] = []
+
+    def request(
+        _client: object,
+        _model: str,
+        _context_window: int,
+        _instructions: str,
+        markdown: str,
+        _cancellation: object,
+        **_kwargs: object,
+    ) -> str:
+        requests.append(markdown)
+        return markdown
+
+    monkeypatch.setattr(improvement_module, "_request_improvement", request)
+    context = improvement_module._TranslationContext(
+        source_language="en",
+        target_language="es",
+        preserve_paragraphs=True,
+    )
+
+    result = improvement_module._repair_untranslated_titles(
+        object(),
+        "model",
+        8192,
+        "Translate.",
+        "## A. CONJUNCTION (sunodos), LYING HIDDEN",
+        "## A. CONJUNCIÓN (sunodos), LYING HIDDEN",
+        context,
+        None,
+    )
+
+    assert result == "## A. CONJUNCIÓN (sunodos), OCULTO"
+    assert requests == []
+
+
+def test_bilingual_title_retranslation_prefers_one_proven_multiword_residue() -> None:
+    requests: list[str] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        content = payload["messages"][1]["content"]
+        requests.append(content)
+        return httpx.Response(200, json={"message": {"content": content}})
+
+    result = improvement_module.retranslate_residual_title(
+        "## A. CONJUNCTION (sunodos), LYING HIDDEN",
+        "## A. CONJUNCIÓN (sunodos), LYING HIDDEN",
+        LOCAL_SETTINGS,
+        "Español",
+        source_language_code="en",
+        transport=httpx.MockTransport(respond),
+    )
+
+    assert result == "## A. CONJUNCIÓN (sunodos), OCULTO"
+    assert requests == []
 
 
 def test_dense_index_defers_multiple_title_repairs_to_line_fallback(
@@ -2973,6 +3596,154 @@ def test_translation_protects_short_foreign_terms_inside_emphasis() -> None:
     assert improvement_module._restore_protected_values(protected.text, protected.values) == source
 
 
+def test_translation_can_protect_simple_emphasis_delimiters_without_hiding_words() -> None:
+    source = (
+        "Keep *ordinary prose*, **important guidance**, ~~obsolete wording~~ and "
+        "word_with_underscores visible. Do not alter `*literal code*`."
+    )
+
+    protected = improvement_module._protect_translation_values(
+        source,
+        protect_numbers=False,
+        protect_headings=False,
+        protect_paragraphs=False,
+        protect_emphasis=True,
+    )
+
+    protected_values = [value.value for value in protected.values]
+    assert protected_values.count("*") == 2
+    assert protected_values.count("**") == 2
+    assert protected_values.count("~~") == 2
+    assert "ordinary prose" in protected.text
+    assert "important guidance" in protected.text
+    assert "obsolete wording" in protected.text
+    assert "word_with_underscores" in protected.text
+    assert "`*literal code*`" not in protected.text
+    emphasis_tokens = [
+        value.token for value in protected.values if value.value in {"*", "**", "~~"}
+    ]
+    assert emphasis_tokens[0].startswith("<PZDOCE")
+    assert emphasis_tokens[1] == emphasis_tokens[0].replace("<", "</", 1)
+    assert improvement_module._restore_protected_values(protected.text, protected.values) == source
+
+
+def test_translation_protects_combined_bold_italic_delimiters_as_one_pair() -> None:
+    source = "Keep ***important guidance*** and ___a second passage___ visible."
+
+    protected = improvement_module._protect_translation_values(
+        source,
+        protect_numbers=False,
+        protect_headings=False,
+        protect_paragraphs=False,
+        protect_emphasis=True,
+    )
+
+    protected_values = [value.value for value in protected.values]
+    assert protected_values.count("***") == 2
+    assert protected_values.count("___") == 2
+    assert "important guidance" in protected.text
+    assert "a second passage" in protected.text
+    assert "***" not in protected.text
+    assert "___" not in protected.text
+    assert improvement_module._restore_protected_values(protected.text, protected.values) == source
+
+
+def test_translation_protects_nested_mixed_emphasis_delimiters() -> None:
+    source = "Keep **_important guidance_** and __*a second passage*__ visible."
+
+    protected = improvement_module._protect_translation_values(
+        source,
+        protect_numbers=False,
+        protect_headings=False,
+        protect_paragraphs=False,
+        protect_emphasis=True,
+    )
+
+    assert "important guidance" in protected.text
+    assert "a second passage" in protected.text
+    assert improvement_module._restore_protected_values(protected.text, protected.values) == source
+
+
+def test_translation_protects_a_bare_email_address() -> None:
+    source = "Write to **reader@example.com** for assistance."
+
+    protected = improvement_module._protect_translation_values(
+        source,
+        protect_numbers=False,
+        protect_headings=False,
+        protect_paragraphs=False,
+        protect_emphasis=True,
+    )
+
+    assert "reader@example.com" not in protected.text
+    assert any(value.value == "reader@example.com" for value in protected.values)
+    assert improvement_module._restore_protected_values(protected.text, protected.values) == source
+
+
+def test_translation_protects_each_repeated_emphasis_span_independently() -> None:
+    source = "Read *first work*, *second work* and *third work* in order."
+
+    protected = improvement_module._protect_translation_values(
+        source,
+        protect_numbers=False,
+        protect_headings=False,
+        protect_paragraphs=False,
+        protect_emphasis=True,
+    )
+
+    emphasis_values = [value for value in protected.values if value.value == "*"]
+    assert len(emphasis_values) == 6
+    assert len({value.token for value in emphasis_values}) == 6
+    assert (
+        markdown_safety_module.markdown_emphasis_structure(
+            protected.text,
+            preserve_inline_positions=False,
+        )
+        == ()
+    )
+    assert improvement_module._restore_protected_values(protected.text, protected.values) == source
+
+
+def test_translation_removes_emphasis_added_around_opaque_source_markers() -> None:
+    protected_source = "Keep PZDOCAXZQordinary prosePZDOCBXZQ visible."
+    response = "Mantén *PZDOCAXZQprosa ordinariaPZDOCBXZQ* visible."
+
+    assert (
+        improvement_module._remove_added_simple_translation_emphasis(
+            protected_source,
+            response,
+        )
+        == "Mantén PZDOCAXZQprosa ordinariaPZDOCBXZQ visible."
+    )
+
+
+def test_translation_removes_only_spaces_added_inside_opaque_emphasis_markers() -> None:
+    source = "Keep *ordinary prose* visible."
+    protected = improvement_module._protect_translation_values(
+        source,
+        protect_numbers=False,
+        protect_headings=False,
+        protect_paragraphs=False,
+        protect_emphasis=True,
+    )
+    opening, closing = (value.token for value in protected.values)
+    response = f"Mantén{opening} prosa ordinaria {closing}visible."
+
+    reconciled = improvement_module._reconcile_protected_emphasis_spacing(
+        protected.text,
+        response,
+        protected.values,
+    )
+
+    assert (
+        improvement_module._restore_protected_values(
+            reconciled,
+            protected.values,
+        )
+        == "Mantén *prosa ordinaria* visible."
+    )
+
+
 def test_translation_protects_macron_transliterations_without_pdf_inline_emphasis() -> None:
     source = "The terms chrēmatizō and chrēmatistikos remain exact in translated prose."
 
@@ -3004,6 +3775,35 @@ def test_translation_fallback_can_split_sentences_inside_whole_line_emphasis() -
     ]
 
 
+def test_translation_fallback_never_splits_inside_inline_emphasis() -> None:
+    source = (
+        "Before *the first emphasized sentence. The second remains emphasized.* "
+        "An outside sentence follows. A final sentence ends the paragraph."
+    )
+
+    parts = improvement_module._translation_fallback_parts(source)
+
+    assert "".join(part.text for part in parts) == source
+    assert all(part.text.count("*") % 2 == 0 for part in parts)
+    inside_emphasis = source.index(". The second") + 1
+    assert not improvement_module._is_safe_markdown_boundary(source, inside_emphasis)
+
+
+def test_translation_fallback_can_split_between_sequential_emphasis_spans() -> None:
+    source = (
+        "Compare *the first complete phrase* with *the second complete phrase* and "
+        "*the third complete phrase* before *the fourth complete phrase* and "
+        "*the fifth complete phrase*"
+    )
+
+    parts = improvement_module._translation_fallback_parts(source)
+
+    assert "".join(part.text for part in parts) == source
+    assert len([part for part in parts if part.should_improve]) == 5
+    assert all(part.text.count("*") == 2 for part in parts if part.should_improve)
+    assert all(part.text.isspace() for part in parts if not part.should_improve)
+
+
 def test_translation_fallback_splits_a_long_single_sentence_at_safe_clauses() -> None:
     source = (
         "In this system the first house begins at the degree of the Ascendant, "
@@ -3015,6 +3815,93 @@ def test_translation_fallback_splits_a_long_single_sentence_at_safe_clauses() ->
 
     assert "".join(part.text for part in parts) == source
     assert len([part for part in parts if part.should_improve]) >= 2
+
+
+def test_translation_fallback_recursively_splits_dense_protected_emphasis() -> None:
+    dense_paragraph = (
+        "Read *the first important passage* at 10 degrees, then compare "
+        "*the second useful passage* and *the third complete passage*. "
+        "Study *the fourth careful passage* before reviewing *the fifth final passage*."
+    )
+    source = f"{dense_paragraph}\n\nA short conclusion explains the method clearly."
+    requests: list[str] = []
+    word_translations = {
+        "A": "Una",
+        "Read": "Lee",
+        "Study": "Estudia",
+        "and": "y",
+        "at": "a",
+        "before": "antes",
+        "careful": "cuidadoso",
+        "clearly": "claramente",
+        "compare": "compara",
+        "complete": "completo",
+        "conclusion": "conclusión",
+        "degrees": "grados",
+        "explains": "explica",
+        "fifth": "quinto",
+        "final": "final",
+        "first": "primer",
+        "fourth": "cuarto",
+        "important": "importante",
+        "method": "método",
+        "of": "de",
+        "passage": "pasaje",
+        "reviewing": "revisar",
+        "second": "segundo",
+        "short": "breve",
+        "the": "el",
+        "then": "luego",
+        "third": "tercer",
+        "useful": "útil",
+    }
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        content = json.loads(request.content)["messages"][1]["content"]
+        requests.append(content)
+        protected_markers = re.findall(r"</?PZDOCE[A-Z]+XZQ>", content)
+        if len(protected_markers) > MAX_TRANSLATION_PROTECTED_VALUES_PER_CHUNK:
+            return httpx.Response(
+                200,
+                json={"message": {"content": content.replace(protected_markers[-1], "", 1)}},
+            )
+        translated = re.sub(
+            r"[A-Za-z]+",
+            lambda match: (
+                match.group(0)
+                if match.group(0).startswith("PZDOC")
+                else word_translations[match.group(0)]
+            ),
+            content,
+        )
+        return httpx.Response(200, json={"message": {"content": translated}})
+
+    context = improvement_module._TranslationContext("en", "es", True)
+    with httpx.Client(transport=httpx.MockTransport(respond)) as client:
+        translated = improvement_module._improve_translation_segments(
+            client,
+            "parsezen-local",
+            8_192,
+            build_instructions(ImprovementMode.TRANSLATE, "Español"),
+            source,
+            context,
+            None,
+        )
+
+    assert translated.count("*") == source.count("*")
+    assert "passage" not in translated
+    assert context.preserved_segments == []
+    assert any(
+        len(re.findall(r"</?PZDOCE[A-Z]+XZQ>", content))
+        > MAX_TRANSLATION_PROTECTED_VALUES_PER_CHUNK
+        for content in requests
+    )
+    assert any(
+        0
+        < len(re.findall(r"</?PZDOCE[A-Z]+XZQ>", content))
+        <= MAX_TRANSLATION_PROTECTED_VALUES_PER_CHUNK
+        for content in requests
+    )
 
 
 def test_bilingual_residual_title_retries_once_when_source_words_remain() -> None:
@@ -4619,6 +5506,8 @@ def test_translation_retries_when_the_first_response_stays_in_the_source_languag
     [
         ("cambió números o fechas", "elementos protegidos"),
         ("cambió la estructura de las listas", "estructura Markdown"),
+        ("cambió la estructura de énfasis Markdown", "estructura Markdown"),
+        ("cambió la separación de párrafos", "estructura Markdown"),
         ("no quedó en el idioma solicitado", "dejó texto natural"),
         ("parece haber duplicado o añadido contenido", "exactamente una vez"),
         ("no devolvió el fragmento en una sola línea", "exactamente una sola línea"),
@@ -4632,6 +5521,72 @@ def test_validation_retry_instruction_is_specialized_by_failure_type(
     instruction = improvement_module._specialized_retry_instruction(ImprovementError(reason))
 
     assert expected in instruction
+
+
+def test_translation_hides_emphasis_delimiters_from_the_model_and_restores_them() -> None:
+    source = "Translate *ordinary prose* and **useful guidance** in this complete sentence."
+    requests: list[dict[str, object]] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        requests.append(payload)
+        messages = payload["messages"]
+        assert isinstance(messages, list)
+        protected_source = messages[-1]["content"]
+        assert isinstance(protected_source, str)
+        markers = re.findall(r"</?PZDOC[A-Z]+XZQ>", protected_source)
+        assert len(markers) == 4
+        assert "*ordinary prose*" not in protected_source
+        assert "**useful guidance**" not in protected_source
+        content = (
+            f"Traduce {markers[0]}prosa ordinaria{markers[1]} y "
+            f"{markers[2]}orientación útil{markers[3]} en esta frase completa."
+        )
+        return httpx.Response(200, json={"message": {"content": content}})
+
+    result = improve_markdown(
+        source,
+        ImprovementMode.TRANSLATE,
+        LOCAL_SETTINGS,
+        "Español",
+        transport=httpx.MockTransport(respond),
+        source_language_code="en",
+    )
+
+    assert result == "Traduce *prosa ordinaria* y **orientación útil** en esta frase completa."
+    assert len(requests) == 1
+
+
+def test_translation_hides_combined_bold_italic_delimiters_from_the_model() -> None:
+    source = "Translate ***important and nuanced guidance*** carefully."
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        protected_source = json.loads(request.content)["messages"][-1]["content"]
+        markers = re.findall(r"</?PZDOC[A-Z]+XZQ>", protected_source)
+        assert len(markers) == 2
+        assert "***" not in protected_source
+        return httpx.Response(
+            200,
+            json={
+                "message": {
+                    "content": (
+                        f"Traduce {markers[0]}orientación importante y matizada"
+                        f"{markers[1]} cuidadosamente."
+                    )
+                }
+            },
+        )
+
+    result = improve_markdown(
+        source,
+        ImprovementMode.TRANSLATE,
+        LOCAL_SETTINGS,
+        "Español",
+        transport=httpx.MockTransport(respond),
+        source_language_code="en",
+    )
+
+    assert result == "Traduce ***orientación importante y matizada*** cuidadosamente."
 
 
 def test_translation_preserves_the_whole_block_when_segmented_coverage_still_fails() -> None:
@@ -4928,6 +5883,15 @@ def test_table_checkpoint_invalidates_pre_bilingual_residue_fallbacks() -> None:
     assert improvement_module._chunk_checkpoint_key(ImprovementMode.TRANSLATE, source) != stale_key
 
 
+def test_translation_checkpoint_invalidates_pre_combined_emphasis_protection() -> None:
+    source = "***Important guidance must be translated.***"
+    stale_key = hashlib.sha256(
+        f"ollama-translation-chunk-v18\ntranslate\n{source}".encode()
+    ).hexdigest()
+
+    assert improvement_module._chunk_checkpoint_key(ImprovementMode.TRANSLATE, source) != stale_key
+
+
 def test_contextual_table_checkpoint_keeps_its_table_revision() -> None:
     source = "<table><tbody><tr><td>The Special Lot of the Moon</td></tr></tbody></table>"
     identity = f"Chapter context\n{source}"
@@ -5013,6 +5977,41 @@ def test_table_uppercase_preservation_never_uppercases_html_tags() -> None:
         "<table><thead><tr><th>TÍTULO</th></tr></thead>"
         "<tbody><tr><td>TEXTO</td></tr></tbody></table>"
     )
+
+
+def test_table_capitalization_preserves_every_aligned_term_not_only_examples() -> None:
+    source = (
+        "<table><tbody><tr><td>Day/night, Same/contrary</td></tr>"
+        "<tr><td>Domicile, Exaltation</td></tr>"
+        "<tr><td>Visibility/Beams/Chariot</td></tr>"
+        "<tr><td>Lunar application</td></tr>"
+        "<tr><td>The Sun forms a square</td></tr></tbody></table>"
+    )
+    translated = (
+        "<table><tbody><tr><td>Día/noche, misma/contraria</td></tr>"
+        "<tr><td>Domicilio, exaltación</td></tr>"
+        "<tr><td>Visibilidad/rayos/carro</td></tr>"
+        "<tr><td>Aplicación lunar</td></tr>"
+        "<tr><td>El Sol forma una cuadratura</td></tr></tbody></table>"
+    )
+
+    preserved = improvement_module._preserve_translation_uppercase_fragment(
+        source,
+        translated,
+    )
+
+    assert preserved == (
+        "<table><tbody><tr><td>Día/noche, Misma/contraria</td></tr>"
+        "<tr><td>Domicilio, Exaltación</td></tr>"
+        "<tr><td>Visibilidad/Rayos/Carro</td></tr>"
+        "<tr><td>Aplicación Lunar</td></tr>"
+        "<tr><td>El Sol forma una cuadratura</td></tr></tbody></table>"
+    )
+
+
+def test_translation_prompt_preserves_deliberate_initial_capitalization() -> None:
+    assert "patrón tipográfico deliberado" in improvement_module.BASE_INSTRUCTIONS
+    assert "comas, barras o saltos de línea" in improvement_module.BASE_INSTRUCTIONS
 
 
 def test_focused_table_cell_retries_one_damaged_protected_marker() -> None:
@@ -5585,11 +6584,14 @@ def test_html_table_keeps_a_source_internal_linebreak_without_false_failure(
         preserve_paragraphs=True,
     )
 
-    monkeypatch.setattr(
-        improvement_module,
-        "_translate_table_text_batch",
-        lambda *_args, **_kwargs: "Primera\nCasa",
-    )
+    def translate(*args: object, **_kwargs: object) -> str:
+        return {
+            "First\n\nHouse": "Primera\n\nCasa",
+            "First": "Primera",
+            "House": "Casa",
+        }[str(args[4])]
+
+    monkeypatch.setattr(improvement_module, "_translate_table_text_batch", translate)
     with httpx.Client() as client:
         translated = improvement_module._translate_safe_html_table(
             client,
@@ -5793,6 +6795,69 @@ def test_table_residual_recognizes_a_partially_translated_compact_title() -> Non
         "en",
         "es",
     )
+
+
+@pytest.mark.parametrize("residue", ("by", "agencylessness"))
+def test_table_residual_recognizes_unambiguous_copied_english_words(residue: str) -> None:
+    assert improvement_module._has_table_source_language_residue(
+        "A condition marked by agencylessness",
+        f"Una condición marcada {residue}",
+        "en",
+        "es",
+    )
+
+
+def test_table_residual_recognizes_an_unchanged_lowercase_index_term() -> None:
+    assert improvement_module._has_table_source_language_residue(
+        "ancestors,",
+        "ancestors,",
+        "en",
+        "es",
+    )
+
+
+def test_split_html_table_nodes_receive_the_complete_parent_cell_as_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = "<table><tbody><tr><td>Struck by a<br>ray from a<br>malefic</td></tr></tbody></table>"
+    observed_contexts: list[str] = []
+    translations = ("Golpeado por un", "rayo procedente de un", "maléfico")
+
+    def translate_aligned(
+        _client: httpx.Client,
+        _model: str,
+        _context_window: int,
+        _instructions: str,
+        items: tuple[improvement_module._AlignedTranslationBatchItem, ...],
+        _context: improvement_module._TranslationContext,
+        _cancellation: object,
+        **_kwargs: object,
+    ) -> dict[int, str]:
+        observed_contexts.extend(item.hierarchical_context for item in items)
+        return {item.part_index: translations[item.part_index] for item in items}
+
+    monkeypatch.setattr(improvement_module, "_translate_aligned_batch", translate_aligned)
+    context = improvement_module._TranslationContext(
+        source_language="en",
+        target_language="es",
+        preserve_paragraphs=True,
+    )
+    with httpx.Client() as client:
+        translated = improvement_module._translate_safe_html_table(
+            client,
+            "parsezen-local",
+            8_192,
+            "Translate",
+            source,
+            context,
+            None,
+        )
+
+    assert translated == (
+        "<table><tbody><tr><td>Golpeado por un<br>rayo procedente de un<br>maléfico"
+        "</td></tr></tbody></table>"
+    )
+    assert observed_contexts == ["Struck by a ray from a malefic"] * 2
 
 
 def test_table_residual_is_preserved_when_bilingual_repair_still_has_source_language(

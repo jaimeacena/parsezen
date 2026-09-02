@@ -29,7 +29,17 @@ from parsezen.domain.attempt_activity import (
     AttemptPhase,
     is_safe_token,
 )
-from parsezen.domain.jobs import MarkdownOrganization, ReviewRecommendation
+from parsezen.domain.execution_plan import (
+    ExecutionPlan,
+    ExecutionStep,
+    execution_plan_from_runtime,
+)
+from parsezen.domain.jobs import (
+    DocumentFormat,
+    MarkdownOrganization,
+    ReviewRecommendation,
+    TranslationMethod,
+)
 from parsezen.domain.process_lifecycle import ProcessStage, phase_for_process_stage
 from parsezen.domain.source_identity import is_sha256_digest, sha256_file
 from parsezen.epub_builder import (
@@ -91,6 +101,7 @@ from parsezen.pdf_conversion import (
     render_pdf_page_cover,
     resolve_pdf_page_range,
     strip_pdf_page_markers,
+    strip_pdf_public_markers,
 )
 from parsezen.pipeline.contracts import (
     ProcessRequest,
@@ -166,7 +177,7 @@ from parsezen.work_checkpoints import (
     WorkCheckpoints,
     open_work_checkpoints,
 )
-from parsezen.workflow import OutputFormat, WorkflowOptions, plan_workflow
+from parsezen.workflow import OutputFormat
 
 LOGGER = logging.getLogger(__name__)
 _CURRENT_ATTEMPT_ID: ContextVar[str | None] = ContextVar(
@@ -230,6 +241,7 @@ class _PreparedEpubReview:
     integrity_report: FinalIntegrityReport | None
     revision_draft: RevisionDraft | None
     linguistic_review_mode: LinguisticReviewMode
+    reviewed_translation_blocks: int
     translation_quality_report: TranslationQualityReport
     review_translation_quality_report: TranslationQualityReport
     normalized_output: bool
@@ -410,6 +422,8 @@ def apply_reviewed_revision(result: ProcessResult, reviewed_text: str) -> Proces
 
     suffix = result.final_path.suffix.lower()
     published_text = strip_pdf_page_markers(reviewed_text)
+    if suffix in {".md", ".markdown"}:
+        published_text = strip_pdf_public_markers(reviewed_text)
     if suffix in {".md", ".markdown"} and result.markdown_include_page_references:
         published_text = re.sub(
             r"<!--\s*PZDOC PDF PAGE (\d+)\s*-->",
@@ -468,7 +482,7 @@ def apply_reviewed_revision(result: ProcessResult, reviewed_text: str) -> Proces
                 integrity.report,
             )
         else:
-            built = build_epub(published_text, result.revision_resources, metadata)
+            built = build_epub(reviewed_text, result.revision_resources, metadata)
             integrity = binary_integrity_capture(
                 built.content,
                 format_label="EPUB",
@@ -662,7 +676,8 @@ def _process_document(
     _validate_request(request, settings)
     check_cancelled(cancellation)
 
-    if _is_epub_translation(request):
+    execution_plan = _execution_plan(request)
+    if execution_plan.uses_direct_epub_executor and execution_plan.translates:
         epub_source_digest = _checkpoint_source_digest(request)
         return _process_epub_translation(
             request,
@@ -675,7 +690,7 @@ def _process_document(
             source_digest=epub_source_digest,
         )
 
-    if _is_epub_personalization(request):
+    if execution_plan.uses_direct_epub_executor:
         return _process_epub_personalization(
             request,
             on_stage,
@@ -709,7 +724,7 @@ def _process_document(
         page_range_resolver=resolve_pdf_page_range,
         pdf_visual_arbiter_factory=_pdf_visual_arbiter_factory(request, settings),
     )
-    generated_epub = request.output_format is OutputFormat.EPUB
+    generated_epub = execution_plan.includes(ExecutionStep.BUILD_EPUB)
 
     transformed = transform_prepared_document(
         prepared,
@@ -844,11 +859,23 @@ def _prepare_translated_epub_review(
         if content_review_fused
         else LinguisticReviewMode.NOT_REVIEWED
     )
+    reviewed_translation_blocks = (
+        max(
+            review_base_quality_report.checked_segments,
+            review_base_quality_report.translated_blocks,
+        )
+        if content_review_fused
+        else 0
+    )
+
+    def record_bilingual_review_coverage(reviewed_blocks: int) -> None:
+        nonlocal reviewed_translation_blocks
+        reviewed_translation_blocks = max(0, reviewed_blocks)
+
     if request.review_content and not content_review_fused:
         if settings is None:
             raise AssertionError("Validated review requests always have settings.")
         _notify(on_stage, ProcessStage.REVIEWING_CONTENT)
-        linguistic_review_mode = LinguisticReviewMode.INDEPENDENT_BILINGUAL
         translation_review_source = converted_source.markdown
         reviewed_markdown = _review_translation_with_checkpoints(
             translation_review_source,
@@ -859,7 +886,18 @@ def _prepare_translated_epub_review(
             cancellation,
             work_checkpoints,
             quality_report=review_base_quality_report,
+            on_reviewed_segments=record_bilingual_review_coverage,
         )
+        translated_blocks = max(
+            review_base_quality_report.checked_segments,
+            review_base_quality_report.translated_blocks,
+        )
+        if reviewed_translation_blocks:
+            linguistic_review_mode = (
+                LinguisticReviewMode.INDEPENDENT_BILINGUAL
+                if translated_blocks and reviewed_translation_blocks >= translated_blocks
+                else LinguisticReviewMode.TARGETED_BILINGUAL
+            )
         if reviewed_markdown != revision_source:
             revision_kinds.add(RevisionKind.CONTENT)
     if request.review_structure:
@@ -944,6 +982,7 @@ def _prepare_translated_epub_review(
         integrity_report=integrity_report,
         revision_draft=revision_draft,
         linguistic_review_mode=linguistic_review_mode,
+        reviewed_translation_blocks=reviewed_translation_blocks,
         translation_quality_report=initial_translation_quality_report,
         review_translation_quality_report=review_translation_quality_report,
         normalized_output=normalize_output,
@@ -997,6 +1036,9 @@ def _process_epub_translation(
     translation_glossary = combined_translation_glossary(
         request.glossary,
         source_semantic.terms,
+        source_markdown=converted_source.markdown,
+        source_language_code=source_language_code,
+        target_language_code=language_code,
     )
     effective_ai_mode = _effective_ai_improvement_mode(request)
     if request.offline_translation_language is not None:
@@ -1010,6 +1052,7 @@ def _process_epub_translation(
             settings,
             language_code,
             source_semantic.terms,
+            translation_glossary=translation_glossary,
         ),
         root=epub_checkpoint_root,
         source_digest=source_digest,
@@ -1182,6 +1225,16 @@ def _process_epub_translation(
         linguistic_review_coverage=_linguistic_review_coverage(
             prepared_review.review_translation_quality_report,
             mode=prepared_review.linguistic_review_mode,
+            reviewed_blocks=prepared_review.reviewed_translation_blocks,
+            independently_verified_blocks=(
+                prepared_review.reviewed_translation_blocks
+                if prepared_review.linguistic_review_mode
+                in {
+                    LinguisticReviewMode.INDEPENDENT_BILINGUAL,
+                    LinguisticReviewMode.TARGETED_BILINGUAL,
+                }
+                else 0
+            ),
         ),
         preserved_images=prepared_review.resource_count,
         epub_chapters=prepared_review.chapter_count,
@@ -1420,7 +1473,7 @@ def _open_pdf_conversion_checkpoints(
     # sharing data between different source bytes or OCR strategies.
     # Bump this whenever deterministic native-page reconciliation changes. Reusing
     # an older page payload would otherwise retain already-fixed TOC glyph errors.
-    resume_key = repr(("pdf-conversion-v7", request.force_pdf_ocr))
+    resume_key = repr(("pdf-conversion-v11", request.force_pdf_ocr))
     return open_work_checkpoints(
         request.source_path,
         resume_key,
@@ -1681,44 +1734,46 @@ def _validate_requested_action(request: ProcessRequest) -> None:
 def _validate_output_format(request: ProcessRequest) -> None:
     if not isinstance(request.output_format, OutputFormat):
         raise RequestValidationError("El formato de salida seleccionado no es válido.")
-    mode = request.improvement_mode
-    plan = plan_workflow(
-        (request.source_path.suffix,),
-        request.output_format,
-        options=WorkflowOptions(
-            improvement_enabled=mode is not None
-            or request.offline_translation_language is not None
-            or request.review_content
-            or request.review_structure,
-            clean=mode in {ImprovementMode.CLEAN, ImprovementMode.CLEAN_AND_TRANSLATE},
-            translate=(
-                request.offline_translation_language is not None
-                or mode in {ImprovementMode.TRANSLATE, ImprovementMode.CLEAN_AND_TRANSLATE}
-            ),
-            review_content=request.review_content,
-            review_structure=request.review_structure,
-        ),
-    )
-    direct_epub_translation = _is_epub_translation(request)
-    direct_epub_personalization = _is_epub_personalization(request)
-    generated_epub = (
-        request.output_format is OutputFormat.EPUB
-        and (
-            plan.epub_buildable
-            or (plan.epub_rebuildable and (request.review_content or request.review_structure))
-        )
-        and request.convert_to_markdown
-    )
-    if not plan.output_available:
+    plan = _execution_plan(request)
+    expected_plan = _execution_plan(replace(request, execution_plan=None))
+    if request.execution_plan is not None and plan != expected_plan:
         raise RequestValidationError(
-            "El formato de salida no está disponible para el documento seleccionado."
+            "La ruta de ejecución no coincide con las opciones del documento."
         )
-    if request.output_format is OutputFormat.EPUB and not (
-        generated_epub or direct_epub_translation or direct_epub_personalization
+    if (
+        plan.source_format is DocumentFormat.EPUB
+        and plan.output_format is DocumentFormat.EPUB
+        and not plan.translates
+        and not plan.includes(ExecutionStep.REVIEW_CONTENT)
+        and request.convert_to_markdown
     ):
         raise RequestValidationError("Para conservar un EPUB como libro, activa Traducir.")
-    if direct_epub_translation and plan.semantic_issue is not None:
-        raise RequestValidationError(plan.semantic_issue)
+    if (
+        plan.source_format is DocumentFormat.EPUB
+        and plan.output_format is DocumentFormat.EPUB
+        and plan.translates
+        and request.improvement_mode in {ImprovementMode.CLEAN, ImprovementMode.CLEAN_AND_TRANSLATE}
+    ):
+        raise RequestValidationError(
+            "Esta configuración antigua no puede conservar el EPUB. "
+            "Usa Corregir errores y ruido para revisarlo y reconstruirlo."
+        )
+    if (
+        request.execution_plan is not None
+        and plan.includes(ExecutionStep.CONVERT) != request.convert_to_markdown
+    ):
+        if (
+            plan.source_format is DocumentFormat.EPUB
+            and plan.output_format is DocumentFormat.EPUB
+            and plan.translates
+        ):
+            raise RequestValidationError(
+                "Esta configuración antigua no puede conservar el EPUB. "
+                "Usa Corregir errores y ruido para revisarlo y reconstruirlo."
+            )
+        raise RequestValidationError(
+            "La ruta de ejecución no coincide con las opciones del documento."
+        )
     if request.image_output_directory is not None and not isinstance(
         request.image_output_directory, Path
     ):
@@ -1928,30 +1983,70 @@ def _validate_temporary_working_space(request: ProcessRequest) -> None:
 
 
 def _is_epub_translation(request: ProcessRequest) -> bool:
-    return (
-        request.source_path.suffix.lower() == ".epub"
-        and request.output_format is OutputFormat.EPUB
-        and _request_translates(request)
-    )
+    plan = _execution_plan(request)
+    return plan.uses_direct_epub_executor and plan.translates
 
 
 def _is_epub_personalization(request: ProcessRequest) -> bool:
-    return (
-        request.source_path.suffix.lower() == ".epub"
-        and not request.convert_to_markdown
-        and request.output_format is OutputFormat.EPUB
-        and request.improvement_mode is None
-        and request.offline_translation_language is None
-        and not request.review_content
-        and not request.review_structure
+    plan = _execution_plan(request)
+    return plan.uses_direct_epub_executor and not plan.translates
+
+
+def _execution_plan(request: ProcessRequest) -> ExecutionPlan:
+    if request.execution_plan is not None:
+        return request.execution_plan
+    mode = request.improvement_mode
+    translation_method = (
+        TranslationMethod.OFFLINE
+        if request.offline_translation_language is not None
+        else TranslationMethod.LOCAL_AI
+        if mode in {ImprovementMode.TRANSLATE, ImprovementMode.CLEAN_AND_TRANSLATE}
+        else None
+    )
+    reviewed = (
+        request.review_content
+        or request.review_structure
+        or mode
+        in {
+            ImprovementMode.CLEAN,
+            ImprovementMode.CLEAN_AND_TRANSLATE,
+        }
+    )
+    return execution_plan_from_runtime(
+        _source_document_format(request.source_path.suffix),
+        (
+            DocumentFormat.EPUB
+            if request.output_format is OutputFormat.EPUB
+            else DocumentFormat.MARKDOWN
+        ),
+        translation_method=translation_method,
+        reviewed=reviewed,
+        preserve_epub_package=(
+            request.preserve_styles
+            and request.include_images
+            and request.epub_cover_path is None
+            and not request.epub_remove_cover
+        ),
+        convert_source=request.convert_to_markdown,
     )
 
 
+def _source_document_format(suffix: str) -> DocumentFormat:
+    try:
+        return {
+            ".txt": DocumentFormat.TEXT,
+            ".md": DocumentFormat.MARKDOWN,
+            ".markdown": DocumentFormat.MARKDOWN,
+            ".docx": DocumentFormat.DOCX,
+            ".pdf": DocumentFormat.PDF,
+            ".epub": DocumentFormat.EPUB,
+        }[suffix.casefold()]
+    except KeyError as exc:
+        raise RequestValidationError("El formato del documento no es compatible.") from exc
+
+
 def _request_translates(request: ProcessRequest) -> bool:
-    return request.offline_translation_language is not None or request.improvement_mode in {
-        ImprovementMode.TRANSLATE,
-        ImprovementMode.CLEAN_AND_TRANSLATE,
-    }
+    return _execution_plan(request).translates
 
 
 def _validate_epub_path(path: Path) -> None:

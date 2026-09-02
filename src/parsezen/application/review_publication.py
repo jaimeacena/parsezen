@@ -65,6 +65,7 @@ class ReviewPublicationCoordinator:
         reviewed_text: str,
     ) -> BookDocument:
         source_text = strip_pdf_page_markers(reviewed_text)
+        planning_text = reviewed_text
         existing = self._books.load_book(job_id)
         preserve_source_package = bool(
             result.preserve_epub_package_on_unchanged_review
@@ -74,7 +75,11 @@ class ReviewPublicationCoordinator:
         )
         if (
             existing is not None
-            and existing.source_fingerprint == book_source_fingerprint(source_text)
+            and existing.source_fingerprint
+            in {
+                book_source_fingerprint(planning_text),
+                book_source_fingerprint(source_text),
+            }
             and (not preserve_source_package or existing.source_package_artifact_id is not None)
         ):
             return existing
@@ -94,7 +99,7 @@ class ReviewPublicationCoordinator:
             )
             if preserve_source_package
             else create_book_from_markdown(
-                source_text,
+                planning_text,
                 result.revision_resources,
                 metadata,
                 self._artifacts,

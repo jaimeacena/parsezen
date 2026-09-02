@@ -20,6 +20,7 @@ from parsezen.processing_metrics import (
 )
 from parsezen.translation_quality import (
     ATX_HEADING_PATTERN,
+    EMAIL_ADDRESS_PATTERN,
     MAX_AUTOMATIC_SOURCE_TEXT_REPAIRS,
     NUMBER_PATTERN,
     TITLE_ROMAN_REFERENCE_PATTERN,
@@ -58,6 +59,7 @@ PROTECTED_INLINE_PATTERN = re.compile(
     r"|<(?:(?:https?|mailto):)[^>\n]+>"  # autolink
     r"|</?[A-Za-z][^>\n]*>"  # HTML tag
     r"|(?:https?://|mailto:)[^\s<>)\]]+"  # raw URL
+    rf"|(?i:{EMAIL_ADDRESS_PATTERN.pattern})"  # bare email address
     r"|<!--[\s\S]*?-->"  # protected HTML comment
     r"|\\."  # escaped Markdown character
     r"|[\\`*_~#>\[\]{}|]+"  # Markdown punctuation
@@ -274,6 +276,12 @@ def _valid_offline_translation_work_item(
         or "\0" in translated
         or len(translated) > MAX_OUTPUT_CHARACTERS
     ):
+        return False
+    source_emails = Counter(match.group(0) for match in EMAIL_ADDRESS_PATTERN.finditer(source))
+    translated_emails = Counter(
+        match.group(0) for match in EMAIL_ADDRESS_PATTERN.finditer(translated)
+    )
+    if source_emails != translated_emails:
         return False
     try:
         validate_translation_quality(
@@ -532,6 +540,7 @@ def _translate_title_case_normalized(
     content = heading.group(2) if heading is not None else title
     letters = [character for character in natural_language_text(content) if character.isalpha()]
     was_uppercase = bool(letters) and all(character.isupper() for character in letters)
+    used_deliberate_initial_capitals = _uses_deliberate_title_initials(content)
 
     normalized = "".join(
         part.text.casefold() if part.should_translate else part.text
@@ -543,9 +552,83 @@ def _translate_title_case_normalized(
         raise TranslationError("El traductor offline dejó un título en el idioma original.")
     if was_uppercase:
         translated = _transform_translatable_parts(translated, str.upper)
+    elif used_deliberate_initial_capitals:
+        translated = _transform_translatable_parts(translated, _capitalize_title_words)
     else:
         translated = _capitalize_first_translatable_part(translated)
     return f"{prefix}{translated}"
+
+
+_TITLE_WORD_PATTERN = re.compile(r"[^\W\d_]+(?:['’][^\W\d_]+)*", re.UNICODE)
+_TITLE_CONNECTORS = frozenset(
+    {
+        "a",
+        "al",
+        "an",
+        "and",
+        "as",
+        "at",
+        "by",
+        "con",
+        "de",
+        "del",
+        "des",
+        "du",
+        "e",
+        "el",
+        "en",
+        "et",
+        "for",
+        "from",
+        "in",
+        "la",
+        "las",
+        "le",
+        "les",
+        "los",
+        "o",
+        "of",
+        "on",
+        "or",
+        "para",
+        "por",
+        "sin",
+        "the",
+        "to",
+        "u",
+        "un",
+        "una",
+        "with",
+        "y",
+    }
+)
+
+
+def _uses_deliberate_title_initials(value: str) -> bool:
+    words = [match.group(0) for match in _TITLE_WORD_PATTERN.finditer(natural_language_text(value))]
+    if len(words) < 2:
+        return False
+    capitalized = sum(word[:1].isupper() for word in words)
+    lowercase_content = [
+        word for word in words if word[:1].islower() and word.casefold() not in _TITLE_CONNECTORS
+    ]
+    return capitalized >= 2 and not lowercase_content
+
+
+def _capitalize_title_words(value: str) -> str:
+    words = list(_TITLE_WORD_PATTERN.finditer(value))
+    replacements: list[tuple[int, int, str]] = []
+    previous_end = 0
+    for index, match in enumerate(words):
+        word = match.group(0)
+        separator = value[previous_end : match.start()]
+        begins_unit = index == 0 or any(marker in separator for marker in (":", "—"))
+        if (begins_unit or word.casefold() not in _TITLE_CONNECTORS) and word[:1].islower():
+            replacements.append((match.start(), match.end(), f"{word[:1].upper()}{word[1:]}"))
+        previous_end = match.end()
+    for start, end, replacement in reversed(replacements):
+        value = f"{value[:start]}{replacement}{value[end:]}"
+    return value
 
 
 def _preserve_source_uppercase(source: str, translated: str) -> str:
@@ -738,6 +821,21 @@ def _get_installed_translation(
         return result
 
     return translate
+
+
+def is_offline_translation_pair_installed(source_code: str, target_code: str) -> bool:
+    """Return whether a direct Argos pair is already local without downloading anything."""
+
+    try:
+        _configure_safe_argos()
+        import argostranslate.package as argos_package
+
+        installed = argos_package.get_installed_packages()
+    except Exception:
+        return False
+    return any(
+        package.from_code == source_code and package.to_code == target_code for package in installed
+    )
 
 
 def _configure_safe_argos() -> None:

@@ -284,3 +284,43 @@ def test_lfm_adapter_extracts_complete_final_json_value(monkeypatch: Any) -> Non
         client.close()
 
     assert result == '[{"old":"cerrado","new":"listo"}]'
+
+
+def test_lfm_translation_review_keeps_approved_reasoning_template(monkeypatch: Any) -> None:
+    captured: dict[str, object] = {}
+
+    def raw(
+        _client: httpx.Client,
+        _model: str,
+        _context_window: int,
+        prompt: str,
+        _cancellation: object,
+        **options: object,
+    ) -> str:
+        captured.update(prompt=prompt, options=options)
+        return "[]"
+
+    monkeypatch.setattr(adapters, "request_local_ai_raw", raw)
+    client = httpx.Client()
+    try:
+        result = adapters.request_adapted_local_ai(
+            client,
+            "parsezen/lfm-review:Q6_K",
+            8192,
+            "Review bilingual content.",
+            "Synthetic fragment.",
+            None,
+            prediction_characters=90,
+            operation="translation_review",
+        )
+    finally:
+        client.close()
+
+    assert result == "[]"
+    prompt = captured["prompt"]
+    assert isinstance(prompt, str)
+    assert prompt.endswith("<|im_start|>assistant\n")
+    assert "<think></think>" not in prompt
+    options = captured["options"]
+    assert isinstance(options, dict)
+    assert options["prediction_characters"] == (90 + adapters._LFM_REASONING_OVERHEAD_CHARACTERS)

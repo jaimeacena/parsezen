@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import re
 from collections.abc import Callable
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from html import escape
 from io import BytesIO
 from pathlib import Path, PurePosixPath
@@ -23,6 +23,7 @@ from parsezen.epub_builder import (
     EpubBookMetadata,
     EpubChapterPlan,
     EpubNavigationNode,
+    EpubOutlineEntry,
     build_epub,
     build_epub_from_xhtml,
     chapter_filename,
@@ -49,7 +50,16 @@ _COVER_MEDIA_TYPES = {
     ".webp": "image/webp",
 }
 _MAX_COVER_BYTES = 20 * 1024 * 1024
+_NAVIGATION_HINT_ATTRIBUTE = "data-parsezen-navigation"
+_NAVIGATION_LEVEL_ATTRIBUTE = "data-parsezen-navigation-level"
 SectionTuple = tuple[BookSection, ...]
+
+
+@dataclass(slots=True)
+class _MutableBookNavigationNode:
+    title: str
+    fragment: str
+    children: list[_MutableBookNavigationNode]
 
 
 class BookEditor:
@@ -276,12 +286,18 @@ def create_book_from_markdown(
     plan = plan_epub(markdown, metadata.title)
     sections: list[BookSection] = []
     book_resources: list[BookResource] = []
+    outline_by_chapter: dict[int, list[EpubOutlineEntry]] = {}
+    for entry in plan.outline:
+        outline_by_chapter.setdefault(entry.chapter_number, []).append(entry)
     with ZipFile(BytesIO(built.content)) as archive:
         for index, chapter in enumerate(plan.chapters, start=1):
             xhtml = archive.read(f"EPUB/text/{chapter.filename}")
             record = artifacts.put(
                 job_id=job_id,
-                payload=xhtml,
+                payload=_with_navigation_hints(
+                    xhtml.decode("utf-8"),
+                    tuple(outline_by_chapter.get(index, ())),
+                ).encode("utf-8"),
                 media_type="application/xhtml+xml",
             )
             sections.append(
@@ -306,9 +322,15 @@ def create_book_from_markdown(
                 record.id,
             )
         )
+    roles_by_id = {
+        section.id: chapter.role for section, chapter in zip(sections, plan.chapters, strict=True)
+    }
     nested_sections = _nest_explicit_chapter_sections(
-        tuple(sections),
-        tuple(chapter.role for chapter in plan.chapters),
+        _nest_toc_sections(
+            tuple(sections),
+            tuple(chapter.toc_level for chapter in plan.chapters),
+        ),
+        roles_by_id,
     )
     book = BookDocument(
         metadata=BookMetadata(
@@ -569,21 +591,23 @@ def publish_book(
         for section_id in book.spine
     }
     anchors = _book_anchor_index(raw_xhtml, sections_by_id)
+    rendered_by_section: dict[str, str] = {}
     for section_id in book.spine:
         section = sections_by_id[section_id]
         filename = filenames[section_id]
         chapters.append(EpubChapterPlan(filename, section.title, ""))
-        rendered.append(
-            _validated_xhtml(
-                raw_xhtml[section_id],
-                section.title,
-                resource_paths,
-                section_id=section_id,
-                filenames=filenames,
-                source_filenames=source_filenames,
-                anchors=anchors,
-            )
+        validated = _validated_xhtml(
+            raw_xhtml[section_id],
+            section.title,
+            resource_paths,
+            section_id=section_id,
+            filenames=filenames,
+            source_filenames=source_filenames,
+            anchors=anchors,
         )
+        prepared = _ensure_navigation_heading_ids(validated)
+        rendered.append(prepared)
+        rendered_by_section[section_id] = prepared
     resources = tuple(
         ConvertedResource(
             PurePosixPath(resource.href),
@@ -603,9 +627,11 @@ def publish_book(
         if book.cover_resource_id is not None
         else None
     )
+    navigation = _navigation(book.sections, filenames, rendered_by_section)
+    published_rendered = tuple(_without_navigation_hints(xhtml) for xhtml in rendered)
     built = build_epub_from_xhtml(
         tuple(chapters),
-        tuple(rendered),
+        published_rendered,
         resources,
         EpubBookMetadata(
             book.metadata.title,
@@ -616,7 +642,7 @@ def publish_book(
             publisher=book.metadata.publisher,
             publication_date=book.metadata.publication_date,
         ),
-        navigation=_navigation(book.sections, filenames),
+        navigation=navigation,
         identifier=(
             UUID(book.metadata.identifier) if book.metadata.identifier is not None else None
         ),
@@ -628,15 +654,180 @@ def publish_book(
 def _navigation(
     sections: tuple[BookSection, ...],
     filenames: dict[str, str],
+    xhtml_by_section: dict[str, str],
 ) -> tuple[EpubNavigationNode, ...]:
-    return tuple(
-        EpubNavigationNode(
-            section.title,
-            filenames[section.id],
-            _navigation(section.children, filenames),
+    navigation: list[EpubNavigationNode] = []
+    for section in sections:
+        xhtml = xhtml_by_section[section.id]
+        children = (
+            *_heading_navigation(section, filenames[section.id], xhtml),
+            *_navigation(section.children, filenames, xhtml_by_section),
         )
-        for section in sections
+        if _section_navigation_is_excluded(xhtml):
+            navigation.extend(children)
+            continue
+        navigation.append(
+            EpubNavigationNode(
+                section.title,
+                filenames[section.id],
+                children,
+            )
+        )
+    return tuple(navigation)
+
+
+def _section_navigation_is_excluded(xhtml: str) -> bool:
+    parser = etree.XMLParser(resolve_entities=False, no_network=True, recover=False)
+    root = etree.fromstring(xhtml.encode("utf-8"), parser)
+    for element in root.iter():
+        local_name = (
+            etree.QName(element).localname.casefold() if isinstance(element.tag, str) else ""
+        )
+        if re.fullmatch(r"h[1-6]", local_name) is not None:
+            return element.attrib.get(_NAVIGATION_HINT_ATTRIBUTE) == "exclude"
+    return False
+
+
+def _ensure_navigation_heading_ids(xhtml: str) -> str:
+    """Add stable local targets only to headings that do not already have one."""
+
+    parser = etree.XMLParser(resolve_entities=False, no_network=True, recover=False)
+    root = etree.fromstring(xhtml.encode("utf-8"), parser)
+    used_ids = {anchor for element in root.iter() if (anchor := element.attrib.get("id"))}
+    heading_number = 0
+    for element in root.iter():
+        local_name = (
+            etree.QName(element).localname.casefold() if isinstance(element.tag, str) else ""
+        )
+        if re.fullmatch(r"h[1-6]", local_name) is None:
+            continue
+        heading_number += 1
+        if element.attrib.get("id"):
+            continue
+        candidate_number = heading_number
+        while f"nav-heading-{candidate_number:04d}" in used_ids:
+            candidate_number += 1
+        anchor = f"nav-heading-{candidate_number:04d}"
+        element.attrib["id"] = anchor
+        used_ids.add(anchor)
+    return cast(str, etree.tostring(root, encoding="unicode", xml_declaration=False))
+
+
+def _with_navigation_hints(
+    xhtml: str,
+    outline: tuple[EpubOutlineEntry, ...],
+) -> str:
+    """Keep the reviewed menu selection inside the encrypted editor draft only."""
+
+    parser = etree.XMLParser(resolve_entities=False, no_network=True, recover=False)
+    root = etree.fromstring(xhtml.encode("utf-8"), parser)
+    headings = [
+        element
+        for element in root.iter()
+        if isinstance(element.tag, str)
+        and re.fullmatch(r"h[1-6]", etree.QName(element).localname.casefold()) is not None
+    ]
+    if len(headings) != len(outline):
+        return xhtml
+    for element, entry in zip(headings, outline, strict=True):
+        element.attrib[_NAVIGATION_HINT_ATTRIBUTE] = (
+            "include" if entry.include_in_navigation else "exclude"
+        )
+        element.attrib[_NAVIGATION_LEVEL_ATTRIBUTE] = str(entry.navigation_level or entry.level)
+    return cast(str, etree.tostring(root, encoding="unicode", xml_declaration=False))
+
+
+def _without_navigation_hints(xhtml: str) -> str:
+    """Remove private planning hints from the user-facing EPUB."""
+
+    parser = etree.XMLParser(resolve_entities=False, no_network=True, recover=False)
+    root = etree.fromstring(xhtml.encode("utf-8"), parser)
+    for element in root.iter():
+        element.attrib.pop(_NAVIGATION_HINT_ATTRIBUTE, None)
+        element.attrib.pop(_NAVIGATION_LEVEL_ATTRIBUTE, None)
+    return cast(str, etree.tostring(root, encoding="unicode", xml_declaration=False))
+
+
+def _heading_navigation(
+    section: BookSection,
+    filename: str,
+    xhtml: str,
+) -> tuple[EpubNavigationNode, ...]:
+    """Build the in-document outline that belongs below one spine section."""
+
+    parser = etree.XMLParser(resolve_entities=False, no_network=True, recover=False)
+    root = etree.fromstring(xhtml.encode("utf-8"), parser)
+    entries: list[tuple[int, str, str]] = []
+    seen_titles = {_normalized_navigation_title(section.title)}
+    for element in root.iter():
+        local_name = (
+            etree.QName(element).localname.casefold() if isinstance(element.tag, str) else ""
+        )
+        if re.fullmatch(r"h[1-6]", local_name) is None:
+            continue
+        title = " ".join("".join(element.itertext()).split()).strip()
+        fragment = element.attrib.get("id", "").strip()
+        normalized_title = _normalized_navigation_title(title)
+        repeated_chapter_marker = (
+            _bare_navigation_chapter_marker(title) is not None
+            and _bare_navigation_chapter_marker(title) == _navigation_chapter_marker(section.title)
+            and normalized_title != _normalized_navigation_title(section.title)
+        )
+        if (
+            title
+            and fragment
+            and element.attrib.get(_NAVIGATION_HINT_ATTRIBUTE) != "exclude"
+            and normalized_title not in seen_titles
+            and not repeated_chapter_marker
+        ):
+            hinted_level = element.attrib.get(_NAVIGATION_LEVEL_ATTRIBUTE, "")
+            navigation_level = (
+                int(hinted_level) if re.fullmatch(r"[1-6]", hinted_level) else int(local_name[1])
+            )
+            entries.append((navigation_level, title[:500], fragment))
+            seen_titles.add(normalized_title)
+
+    mutable_roots: list[_MutableBookNavigationNode] = []
+    mutable_stack: list[tuple[int, _MutableBookNavigationNode]] = []
+    for level, title, fragment in entries:
+        node = _MutableBookNavigationNode(title, fragment, [])
+        while mutable_stack and mutable_stack[-1][0] >= level:
+            mutable_stack.pop()
+        if mutable_stack:
+            mutable_stack[-1][1].children.append(node)
+        else:
+            mutable_roots.append(node)
+        mutable_stack.append((level, node))
+
+    def freeze(node: _MutableBookNavigationNode) -> EpubNavigationNode:
+        return EpubNavigationNode(
+            node.title,
+            filename,
+            tuple(freeze(child) for child in node.children),
+            node.fragment,
+        )
+
+    return tuple(freeze(node) for node in mutable_roots)
+
+
+def _normalized_navigation_title(value: str) -> str:
+    return re.sub(r"[^\w]+", " ", value, flags=re.UNICODE).strip().casefold()
+
+
+def _navigation_chapter_marker(value: str) -> str | None:
+    normalized = _normalized_navigation_title(value)
+    match = re.match(
+        r"^(?:chapter|chapitre|capitulo|capítulo|cap)\s+"
+        r"(?:\d{1,3}|[ivxlcdm]+|one|two|three|four|five|six|seven|eight|nine|ten|"
+        r"uno|dos|tres|cuatro|cinco|seis|siete|ocho|nueve|diez)\b",
+        normalized,
     )
+    return match.group(0) if match is not None else None
+
+
+def _bare_navigation_chapter_marker(value: str) -> str | None:
+    marker = _navigation_chapter_marker(value)
+    return marker if marker == _normalized_navigation_title(value) else None
 
 
 def _xhtml_document(title: str, body: str, language: str) -> str:
@@ -974,30 +1165,73 @@ def _spine(sections: tuple[BookSection, ...]) -> tuple[str, ...]:
 
 def _nest_explicit_chapter_sections(
     sections: tuple[BookSection, ...],
-    roles: tuple[str | None, ...],
+    roles_by_id: dict[str, str | None],
 ) -> tuple[BookSection, ...]:
     """Nest a container only around two or more unambiguous chapter siblings."""
 
-    if len(sections) != len(roles):
-        raise ValueError("Las secciones y sus roles deben tener la misma longitud.")
+    sections = tuple(
+        replace(
+            section,
+            children=_nest_explicit_chapter_sections(section.children, roles_by_id),
+        )
+        for section in sections
+    )
     roots: list[BookSection] = []
     index = 0
     while index < len(sections):
-        if roles[index] != "container":
+        if roles_by_id.get(sections[index].id) != "container" or sections[index].children:
             roots.append(sections[index])
             index += 1
             continue
         end = index + 1
-        while end < len(sections) and roles[end] == "chapter":
+        while end < len(sections) and roles_by_id.get(sections[end].id) == "chapter":
             end += 1
-        child_roles = roles[index + 1 : end]
-        if len(child_roles) >= 2:
+        if end - index - 1 >= 2:
             roots.append(replace(sections[index], children=sections[index + 1 : end]))
             index = end
             continue
         roots.append(sections[index])
         index += 1
     return tuple(roots)
+
+
+def _nest_toc_sections(
+    sections: tuple[BookSection, ...],
+    toc_levels: tuple[int | None, ...],
+) -> tuple[BookSection, ...]:
+    """Apply exact printed-contents depth only across consecutive matched spine sections."""
+
+    if len(sections) != len(toc_levels):
+        raise ValueError("Las secciones y los niveles del índice deben tener la misma longitud.")
+    children_by_id: dict[str, list[str]] = {section.id: [] for section in sections}
+    sections_by_id = {section.id: section for section in sections}
+    roots: list[str] = []
+    stack: list[tuple[int, str]] = []
+    nested = False
+    for section, level in zip(sections, toc_levels, strict=True):
+        if level is None:
+            roots.append(section.id)
+            stack.clear()
+            continue
+        while stack and stack[-1][0] >= level:
+            stack.pop()
+        if stack:
+            children_by_id[stack[-1][1]].append(section.id)
+            nested = True
+        else:
+            roots.append(section.id)
+        stack.append((level, section.id))
+    if not nested:
+        return sections
+
+    def freeze(section_id: str) -> BookSection:
+        section = sections_by_id[section_id]
+        return replace(
+            section,
+            children=tuple(freeze(child_id) for child_id in children_by_id[section_id]),
+        )
+
+    return tuple(freeze(section_id) for section_id in roots)
 
 
 def _map_section(

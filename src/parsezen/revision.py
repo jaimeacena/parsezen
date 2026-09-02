@@ -123,11 +123,20 @@ class RevisionDraft:
         return "".join(output)
 
 
-def split_markdown_blocks(markdown: str) -> tuple[MarkdownBlock, ...]:
-    """Split Markdown at blank lines outside fenced code blocks."""
+def split_markdown_blocks(
+    markdown: str,
+    *,
+    enforce_review_limit: bool = True,
+) -> tuple[MarkdownBlock, ...]:
+    """Split Markdown at blank lines outside fenced code blocks.
+
+    The size ceiling protects interactive revision surfaces. Deterministic document analysis and
+    final integrity checks can explicitly disable it so a large source-only EPUB is not rejected
+    merely because its Markdown would be too large to open in the in-app editor.
+    """
     if not isinstance(markdown, str) or "\0" in markdown:
         raise ImprovementError("El documento para revisar no es válido.")
-    if len(markdown) > _MAX_REVIEW_MARKDOWN_CHARACTERS:
+    if enforce_review_limit and len(markdown) > _MAX_REVIEW_MARKDOWN_CHARACTERS:
         raise ImprovementError("El documento es demasiado grande para revisarlo localmente.")
     if not markdown:
         return ()

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
@@ -13,6 +13,7 @@ from typing import Any
 
 from parsezen.domain.books import BookDocument, BookMetadata, BookResource, BookSection
 from parsezen.domain.estimates import ProcessingMetric, WorkloadProfile
+from parsezen.domain.job_events import JOB_EVENT_PAYLOAD_VERSION, JobEvent, JobEventKind
 from parsezen.domain.jobs import (
     AIProfileConfiguration,
     CoverStrategy,
@@ -47,10 +48,73 @@ from parsezen.domain.stages import (
 )
 
 SCHEMA_VERSION = 6
+PAYLOAD_VERSION = 1
+
+
+def _preserve_compatible_payloads(_connection: sqlite3.Connection) -> None:
+    """Advance a legacy version whose JSON/table contracts remain readable."""
+
+
+MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
+    version: _preserve_compatible_payloads for version in range(1, SCHEMA_VERSION)
+}
+
+_SCHEMA_STATEMENTS = (
+    """CREATE TABLE IF NOT EXISTS metadata (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL
+    )""",
+    """CREATE TABLE IF NOT EXISTS jobs (
+        id TEXT PRIMARY KEY,
+        order_index INTEGER NOT NULL UNIQUE,
+        payload TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    )""",
+    """CREATE TABLE IF NOT EXISTS reviews (
+        id TEXT PRIMARY KEY,
+        job_id TEXT NOT NULL,
+        payload TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        FOREIGN KEY(job_id) REFERENCES jobs(id) ON DELETE CASCADE
+    )""",
+    "CREATE INDEX IF NOT EXISTS reviews_job_id ON reviews(job_id)",
+    """CREATE TABLE IF NOT EXISTS job_events (
+        sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+        job_id TEXT NOT NULL,
+        event_type TEXT NOT NULL,
+        payload TEXT NOT NULL,
+        created_at TEXT NOT NULL
+    )""",
+    """CREATE TABLE IF NOT EXISTS books (
+        job_id TEXT PRIMARY KEY,
+        payload TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        FOREIGN KEY(job_id) REFERENCES jobs(id) ON DELETE CASCADE
+    )""",
+    """CREATE TABLE IF NOT EXISTS result_snapshots (
+        job_id TEXT PRIMARY KEY,
+        artifact_id TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        FOREIGN KEY(job_id) REFERENCES jobs(id) ON DELETE CASCADE
+    )""",
+    """CREATE TABLE IF NOT EXISTS processing_metrics (
+        sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+        payload TEXT NOT NULL,
+        created_at TEXT NOT NULL
+    )""",
+)
 
 
 class StateStoreError(RuntimeError):
     """Raised when the durable queue cannot be read or updated safely."""
+
+
+class StateStoreCorruptionError(StateStoreError):
+    """Raised only when the SQLite structure itself cannot be interpreted."""
+
+
+class StateStoreMigrationError(StateStoreError):
+    """Raised when a backed-up schema upgrade cannot finish atomically."""
 
 
 class StateStore:
@@ -58,9 +122,22 @@ class StateStore:
 
     def __init__(self, path: Path) -> None:
         self.path = path
+        self.migration_backup_path: Path | None = None
+        self._write_disabled = False
         self._lock = RLock()
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._initialize()
+
+    @classmethod
+    def unavailable(cls, path: Path) -> StateStore:
+        """Build a disabled handle so the UI can stay open without touching failed state."""
+
+        store = cls.__new__(cls)
+        store.path = path
+        store.migration_backup_path = None
+        store._write_disabled = True
+        store._lock = RLock()
+        return store
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.path, timeout=15.0)
@@ -77,15 +154,19 @@ class StateStore:
     @contextmanager
     def _transaction(self) -> Iterator[sqlite3.Connection]:
         with self._lock:
+            if self._write_disabled:
+                raise StateStoreError("The Parsezen state is unavailable for updates.")
             connection: sqlite3.Connection | None = None
             try:
                 connection = self._connect()
                 connection.execute("BEGIN IMMEDIATE")
                 yield connection
                 connection.commit()
-            except (OSError, sqlite3.Error, TypeError, ValueError) as exc:
+            except Exception as exc:
                 if connection is not None:
                     connection.rollback()
+                if isinstance(exc, StateStoreError):
+                    raise
                 raise StateStoreError("The Parsezen state could not be updated.") from exc
             finally:
                 if connection is not None:
@@ -105,77 +186,109 @@ class StateStore:
                     connection.close()
 
     def _initialize(self) -> None:
-        with self._transaction() as connection:
-            connection.executescript(
-                """
-                CREATE TABLE IF NOT EXISTS metadata (
-                    key TEXT PRIMARY KEY,
-                    value TEXT NOT NULL
-                );
-                CREATE TABLE IF NOT EXISTS jobs (
-                    id TEXT PRIMARY KEY,
-                    order_index INTEGER NOT NULL UNIQUE,
-                    payload TEXT NOT NULL,
-                    updated_at TEXT NOT NULL
-                );
-                CREATE TABLE IF NOT EXISTS reviews (
-                    id TEXT PRIMARY KEY,
-                    job_id TEXT NOT NULL,
-                    payload TEXT NOT NULL,
-                    updated_at TEXT NOT NULL,
-                    FOREIGN KEY(job_id) REFERENCES jobs(id) ON DELETE CASCADE
-                );
-                CREATE INDEX IF NOT EXISTS reviews_job_id ON reviews(job_id);
-                CREATE TABLE IF NOT EXISTS job_events (
-                    sequence INTEGER PRIMARY KEY AUTOINCREMENT,
-                    job_id TEXT NOT NULL,
-                    event_type TEXT NOT NULL,
-                    payload TEXT NOT NULL,
-                    created_at TEXT NOT NULL
-                );
-                CREATE TABLE IF NOT EXISTS books (
-                    job_id TEXT PRIMARY KEY,
-                    payload TEXT NOT NULL,
-                    updated_at TEXT NOT NULL,
-                    FOREIGN KEY(job_id) REFERENCES jobs(id) ON DELETE CASCADE
-                );
-                CREATE TABLE IF NOT EXISTS result_snapshots (
-                    job_id TEXT PRIMARY KEY,
-                    artifact_id TEXT NOT NULL,
-                    updated_at TEXT NOT NULL,
-                    FOREIGN KEY(job_id) REFERENCES jobs(id) ON DELETE CASCADE
-                );
-                CREATE TABLE IF NOT EXISTS processing_metrics (
-                    sequence INTEGER PRIMARY KEY AUTOINCREMENT,
-                    payload TEXT NOT NULL,
-                    created_at TEXT NOT NULL
-                );
-                """
-            )
-            current = connection.execute(
-                "SELECT value FROM metadata WHERE key = 'schema_version'"
-            ).fetchone()
-            if current is None:
-                connection.execute(
-                    "INSERT INTO metadata(key, value) VALUES ('schema_version', ?)",
-                    (str(SCHEMA_VERSION),),
-                )
-            else:
-                current_version = int(current["value"])
-                if current_version < SCHEMA_VERSION:
-                    # Product configuration v5 is an intentional clean break:
-                    # discard only Parsezen's rebuildable metadata, never source files.
-                    connection.execute("DELETE FROM jobs")
-                    connection.execute("DELETE FROM job_events")
-                    connection.execute("DELETE FROM processing_metrics")
+        current_version = self._stored_schema_version()
+        if current_version is not None and current_version > SCHEMA_VERSION:
+            raise StateStoreError("The Parsezen state uses a newer unsupported schema.")
+        migrating = current_version is not None and current_version < SCHEMA_VERSION
+        try:
+            if migrating:
+                assert current_version is not None
+                self.migration_backup_path = self._backup_before_migration(current_version)
+
+            with self._transaction() as connection:
+                for statement in _SCHEMA_STATEMENTS:
+                    connection.execute(statement)
+                if current_version is None:
                     connection.execute(
-                        "UPDATE metadata SET value = ? WHERE key = 'schema_version'",
+                        "INSERT INTO metadata(key, value) VALUES ('schema_version', ?)",
                         (str(SCHEMA_VERSION),),
                     )
-                elif current_version != SCHEMA_VERSION:
-                    raise StateStoreError("The Parsezen state uses an unsupported schema.")
+                    return
+                while current_version < SCHEMA_VERSION:
+                    migration = MIGRATIONS.get(current_version)
+                    if migration is None:
+                        raise StateStoreError(
+                            f"No migration is available for Parsezen schema {current_version}."
+                        )
+                    migration(connection)
+                    current_version += 1
+                    connection.execute(
+                        "UPDATE metadata SET value = ? WHERE key = 'schema_version'",
+                        (str(current_version),),
+                    )
+        except StateStoreError as exc:
+            if migrating:
+                raise StateStoreMigrationError(
+                    "The Parsezen state migration failed; the original state was preserved."
+                ) from exc
+            raise
 
-    def replace_jobs(self, jobs: tuple[DocumentJob, ...]) -> None:
+    def _stored_schema_version(self) -> int | None:
+        if not self.path.is_file() or self.path.stat().st_size == 0:
+            return None
+        connection: sqlite3.Connection | None = None
+        try:
+            connection = sqlite3.connect(self.path)
+            metadata_exists = connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'metadata'"
+            ).fetchone()
+            if metadata_exists is None:
+                user_tables = connection.execute(
+                    "SELECT name FROM sqlite_master "
+                    "WHERE type = 'table' AND name NOT LIKE 'sqlite_%'"
+                ).fetchall()
+                if user_tables:
+                    raise StateStoreCorruptionError("The Parsezen state has no schema metadata.")
+                return None
+            row = connection.execute(
+                "SELECT value FROM metadata WHERE key = 'schema_version'"
+            ).fetchone()
+            if row is None:
+                raise StateStoreCorruptionError("The Parsezen schema version is missing.")
+            version = int(row[0])
+            if version < 1:
+                raise StateStoreCorruptionError("The Parsezen schema version is invalid.")
+            return version
+        except (OSError, sqlite3.Error, TypeError, ValueError) as exc:
+            raise StateStoreCorruptionError(
+                "The Parsezen schema version could not be read."
+            ) from exc
+        finally:
+            if connection is not None:
+                connection.close()
+
+    def _backup_before_migration(self, current_version: int) -> Path:
+        timestamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%S-%f")
+        destination = self.path.with_name(
+            f"{self.path.stem}.pre-migration-v{current_version}-to-v{SCHEMA_VERSION}-"
+            f"{timestamp}{self.path.suffix}"
+        )
+        source: sqlite3.Connection | None = None
+        backup: sqlite3.Connection | None = None
+        try:
+            source = sqlite3.connect(self.path, timeout=15.0)
+            backup = sqlite3.connect(destination)
+            source.backup(backup)
+            backup.commit()
+        except (OSError, sqlite3.Error) as exc:
+            try:
+                destination.unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise StateStoreError("The Parsezen state backup could not be created.") from exc
+        finally:
+            if backup is not None:
+                backup.close()
+            if source is not None:
+                source.close()
+        return destination
+
+    def replace_jobs(
+        self,
+        jobs: tuple[DocumentJob, ...],
+        *,
+        events: tuple[JobEvent, ...] = (),
+    ) -> None:
         """Atomically replace the queue projection while preserving its reviews."""
 
         orders = tuple(job.order for job in jobs)
@@ -184,6 +297,8 @@ class StateStore:
         identifiers = tuple(job.id for job in jobs)
         if len(identifiers) != len(set(identifiers)):
             raise ValueError("Job ids must be unique.")
+        if any(event.job_id not in identifiers for event in events):
+            raise ValueError("A job event cannot outlive its document job.")
 
         with self._transaction() as connection:
             retained = set(identifiers)
@@ -222,6 +337,9 @@ class StateStore:
             for row in existing:
                 if row["id"] not in retained:
                     connection.execute("DELETE FROM jobs WHERE id = ?", (row["id"],))
+            now = datetime.now().astimezone().isoformat()
+            for event in events:
+                _insert_job_event(connection, event, created_at=now)
 
     def upsert_job(self, job: DocumentJob, *, event_type: str | None = None) -> None:
         with self._transaction() as connection:
@@ -243,7 +361,23 @@ class StateStore:
                     INSERT INTO job_events(job_id, event_type, payload, created_at)
                     VALUES (?, ?, ?, ?)
                     """,
-                    (job.id, event_type, "{}", now),
+                    (
+                        job.id,
+                        event_type,
+                        _json_dump(
+                            {
+                                "payload_version": JOB_EVENT_PAYLOAD_VERSION,
+                                "stage": None,
+                                "from_status": None,
+                                "to_status": None,
+                                "configuration_revision": job.configuration_revision,
+                                "attempt_id": None,
+                                "error_code": None,
+                                "snapshot_generation": None,
+                            }
+                        ),
+                        now,
+                    ),
                 )
 
     def load_jobs(self) -> tuple[DocumentJob, ...]:
@@ -350,6 +484,25 @@ class StateStore:
         except sqlite3.Error as exc:
             raise StateStoreError("The Parsezen event history could not be read.") from exc
 
+    def load_job_events(self, job_id: str) -> tuple[JobEvent, ...]:
+        """Load typed audit rows while leaving legacy marker rows queryable separately."""
+
+        event_types = tuple(kind.value for kind in JobEventKind)
+        placeholders = ",".join("?" for _ in event_types)
+        try:
+            with self._read_connection() as connection:
+                rows = connection.execute(
+                    f"""
+                    SELECT job_id, event_type, payload FROM job_events
+                    WHERE job_id = ? AND event_type IN ({placeholders})
+                    ORDER BY sequence
+                    """,
+                    (job_id, *event_types),
+                ).fetchall()
+            return tuple(_job_event_from_row(row) for row in rows)
+        except (json.JSONDecodeError, sqlite3.Error, TypeError, ValueError) as exc:
+            raise StateStoreError("The typed Parsezen event history is invalid.") from exc
+
     def save_book(self, job_id: str, book: BookDocument) -> None:
         with self._transaction() as connection:
             if connection.execute("SELECT 1 FROM jobs WHERE id = ?", (job_id,)).fetchone() is None:
@@ -388,8 +541,13 @@ class StateStore:
         """Point a job at one encrypted processing-result manifest."""
 
         with self._transaction() as connection:
-            if connection.execute("SELECT 1 FROM jobs WHERE id = ?", (job_id,)).fetchone() is None:
+            job_row = connection.execute(
+                "SELECT payload FROM jobs WHERE id = ?",
+                (job_id,),
+            ).fetchone()
+            if job_row is None:
                 raise ValueError("A result snapshot cannot outlive its document job.")
+            now = datetime.now().astimezone().isoformat()
             connection.execute(
                 """
                 INSERT INTO result_snapshots(job_id, artifact_id, updated_at)
@@ -401,8 +559,19 @@ class StateStore:
                 (
                     job_id,
                     artifact_id,
-                    datetime.now().astimezone().isoformat(),
+                    now,
                 ),
+            )
+            job = _job_from_json(json.loads(job_row["payload"]))
+            _insert_job_event(
+                connection,
+                JobEvent(
+                    job_id,
+                    JobEventKind.SNAPSHOT_SAVED,
+                    job.configuration_revision,
+                    snapshot_generation=artifact_id,
+                ),
+                created_at=now,
             )
 
     def load_result_snapshot(self, job_id: str) -> str | None:
@@ -487,6 +656,69 @@ def _json_dump(value: dict[str, Any]) -> str:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
 
 
+def _insert_job_event(
+    connection: sqlite3.Connection,
+    event: JobEvent,
+    *,
+    created_at: str,
+) -> None:
+    connection.execute(
+        """
+        INSERT INTO job_events(job_id, event_type, payload, created_at)
+        VALUES (?, ?, ?, ?)
+        """,
+        (
+            event.job_id,
+            event.kind.value,
+            _json_dump(_job_event_to_json(event)),
+            created_at,
+        ),
+    )
+
+
+def _job_event_to_json(event: JobEvent) -> dict[str, Any]:
+    return {
+        "payload_version": event.payload_version,
+        "stage": event.stage.value if event.stage is not None else None,
+        "from_status": event.from_status.value if event.from_status is not None else None,
+        "to_status": event.to_status.value if event.to_status is not None else None,
+        "configuration_revision": event.configuration_revision,
+        "attempt_id": event.attempt_id,
+        "error_code": event.error_code,
+        "snapshot_generation": event.snapshot_generation,
+    }
+
+
+def _job_event_from_row(row: sqlite3.Row) -> JobEvent:
+    raw = json.loads(row["payload"])
+    if not isinstance(raw, dict) or set(raw) != {
+        "payload_version",
+        "stage",
+        "from_status",
+        "to_status",
+        "configuration_revision",
+        "attempt_id",
+        "error_code",
+        "snapshot_generation",
+    }:
+        raise ValueError("The job event payload fields are invalid.")
+    stage = raw["stage"]
+    from_status = raw["from_status"]
+    to_status = raw["to_status"]
+    return JobEvent(
+        job_id=str(row["job_id"]),
+        kind=JobEventKind(str(row["event_type"])),
+        payload_version=int(raw["payload_version"]),
+        stage=None if stage is None else StageKind(str(stage)),
+        from_status=None if from_status is None else StageStatus(str(from_status)),
+        to_status=None if to_status is None else StageStatus(str(to_status)),
+        configuration_revision=int(raw["configuration_revision"]),
+        attempt_id=raw["attempt_id"],
+        error_code=raw["error_code"],
+        snapshot_generation=raw["snapshot_generation"],
+    )
+
+
 def _optional_path(path: Path | None) -> str | None:
     return str(path) if path is not None else None
 
@@ -494,6 +726,7 @@ def _optional_path(path: Path | None) -> str | None:
 def _processing_metric_to_json(metric: ProcessingMetric) -> dict[str, Any]:
     profile = metric.profile
     return {
+        "payload_version": PAYLOAD_VERSION,
         "source_format": profile.source_format.value,
         "output_format": profile.output_format.value,
         "work_units": profile.work_units,
@@ -551,6 +784,7 @@ def _book_to_json(book: BookDocument) -> dict[str, Any]:
         }
 
     return {
+        "payload_version": PAYLOAD_VERSION,
         "metadata": {
             "title": book.metadata.title,
             "language": book.metadata.language,
@@ -704,6 +938,7 @@ def _required_text(raw: dict[object, object], key: str) -> str:
 def _job_to_json(job: DocumentJob) -> dict[str, Any]:
     configuration = job.configuration
     return {
+        "payload_version": PAYLOAD_VERSION,
         "id": job.id,
         "order": job.order,
         "source": {
@@ -923,6 +1158,7 @@ def _stage_from_json(raw: object) -> StageState:
 
 def _review_to_json(review: ReviewSession) -> dict[str, Any]:
     return {
+        "payload_version": PAYLOAD_VERSION,
         "id": review.id,
         "job_id": review.job_id,
         "stage": review.stage.value,

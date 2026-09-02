@@ -81,6 +81,16 @@ class QueueConfigurationService:
             updated_jobs.append(self._queue.replace(updated))
         return tuple(updated_jobs)
 
+    def compatible_job_count(self, source_job: DocumentJob) -> int:
+        """Count editable jobs that can deliberately inherit shared choices."""
+
+        return sum(
+            candidate.id != source_job.id
+            and candidate.source.format is source_job.source.format
+            and candidate.status in _EDITABLE_STATUSES
+            for candidate in self._queue.jobs
+        )
+
     def apply_to_compatible_jobs(
         self,
         source_job: DocumentJob,
@@ -104,12 +114,21 @@ class QueueConfigurationService:
                 output=replace(
                     configuration.output,
                     title=(
-                        candidate.source.path.stem
+                        candidate.configuration.output.title or candidate.source.path.stem
                         if configuration.output.format is DocumentFormat.EPUB
                         else None
                     ),
+                    author=(
+                        candidate.configuration.output.author
+                        if configuration.output.format is DocumentFormat.EPUB
+                        else None
+                    ),
+                    cover_strategy=candidate.configuration.output.cover_strategy,
+                    cover_path=candidate.configuration.output.cover_path,
                 ),
             )
+            if candidate.configuration == candidate_configuration:
+                continue
             try:
                 updated = candidate.with_configuration(candidate_configuration)
                 request, _runtime = request_and_settings_from_job(

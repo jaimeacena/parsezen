@@ -46,6 +46,45 @@ def test_translates_only_text_and_preserves_markdown_structure(
     )
 
 
+def test_preserves_a_bare_email_address_without_sending_it_to_argos(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    address = "reader@example.com"
+    source = f"Contact {address} for complete details in this paragraph."
+    requests: list[str] = []
+
+    def translate(text: str) -> str:
+        requests.append(text)
+        return text.replace("Contact", "Contacta").replace(
+            "for complete details in this paragraph.",
+            "para obtener todos los detalles de este párrafo.",
+        )
+
+    monkeypatch.setattr(translation_module, "detect_source_language", lambda _text: "en")
+    monkeypatch.setattr(
+        translation_module,
+        "_get_or_install_translator",
+        lambda _source, _target: translate,
+    )
+
+    translated = translate_markdown_offline(source, "Español")
+
+    assert translated.count(address) == 1
+    assert all(address not in request for request in requests)
+
+
+def test_rejects_an_offline_work_item_that_mutates_a_bare_email_address() -> None:
+    source = "Contact author@example.com for complete details in this paragraph."
+    translated = "Contacta con hacker@example.net para obtener todos los detalles del párrafo."
+
+    assert not translation_module._valid_offline_translation_work_item(
+        source,
+        translated,
+        source_code="en",
+        target_code="es",
+    )
+
+
 def test_preserves_roman_index_references_without_sending_them_to_argos(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -575,7 +614,8 @@ def test_rejects_an_offline_result_left_in_the_source_language(
 @pytest.mark.parametrize(
     ("source", "engine_output", "expected"),
     [
-        ("### Journal Prompts:", "indicaciones del diario:", "### Indicaciones del diario:"),
+        ("### Journal Prompts:", "indicaciones del diario:", "### Indicaciones del Diario:"),
+        ("### The Art of Judgment", "el arte del juicio", "### El Arte del Juicio"),
         ("PROMISE TO YO' SELF", "prometerte a ti mismo", "PROMETERTE A TI MISMO"),
     ],
 )

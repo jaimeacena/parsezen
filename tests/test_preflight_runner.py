@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 from threading import Event
 
@@ -9,8 +10,39 @@ import parsezen.presentation.preflight_runner as runner_module
 from parsezen.application.run_preparation import PreparedQueueRun
 from parsezen.application.scheduler import QueueRunPlan, RunMode
 from parsezen.cancellation import CancellationToken
-from parsezen.domain.jobs import DocumentJob, DocumentSource, JobConfiguration
+from parsezen.domain.jobs import (
+    AIProfileConfiguration,
+    DocumentJob,
+    DocumentSource,
+    JobConfiguration,
+)
 from parsezen.presentation.preflight_runner import ForecastBatch, PreflightRunner
+
+
+def test_forecast_cache_key_distinguishes_specialized_ai_profiles(tmp_path: Path) -> None:
+    source = tmp_path / "source.md"
+    source.write_text("Text", encoding="utf-8")
+    job = DocumentJob.create(
+        DocumentSource.inspect(source),
+        JobConfiguration(
+            ai=AIProfileConfiguration(
+                translation_model="translator:7b",
+                review_model="reviewer:7b",
+                review_context_window=8_192,
+            ),
+        ),
+        order=0,
+        job_id="stable",
+    )
+    changed = replace(
+        job,
+        configuration=replace(
+            job.configuration,
+            ai=replace(job.configuration.ai, review_context_window=16_384),
+        ),
+    )
+
+    assert runner_module.forecast_cache_key(job, 1) != runner_module.forecast_cache_key(changed, 1)
 
 
 def test_queue_preparation_keeps_the_qt_event_loop_responsive(

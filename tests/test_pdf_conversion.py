@@ -57,6 +57,367 @@ def test_repeated_margin_lines_detect_local_running_headers_in_a_long_book() -> 
     assert repeated == {pdf_conversion_module._margin_key("CHAPTER 6")}
 
 
+def test_repeated_margin_lines_detect_centered_headers_below_the_strict_margin() -> None:
+    lines = [
+        _margin_line(20, "CHAPTER 40", top=112),
+        _margin_line(21, "CHAPTER 4 0", top=112),
+        _margin_line(22, "CHAPTER 40", top=112),
+    ]
+
+    repeated = pdf_conversion_module._repeated_margin_lines(lines, page_count=700)
+
+    assert repeated == {pdf_conversion_module._margin_key("CHAPTER 40")}
+    assert pdf_conversion_module._omit_margin_line(
+        lines[1],
+        repeated_margins=repeated,
+        previous=None,
+        body_size=12,
+    )
+
+
+def test_repairs_a_malformed_astrological_roman_from_nearby_sibling_consensus() -> None:
+    lines = tuple(
+        replace(
+            _margin_line(145, text, top=100 + index * 80),
+            italic=True,
+            font_size=11,
+        )
+        for index, text in enumerate(("Jupiter in Virgo n", "Mars in Virgo II", "Sun in Virgo II"))
+    )
+    page = pdf_conversion_module._PdfPage(
+        145,
+        lines,
+        has_images=False,
+        image_area_ratios=(),
+        has_table=False,
+        image_orientation_mismatch=False,
+    )
+
+    repaired = pdf_conversion_module._repair_astrological_series_roman_glyphs([page], 11)
+
+    assert repaired[0].lines[0].text == "Jupiter in Virgo II"
+    assert tuple(line.text for line in repaired[0].lines[1:]) == (
+        "Mars in Virgo II",
+        "Sun in Virgo II",
+    )
+
+
+def test_keeps_a_malformed_astrological_roman_without_unanimous_sibling_evidence() -> None:
+    lines = tuple(
+        replace(
+            _margin_line(145, text, top=100 + index * 80),
+            italic=True,
+            font_size=11,
+        )
+        for index, text in enumerate(("Jupiter in Virgo n", "Mars in Virgo I", "Sun in Virgo II"))
+    )
+    page = pdf_conversion_module._PdfPage(
+        145,
+        lines,
+        has_images=False,
+        image_area_ratios=(),
+        has_table=False,
+        image_orientation_mismatch=False,
+    )
+
+    repaired = pdf_conversion_module._repair_astrological_series_roman_glyphs([page], 11)
+
+    assert repaired[0].lines[0].text == "Jupiter in Virgo n"
+
+
+def test_repairs_a_broken_decan_title_from_the_complete_three_part_series() -> None:
+    pages = [
+        pdf_conversion_module._PdfPage(
+            number,
+            (
+                replace(
+                    _margin_line(number, text, top=120),
+                    font_size=16,
+                ),
+            ),
+            has_images=False,
+            image_area_ratios=(),
+            has_table=False,
+            image_orientation_mismatch=False,
+        )
+        for number, text in (
+            (160, "SCORPIO i: THE FIRST TITLE"),
+            (176, "SCORPIO IE AN APPARATUS FOR MUTUAL DISTILLATION"),
+            (190, "SCORPIO III: THE THIRD TITLE"),
+        )
+    ]
+
+    repaired = pdf_conversion_module._repair_astrological_series_roman_glyphs(pages, 11)
+
+    assert repaired[1].lines[0].text == "SCORPIO II: AN APPARATUS FOR MUTUAL DISTILLATION"
+
+
+def test_repairs_broken_placement_romans_from_the_preceding_decan_title() -> None:
+    pages = [
+        pdf_conversion_module._PdfPage(
+            number,
+            tuple(
+                replace(
+                    _margin_line(number, text, top=120 + index * 80),
+                    font_size=11 if " in " in text else 16,
+                    italic=" in " in text,
+                )
+                for index, text in enumerate(lines)
+            ),
+            has_images=False,
+            image_area_ratios=(),
+            has_table=False,
+            image_orientation_mismatch=False,
+        )
+        for number, lines in (
+            (140, ("VIRGO I: THE FIRST TITLE",)),
+            (142, ("VIRGO IE THE SECOND TITLE",)),
+            (145, ("Jupiter in Virgo n", "Venus in Virgo it")),
+            (150, ("VIRGO III: THE THIRD TITLE",)),
+        )
+    ]
+
+    repaired = pdf_conversion_module._repair_astrological_series_roman_glyphs(pages, 11)
+
+    assert repaired[1].lines[0].text == "VIRGO II: THE SECOND TITLE"
+    assert tuple(line.text for line in repaired[2].lines) == (
+        "Jupiter in Virgo II",
+        "Venus in Virgo II",
+    )
+
+
+def test_keeps_a_broken_decan_title_without_a_complete_series_consensus() -> None:
+    pages = [
+        pdf_conversion_module._PdfPage(
+            number,
+            (
+                replace(
+                    _margin_line(number, text, top=120),
+                    font_size=16,
+                ),
+            ),
+            has_images=False,
+            image_area_ratios=(),
+            has_table=False,
+            image_orientation_mismatch=False,
+        )
+        for number, text in (
+            (160, "SCORPIO I: THE FIRST TITLE"),
+            (176, "SCORPIO IE AN APPARATUS FOR MUTUAL DISTILLATION"),
+        )
+    ]
+
+    repaired = pdf_conversion_module._repair_astrological_series_roman_glyphs(pages, 11)
+
+    assert repaired[1].lines[0].text == "SCORPIO IE AN APPARATUS FOR MUTUAL DISTILLATION"
+
+
+def test_repeated_chapter_label_survives_only_on_its_visual_opening_page() -> None:
+    opening_label = _margin_line(20, "CHAPTER 14", top=190)
+    title = replace(
+        _margin_line(20, "EXALTATION LORDS", top=230),
+        bottom=258,
+        font_size=22,
+    )
+    exercise_label = _margin_line(21, "CHAPTER 14", top=112)
+    exercise_title = replace(
+        _margin_line(21, "EXERCISE 14", top=160),
+        bottom=188,
+        font_size=22,
+    )
+    running_label = _margin_line(22, "CHAPTER 14", top=112)
+    later_running_label = _margin_line(23, "CHAPTER 14", top=112)
+    pages = [
+        pdf_conversion_module._PdfPage(
+            20,
+            (opening_label, title),
+            has_images=False,
+            image_area_ratios=(),
+            has_table=False,
+            image_orientation_mismatch=False,
+        ),
+        pdf_conversion_module._PdfPage(
+            21,
+            (exercise_label, exercise_title),
+            has_images=False,
+            image_area_ratios=(),
+            has_table=False,
+            image_orientation_mismatch=False,
+        ),
+        pdf_conversion_module._PdfPage(
+            22,
+            (running_label,),
+            has_images=False,
+            image_area_ratios=(),
+            has_table=False,
+            image_orientation_mismatch=False,
+        ),
+        pdf_conversion_module._PdfPage(
+            23,
+            (later_running_label,),
+            has_images=False,
+            image_area_ratios=(),
+            has_table=False,
+            image_orientation_mismatch=False,
+        ),
+    ]
+    repeated = pdf_conversion_module._repeated_margin_lines(
+        [line for page in pages for line in page.lines],
+        page_count=700,
+    )
+
+    preserved = pdf_conversion_module._preserved_structural_margin_headings(
+        pages,
+        body_size=12,
+        repeated_margins=repeated,
+    )
+
+    assert pdf_conversion_module._visual_line_key(opening_label) in preserved
+    assert not pdf_conversion_module._omit_margin_line(
+        opening_label,
+        repeated,
+        None,
+        12,
+        preserved_repeated_headings=preserved,
+    )
+    assert pdf_conversion_module._omit_margin_line(
+        exercise_label,
+        repeated,
+        None,
+        12,
+        preserved_repeated_headings=preserved,
+    )
+    assert pdf_conversion_module._omit_margin_line(
+        running_label,
+        repeated,
+        None,
+        12,
+        preserved_repeated_headings=preserved,
+    )
+
+
+def test_visual_chapter_opening_is_rendered_as_structure_not_body_text(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    opening_label = _margin_line(20, "CHAPTER 14", top=190)
+    opening_title = replace(
+        _margin_line(20, "EXALTATION LORDS", top=230),
+        bottom=258,
+        font_size=22,
+    )
+    exercise_label = _margin_line(21, "CHAPTER 14", top=112)
+    exercise_title = replace(
+        _margin_line(21, "EXERCISE 14", top=160),
+        bottom=188,
+        font_size=22,
+    )
+    running_label = _margin_line(22, "CHAPTER 14", top=112)
+    later_running_label = _margin_line(23, "CHAPTER 14", top=112)
+    pages = [
+        pdf_conversion_module._PdfPage(
+            20,
+            (opening_label, opening_title),
+            has_images=False,
+            image_area_ratios=(),
+            has_table=False,
+            image_orientation_mismatch=False,
+        ),
+        pdf_conversion_module._PdfPage(
+            21,
+            (exercise_label, exercise_title),
+            has_images=False,
+            image_area_ratios=(),
+            has_table=False,
+            image_orientation_mismatch=False,
+        ),
+        pdf_conversion_module._PdfPage(
+            22,
+            (running_label,),
+            has_images=False,
+            image_area_ratios=(),
+            has_table=False,
+            image_orientation_mismatch=False,
+        ),
+        pdf_conversion_module._PdfPage(
+            23,
+            (later_running_label,),
+            has_images=False,
+            image_area_ratios=(),
+            has_table=False,
+            image_orientation_mismatch=False,
+        ),
+    ]
+    repeated = pdf_conversion_module._repeated_margin_lines(
+        [line for page in pages for line in page.lines],
+        page_count=700,
+    )
+    monkeypatch.setattr(
+        pdf_conversion_module,
+        "_should_replace_with_ocr",
+        lambda page, _markdown: page.number == 20,
+    )
+
+    markdown, _issues = pdf_conversion_module._render_document(
+        pages,
+        body_size=12,
+        heading_sizes={22: 1},
+        repeated_margins=repeated,
+        referenced_pages=set(),
+        ocr_pages={20: "CHAPTER 14\n\n# EXALTATION LORDS"},
+        ocr_failed_pages=set(),
+    )
+
+    assert markdown.count("## CHAPTER 14") == 1
+    assert "\nCHAPTER 14\n" not in markdown
+
+
+def test_repeated_margin_lines_confirm_a_confusable_folio_from_neighboring_pages() -> None:
+    def folio(page_number: int, text: str) -> _PdfLine:
+        return replace(
+            _margin_line(page_number, text, top=100),
+            x0=90,
+            x1=110,
+            font_size=7,
+        )
+
+    lines = [
+        folio(210, "178"),
+        folio(211, "179"),
+        folio(212, "i8o"),
+        folio(213, "181"),
+    ]
+
+    repeated = pdf_conversion_module._repeated_margin_lines(lines, page_count=4)
+
+    assert pdf_conversion_module._margin_key("i8o") in repeated
+
+
+def test_repeated_margin_lines_do_not_guess_an_unsupported_margin_code() -> None:
+    line = replace(
+        _margin_line(212, "i8o", top=100),
+        x0=90,
+        x1=110,
+        font_size=7,
+    )
+
+    assert pdf_conversion_module._repeated_margin_lines([line], page_count=1) == set()
+
+
+def test_omits_an_isolated_confusable_folio_only_with_strict_margin_geometry() -> None:
+    folio = replace(
+        _margin_line(212, "i8o", top=100),
+        x0=90,
+        x1=110,
+        font_size=7,
+    )
+    centered = replace(folio, x0=290, x1=310)
+    distant_code = replace(folio, text="O1")
+
+    assert pdf_conversion_module._omit_margin_line(folio, set(), None, 9)
+    assert not pdf_conversion_module._omit_margin_line(centered, set(), None, 9)
+    assert not pdf_conversion_module._omit_margin_line(distant_code, set(), None, 9)
+
+
 def test_preserves_a_meaningful_pdf_image_as_a_portable_resource(tmp_path: Path) -> None:
     source = tmp_path / "illustrated.pdf"
     _write_image_pdf(
@@ -101,6 +462,35 @@ def test_preserves_a_full_page_table_image_beside_its_ocr_text(tmp_path: Path) -
     assert len(converted.resources) == 1
     assert ocr_table in converted.markdown
     assert "__parsezen_resources__/pdf/page-0001-image-01.jpg" in converted.markdown
+
+
+def test_does_not_duplicate_a_reliable_reflow_table_as_a_full_page_image() -> None:
+    page = SimpleNamespace(
+        width=600,
+        height=800,
+        bbox=(0, 0, 600, 800),
+        images=[{"x0": 0, "x1": 600, "top": 0, "bottom": 800}],
+        curves=[],
+    )
+    table = pdf_conversion_module._PdfTable(
+        (90, 180, 510, 420),
+        (("Label", "Value"), ("Condition", "Result")),
+        pdf_conversion_module._TableRendering.HTML,
+    )
+    model = pdf_conversion_module._PdfPage(
+        number=1,
+        lines=(),
+        has_images=True,
+        image_area_ratios=(1.0,),
+        has_table=True,
+        image_orientation_mismatch=False,
+        tables=(table,),
+    )
+    ocr_table = "| Label | Value |\n| --- | --- |\n| Condition | Result |"
+
+    boxes = pdf_conversion_module._exportable_image_boxes(page, model, ocr_table)
+
+    assert boxes == ()
 
 
 def test_omits_a_full_page_contents_scan_when_ocr_recovers_its_entries(tmp_path: Path) -> None:
@@ -414,7 +804,7 @@ def test_table_renderer_uses_markdown_html_and_reviewable_text_fallbacks() -> No
     assert pdf_conversion_module._table_rendering(simple, 2).value == "markdown"
     assert "| Name | Value |" in pdf_conversion_module._markdown_table(simple)
 
-    multiline = (("Name", "Notes"), ("A", "first\nsecond"))
+    multiline = (("Name", "Notes"), ("A", "First item.\nSecond item."))
     assert pdf_conversion_module._table_rendering(multiline, 2).value == "html"
     assert "<br>" in pdf_conversion_module._html_table(multiline)
 
@@ -429,6 +819,22 @@ def test_table_renderer_uses_markdown_html_and_reviewable_text_fallbacks() -> No
     pdf_conversion_module._append_pdf_table(blocks, 7, table)
     assert any(block.kind == "warning" and "página 7" in block.text for block in blocks)
     assert any("Tabla recuperada" in block.text for block in blocks)
+
+
+def test_table_renderer_flags_sparse_continuation_rows_for_visual_review() -> None:
+    fragmented = (
+        ("A", "B", "C", "D"),
+        ("record one", "value", "value", "value"),
+        ("continuation", "value", "value", "value"),
+        ("continued", "", "value", ""),
+        ("record two", "value", "value", "value"),
+        ("continued", "", "value", ""),
+    )
+
+    assert (
+        pdf_conversion_module._table_rendering(fragmented, 4)
+        is pdf_conversion_module._TableRendering.STRUCTURED_TEXT
+    )
 
 
 def test_explains_that_an_empty_pdf_has_nothing_to_recognize(tmp_path: Path) -> None:
@@ -783,6 +1189,97 @@ def test_ordinary_english_ordinals_do_not_trigger_visual_ocr() -> None:
     assert pdf_conversion_module._is_mixed_visual_glyph("6S")
 
 
+def test_legitimate_currency_amounts_do_not_trigger_local_ocr() -> None:
+    page = pdf_conversion_module._PdfPage(
+        1,
+        (
+            _pdf_model_line(
+                1,
+                "A $10 million prize, $1,000,000 goal, $50k/year salary, and $$$ rewards.",
+            ),
+        ),
+        has_images=False,
+        image_area_ratios=(),
+        has_table=False,
+        image_orientation_mismatch=False,
+    )
+
+    assert not pdf_conversion_module._has_suspicious_glyph_encoding(page)
+    assert pdf_conversion_module._pages_requiring_ocr([page]) == set()
+
+
+def test_single_replacement_glyph_triggers_local_ocr_and_review_warning() -> None:
+    line = _pdf_model_line(1, "Antiochus Thesaurus·.")
+    page = pdf_conversion_module._PdfPage(
+        1,
+        (line,),
+        has_images=False,
+        image_area_ratios=(),
+        has_table=False,
+        image_orientation_mismatch=False,
+    )
+
+    assert pdf_conversion_module._has_suspicious_glyph_encoding(page)
+    assert pdf_conversion_module._pages_requiring_ocr([page]) == {1}
+    warning = pdf_conversion_module._page_conversion_warning(page, [line], False, "")
+    assert warning is not None
+    assert "glifo ilegible" in warning
+
+
+@pytest.mark.parametrize(
+    "text",
+    (
+        "Try to look for the beginnings of 3D shapes.",
+        "Evidence: https://imgur.com/a/4l74MHe",
+        "Water is H2O.",
+    ),
+)
+def test_ordinary_alphanumeric_terms_do_not_trigger_numeric_ocr(text: str) -> None:
+    page = pdf_conversion_module._PdfPage(
+        1,
+        (_pdf_model_line(1, text),),
+        has_images=False,
+        image_area_ratios=(),
+        has_table=False,
+        image_orientation_mismatch=False,
+    )
+
+    assert not pdf_conversion_module._has_suspicious_numeric_glyph_encoding(page)
+    assert pdf_conversion_module._pages_requiring_ocr([page]) == set()
+
+
+def test_number_shaped_header_glyphs_trigger_numeric_ocr() -> None:
+    page = pdf_conversion_module._PdfPage(
+        1,
+        (_pdf_model_line(1, "I8O"),),
+        has_images=False,
+        image_area_ratios=(),
+        has_table=False,
+        image_orientation_mismatch=False,
+    )
+
+    assert pdf_conversion_module._has_suspicious_numeric_glyph_encoding(page)
+    assert pdf_conversion_module._pages_requiring_ocr([page]) == {1}
+
+
+@pytest.mark.parametrize("native", ("IO63", "Broken quote ”$"))
+def test_self_suspicious_visual_lines_receive_fallback_priority(native: str) -> None:
+    line = _pdf_model_line(1, native)
+    page = pdf_conversion_module._PdfPage(
+        1,
+        (line,),
+        has_images=False,
+        image_area_ratios=(),
+        has_table=False,
+        image_orientation_mismatch=False,
+    )
+
+    disagreements = pdf_conversion_module._visual_text_disagreements([page], {1: native})
+
+    assert len(disagreements) == 1
+    assert disagreements[0].priority >= 126
+
+
 @pytest.mark.parametrize("include_page_number", [False, True])
 def test_blank_or_page_number_only_vector_page_does_not_trigger_optional_ocr(
     include_page_number: bool,
@@ -1095,6 +1592,474 @@ def test_repairs_a_long_spaced_word_without_joining_surrounding_prose() -> None:
     )
 
 
+def test_ocr_winner_restores_spacing_only_from_an_exact_native_line() -> None:
+    native = _pdf_model_line(
+        1,
+        "RULERSHIPS through which a planet may derive power. When a planet arrives.",
+    )
+    page = pdf_conversion_module._PdfPage(
+        1,
+        (native,),
+        has_images=True,
+        image_area_ratios=(1.0,),
+        has_table=False,
+        image_orientation_mismatch=False,
+    )
+
+    repaired = pdf_conversion_module._repair_ocr_spacing_from_native(
+        page,
+        "Earlier. RULERSHIPS th ro u g h which a planet may derive power. "
+        "W hen a planet arrives. Later.",
+    )
+    different = pdf_conversion_module._repair_ocr_spacing_from_native(
+        page,
+        "RULERSHIPS th r o u g h which a planet may derive powers. W h e n a planet arrives.",
+    )
+
+    assert repaired == f"Earlier. {native.text} Later."
+    assert different.endswith("derive powers. W h e n a planet arrives.")
+
+
+def test_ocr_repairs_repeated_degree_zeros_only_with_a_confirmed_peer() -> None:
+    broken = (
+        "The values are 190 *Aries*, 30 *Taurus*, 190 *Libra*, 150 *Cancer*, "
+        "28° *Capricorn*, 270 *Pisces*, and 150 *Virgo*."
+    )
+
+    assert pdf_conversion_module._repair_ocr_degree_marker_consensus(broken) == (
+        "The values are 19° *Aries*, 3° *Taurus*, 19° *Libra*, 15° *Cancer*, "
+        "28° *Capricorn*, 27° *Pisces*, and 15° *Virgo*."
+    )
+    assert (
+        pdf_conversion_module._repair_ocr_degree_marker_consensus(
+            "The shipment includes 100 Boxes, 150 Cases, and 200 Packages."
+        )
+        == "The shipment includes 100 Boxes, 150 Cases, and 200 Packages."
+    )
+
+
+def test_ocr_repairs_repeated_degree_zeros_across_markdown_table_cells() -> None:
+    broken = (
+        "| Body | Degree | Sign |\n"
+        "| --- | ---: | --- |\n"
+        "| Sun | 190 | Aries |\n"
+        "| Moon | 30 | Taurus |\n"
+        "| Mars | 28° | Capricorn |\n"
+        "| Venus | 270 | Pisces |"
+    )
+
+    assert pdf_conversion_module._repair_ocr_degree_marker_consensus(broken) == (
+        "| Body | Degree | Sign |\n"
+        "| --- | ---: | --- |\n"
+        "| Sun | 19° | Aries |\n"
+        "| Moon | 3° | Taurus |\n"
+        "| Mars | 28° | Capricorn |\n"
+        "| Venus | 27° | Pisces |"
+    )
+
+
+def test_native_degree_zero_repair_requires_superscript_geometry() -> None:
+    def character(
+        text: str,
+        *,
+        size: float = 9.0,
+        bottom: float = 10.0,
+    ) -> pdf_conversion_module._PdfCharacter:
+        return pdf_conversion_module._PdfCharacter(
+            text=text,
+            x0=0.0,
+            x1=1.0,
+            top=0.0,
+            bottom=bottom,
+            size=size,
+            upright=True,
+        )
+
+    def line(text: str, *, superscript_zeroes: bool) -> _PdfLine:
+        characters = tuple(
+            character(
+                value,
+                size=6.0 if value == "0" and superscript_zeroes else 9.0,
+                bottom=6.5 if value == "0" and superscript_zeroes else 10.0,
+            )
+            for value in text
+            if not value.isspace()
+        )
+        return replace(
+            _pdf_model_line(1, text),
+            chars=characters,
+            top=0.0,
+            bottom=10.0,
+            font_size=9.0,
+        )
+
+    broken = line("Sun 190 Aries and Moon 30 Taurus", superscript_zeroes=True)
+    ordinary = line("Shipment 190 Boxes and 30 Cases", superscript_zeroes=False)
+    pages = [
+        pdf_conversion_module._PdfPage(
+            1,
+            (broken, ordinary),
+            has_images=False,
+            image_area_ratios=(),
+            has_table=False,
+            image_orientation_mismatch=False,
+        )
+    ]
+
+    repaired, accepted = pdf_conversion_module._repair_native_degree_markers(pages)
+
+    assert accepted == 2
+    assert repaired[0].lines[0].text == "Sun 19° Aries and Moon 3° Taurus"
+    assert repaired[0].lines[1].text == ordinary.text
+
+
+def test_native_invalid_zodiac_degree_repairs_only_the_superscript_marker() -> None:
+    def line(text: str) -> _PdfLine:
+        characters = tuple(
+            pdf_conversion_module._PdfCharacter(
+                text=value,
+                x0=float(index),
+                x1=float(index + 1),
+                top=0.0,
+                bottom=6.5 if value == "0" else 10.0,
+                size=6.0 if value == "0" else 9.0,
+                upright=True,
+            )
+            for index, value in enumerate(text)
+            if not value.isspace()
+        )
+        return replace(
+            _pdf_model_line(1, text),
+            chars=characters,
+            top=0.0,
+            bottom=10.0,
+            font_size=9.0,
+        )
+
+    broken = line("Sun 750 Virgo")
+    ordinary = line("The arc is 750 Degrees")
+    page = pdf_conversion_module._PdfPage(
+        1,
+        (broken, ordinary),
+        has_images=False,
+        image_area_ratios=(),
+        has_table=False,
+        image_orientation_mismatch=False,
+    )
+
+    repaired, accepted = pdf_conversion_module._repair_native_degree_markers([page])
+
+    assert accepted == 1
+    assert repaired[0].lines[0].text == "Sun 75° Virgo"
+    assert repaired[0].lines[1].text == ordinary.text
+
+
+def test_native_degree_geometry_does_not_require_a_following_proper_name() -> None:
+    characters = tuple(
+        pdf_conversion_module._PdfCharacter(
+            text=value,
+            x0=float(index),
+            x1=float(index + 1),
+            top=0.0,
+            bottom=6.5 if value == "0" else 10.0,
+            size=6.0 if value == "0" else 9.0,
+            upright=True,
+        )
+        for index, value in enumerate("15° behind".replace("°", "0"))
+        if not value.isspace()
+    )
+    line = replace(
+        _pdf_model_line(1, "The phase extends from 150 behind the Sun."),
+        chars=characters,
+        top=0.0,
+        bottom=10.0,
+        font_size=9.0,
+    )
+    page = pdf_conversion_module._PdfPage(
+        1,
+        (line,),
+        has_images=False,
+        image_area_ratios=(),
+        has_table=False,
+        image_orientation_mismatch=False,
+    )
+
+    repaired, accepted = pdf_conversion_module._repair_native_degree_markers([page])
+
+    assert accepted == 1
+    assert repaired[0].lines[0].text == "The phase extends from 15° behind the Sun."
+
+
+def test_invalid_within_sign_degree_is_flagged_without_guessing_its_value() -> None:
+    suspicious = _pdf_model_line(1, "Sun at 75° Virgo")
+    ordinary = _pdf_model_line(1, "The arc spans 75° above the horizon")
+    page = pdf_conversion_module._PdfPage(
+        1,
+        (suspicious, ordinary),
+        has_images=False,
+        image_area_ratios=(),
+        has_table=False,
+        image_orientation_mismatch=False,
+    )
+
+    assert pdf_conversion_module._has_suspicious_numeric_glyph_encoding(page)
+    assert pdf_conversion_module._line_has_suspicious_numeric_glyph(suspicious)
+    assert not pdf_conversion_module._line_has_suspicious_numeric_glyph(ordinary)
+    assert "glifo numérico ambiguo" in pdf_conversion_module._page_conversion_warning(
+        page,
+        [suspicious, ordinary],
+        False,
+        None,
+    )
+
+
+def test_unconfirmed_degree_ocr_remains_evidence_without_adding_structure() -> None:
+    page = pdf_conversion_module._PdfPage(
+        1,
+        (
+            _pdf_model_line(
+                1,
+                "The native paragraph remains useful while the diagram says 75° Virgo.",
+            ),
+        ),
+        has_images=True,
+        image_area_ratios=(0.4,),
+        has_table=False,
+        image_orientation_mismatch=False,
+    )
+    ocr_pages = {1: "FIGURE 38\n\n- 158 Virgo\n- 258 Libra\n- unrelated OCR-only additions"}
+
+    assert (
+        pdf_conversion_module._ocr_pages_safe_for_structural_rendering(
+            [page],
+            ocr_pages,
+        )
+        == {}
+    )
+
+    clean_page = replace(
+        page,
+        lines=(_pdf_model_line(1, "The native paragraph remains useful."),),
+    )
+    assert (
+        pdf_conversion_module._ocr_pages_safe_for_structural_rendering(
+            [clean_page],
+            ocr_pages,
+        )
+        == ocr_pages
+    )
+
+
+def test_overlapping_native_symbol_repair_requires_matching_geometry() -> None:
+    def symbol_line(*, overlap: bool) -> _PdfLine:
+        characters = tuple(
+            pdf_conversion_module._PdfCharacter(
+                text=value,
+                x0=x0,
+                x1=x1,
+                top=0.0,
+                bottom=9.0,
+                size=9.0,
+                upright=True,
+            )
+            for value, x0, x1 in (
+                ("A", 0.0, 5.0),
+                ("(", 6.0, 8.0),
+                ("%", 7.5 if overlap else 8.5, 12.0),
+                ("B", 13.0, 18.0),
+            )
+        )
+        return replace(_pdf_model_line(1, "A (% B"), chars=characters)
+
+    repaired, accepted = pdf_conversion_module._repair_overlapping_native_symbols(
+        [
+            pdf_conversion_module._PdfPage(
+                1,
+                (symbol_line(overlap=True), symbol_line(overlap=False)),
+                has_images=False,
+                image_area_ratios=(),
+                has_table=False,
+                image_orientation_mismatch=False,
+            )
+        ]
+    )
+
+    assert accepted == 1
+    assert repaired[0].lines[0].text == "A & B"
+    assert pdf_conversion_module._display_heading_text(repaired[0].lines[0]) == "A & B"
+    assert repaired[0].lines[1].text == "A (% B"
+
+
+def test_overlapping_native_ampersand_triplet_requires_matching_geometry() -> None:
+    def symbol_line(*, overlap: bool) -> _PdfLine:
+        middle_x0 = 7.5 if overlap else 8.5
+        right_x0 = 11.5 if overlap else 13.5
+        characters = tuple(
+            pdf_conversion_module._PdfCharacter(
+                text=value,
+                x0=x0,
+                x1=x1,
+                top=0.0,
+                bottom=9.0,
+                size=9.0,
+                upright=True,
+            )
+            for value, x0, x1 in (
+                ("A", 0.0, 5.0),
+                ("(", 6.0, 8.0),
+                ("3", middle_x0, 12.0),
+                ("[", right_x0, 14.0),
+                ("B", 15.0, 20.0),
+            )
+        )
+        return replace(_pdf_model_line(1, "A (3[ B"), chars=characters)
+
+    repaired, accepted = pdf_conversion_module._repair_overlapping_native_symbols(
+        [
+            pdf_conversion_module._PdfPage(
+                1,
+                (symbol_line(overlap=True), symbol_line(overlap=False)),
+                has_images=False,
+                image_area_ratios=(),
+                has_table=False,
+                image_orientation_mismatch=False,
+            )
+        ]
+    )
+
+    assert accepted == 1
+    assert repaired[0].lines[0].text == "A & B"
+    assert pdf_conversion_module._display_heading_text(repaired[0].lines[0]) == "A & B"
+    assert repaired[0].lines[1].text == "A (3[ B"
+
+
+def test_reliable_native_table_is_not_replaced_by_an_ocr_table() -> None:
+    table = pdf_conversion_module._PdfTable(
+        (50.0, 100.0, 550.0, 300.0),
+        (("Name", "Value"), ("Alpha", "First\nSecond")),
+        pdf_conversion_module._TableRendering.HTML,
+    )
+    page = pdf_conversion_module._PdfPage(
+        1,
+        (_pdf_model_line(1, "Readable native introduction and table."),),
+        has_images=False,
+        image_area_ratios=(),
+        has_table=True,
+        image_orientation_mismatch=False,
+        tables=(table,),
+    )
+    ocr = "| Name | Value |\n| --- | --- |\n| Alpha | First Second |"
+
+    assert not pdf_conversion_module._should_replace_with_ocr(page, ocr)
+
+
+def test_uppercase_sentence_leadin_is_not_promoted_to_a_heading() -> None:
+    leadin = replace(
+        _pdf_model_line(1, "THIS OPENING CONTINUES AS ONE SENTENCE", centered=True),
+        top=100.0,
+        bottom=109.0,
+        font_size=9.0,
+    )
+    continuation = replace(
+        _pdf_model_line(1, "through the rest of the paragraph."),
+        top=112.0,
+        bottom=121.0,
+        font_size=9.0,
+    )
+    separated = replace(continuation, top=140.0, bottom=149.0)
+
+    assert pdf_conversion_module._uppercase_leadin_continues(
+        leadin,
+        continuation,
+        9.0,
+    )
+    assert not pdf_conversion_module._uppercase_leadin_continues(
+        leadin,
+        separated,
+        9.0,
+    )
+
+
+def test_repeated_native_lines_repair_only_a_spacing_variant_confirmed_twice() -> None:
+    clean = "Visibility/Beams/Chariot"
+    pages = [
+        pdf_conversion_module._PdfPage(
+            page_number,
+            (_pdf_model_line(page_number, clean),),
+            has_images=False,
+            image_area_ratios=(),
+            has_table=False,
+            image_orientation_mismatch=False,
+        )
+        for page_number in range(1, 4)
+    ]
+    broken = "Vis ib il it y/Be am s/Ch ar io t"
+    pages.append(
+        pdf_conversion_module._PdfPage(
+            4,
+            (_pdf_model_line(4, broken),),
+            has_images=False,
+            image_area_ratios=(),
+            has_table=False,
+            image_orientation_mismatch=False,
+        )
+    )
+
+    repaired, changes = pdf_conversion_module._repair_repeated_native_spacing(pages)
+
+    assert changes == 1
+    assert repaired[-1].lines[0].text == clean
+
+
+def test_repeated_native_spacing_abstains_without_three_pages_of_evidence() -> None:
+    clean = _pdf_model_line(1, "Visibility/Beams/Chariot")
+    broken = _pdf_model_line(
+        2,
+        "Vis ib il it y/Be am s/Ch ar io t",
+    )
+    pages = [
+        pdf_conversion_module._PdfPage(
+            page_number,
+            (line,),
+            has_images=False,
+            image_area_ratios=(),
+            has_table=False,
+            image_orientation_mismatch=False,
+        )
+        for page_number, line in enumerate((clean, broken), start=1)
+    ]
+
+    repaired, changes = pdf_conversion_module._repair_repeated_native_spacing(pages)
+
+    assert changes == 0
+    assert repaired == pages
+
+
+def test_literal_asterisk_legend_is_not_rendered_as_a_markdown_list() -> None:
+    line = _pdf_model_line(1, "* = PLANET IS ITS OWN LORD", bold=True)
+    page = pdf_conversion_module._PdfPage(
+        1,
+        (line,),
+        has_images=False,
+        image_area_ratios=(),
+        has_table=False,
+        image_orientation_mismatch=False,
+    )
+
+    markdown, issues = pdf_conversion_module._render_document(
+        [page],
+        body_size=12,
+        heading_sizes={},
+        repeated_margins=set(),
+        referenced_pages=set(),
+        ocr_pages={},
+        ocr_failed_pages=set(),
+    )
+
+    assert r"\* = PLANET IS ITS OWN LORD" in markdown
+    assert issues == ()
+
+
 def test_splits_widely_separated_columns_and_orders_each_column_contiguously() -> None:
     def line(text: str, x0: float, x1: float, top: float, *, bold: bool = False) -> object:
         return pdf_conversion_module._PdfLine(
@@ -1137,6 +2102,66 @@ def test_splits_widely_separated_columns_and_orders_each_column_contiguously() -
         "Right two",
         "Right three",
     ]
+
+
+def test_orders_the_column_that_continues_a_full_width_line_before_a_figure_caption() -> None:
+    def line(
+        text: str,
+        x0: float,
+        x1: float,
+        top: float,
+        *,
+        chars: tuple[object, ...] = (),
+    ) -> object:
+        return pdf_conversion_module._PdfLine(
+            page_number=1,
+            page_width=400,
+            page_height=600,
+            text=text,
+            chars=chars,
+            x0=x0,
+            x1=x1,
+            top=top,
+            bottom=top + 9,
+            font_size=9,
+            bold=text.startswith("FIGURE"),
+            links=(),
+            soft_hyphen_end=text.endswith("Can"),
+            hard_hyphen_end=False,
+            rotated=False,
+        )
+
+    merged_chars = (
+        pdf_conversion_module._PdfCharacter("cer), placed in Taurus", 54, 194, 526, 535, 9, True),
+        pdf_conversion_module._PdfCharacter("twelfth house continues", 207, 348, 526, 535, 9, True),
+    )
+    source = [
+        line("it contributes a share", 56, 346, 299),
+        line("FIGURE IO9. TWELFTH-HOUSE LORD", 54, 176, 495),
+        line("IN THE TENTH", 54, 102, 504),
+        line("The Moon is the lord (Can", 54, 196, 519),
+        line("the favorable tenth house.", 54, 132, 539),
+        line("of its own good fortune", 207, 348, 311),
+        line("the house it rules", 207, 347, 323),
+        line("house topics prosper", 207, 346, 335),
+        line("the example continues", 207, 347, 347),
+        line(
+            "cer), placed in Taurus twelfth house continues",
+            54,
+            348,
+            526,
+            chars=merged_chars,
+        ),
+        line("is in the tenth house", 207, 348, 539),
+    ]
+
+    split = pdf_conversion_module._split_lines_at_established_gutters(source)
+    ordered = pdf_conversion_module._reading_order_lines(split)
+    texts = [item.text for item in ordered]
+
+    assert "cer), placed in Taurus" in texts
+    assert "twelfth house continues" in texts
+    assert texts.index("of its own good fortune") < texts.index("FIGURE IO9. TWELFTH-HOUSE LORD")
 
 
 def test_detects_a_scanned_table_from_repeated_side_by_side_text() -> None:
@@ -1341,6 +2366,20 @@ def test_table_cells_join_discretionary_and_typesetting_hyphens() -> None:
     assert pdf_conversion_module._render_table_cell("ISO-\n9001") == "ISO-\n9001"
 
 
+def test_table_cells_join_visual_line_wraps_but_preserve_explicit_items() -> None:
+    assert (
+        pdf_conversion_module._render_table_cell(
+            "It has the face of\nIsis. It wears a winged queen's\ncrown."
+        )
+        == "It has the face of Isis. It wears a winged queen's crown."
+    )
+    assert (
+        pdf_conversion_module._render_table_cell("First instruction.\nSecond instruction.")
+        == "First instruction.\nSecond instruction."
+    )
+    assert pdf_conversion_module._render_table_cell("Name\n1. First item") == "Name\n1. First item"
+
+
 def test_table_rendering_preserves_an_empty_header_without_inventing_a_label() -> None:
     rows = (("", "Image"), ("Aries I", "A figure"))
 
@@ -1361,6 +2400,106 @@ def test_recovers_a_short_captioned_table_with_only_outer_raster_rules(tmp_path:
         ("Aries 1", "Chontare", "Aulathamas", "First description continues here"),
         ("Aries 2", "Chontachre", "Sabaoth", "Second description continues here"),
     )
+
+
+def test_recovers_an_open_two_column_table_with_multiline_cells(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "open-two-column-table.pdf"
+    _write_open_raster_table_pdf(source, layout="labels")
+    monkeypatch.setattr(
+        pdf_conversion_module,
+        "convert_pdf_pages_with_ocr",
+        lambda *_args, **_kwargs: {},
+    )
+
+    page = pdf_conversion_module._extract_pages(source, None)[0]
+    reports: list[PdfQualityReport] = []
+    converted = convert_pdf_document(
+        source,
+        include_images=True,
+        on_quality_report=reports.append,
+    )
+
+    assert len(page.tables) == 1
+    assert page.tables[0].inferred_from_raster
+    assert page.tables[0].rows == (
+        ("Authors", "Significations"),
+        ("HERMES\nEgypt E", "Life and livelihood\ncontinues below"),
+        ("THRASYLLUS\nAlexandria", "Fortune and death"),
+        ("VALENS\nAntioch", "Benefits and lawsuits"),
+    )
+    assert (
+        pdf_conversion_module._deserialize_page_checkpoint(
+            pdf_conversion_module._serialize_page_checkpoint(page),
+            1,
+        )
+        == page
+    )
+    assert len(converted.resources) == 1
+    assert converted.resources[0].page_number == 1
+    assert len(reports) == 1
+    assert len(reports[0].issues) == 1
+    assert "tabla escaneada" in reports[0].issues[0].message
+
+
+def test_recovers_a_sparse_open_matrix_from_repeated_header_gutters(tmp_path: Path) -> None:
+    source = tmp_path / "open-sparse-matrix.pdf"
+    _write_open_raster_table_pdf(source, layout="matrix")
+
+    page = pdf_conversion_module._extract_pages(source, None)[0]
+
+    assert len(page.tables) == 1
+    assert page.tables[0].inferred_from_raster
+    assert page.tables[0].rows == (
+        ("KEY\nKIND", "SUN\nFIRE", "MOON\nWATR", "MARS\nAIR"),
+        ("C1", "-", "-", "Hit"),
+        ("C2", "-", "-", "Hit"),
+        ("C3", "-", "-", "Hit"),
+        ("C4", "-", "-", "Hit"),
+    )
+
+
+def test_restores_sparse_matrix_dashes_visible_only_in_the_scan(tmp_path: Path) -> None:
+    source = tmp_path / "open-sparse-matrix-visual-placeholders.pdf"
+    _write_open_raster_table_pdf(source, layout="matrix_visual_placeholders")
+
+    page = pdf_conversion_module._extract_pages(source, None)[0]
+
+    assert len(page.tables) == 1
+    assert page.tables[0].rows == (
+        ("KEY\nKIND", "SUN\nFIRE", "MOON\nWATR", "MARS\nAIR"),
+        ("C1", "—", "—", "Hit"),
+        ("C2", "—", "—", "Hit"),
+        ("C3", "—", "—", "Hit"),
+        ("C4", "—", "—", "Hit"),
+    )
+
+
+def test_repairs_a_degree_glyph_only_from_repeated_matrix_header_evidence() -> None:
+    rows = (
+        ("KEY", "SUN\n5° FIRE", "MOON\n9°WATR", "MARS\n240 AIR"),
+        ("C1", "—", "—", "Hit"),
+    )
+
+    assert pdf_conversion_module._repair_consensus_degree_markers(rows) == (
+        ("KEY", "SUN\n5° FIRE", "MOON\n9° WATR", "MARS\n24° AIR"),
+        ("C1", "—", "—", "Hit"),
+    )
+    assert pdf_conversion_module._repair_consensus_degree_markers(
+        (("KEY", "Value 240 AIR", "Other", "Third"), ("C1", "1", "2", "3"))
+    ) == (("KEY", "Value 240 AIR", "Other", "Third"), ("C1", "1", "2", "3"))
+
+
+def test_open_rules_do_not_turn_two_column_prose_into_a_table(tmp_path: Path) -> None:
+    source = tmp_path / "open-two-column-prose.pdf"
+    _write_open_raster_table_pdf(source, layout="prose")
+
+    page = pdf_conversion_module._extract_pages(source, None)[0]
+
+    assert page.tables == ()
+    assert not page.has_table
 
 
 def test_raster_ruled_table_with_a_link_stays_in_the_normal_text_flow(tmp_path: Path) -> None:
@@ -1770,6 +2909,48 @@ def test_repairs_toc_spacing_and_roman_glyphs_only_with_native_heading_consensus
     ]
 
 
+def test_normalizes_only_footnotes_backed_by_small_bottom_definitions() -> None:
+    body = replace(
+        _pdf_model_line(1, "A sourced statement.6 Another value.7"),
+        top=180,
+        bottom=192,
+        font_size=12,
+    )
+    definition = replace(
+        _pdf_model_line(1, "6 Paulus, Introduction 3."),
+        top=700,
+        bottom=708,
+        font_size=8,
+    )
+
+    normalized = pdf_conversion_module._normalize_page_footnotes(
+        [body, definition],
+        body_size=12,
+    )
+
+    assert [line.text for line in normalized] == [
+        "A sourced statement.⁶ Another value.7",
+        "6. Paulus, Introduction 3.",
+    ]
+
+
+def test_does_not_guess_footnotes_without_matching_bottom_geometry() -> None:
+    body = _pdf_model_line(1, "A version.6")
+    ordinary_line = replace(
+        _pdf_model_line(1, "6 Ordinary numbered prose"),
+        top=700,
+        bottom=712,
+        font_size=12,
+    )
+
+    normalized = pdf_conversion_module._normalize_page_footnotes(
+        [body, ordinary_line],
+        body_size=12,
+    )
+
+    assert normalized == [body, ordinary_line]
+
+
 def test_renders_toc_entries_as_a_reflowable_aligned_table() -> None:
     def line(
         text: str,
@@ -1902,6 +3083,36 @@ def test_separates_unnumbered_toc_sections_from_adjacent_list_entries() -> None:
     assert pdf_conversion_module._blocks_to_markdown(blocks) == (
         "- PISCES III 258\n\n**APPENDICES**\n\n- Decanic Magic 266\n\n**TABLES OF CORRESPONDENCE**"
     )
+
+
+def test_generated_toc_table_keeps_an_adjacent_unpaginated_part_as_a_root_row() -> None:
+    blocks = [
+        pdf_conversion_module._MarkdownBlock(
+            "heading",
+            "PART II: PROFILES",
+            6,
+        ),
+        pdf_conversion_module._MarkdownBlock(
+            "toc-entry",
+            "Profile I",
+            6,
+            toc_folio="53",
+            toc_level=1,
+        ),
+        pdf_conversion_module._MarkdownBlock(
+            "toc-entry",
+            "Profile II",
+            6,
+            toc_folio="59",
+            toc_level=1,
+        ),
+    ]
+
+    markdown = pdf_conversion_module._blocks_to_markdown(blocks)
+
+    assert '<td class="toc-label toc-level-0">PART II: PROFILES</td>' in markdown
+    assert '<td class="toc-folio"></td>' in markdown
+    assert '<td class="toc-label toc-level-1">Profile I</td>' in markdown
 
 
 def test_table_ocr_requires_faithful_size_tokens_and_numbers() -> None:
@@ -2211,6 +3422,66 @@ def test_recovers_a_clustered_vector_illustration_as_an_image_box() -> None:
     assert bottom >= 390
 
 
+def test_recovers_a_two_curve_vector_plot_as_an_image_box() -> None:
+    page = SimpleNamespace(
+        width=536,
+        height=697,
+        bbox=(0, 0, 536, 697),
+        images=[],
+        curves=[
+            {"x0": 169, "x1": 388, "top": 222, "bottom": 224},
+            {"x0": 174, "x1": 384, "top": 150, "bottom": 289},
+        ],
+    )
+    y_axis_label = replace(
+        _pdf_model_line(1, "-1.0"),
+        x0=150,
+        x1=166,
+        top=275,
+        bottom=283,
+    )
+    model = pdf_conversion_module._PdfPage(
+        number=1,
+        lines=(y_axis_label,),
+        has_images=False,
+        image_area_ratios=(),
+        has_table=False,
+        image_orientation_mismatch=False,
+    )
+
+    boxes = pdf_conversion_module._exportable_image_boxes(page, model, None)
+
+    assert len(boxes) == 1
+    x0, top, x1, bottom = boxes[0]
+    assert x0 <= 150
+    assert top <= 150
+    assert x1 >= 388
+    assert bottom >= 289
+
+
+def test_two_thin_vector_rules_do_not_become_an_image() -> None:
+    page = SimpleNamespace(
+        width=600,
+        height=800,
+        bbox=(0, 0, 600, 800),
+        images=[],
+        curves=[
+            {"x0": 100, "x1": 500, "top": 100, "bottom": 101},
+            {"x0": 100, "x1": 500, "top": 120, "bottom": 121},
+        ],
+    )
+    model = pdf_conversion_module._PdfPage(
+        number=1,
+        lines=(),
+        has_images=False,
+        image_area_ratios=(),
+        has_table=False,
+        image_orientation_mismatch=False,
+    )
+
+    assert pdf_conversion_module._exportable_image_boxes(page, model, None) == ()
+
+
 @pytest.mark.parametrize(("letters", "expected"), [(150, 1), (400, 0)])
 def test_preserves_only_sparse_hybrid_full_page_illustrations(
     letters: int,
@@ -2235,6 +3506,196 @@ def test_preserves_only_sparse_hybrid_full_page_illustrations(
     boxes = pdf_conversion_module._exportable_image_boxes(page, model, None)
 
     assert len(boxes) == expected
+
+
+def test_preserves_a_terminal_full_page_visual_beside_dense_ocr() -> None:
+    page = SimpleNamespace(
+        width=600,
+        height=800,
+        bbox=(0, 0, 600, 800),
+        images=[{"x0": 0, "x1": 600, "top": 0, "bottom": 800}],
+        curves=[],
+    )
+    model = pdf_conversion_module._PdfPage(
+        number=2,
+        lines=(),
+        has_images=True,
+        image_area_ratios=(1.0,),
+        has_table=False,
+        image_orientation_mismatch=False,
+    )
+    dense_ocr = "Recognized back cover copy. " * 30
+
+    assert pdf_conversion_module._exportable_image_boxes(page, model, dense_ocr) == ()
+    assert pdf_conversion_module._exportable_image_boxes(
+        page,
+        model,
+        dense_ocr,
+        preserve_full_page_visual=True,
+    ) == ((0.0, 0.0, 600.0, 800.0),)
+
+
+@pytest.mark.parametrize(
+    ("caption", "bold"),
+    (
+        ("FIGURE 62.", False),
+        ("FIGURES 10 Q 11 SECT REJOICING BY HEMISPHERE", True),
+        ("F i G U R E 6 8.", False),
+    ),
+)
+def test_preserves_a_dense_full_page_scan_with_a_numbered_figure_caption(
+    caption: str,
+    bold: bool,
+) -> None:
+    page = SimpleNamespace(
+        width=600,
+        height=800,
+        bbox=(0, 0, 600, 800),
+        images=[{"x0": 0, "x1": 600, "top": 0, "bottom": 800}],
+        curves=[],
+    )
+    model = pdf_conversion_module._PdfPage(
+        number=1,
+        lines=(
+            _pdf_model_line(1, "A" * 400),
+            _pdf_model_line(1, caption, bold=bold),
+        ),
+        has_images=True,
+        image_area_ratios=(1.0,),
+        has_table=False,
+        image_orientation_mismatch=False,
+    )
+
+    boxes = pdf_conversion_module._exportable_image_boxes(page, model, None)
+
+    assert boxes == ((0.0, 0.0, 600.0, 800.0),)
+
+
+def test_native_numbered_figure_outweighs_a_false_positive_ocr_contents_label() -> None:
+    page = SimpleNamespace(
+        width=600,
+        height=800,
+        bbox=(0, 0, 600, 800),
+        images=[{"x0": 0, "x1": 600, "top": 0, "bottom": 800}],
+        curves=[],
+    )
+    model = pdf_conversion_module._PdfPage(
+        number=1,
+        lines=(
+            _pdf_model_line(1, "A" * 400),
+            _pdf_model_line(1, "FIGURE 38. MORNING AND EVENING PLANETS"),
+        ),
+        has_images=True,
+        image_area_ratios=(1.0,),
+        has_table=False,
+        image_orientation_mismatch=False,
+    )
+    misleading_ocr = "CONTENTS\nChapter One 1\nChapter Two 2\nChapter Three 3\nChapter Four 4"
+
+    assert pdf_conversion_module._is_toc_markdown(misleading_ocr)
+    assert pdf_conversion_module._exportable_image_boxes(
+        page,
+        model,
+        misleading_ocr,
+    ) == ((0.0, 0.0, 600.0, 800.0),)
+
+
+def test_does_not_treat_a_prose_figure_reference_as_a_figure_caption() -> None:
+    page = SimpleNamespace(
+        width=600,
+        height=800,
+        bbox=(0, 0, 600, 800),
+        images=[{"x0": 0, "x1": 600, "top": 0, "bottom": 800}],
+        curves=[],
+    )
+    model = pdf_conversion_module._PdfPage(
+        number=1,
+        lines=(
+            _pdf_model_line(1, "A" * 400),
+            _pdf_model_line(1, "Figure 62 shows the relevant relationship."),
+        ),
+        has_images=True,
+        image_area_ratios=(1.0,),
+        has_table=False,
+        image_orientation_mismatch=False,
+    )
+
+    boxes = pdf_conversion_module._exportable_image_boxes(page, model, None)
+
+    assert boxes == ()
+
+
+def test_does_not_preserve_a_full_page_list_of_figures_as_a_figure() -> None:
+    page = SimpleNamespace(
+        width=600,
+        height=800,
+        bbox=(0, 0, 600, 800),
+        images=[{"x0": 0, "x1": 600, "top": 0, "bottom": 800}],
+        curves=[],
+    )
+    model = pdf_conversion_module._PdfPage(
+        number=1,
+        lines=tuple(
+            _pdf_model_line(1, f"FIGURE {number}. Entry {number * 10}") for number in range(1, 5)
+        ),
+        has_images=True,
+        image_area_ratios=(1.0,),
+        has_table=False,
+        image_orientation_mismatch=False,
+    )
+
+    boxes = pdf_conversion_module._exportable_image_boxes(page, model, None)
+
+    assert boxes == ()
+
+
+def test_reports_a_numbered_figure_when_its_scan_cannot_be_exported(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "numbered-figure-scan.pdf"
+    _write_image_pdf(source)
+    model = pdf_conversion_module._PdfPage(
+        number=1,
+        lines=(
+            _pdf_model_line(1, "A" * 400),
+            _pdf_model_line(1, "FIGURES 10 & 11."),
+        ),
+        has_images=True,
+        image_area_ratios=(1.0,),
+        has_table=False,
+        image_orientation_mismatch=False,
+    )
+
+    def fail_render(*_args: object, **_kwargs: object) -> bytes:
+        raise OSError("synthetic render failure")
+
+    monkeypatch.setattr(pdf_conversion_module, "_render_pdf_image", fail_render)
+
+    resources, omitted, failed_pages = pdf_conversion_module._extract_embedded_images(
+        source,
+        [model],
+        {},
+        None,
+        None,
+        None,
+    )
+    _markdown, issues = pdf_conversion_module._render_document(
+        [model],
+        body_size=12,
+        heading_sizes={},
+        repeated_margins=set(),
+        referenced_pages=set(),
+        ocr_pages={},
+        ocr_failed_pages=set(),
+        required_figure_failure_pages=failed_pages,
+    )
+
+    assert resources == {}
+    assert omitted == 1
+    assert failed_pages == {1}
+    assert len(issues) == 1
+    assert "figura numerada" in issues[0].message
 
 
 def test_fragmented_graphic_labels_keep_the_complete_page_image() -> None:
@@ -2265,6 +3726,66 @@ def test_fragmented_graphic_labels_keep_the_complete_page_image() -> None:
     boxes = pdf_conversion_module._exportable_image_boxes(page, model, ocr)
 
     assert boxes == ((0.0, 0.0, 600.0, 800.0),)
+
+
+def test_dense_graphic_label_mosaic_stays_visual_even_with_many_ocr_letters() -> None:
+    page = pdf_conversion_module._PdfPage(
+        number=52,
+        lines=(),
+        has_images=True,
+        image_area_ratios=(1.0,),
+        has_table=False,
+        image_orientation_mismatch=False,
+    )
+    ocr = "\n".join(f"HOODIES {index:02d}" for index in range(18))
+
+    assert pdf_conversion_module._fragmented_graphic_text_should_stay_in_image(page, ocr)
+
+
+def test_dense_prose_scan_is_not_mistaken_for_a_graphic_label_mosaic() -> None:
+    page = pdf_conversion_module._PdfPage(
+        number=20,
+        lines=(),
+        has_images=True,
+        image_area_ratios=(1.0,),
+        has_table=False,
+        image_orientation_mismatch=False,
+    )
+    ocr = "\n".join(
+        f"This is a complete prose sentence number {index} with ordinary reading flow."
+        for index in range(18)
+    )
+
+    assert not pdf_conversion_module._fragmented_graphic_text_should_stay_in_image(page, ocr)
+
+
+def test_rotated_visual_with_removed_vertical_stack_does_not_add_unverified_ocr() -> None:
+    page = pdf_conversion_module._PdfPage(
+        number=5,
+        lines=(),
+        has_images=True,
+        image_area_ratios=(0.4,),
+        has_table=False,
+        image_orientation_mismatch=True,
+    )
+    resource = pdf_conversion_module.PdfEmbeddedResource(
+        pdf_conversion_module.PurePosixPath("pdf/page-0005-image-01.jpg"),
+        b"rotated check",
+        "image/jpeg",
+        5,
+        (100, 200, 500, 700),
+    )
+
+    assert not pdf_conversion_module._should_include_ocr_additions(
+        page,
+        skipped_vertical=True,
+        resources=(resource,),
+    )
+    assert pdf_conversion_module._should_include_ocr_additions(
+        page,
+        skipped_vertical=False,
+        resources=(resource,),
+    )
 
 
 def test_fragmented_graphic_labels_are_not_reflowed_beside_the_page_image() -> None:
@@ -2302,6 +3823,604 @@ def test_fragmented_graphic_labels_are_not_reflowed_beside_the_page_image() -> N
     assert "A0" not in markdown
     assert "A9" not in markdown
     assert "__parsezen_resources__/pdf/page-0001-image-01.jpg" in markdown
+
+
+def test_sparse_raster_cover_uses_its_image_instead_of_unverified_ocr() -> None:
+    page = pdf_conversion_module._PdfPage(
+        number=1,
+        lines=(),
+        has_images=True,
+        image_area_ratios=(0.99,),
+        has_table=False,
+        image_orientation_mismatch=False,
+    )
+    resource = pdf_conversion_module.PdfEmbeddedResource(
+        pdf_conversion_module.PurePosixPath("pdf/page-0001-image-01.jpg"),
+        b"cover",
+        "image/jpeg",
+        1,
+        (0, 0, 600, 800),
+        True,
+    )
+
+    markdown, _issues = pdf_conversion_module._render_document(
+        [page],
+        body_size=12,
+        heading_sizes={},
+        repeated_margins=set(),
+        referenced_pages=set(),
+        ocr_pages={1: "BROKEN COVER OCR"},
+        ocr_failed_pages=set(),
+        page_images={1: (resource,)},
+    )
+
+    assert "BROKEN COVER OCR" not in markdown
+    assert "__parsezen_resources__/pdf/page-0001-image-01.jpg" in markdown
+
+
+def test_unresolved_raster_table_uses_the_scan_instead_of_losing_a_diacritic() -> None:
+    native_line = replace(
+        _pdf_model_line(1, "Connection sunaphê with a malefic"),
+        top=120,
+        bottom=132,
+    )
+    table = pdf_conversion_module._PdfTable(
+        bbox=(40, 80, 560, 720),
+        rows=(("Topic",), ("Connection sunaphê with a malefic",)),
+        rendering=pdf_conversion_module._TableRendering.MARKDOWN,
+    )
+    page = pdf_conversion_module._PdfPage(
+        number=1,
+        lines=(native_line,),
+        has_images=True,
+        image_area_ratios=(0.99,),
+        has_table=True,
+        image_orientation_mismatch=False,
+        tables=(table,),
+    )
+    resource = pdf_conversion_module.PdfEmbeddedResource(
+        pdf_conversion_module.PurePosixPath("pdf/page-0001-image-01.jpg"),
+        b"table",
+        "image/jpeg",
+        1,
+        table.bbox,
+    )
+    ocr = "| Topic |\n| --- |\n| Connection sunaphe with a malefic |"
+
+    markdown, issues = pdf_conversion_module._render_document(
+        [page],
+        body_size=12,
+        heading_sizes={},
+        repeated_margins=set(),
+        referenced_pages=set(),
+        ocr_pages={1: ocr},
+        ocr_failed_pages=set(),
+        page_images={1: (resource,)},
+    )
+
+    assert "sunaph" not in markdown.casefold()
+    assert "__parsezen_resources__/pdf/page-0001-image-01.jpg" in markdown
+    assert any("grafía" in issue.message for issue in issues)
+
+
+def test_unresolved_text_line_uses_its_visual_crop_and_keeps_reliable_prose() -> None:
+    uncertain = replace(
+        _pdf_model_line(1, "The sunaph� term remains uncertain."),
+        x0=60,
+        x1=400,
+        top=120,
+        bottom=132,
+    )
+    reliable = replace(
+        _pdf_model_line(1, "Reliable prose remains reflowable."),
+        x0=60,
+        x1=400,
+        top=160,
+        bottom=172,
+    )
+    page = pdf_conversion_module._PdfPage(
+        number=1,
+        lines=(uncertain, reliable),
+        has_images=False,
+        image_area_ratios=(),
+        has_table=False,
+        image_orientation_mismatch=False,
+    )
+    bbox = pdf_conversion_module._visual_text_crop_bbox((0, 0, 600, 800), uncertain)
+    resource = pdf_conversion_module.PdfEmbeddedResource(
+        pdf_conversion_module.PurePosixPath("pdf/page-0001-image-01.jpg"),
+        b"visual evidence",
+        "image/jpeg",
+        1,
+        bbox,
+        visual_text_authority=True,
+    )
+
+    markdown, issues = pdf_conversion_module._render_document(
+        [page],
+        body_size=12,
+        heading_sizes={},
+        repeated_margins=set(),
+        referenced_pages=set(),
+        ocr_pages={1: "The sunaphe term remains uncertain.\nReliable prose remains reflowable."},
+        ocr_failed_pages=set(),
+        page_images={1: (resource,)},
+    )
+
+    assert "sunaphê" not in markdown
+    assert "sunaphe" not in markdown
+    assert "Reliable prose remains reflowable." in markdown
+    assert "__parsezen_resources__/pdf/page-0001-image-01.jpg" in markdown
+    assert any("recortes visuales" in issue.message for issue in issues)
+
+
+def test_native_diacritic_stays_reflowable_when_ocr_only_strips_it() -> None:
+    native = replace(
+        _pdf_model_line(1, "The sunaphê term remains reflowable."),
+        x0=60,
+        x1=400,
+        top=120,
+        bottom=132,
+    )
+    page = pdf_conversion_module._PdfPage(
+        number=1,
+        lines=(native,),
+        has_images=False,
+        image_area_ratios=(),
+        has_table=False,
+        image_orientation_mismatch=False,
+    )
+    ocr = "The sunaphe term remains reflowable."
+
+    assert (
+        pdf_conversion_module._unresolved_text_visual_boxes(
+            page,
+            ocr,
+            (0, 0, 600, 800),
+        )
+        == ()
+    )
+
+    markdown, issues = pdf_conversion_module._render_document(
+        [page],
+        body_size=12,
+        heading_sizes={},
+        repeated_margins=set(),
+        referenced_pages=set(),
+        ocr_pages={1: ocr},
+        ocr_failed_pages=set(),
+        page_images={},
+    )
+
+    assert "sunaphê" in markdown
+    assert "sunaphe" not in markdown
+    assert not any("recortes visuales" in issue.message for issue in issues)
+
+
+def test_ocr_additions_ignore_a_copy_that_only_drops_native_diacritics() -> None:
+    page = pdf_conversion_module._PdfPage(
+        number=1,
+        lines=(
+            _pdf_model_line(
+                1,
+                "La conversación continúa con precisión y mantiene la información.",
+            ),
+        ),
+        has_images=False,
+        image_area_ratios=(),
+        has_table=False,
+        image_orientation_mismatch=False,
+    )
+
+    additions = pdf_conversion_module._ocr_additions(
+        page,
+        "La conversacion continua con precision y mantiene la informacion.",
+    )
+
+    assert additions == ""
+
+
+def test_visual_text_crop_does_not_capture_adjacent_lines() -> None:
+    line = replace(
+        _pdf_model_line(1, "One objectively damaged line."),
+        x0=60,
+        x1=400,
+        top=120,
+        bottom=132,
+    )
+
+    bbox = pdf_conversion_module._visual_text_crop_bbox((0, 0, 600, 800), line)
+
+    assert bbox[1] >= 118
+    assert bbox[3] <= 134
+
+
+def test_many_unresolved_text_lines_preserve_the_complete_page_visual() -> None:
+    lines = tuple(
+        replace(
+            _pdf_model_line(1, f"Concept {index} sunaph� remains uncertain."),
+            x0=60,
+            x1=420,
+            top=80 + index * 30,
+            bottom=92 + index * 30,
+        )
+        for index in range(9)
+    )
+    page = pdf_conversion_module._PdfPage(
+        number=1,
+        lines=lines,
+        has_images=False,
+        image_area_ratios=(),
+        has_table=False,
+        image_orientation_mismatch=False,
+    )
+    ocr = "\n".join(f"Concept {index} sunaphe remains uncertain." for index in range(9))
+
+    assert pdf_conversion_module._unresolved_text_visual_boxes(
+        page,
+        ocr,
+        (0, 0, 600, 800),
+    ) == ((0, 0, 600, 800),)
+
+
+def test_generic_low_priority_ocr_difference_does_not_demote_prose_to_an_image() -> None:
+    line = replace(
+        _pdf_model_line(1, "A rare epikataphoray reading remains reflowable."),
+        x0=60,
+        x1=420,
+        top=120,
+        bottom=132,
+    )
+    page = pdf_conversion_module._PdfPage(
+        number=1,
+        lines=(line,),
+        has_images=False,
+        image_area_ratios=(),
+        has_table=False,
+        image_orientation_mismatch=False,
+    )
+    ocr = "A rare epikataphora reading remains reflowable."
+
+    disagreements = pdf_conversion_module._visual_text_disagreements([page], {1: ocr})
+
+    assert disagreements
+    assert max(item.priority for item in disagreements) < 100
+    assert (
+        pdf_conversion_module._unresolved_text_visual_boxes(
+            page,
+            ocr,
+            (0, 0, 600, 800),
+        )
+        == ()
+    )
+
+
+def test_unresolved_raster_table_accepts_plain_ocr_as_disagreement_evidence() -> None:
+    native_line = replace(
+        _pdf_model_line(1, "Connection sunaphê with a malefic"),
+        top=120,
+        bottom=132,
+    )
+    outside_prose = replace(
+        _pdf_model_line(1, "Reliable prose outside the table."),
+        top=740,
+        bottom=752,
+    )
+    table = pdf_conversion_module._PdfTable(
+        bbox=(40, 80, 560, 720),
+        rows=(("Topic",), ("Connection sunaphê with a malefic",)),
+        rendering=pdf_conversion_module._TableRendering.HTML,
+    )
+    page = pdf_conversion_module._PdfPage(
+        number=1,
+        lines=(native_line, outside_prose),
+        has_images=True,
+        image_area_ratios=(0.99,),
+        has_table=True,
+        image_orientation_mismatch=False,
+        tables=(table,),
+    )
+    resource = pdf_conversion_module.PdfEmbeddedResource(
+        pdf_conversion_module.PurePosixPath("pdf/page-0001-image-01.jpg"),
+        b"table",
+        "image/jpeg",
+        1,
+        table.bbox,
+    )
+
+    markdown, issues = pdf_conversion_module._render_document(
+        [page],
+        body_size=12,
+        heading_sizes={},
+        repeated_margins=set(),
+        referenced_pages=set(),
+        ocr_pages={1: "Topic\nConnection sunaphe with a malefic"},
+        ocr_failed_pages=set(),
+        page_images={1: (resource,)},
+    )
+
+    assert "sunaph" not in markdown.casefold()
+    assert "Reliable prose outside the table." in markdown
+    assert "__parsezen_resources__/pdf/page-0001-image-01.jpg" in markdown
+    assert any("grafía" in issue.message for issue in issues)
+
+
+def test_raster_table_does_not_use_an_alternate_ocr_occurrence_over_an_exact_one() -> None:
+    native_line = replace(
+        _pdf_model_line(1, "Connection sunaphê"),
+        top=120,
+        bottom=132,
+    )
+    table = pdf_conversion_module._PdfTable(
+        bbox=(40, 80, 560, 720),
+        rows=(("Connection sunaphê",),),
+        rendering=pdf_conversion_module._TableRendering.HTML,
+    )
+    page = pdf_conversion_module._PdfPage(
+        number=1,
+        lines=(native_line,),
+        has_images=True,
+        image_area_ratios=(0.99,),
+        has_table=True,
+        image_orientation_mismatch=False,
+        tables=(table,),
+    )
+
+    assert not pdf_conversion_module._unresolved_raster_table_text(
+        page,
+        "Connection sunaphê\nAlternative sunaphe",
+    )
+
+
+def test_raster_table_ignores_an_ocr_disagreement_outside_its_bbox() -> None:
+    table_line = replace(
+        _pdf_model_line(1, "Exact table value"),
+        top=120,
+        bottom=132,
+    )
+    outside_line = replace(
+        _pdf_model_line(1, "Outside sunaphê note"),
+        top=740,
+        bottom=752,
+    )
+    table = pdf_conversion_module._PdfTable(
+        bbox=(40, 80, 560, 720),
+        rows=(("Exact table value",),),
+        rendering=pdf_conversion_module._TableRendering.HTML,
+    )
+    page = pdf_conversion_module._PdfPage(
+        number=1,
+        lines=(table_line, outside_line),
+        has_images=True,
+        image_area_ratios=(0.99,),
+        has_table=True,
+        image_orientation_mismatch=False,
+        tables=(table,),
+    )
+
+    assert not pdf_conversion_module._unresolved_raster_table_text(
+        page,
+        "Exact table value\nOutside sunaphe note",
+    )
+
+
+def test_raster_table_abstains_on_one_missing_letter_with_repeated_native_evidence() -> None:
+    table = pdf_conversion_module._PdfTable(
+        bbox=(40, 80, 560, 720),
+        rows=(
+            ("First epikataphoray value",),
+            ("Second epikataphora value",),
+        ),
+        rendering=pdf_conversion_module._TableRendering.HTML,
+    )
+    page = pdf_conversion_module._PdfPage(
+        number=1,
+        lines=(),
+        has_images=True,
+        image_area_ratios=(0.99,),
+        has_table=True,
+        image_orientation_mismatch=False,
+        tables=(table,),
+    )
+
+    assert pdf_conversion_module._unresolved_raster_table_text(
+        page,
+        "First epikataphora value\nSecond epikataphora value",
+    )
+
+
+def test_dense_raster_table_requires_a_visual_fallback() -> None:
+    table = pdf_conversion_module._PdfTable(
+        bbox=(40, 80, 560, 720),
+        rows=tuple((str(index), "A", "B", "C") for index in range(20)),
+        rendering=pdf_conversion_module._TableRendering.HTML,
+    )
+    page = pdf_conversion_module._PdfPage(
+        number=1,
+        lines=(),
+        has_images=True,
+        image_area_ratios=(0.99,),
+        has_table=True,
+        image_orientation_mismatch=False,
+        tables=(table,),
+    )
+
+    assert pdf_conversion_module._dense_raster_table_requires_visual(page, table)
+
+
+def test_complex_raster_table_keeps_outside_prose_and_uses_only_its_visual_crop() -> None:
+    table_line = replace(
+        _pdf_model_line(1, "Unreliable row association"),
+        x0=60,
+        x1=540,
+        top=180,
+        bottom=192,
+    )
+    prose = replace(
+        _pdf_model_line(1, "Reliable prose after the table."),
+        x0=60,
+        x1=540,
+        top=500,
+        bottom=512,
+    )
+    table = pdf_conversion_module._PdfTable(
+        bbox=(50, 150, 550, 450),
+        rows=(
+            ("A", "B", "C", "D"),
+            ("value", "", "", "other"),
+            ("", "continuation", "", ""),
+            ("", "", "continuation", ""),
+            ("last", "row", "is", "complete"),
+        ),
+        rendering=pdf_conversion_module._TableRendering.STRUCTURED_TEXT,
+    )
+    page = pdf_conversion_module._PdfPage(
+        number=1,
+        lines=(table_line, prose),
+        has_images=True,
+        image_area_ratios=(1.0,),
+        has_table=True,
+        image_orientation_mismatch=False,
+        tables=(table,),
+    )
+    resource = pdf_conversion_module.PdfEmbeddedResource(
+        pdf_conversion_module.PurePosixPath("pdf/page-0001-image-01.jpg"),
+        b"table crop",
+        "image/jpeg",
+        1,
+        table.bbox,
+    )
+
+    markdown, issues = pdf_conversion_module._render_document(
+        [page],
+        body_size=12,
+        heading_sizes={},
+        repeated_margins=set(),
+        referenced_pages=set(),
+        ocr_pages={},
+        ocr_failed_pages=set(),
+        page_images={1: (resource,)},
+    )
+
+    assert "Unreliable row association" not in markdown
+    assert "Reliable prose after the table." in markdown
+    assert "__parsezen_resources__/pdf/page-0001-image-01.jpg" in markdown
+    assert any("asociación o grafía" in issue.message for issue in issues)
+
+
+def test_final_sparse_raster_uses_the_preserved_back_cover_as_authority() -> None:
+    page = pdf_conversion_module._PdfPage(
+        number=704,
+        lines=(),
+        has_images=True,
+        image_area_ratios=(1.0,),
+        has_table=False,
+        image_orientation_mismatch=False,
+    )
+    resource = pdf_conversion_module.PdfEmbeddedResource(
+        pdf_conversion_module.PurePosixPath("pdf/page-0704-image-01.jpg"),
+        b"back cover",
+        "image/jpeg",
+        704,
+        (0, 0, 600, 800),
+        True,
+    )
+
+    markdown, _issues = pdf_conversion_module._render_document(
+        [page],
+        body_size=12,
+        heading_sizes={},
+        repeated_margins=set(),
+        referenced_pages=set(),
+        ocr_pages={704: "A long but uncertain OCR rendering of the back cover."},
+        ocr_failed_pages=set(),
+        page_images={704: (resource,)},
+    )
+
+    assert "uncertain OCR" not in markdown
+    assert "__parsezen_resources__/pdf/page-0704-image-01.jpg" in markdown
+
+
+def test_places_a_discrete_image_between_the_heading_and_following_body() -> None:
+    heading = replace(
+        _pdf_model_line(1, "ARIES I: THE AXE"),
+        x0=170,
+        x1=430,
+        top=50,
+        bottom=66,
+        font_size=16,
+        bold=True,
+    )
+    body = replace(
+        _pdf_model_line(1, "The body begins after the illustration."),
+        x0=64,
+        x1=400,
+        top=300,
+        bottom=312,
+    )
+    page = pdf_conversion_module._PdfPage(
+        number=1,
+        lines=(heading, body),
+        has_images=True,
+        image_area_ratios=(0.25,),
+        has_table=False,
+        image_orientation_mismatch=False,
+    )
+    resource = pdf_conversion_module.PdfEmbeddedResource(
+        pdf_conversion_module.PurePosixPath("pdf/page-0001-image-01.jpg"),
+        b"image",
+        "image/jpeg",
+        1,
+        (125, 100, 350, 250),
+    )
+
+    markdown, _issues = pdf_conversion_module._render_document(
+        [page],
+        body_size=12,
+        heading_sizes={16: 1},
+        repeated_margins=set(),
+        referenced_pages=set(),
+        ocr_pages={},
+        ocr_failed_pages=set(),
+        page_images={1: (resource,)},
+    )
+
+    image_marker = "![](<__parsezen_resources__/pdf/page-0001-image-01.jpg>)"
+    assert markdown.index("ARIES I: THE AXE") < markdown.index(image_marker)
+    assert markdown.index(image_marker) < markdown.index("The body begins")
+
+
+def test_places_a_discrete_image_immediately_before_its_confusable_figure_caption() -> None:
+    resource = pdf_conversion_module.PdfEmbeddedResource(
+        pdf_conversion_module.PurePosixPath("pdf/page-0338-image-01.jpg"),
+        b"image",
+        "image/jpeg",
+        338,
+        (58, 326, 199, 469),
+    )
+    right_column = replace(
+        _pdf_model_line(338, "Following prose in the right column."),
+        x0=207,
+        x1=348,
+        top=490,
+        bottom=499,
+    )
+    caption = replace(
+        _pdf_model_line(338, "FIGURE IO9. TWELFTH-HOUSE LORD"),
+        x0=54,
+        x1=176,
+        top=495,
+        bottom=501,
+        font_size=7,
+        bold=True,
+    )
+
+    insertions = pdf_conversion_module._page_image_insertions(
+        (resource,),
+        [right_column, caption],
+    )
+
+    assert insertions == [(1, resource)]
 
 
 def test_short_cover_title_remains_reflowable_text() -> None:
@@ -2490,6 +4609,307 @@ def test_never_joins_paragraphs_across_pdf_pages() -> None:
     )
 
     assert not pdf_conversion_module._should_join_lines(previous, current, 12, 24)
+
+
+def test_renders_a_visually_confirmed_numbered_sequence_as_one_ordered_list() -> None:
+    def line(text: str, top: float, *, x0: float = 90) -> pdf_conversion_module._PdfLine:
+        return replace(
+            _pdf_model_line(1, text),
+            x0=x0,
+            top=top,
+            bottom=top + 9,
+            font_size=9,
+        )
+
+    page = pdf_conversion_module._PdfPage(
+        number=1,
+        lines=(
+            line("SUMMARY OF IMPORTANT POINTS", 90, x0=140),
+            line("1. First point continues", 120),
+            line("on an indented second line.", 132, x0=105),
+            line("2. Second point continues", 150),
+            line("on another indented line.", 162, x0=105),
+            line("3. Third point is complete.", 180),
+        ),
+        has_images=False,
+        image_area_ratios=(),
+        has_table=False,
+        image_orientation_mismatch=False,
+    )
+
+    markdown, _issues = pdf_conversion_module._render_document(
+        [page],
+        body_size=9,
+        heading_sizes={},
+        repeated_margins=set(),
+        referenced_pages=set(),
+        ocr_pages={},
+        ocr_failed_pages=set(),
+    )
+
+    assert (
+        "1. First point continues on an indented second line.\n"
+        "2. Second point continues on another indented line.\n"
+        "3. Third point is complete."
+    ) in markdown
+
+
+def test_repairs_a_split_numbered_label_only_with_native_page_evidence() -> None:
+    def line(text: str, top: float, *, x0: float = 90) -> pdf_conversion_module._PdfLine:
+        return replace(
+            _pdf_model_line(1, text),
+            x0=x0,
+            top=top,
+            bottom=top + 9,
+            font_size=9,
+        )
+
+    page = pdf_conversion_module._PdfPage(
+        number=1,
+        lines=(
+            line("VISIBILITY AT THE HORIZON", 90, x0=150),
+            line("1. visibil it y: Record whether visibility is possible.", 120),
+            line("2. char iot : Check whether the planet is in its chariot.", 144),
+            line("3. hear t : Check whether it is in the heart of the Sun.", 168),
+        ),
+        has_images=False,
+        image_area_ratios=(),
+        has_table=False,
+        image_orientation_mismatch=False,
+    )
+
+    markdown, _issues = pdf_conversion_module._render_document(
+        [page],
+        body_size=9,
+        heading_sizes={},
+        repeated_margins=set(),
+        referenced_pages=set(),
+        ocr_pages={},
+        ocr_failed_pages=set(),
+    )
+
+    assert "1. visibility: Record whether visibility is possible." in markdown
+    assert "2. chariot: Check whether the planet is in its chariot." in markdown
+    assert "3. heart: Check whether it is in the heart of the Sun." in markdown
+
+
+def test_keeps_one_emphasis_span_across_a_numbered_item_wrap() -> None:
+    def line(
+        text: str,
+        top: float,
+        *,
+        x0: float = 90,
+        soft_hyphen_end: bool = False,
+    ) -> pdf_conversion_module._PdfLine:
+        return replace(
+            _pdf_model_line(1, text),
+            x0=x0,
+            top=top,
+            bottom=top + 9,
+            font_size=9,
+            italic=True,
+            soft_hyphen_end=soft_hyphen_end,
+        )
+
+    page = pdf_conversion_module._PdfPage(
+        number=1,
+        lines=(
+            line("1. A Hellenis", 120, soft_hyphen_end=True),
+            line("tic example continues.", 132, x0=105),
+            line("2. The second item is complete.", 156),
+            line("3. The third item is complete.", 180),
+        ),
+        has_images=False,
+        image_area_ratios=(),
+        has_table=False,
+        image_orientation_mismatch=False,
+    )
+
+    markdown, _issues = pdf_conversion_module._render_document(
+        [page],
+        body_size=9,
+        heading_sizes={},
+        repeated_margins=set(),
+        referenced_pages=set(),
+        ocr_pages={},
+        ocr_failed_pages=set(),
+    )
+
+    assert "1. *A Hellenistic example continues.*" in markdown
+    assert "Hellenis**tic" not in markdown
+
+
+@pytest.mark.parametrize(
+    ("font_name", "marker"),
+    (
+        ("Book-Italic", "*"),
+        ("Book-Bold", "**"),
+        ("Book-BoldItalic", "***"),
+    ),
+)
+def test_preserves_inline_source_emphasis_from_pdf_font_runs(
+    font_name: str,
+    marker: str,
+) -> None:
+    text = "These are the rulers of the nativity. They remain."
+    emphasized = "rulers of the nativity"
+    start = text.index(emphasized)
+    end = start + len(emphasized)
+    raw_characters: list[dict[str, object]] = []
+    x = 50.0
+    for index, character in enumerate(text):
+        if character.isspace():
+            x += 4
+            continue
+        raw_characters.append(
+            {
+                "text": character,
+                "x0": x,
+                "x1": x + 5,
+                "top": 100,
+                "bottom": 112,
+                "size": 10,
+                "upright": True,
+                "fontname": font_name if start <= index < end else "Book-Regular",
+            }
+        )
+        x += 5
+    line = pdf_conversion_module._build_line(
+        1,
+        600,
+        800,
+        {
+            "text": text,
+            "chars": raw_characters,
+            "x0": 50,
+            "x1": x,
+            "top": 100,
+            "bottom": 112,
+        },
+        (),
+    )
+
+    assert line is not None
+    assert pdf_conversion_module._apply_source_emphasis(line, line.text) == (
+        f"These are the {marker}{emphasized}{marker}. They remain."
+    )
+    normalized_later = replace(line, text=f"2. {line.text}")
+    assert (
+        pdf_conversion_module._apply_source_emphasis(
+            normalized_later,
+            normalized_later.text,
+        )
+        == f"2. These are the {marker}{emphasized}{marker}. They remain."
+    )
+
+
+def test_pdf_checkpoint_round_trips_and_validates_inline_emphasis_spans() -> None:
+    span = pdf_conversion_module._PdfEmphasisSpan("styled", False, True)
+    line = replace(
+        _pdf_model_line(1, "The styled phrase remains."),
+        emphasis_spans=(span,),
+    )
+    page = pdf_conversion_module._PdfPage(
+        number=1,
+        lines=(line,),
+        has_images=False,
+        image_area_ratios=(),
+        has_table=False,
+        image_orientation_mismatch=False,
+    )
+    payload = pdf_conversion_module._serialize_page_checkpoint(page)
+
+    assert pdf_conversion_module._deserialize_page_checkpoint(payload, 1) == page
+
+    invalid = json.loads(payload)
+    invalid["lines"][0]["emphasis_spans"] = [["", False, True]]
+    assert pdf_conversion_module._deserialize_page_checkpoint(json.dumps(invalid), 1) is None
+
+
+def test_does_not_expand_a_stale_inline_span_to_the_whole_line() -> None:
+    line = replace(
+        _pdf_model_line(1, "Normalized replacement text."),
+        italic=True,
+        emphasis_spans=(pdf_conversion_module._PdfEmphasisSpan("Previous wording", False, True),),
+    )
+
+    assert pdf_conversion_module._apply_source_emphasis(line, line.text) == line.text
+
+
+def test_renders_only_the_source_emphasized_part_of_a_toc_label() -> None:
+    line = replace(
+        _pdf_model_line(1, "1. Ancient Egypt: The Body of Nut 11"),
+        emphasis_spans=(pdf_conversion_module._PdfEmphasisSpan("The Body of Nut", False, True),),
+    )
+    block = pdf_conversion_module._MarkdownBlock(
+        "toc-entry",
+        "1. Ancient Egypt: The Body of Nut",
+        1,
+        source_line=line,
+        toc_folio="11",
+    )
+
+    rendered = pdf_conversion_module._toc_entries_html([block])
+
+    assert "1. Ancient Egypt: <em>The Body of Nut</em>" in rendered
+    assert "<em>1. Ancient Egypt" not in rendered
+
+
+def test_joins_an_inline_emphasis_span_across_a_hyphenated_line_wrap() -> None:
+    previous = replace(
+        _pdf_model_line(1, "The Master (Oikodes-"),
+        hard_hyphen_end=True,
+    )
+    following = _pdf_model_line(1, "potes) remains.")
+
+    assert (
+        pdf_conversion_module._join_line_text(
+            "The Master *(Oikodes-*",
+            "*potes)* remains.",
+            previous,
+            following,
+        )
+        == "The Master *(Oikodespotes)* remains."
+    )
+
+
+def test_does_not_join_a_soft_hyphen_across_two_text_columns() -> None:
+    previous = replace(
+        _pdf_model_line(1, "The Moon is the lord (Can"),
+        x0=54,
+        x1=196,
+        top=519,
+        bottom=528,
+        soft_hyphen_end=True,
+    )
+    other_column = replace(
+        _pdf_model_line(1, "of its own good fortune"),
+        x0=207,
+        x1=348,
+        top=311,
+        bottom=320,
+    )
+    same_column = replace(
+        _pdf_model_line(1, "cer), placed in Taurus"),
+        x0=54,
+        x1=195,
+        top=530,
+        bottom=539,
+    )
+
+    assert not pdf_conversion_module._should_join_lines(previous, other_column, 9, -217)
+    assert pdf_conversion_module._should_join_lines(previous, same_column, 9, 2)
+
+
+def test_leaves_distant_or_incomplete_numbered_paragraphs_outside_lists() -> None:
+    lines = [
+        replace(_pdf_model_line(1, "1. An isolated numbered paragraph."), top=100),
+        replace(_pdf_model_line(1, "Ordinary prose separates the sections."), top=220),
+        replace(_pdf_model_line(1, "2. A distant numbered paragraph."), top=340),
+        replace(_pdf_model_line(1, "2024. A publication year is not an ordinal."), top=460),
+    ]
+
+    assert pdf_conversion_module._ordered_list_item_indexes(lines, 12) == set()
 
 
 def test_pdf_link_without_visible_text_is_kept_outside_the_paragraph() -> None:
@@ -3147,6 +5567,28 @@ def test_visual_disagreement_prioritizes_a_rare_ligature() -> None:
     assert priority >= 115
 
 
+def test_visual_disagreement_prioritizes_mixed_case_and_diacritic_tokens() -> None:
+    mixed = pdf_conversion_module._visual_disagreement_priority(
+        "waxing xMoon",
+        "waxing Moon",
+        0.95,
+    )
+    diacritic = pdf_conversion_module._visual_disagreement_priority(
+        "Sunaphê",
+        "Sunaphe",
+        0.95,
+    )
+    accepted_third_reading = pdf_conversion_module._validated_visual_reading(
+        "Sunaphê",
+        "Sunaphe",
+        "Sunaphē",
+    )
+
+    assert mixed is not None and mixed >= 120
+    assert diacritic is not None and diacritic >= 108
+    assert accepted_third_reading == "Sunaphē"
+
+
 def test_visual_disagreement_prioritizes_an_alphanumeric_toc_number() -> None:
     similarity = pdf_conversion_module.SequenceMatcher(
         None,
@@ -3298,6 +5740,115 @@ def test_visual_disagreement_keeps_a_number_from_an_ocr_table_cell() -> None:
     assert disagreements[0].ocr_text == "68. THE FIFTH HOUSE"
 
 
+def test_visual_disagreement_can_reconcile_tokens_from_interleaved_columns() -> None:
+    candidate = pdf_conversion_module._token_reconciled_visual_candidate(
+        "A rare epikataphoray reading",
+        (
+            "unrelated left-column words epikataphora right-column words",
+            "a repeated ordinary reading",
+        ),
+    )
+
+    assert candidate == "A rare epikataphora reading"
+
+
+def test_visual_replacement_updates_the_matching_structured_table_cell() -> None:
+    line = pdf_conversion_module._PdfLine(
+        page_number=8,
+        page_width=600,
+        page_height=800,
+        text="A rare epikataphoray reading",
+        chars=(),
+        x0=320,
+        x1=520,
+        top=180,
+        bottom=194,
+        font_size=12,
+        bold=False,
+        links=(),
+        soft_hyphen_end=False,
+        hard_hyphen_end=False,
+        rotated=False,
+    )
+    table = pdf_conversion_module._PdfTable(
+        (60, 100, 540, 300),
+        (
+            ("Label", "Value"),
+            ("Case", "A rare epikataphoray reading"),
+        ),
+        pdf_conversion_module._TableRendering.HTML,
+        inferred_from_raster=True,
+    )
+    page = pdf_conversion_module._PdfPage(
+        8,
+        (line,),
+        has_images=True,
+        image_area_ratios=(1.0,),
+        has_table=True,
+        image_orientation_mismatch=False,
+        tables=(table,),
+    )
+
+    updated = pdf_conversion_module._apply_page_text_replacements(
+        page,
+        {
+            pdf_conversion_module._visual_line_key(line): "A rare epikataphora reading",
+        },
+    )
+
+    assert updated.lines[0].text == "A rare epikataphora reading"
+    assert updated.tables[0].rows[1][1] == "A rare epikataphora reading"
+
+
+def test_visual_replacement_updates_one_unique_atom_in_a_longer_table_cell() -> None:
+    line = pdf_conversion_module._PdfLine(
+        page_number=8,
+        page_width=600,
+        page_height=800,
+        text="A rare epikataphoray reading",
+        chars=(),
+        x0=320,
+        x1=520,
+        top=180,
+        bottom=194,
+        font_size=12,
+        bold=False,
+        links=(),
+        soft_hyphen_end=False,
+        hard_hyphen_end=False,
+        rotated=False,
+    )
+    table = pdf_conversion_module._PdfTable(
+        (60, 100, 540, 300),
+        (
+            ("Label", "Value"),
+            ("Case", "Earlier context and an epikataphoray reading\nwith a continuation"),
+        ),
+        pdf_conversion_module._TableRendering.HTML,
+        inferred_from_raster=True,
+    )
+    page = pdf_conversion_module._PdfPage(
+        8,
+        (line,),
+        has_images=True,
+        image_area_ratios=(1.0,),
+        has_table=True,
+        image_orientation_mismatch=False,
+        tables=(table,),
+    )
+
+    updated = pdf_conversion_module._apply_page_text_replacements(
+        page,
+        {
+            pdf_conversion_module._visual_line_key(line): "A rare epikataphora reading",
+        },
+    )
+
+    assert updated.tables[0].rows[1][1] == (
+        "Earlier context and an epikataphora reading\nwith a continuation"
+    )
+
+
 def test_hidden_text_budget_selects_scanned_contents_but_not_ordinary_prose() -> None:
     def page(number: int, lines: tuple[pdf_conversion_module._PdfLine, ...]):
         return pdf_conversion_module._PdfPage(
@@ -3402,8 +5953,8 @@ def test_secondary_native_engine_can_confirm_one_ocr_spelling() -> None:
     page = pdf_conversion_module._PdfPage(
         1,
         (line,),
-        has_images=True,
-        image_area_ratios=(1.0,),
+        has_images=False,
+        image_area_ratios=(),
         has_table=False,
         image_orientation_mismatch=False,
     )
@@ -3416,6 +5967,594 @@ def test_secondary_native_engine_can_confirm_one_ocr_spelling() -> None:
 
     assert changes == 1
     assert reconciled[0].lines[0].text == "The Horimaea 1135"
+
+
+def test_geometry_aligned_secondary_engine_can_confirm_one_ocr_spelling() -> None:
+    line = _pdf_model_line(1, "The Horimiea 1135")
+    page = pdf_conversion_module._PdfPage(
+        1,
+        (line,),
+        has_images=False,
+        image_area_ratios=(),
+        has_table=False,
+        image_orientation_mismatch=False,
+    )
+
+    reconciled, changes = pdf_conversion_module._reconcile_secondary_native_text_lines(
+        [page],
+        {1: "The Horimæa 1135"},
+        {pdf_conversion_module._visual_line_key(line): "The Horimæa 1135"},
+    )
+
+    assert changes == 1
+    assert reconciled[0].lines[0].text == "The Horimæa 1135"
+
+
+def test_geometry_aligned_secondary_engine_rejects_a_third_reading() -> None:
+    line = _pdf_model_line(1, "The Horimiea 1135")
+    page = pdf_conversion_module._PdfPage(
+        1,
+        (line,),
+        has_images=False,
+        image_area_ratios=(),
+        has_table=False,
+        image_orientation_mismatch=False,
+    )
+
+    reconciled, changes = pdf_conversion_module._reconcile_secondary_native_text_lines(
+        [page],
+        {1: "The Horimæa 1135"},
+        {pdf_conversion_module._visual_line_key(line): "The Horimiea 1135"},
+    )
+
+    assert changes == 0
+    assert reconciled == [page]
+
+
+def test_secondary_native_repairs_a_broken_dollar_font_mapping_before_ocr() -> None:
+    first = _pdf_model_line(1, "$Que ocurre ahora en este ejemplo?")
+    second = replace(
+        _pdf_model_line(1, "La $atencion conserva 2026 intacto."),
+        top=140,
+        bottom=152,
+    )
+    page = pdf_conversion_module._PdfPage(
+        1,
+        (first, second),
+        has_images=False,
+        image_area_ratios=(),
+        has_table=False,
+        image_orientation_mismatch=False,
+    )
+
+    reconciled, changes = pdf_conversion_module._reconcile_secondary_dollar_glyphs(
+        [page],
+        {1: "¿Qué ocurre ahora en este ejemplo?\nLa atención conserva 2026 intacto."},
+    )
+
+    assert changes == 2
+    assert reconciled[0].lines[0].text == "¿Qué ocurre ahora en este ejemplo?"
+    assert reconciled[0].lines[1].text == "La atención conserva 2026 intacto."
+
+
+def test_secondary_native_rejects_ambiguous_dollar_font_readings() -> None:
+    line = _pdf_model_line(1, "$Como sigue")
+    page = pdf_conversion_module._PdfPage(
+        1,
+        (line,),
+        has_images=False,
+        image_area_ratios=(),
+        has_table=False,
+        image_orientation_mismatch=False,
+    )
+
+    reconciled, changes = pdf_conversion_module._reconcile_secondary_dollar_glyphs(
+        [page],
+        {1: "¿Cómo sigue\n¡Cómo sigue"},
+    )
+
+    assert changes == 0
+    assert reconciled == [page]
+
+
+def test_secondary_native_keeps_native_heading_capitalization() -> None:
+    line = _pdf_model_line(1, "$QUE OCURRE EN ESTE EJEMPLO")
+    page = pdf_conversion_module._PdfPage(
+        1,
+        (line,),
+        has_images=False,
+        image_area_ratios=(),
+        has_table=False,
+        image_orientation_mismatch=False,
+    )
+
+    reconciled, changes = pdf_conversion_module._reconcile_secondary_dollar_glyphs(
+        [page],
+        {1: "¿Qué ocurre en este ejemplo"},
+    )
+
+    assert changes == 1
+    assert reconciled[0].lines[0].text == "¿QUÉ OCURRE EN ESTE EJEMPLO"
+
+
+def test_geometry_aligned_secondary_line_repairs_a_grouped_font_glyph() -> None:
+    line = _pdf_model_line(1, "La $atencion conserva 2026 intacto.")
+    page = pdf_conversion_module._PdfPage(
+        1,
+        (line,),
+        has_images=False,
+        image_area_ratios=(),
+        has_table=False,
+        image_orientation_mismatch=False,
+    )
+
+    reconciled, changes = pdf_conversion_module._reconcile_secondary_dollar_glyph_lines(
+        [page],
+        {pdf_conversion_module._visual_line_key(line): "La atención conserva 2026 intacto."},
+    )
+
+    assert changes == 1
+    assert reconciled[0].lines[0].text == "La atención conserva 2026 intacto."
+
+
+def test_geometry_aligned_secondary_line_rejects_changed_words_or_numbers() -> None:
+    line = _pdf_model_line(1, "La $atencion conserva 2026 intacto.")
+    page = pdf_conversion_module._PdfPage(
+        1,
+        (line,),
+        has_images=False,
+        image_area_ratios=(),
+        has_table=False,
+        image_orientation_mismatch=False,
+    )
+
+    reconciled, changes = pdf_conversion_module._reconcile_secondary_dollar_glyph_lines(
+        [page],
+        {pdf_conversion_module._visual_line_key(line): "La edición conserva 2027 intacto."},
+    )
+
+    assert changes == 0
+    assert reconciled == [page]
+
+
+@pytest.mark.parametrize(
+    ("native", "secondary"),
+    (
+        ("THE RESULT WILLK ARRIVE", "THE RESULT WILL ARRIVE"),
+        ("Service to EKI remains.", "Service to Él remains."),
+        ("La cancion continúa.", "La canción continúa."),
+    ),
+)
+def test_systemic_secondary_native_repairs_bounded_font_damage(
+    native: str,
+    secondary: str,
+) -> None:
+    line = _pdf_model_line(1, native)
+    page = pdf_conversion_module._PdfPage(
+        1,
+        (line,),
+        has_images=False,
+        image_area_ratios=(),
+        has_table=False,
+        image_orientation_mismatch=False,
+    )
+
+    reconciled, changes = pdf_conversion_module._reconcile_systemic_secondary_native_lines(
+        [page],
+        {pdf_conversion_module._visual_line_key(line): secondary},
+    )
+
+    assert changes == 1
+    assert reconciled[0].lines[0].text == secondary
+
+
+def test_systemic_secondary_native_does_not_import_pdfium_word_splitting() -> None:
+    line = _pdf_model_line(1, "The service remains correctly spaced.")
+    page = pdf_conversion_module._PdfPage(
+        1,
+        (line,),
+        has_images=False,
+        image_area_ratios=(),
+        has_table=False,
+        image_orientation_mismatch=False,
+    )
+
+    reconciled, changes = pdf_conversion_module._reconcile_systemic_secondary_native_lines(
+        [page],
+        {pdf_conversion_module._visual_line_key(line): ("The ser vice remains cor rectly spaced.")},
+    )
+
+    assert changes == 0
+    assert reconciled == [page]
+
+
+def test_systemic_secondary_native_joins_only_a_repeated_pdfium_word() -> None:
+    first = _pdf_model_line(1, "The sacer dotisa returns.")
+    second = replace(
+        _pdf_model_line(1, "Another sacerdotisa appears."),
+        top=140,
+        bottom=152,
+    )
+    page = pdf_conversion_module._PdfPage(
+        1,
+        (first, second),
+        has_images=False,
+        image_area_ratios=(),
+        has_table=False,
+        image_orientation_mismatch=False,
+    )
+
+    reconciled, changes = pdf_conversion_module._reconcile_systemic_secondary_native_lines(
+        [page],
+        {
+            pdf_conversion_module._visual_line_key(first): "The sacerdotisa returns.",
+            pdf_conversion_module._visual_line_key(second): "Another sacerdotisa appears.",
+        },
+    )
+
+    assert changes == 1
+    assert reconciled[0].lines[0].text == "The sacerdotisa returns."
+    assert reconciled[0].lines[1].text == second.text
+
+
+@pytest.mark.parametrize(
+    "secondary",
+    (
+        "The altered sentence keeps 2026.",
+        "The original sentence keeps 2027.",
+        "The original sentence omits content.",
+    ),
+)
+def test_systemic_secondary_native_rejects_content_or_number_changes(
+    secondary: str,
+) -> None:
+    line = _pdf_model_line(1, "The original sentence keeps 2026 intact.")
+    page = pdf_conversion_module._PdfPage(
+        1,
+        (line,),
+        has_images=False,
+        image_area_ratios=(),
+        has_table=False,
+        image_orientation_mismatch=False,
+    )
+
+    reconciled, changes = pdf_conversion_module._reconcile_systemic_secondary_native_lines(
+        [page],
+        {pdf_conversion_module._visual_line_key(line): secondary},
+    )
+
+    assert changes == 0
+    assert reconciled == [page]
+
+
+def test_pdf_outline_repairs_and_promotes_a_matching_broken_heading() -> None:
+    line = replace(
+        _pdf_model_line(8, "$QUE OCURRE AHORA"),
+        top=100,
+        bottom=118,
+        font_size=14,
+        bold=True,
+    )
+    page = pdf_conversion_module._PdfPage(
+        8,
+        (line,),
+        has_images=False,
+        image_area_ratios=(),
+        has_table=False,
+        image_orientation_mismatch=False,
+    )
+
+    reconciled, changes = pdf_conversion_module._reconcile_pdf_outline_headings(
+        [page],
+        (pdf_conversion_module._PdfOutlineEntry(1, "¿QUÉ OCURRE AHORA?", 8),),
+    )
+
+    assert changes == 1
+    assert reconciled[0].lines[0].text == "¿QUÉ OCURRE AHORA?"
+    assert reconciled[0].lines[0].outline_level == 2
+    assert (
+        pdf_conversion_module._heading_level(
+            reconciled[0].lines[0],
+            body_size=12,
+            heading_sizes={},
+            gap_before=24,
+            toc_page=False,
+        )
+        == 2
+    )
+
+
+def test_pdf_outline_heading_carries_private_navigation_evidence() -> None:
+    line = replace(
+        _pdf_model_line(8, "Confirmed section"),
+        outline_level=3,
+    )
+    blocks: list[pdf_conversion_module._MarkdownBlock] = []
+
+    pdf_conversion_module._append_heading(blocks, line, 3, 24)
+    markdown = pdf_conversion_module._blocks_to_markdown(blocks)
+
+    assert markdown == ("<!-- PZDOC PDF OUTLINE 3 -->\n\n### Confirmed section")
+    assert pdf_conversion_module.strip_pdf_page_markers(markdown) == markdown
+    assert pdf_conversion_module.strip_pdf_public_markers(markdown) == ("\n\n### Confirmed section")
+
+
+def test_pdf_outline_joins_a_uniquely_matching_multiline_heading() -> None:
+    first = replace(_pdf_model_line(12, "A LONG CHAPTER"), top=100, bottom=118)
+    second = replace(_pdf_model_line(12, "HEADING"), top=120, bottom=138)
+    page = pdf_conversion_module._PdfPage(
+        12,
+        (first, second),
+        has_images=False,
+        image_area_ratios=(),
+        has_table=False,
+        image_orientation_mismatch=False,
+    )
+
+    reconciled, changes = pdf_conversion_module._reconcile_pdf_outline_headings(
+        [page],
+        (pdf_conversion_module._PdfOutlineEntry(2, "A Long Chapter Heading", 12),),
+    )
+
+    assert changes == 1
+    assert len(reconciled[0].lines) == 1
+    assert reconciled[0].lines[0].text == "A Long Chapter Heading"
+    assert reconciled[0].lines[0].outline_level == 3
+
+
+def test_pdf_outline_rejects_an_ambiguous_or_numerically_changed_match() -> None:
+    first = _pdf_model_line(12, "Chapter 2 Overview")
+    second = replace(first, top=140, bottom=152)
+    page = pdf_conversion_module._PdfPage(
+        12,
+        (first, second),
+        has_images=False,
+        image_area_ratios=(),
+        has_table=False,
+        image_orientation_mismatch=False,
+    )
+
+    reconciled, changes = pdf_conversion_module._reconcile_pdf_outline_headings(
+        [page],
+        (
+            pdf_conversion_module._PdfOutlineEntry(1, "Chapter 2 Overview", 12),
+            pdf_conversion_module._PdfOutlineEntry(1, "Chapter 3 Overview", 12),
+        ),
+    )
+
+    assert changes == 0
+    assert reconciled == [page]
+
+
+@pytest.mark.parametrize(
+    ("native_token", "consensus_token"),
+    (
+        ("epikataphoray", "epikataphora"),
+        ("Sunaphê", "Sunaphē"),
+        ("xMoon", "Moon"),
+    ),
+)
+def test_document_consensus_repairs_one_ocr_token_confirmed_elsewhere(
+    native_token: str,
+    consensus_token: str,
+) -> None:
+    target = _pdf_model_line(1, f"A rare {native_token} reading")
+    donor = _pdf_model_line(2, f"Another {consensus_token} source")
+    table = pdf_conversion_module._PdfTable(
+        (60, 80, 560, 220),
+        (("Label", "Value"), ("Case", target.text)),
+        pdf_conversion_module._TableRendering.HTML,
+        inferred_from_raster=True,
+    )
+    pages = [
+        pdf_conversion_module._PdfPage(
+            1,
+            (target,),
+            has_images=True,
+            image_area_ratios=(1.0,),
+            has_table=True,
+            image_orientation_mismatch=False,
+            tables=(table,),
+        ),
+        pdf_conversion_module._PdfPage(
+            2,
+            (donor,),
+            has_images=False,
+            image_area_ratios=(),
+            has_table=False,
+            image_orientation_mismatch=False,
+        ),
+    ]
+
+    reconciled, changes = pdf_conversion_module._reconcile_document_token_consensus(
+        pages,
+        {
+            1: f"A rare {consensus_token} reading",
+            2: f"Another {consensus_token} source",
+        },
+    )
+
+    assert changes == 1
+    assert reconciled[0].lines[0].text == f"A rare {consensus_token} reading"
+    assert reconciled[0].tables[0].rows[1][1] == f"A rare {consensus_token} reading"
+
+
+def test_document_consensus_rejects_an_ocr_only_spelling() -> None:
+    line = _pdf_model_line(1, "A rare epikataphoray reading")
+    page = pdf_conversion_module._PdfPage(
+        1,
+        (line,),
+        has_images=True,
+        image_area_ratios=(1.0,),
+        has_table=False,
+        image_orientation_mismatch=False,
+    )
+
+    reconciled, changes = pdf_conversion_module._reconcile_document_token_consensus(
+        [page],
+        {1: "A rare epikataphora reading"},
+    )
+
+    assert changes == 0
+    assert reconciled == [page]
+
+
+def test_document_consensus_does_not_remove_a_diacritic() -> None:
+    target = _pdf_model_line(1, "A succèdent place")
+    donor = _pdf_model_line(2, "Another succedent place")
+    pages = [
+        pdf_conversion_module._PdfPage(
+            1,
+            (target,),
+            has_images=True,
+            image_area_ratios=(1.0,),
+            has_table=False,
+            image_orientation_mismatch=False,
+        ),
+        pdf_conversion_module._PdfPage(
+            2,
+            (donor,),
+            has_images=False,
+            image_area_ratios=(),
+            has_table=False,
+            image_orientation_mismatch=False,
+        ),
+    ]
+
+    reconciled, changes = pdf_conversion_module._reconcile_document_token_consensus(
+        pages,
+        {1: "A succedent place", 2: "Another succedent place"},
+    )
+
+    assert changes == 0
+    assert reconciled == pages
+
+
+def test_document_consensus_does_not_normalize_an_internal_capital() -> None:
+    target = _pdf_model_line(1, "A printed worlD form")
+    donor = _pdf_model_line(2, "An ordinary world form")
+    pages = [
+        pdf_conversion_module._PdfPage(
+            1,
+            (target,),
+            has_images=True,
+            image_area_ratios=(1.0,),
+            has_table=False,
+            image_orientation_mismatch=False,
+        ),
+        pdf_conversion_module._PdfPage(
+            2,
+            (donor,),
+            has_images=False,
+            image_area_ratios=(),
+            has_table=False,
+            image_orientation_mismatch=False,
+        ),
+    ]
+
+    reconciled, changes = pdf_conversion_module._reconcile_document_token_consensus(
+        pages,
+        {1: "A printed world form", 2: "An ordinary world form"},
+    )
+
+    assert changes == 0
+    assert reconciled == pages
+
+
+def test_numeric_glyph_consensus_repairs_only_values_confirmed_by_aligned_ocr() -> None:
+    line = _pdf_model_line(1, "Degrees 6o and folio 3OI")
+    page = pdf_conversion_module._PdfPage(
+        1,
+        (line,),
+        has_images=True,
+        image_area_ratios=(1.0,),
+        has_table=False,
+        image_orientation_mismatch=False,
+    )
+
+    reconciled, changes = pdf_conversion_module._reconcile_suspicious_numbers_from_ocr(
+        [page],
+        {1: "Degrees 60 and folio 301"},
+    )
+
+    assert changes == 1
+    assert reconciled[0].lines[0].text == "Degrees 60 and folio 301"
+
+
+def test_numeric_glyph_consensus_keeps_an_unconfirmed_identifier() -> None:
+    line = _pdf_model_line(1, "Reference A1O7")
+    page = pdf_conversion_module._PdfPage(
+        1,
+        (line,),
+        has_images=False,
+        image_area_ratios=(),
+        has_table=False,
+        image_orientation_mismatch=False,
+    )
+
+    reconciled, changes = pdf_conversion_module._reconcile_suspicious_numbers_from_ocr(
+        [page],
+        {1: "Reference A107"},
+    )
+
+    assert changes == 0
+    assert reconciled == [page]
+
+
+def test_repeated_non_currency_dollar_glyphs_trigger_local_ocr() -> None:
+    line = _pdf_model_line(1, "Broken punctuation ”$ and quote $word remains")
+    page = pdf_conversion_module._PdfPage(
+        1,
+        (line,),
+        has_images=False,
+        image_area_ratios=(),
+        has_table=False,
+        image_orientation_mismatch=False,
+    )
+
+    assert pdf_conversion_module._has_suspicious_glyph_encoding(page)
+
+
+def test_one_unresolved_non_currency_dollar_glyph_triggers_local_ocr() -> None:
+    line = _pdf_model_line(1, "One isolated $word remains unresolved")
+    page = pdf_conversion_module._PdfPage(
+        1,
+        (line,),
+        has_images=False,
+        image_area_ratios=(),
+        has_table=False,
+        image_orientation_mismatch=False,
+    )
+
+    assert pdf_conversion_module._has_suspicious_glyph_encoding(page)
+
+
+def test_one_dollar_font_glyph_does_not_replace_an_otherwise_useful_native_page() -> None:
+    lines = tuple(
+        replace(
+            _pdf_model_line(
+                1,
+                (
+                    "This useful native paragraph remains authoritative even when "
+                    f"one {'$' if index == 0 else ''}word is unresolved in line {index}."
+                ),
+            ),
+            top=100 + index * 24,
+            bottom=112 + index * 24,
+        )
+        for index in range(4)
+    )
+    page = pdf_conversion_module._PdfPage(
+        1,
+        lines,
+        has_images=False,
+        image_area_ratios=(),
+        has_table=False,
+        image_orientation_mismatch=False,
+    )
+    ocr = "\n".join(line.text.replace("$", "") for line in lines)
+
+    assert not pdf_conversion_module._should_replace_with_ocr(page, ocr)
 
 
 def test_pdf_nests_explicit_chapters_under_a_container_only_with_two_siblings() -> None:
@@ -3445,6 +6584,67 @@ def test_pdf_leaves_an_ambiguous_container_flat() -> None:
     ]
 
     assert pdf_conversion_module._blocks_to_markdown(blocks) == "#### Parte I\n\n##### Chapter 1"
+
+
+def test_pdf_demotes_a_merged_multisentence_heading_and_rejoins_its_continuation() -> None:
+    previous_line = replace(
+        _pdf_model_line(1, "continues into"),
+        top=180,
+        bottom=194,
+    )
+    current_line = replace(
+        _pdf_model_line(1, "the final clause."),
+        top=196,
+        bottom=210,
+    )
+    false_heading = (
+        "This is ordinary prose that was assigned a misleading local font size. "
+        "It contains several complete sentences and enough explanatory detail to be a paragraph. "
+        "A third sentence makes the classification unambiguous while the last line continues into"
+    )
+    blocks = [
+        pdf_conversion_module._MarkdownBlock(
+            "heading",
+            false_heading,
+            1,
+            level=1,
+            source_line=previous_line,
+        ),
+        pdf_conversion_module._MarkdownBlock(
+            "paragraph",
+            "the final clause.",
+            1,
+            source_line=current_line,
+        ),
+    ]
+
+    markdown = pdf_conversion_module._blocks_to_markdown(blocks)
+
+    assert not markdown.startswith("#")
+    assert "\n\n" not in markdown
+    assert markdown.endswith("continues into the final clause.")
+
+
+def test_pdf_keeps_a_long_single_phrase_heading_structural() -> None:
+    title = " ".join(["Extended"] * 40)
+    blocks = [pdf_conversion_module._MarkdownBlock("heading", title, 1, level=2)]
+
+    assert pdf_conversion_module._blocks_to_markdown(blocks) == f"## {title}"
+
+
+@pytest.mark.parametrize(
+    "sentence",
+    [
+        "Part One contains some traditional lists that were taught by the Buddha",
+        "Chapter one, ‘The Three Trainings’, introduces morality and concentration",
+        "Part Three, so I will give it a short treatment here",
+        "Part One. An old dhamma friend explained the method to me",
+    ],
+)
+def test_pdf_demotes_prose_that_only_begins_like_a_numbered_heading(sentence: str) -> None:
+    blocks = [pdf_conversion_module._MarkdownBlock("heading", sentence, 1, level=2)]
+
+    assert pdf_conversion_module._blocks_to_markdown(blocks) == sentence
 
 
 def test_repairs_a_hyphenated_word_across_a_pdf_page_marker() -> None:
@@ -3526,6 +6726,51 @@ def test_repairs_a_hyphenated_word_split_across_false_heading_blocks() -> None:
 
     assert pdf_conversion_module._blocks_to_markdown(blocks) == (
         "Knowledge despertarte in time and **atrapado in a dream.** More text."
+    )
+
+
+def test_does_not_merge_a_complete_heading_after_hyphenated_prose() -> None:
+    def line(
+        text: str, *, hard_hyphen_end: bool, bold: bool = False
+    ) -> pdf_conversion_module._PdfLine:
+        return pdf_conversion_module._PdfLine(
+            page_number=1,
+            page_width=600,
+            page_height=800,
+            text=text,
+            chars=(),
+            x0=72,
+            x1=500,
+            top=200,
+            bottom=214,
+            font_size=12,
+            bold=bold,
+            links=(),
+            soft_hyphen_end=False,
+            hard_hyphen_end=hard_hyphen_end,
+            rotated=False,
+        )
+
+    paragraph = line("Previous prose ends with a hyphen-", hard_hyphen_end=True)
+    heading = line("complete chapter heading", hard_hyphen_end=False, bold=True)
+    blocks = [
+        pdf_conversion_module._MarkdownBlock(
+            "paragraph",
+            "Previous prose ends with a hyphen-",
+            1,
+            source_line=paragraph,
+        ),
+        pdf_conversion_module._MarkdownBlock(
+            "heading",
+            "complete chapter heading",
+            1,
+            level=2,
+            source_line=heading,
+        ),
+    ]
+
+    assert pdf_conversion_module._blocks_to_markdown(blocks) == (
+        "Previous prose ends with a hyphen-\n\n## complete chapter heading"
     )
 
 
@@ -3766,6 +7011,96 @@ def _write_short_raster_ruled_table_pdf(destination: Path) -> None:
         ),
         image,
         b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+        _stream("\n".join(operations).encode("latin-1")),
+    ]
+    _write_pdf(destination, objects)
+
+
+def _write_open_raster_table_pdf(destination: Path, *, layout: str) -> None:
+    width, height = 600, 800
+    pixels = bytearray(b"\xff" * (width * height))
+    matrix_layout = layout in {"matrix", "matrix_visual_placeholders"}
+    rule_tops = (100, 170, 700) if matrix_layout else (100, 700)
+    for top in rule_tops:
+        for y in (top, top + 1):
+            pixels[y * width + 115 : y * width + 485] = b"\x00" * 370
+    if layout == "matrix_visual_placeholders":
+        for baseline in (590, 470, 350, 230):
+            top = height - baseline - 5
+            for x in (170, 220):
+                for y in (top, top + 1):
+                    pixels[y * width + x : y * width + x + 12] = b"\x00" * 12
+    compressed = zlib.compress(bytes(pixels), level=9)
+    image = (
+        (
+            f"<< /Type /XObject /Subtype /Image /Width {width} /Height {height} "
+            f"/ColorSpace /DeviceGray /BitsPerComponent 8 /Filter /FlateDecode "
+            f"/Length {len(compressed)} >>\nstream\n"
+        ).encode("ascii")
+        + compressed
+        + b"\nendstream"
+    )
+    if matrix_layout:
+        first_column_x = 120
+        text_cells = (
+            (665, first_column_x, "KEY", "F2"),
+            (665, 170, "SUN", "F2"),
+            (665, 220, "MOON", "F2"),
+            (665, 270, "MARS", "F2"),
+            (650, first_column_x, "KIND", "F2"),
+            (650, 170, "FIRE", "F2"),
+            (650, 220, "WATR", "F2"),
+            (650, 270, "AIR", "F2"),
+            (590, first_column_x, "C1", "F1"),
+            (590, 170, "-", "F1"),
+            (590, 220, "-", "F1"),
+            (585, 330, "Hit", "F1"),
+            (470, first_column_x, "C2", "F1"),
+            (470, 170, "-", "F1"),
+            (470, 220, "-", "F1"),
+            (465, 330, "Hit", "F1"),
+            (350, first_column_x, "C3", "F1"),
+            (350, 170, "-", "F1"),
+            (350, 220, "-", "F1"),
+            (345, 330, "Hit", "F1"),
+            (230, first_column_x, "C4", "F1"),
+            (230, 170, "-", "F1"),
+            (230, 220, "-", "F1"),
+            (225, 330, "Hit", "F1"),
+        )
+        if layout == "matrix_visual_placeholders":
+            text_cells = tuple(cell for cell in text_cells if cell[2] != "-")
+    else:
+        labels = layout == "labels"
+        text_cells = (
+            (670, 125, "Authors" if labels else "First section", "F2" if labels else "F1"),
+            (670, 330, "Significations" if labels else "Parallel prose", "F2" if labels else "F1"),
+            (590, 125, "HERMES" if labels else "Second section", "F1"),
+            (575, 125, "Egypt" if labels else "ordinary continuation", "F1"),
+            (575, 310, "E" if labels else "x", "F1"),
+            (590, 330, "Life and livelihood", "F1"),
+            (520, 330, "continues below" if labels else "parallel continuation", "F1"),
+            (470, 125, "THRASYLLUS" if labels else "Third section", "F1"),
+            (455, 125, "Alexandria" if labels else "ordinary continuation", "F1"),
+            (470, 330, "Fortune and death", "F1"),
+            (350, 125, "VALENS" if labels else "Fourth section", "F1"),
+            (335, 125, "Antioch" if labels else "ordinary continuation", "F1"),
+            (350, 330, "Benefits and lawsuits", "F1"),
+        )
+    operations = [f"q\n{width} 0 0 {height} 0 0 cm\n/Im1 Do\nQ"]
+    for y, x, value, font in text_cells:
+        operations.append(f"BT\n/{font} 11 Tf\n{x} {y} Td\n({value}) Tj\nET")
+    objects = [
+        b"<< /Type /Catalog /Pages 2 0 R >>",
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        (
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 600 800] "
+            b"/Resources << /XObject << /Im1 4 0 R >> "
+            b"/Font << /F1 5 0 R /F2 6 0 R >> >> /Contents 7 0 R >>"
+        ),
+        image,
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold >>",
         _stream("\n".join(operations).encode("latin-1")),
     ]
     _write_pdf(destination, objects)

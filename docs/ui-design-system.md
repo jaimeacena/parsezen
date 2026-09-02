@@ -27,7 +27,7 @@ ParsezenMainWindow
 └── ParsezenWorkspace
     ├── cola de documentos + destino + acción contextual
     ├── página de configuración: Resultado / Traducción / Revisión / PDF
-    ├── IA local y modelos
+    ├── componentes de IA local
     ├── glosario
     ├── revisión por fase
     ├── revisión final
@@ -113,7 +113,7 @@ Las capturas iniciales se conservaron fuera del repositorio en
 5. Las revisiones conservan siempre la comparación y la elección; en compacto pasan de dos columnas
    a una secuencia vertical.
 6. La configuración es una página compacta de la pila principal. Markdown/EPUB son las únicas tarjetas
-   de elección, por ser una decisión primaria fácil de reconocer; Revisión automática con IA usa un interruptor.
+   de elección, por ser una decisión primaria fácil de reconocer; Revisión adicional con IA usa un interruptor.
    Las demás decisiones usan `Etiqueta — Valor — ›` y solo el espaciado vertical separa grupos.
    Traductor y glosario dependen del idioma, mientras páginas y OCR aparecen solo para PDF.
 7. Cada texto, contenedor y control debe justificar una decisión o una acción. La información ya
@@ -127,6 +127,13 @@ Las capturas iniciales se conservaron fuera del repositorio en
 9. La jerarquía de Flujo comunica progreso, no decoración: el paso actual usa acento y semibold, los
    completados una marca discreta con texto atenuado, los futuros gris y la revisión humana pendiente
    el tono de aviso. No usa tachado, fondos de etiqueta ni números.
+10. Cada superficie de control responde, en este orden, qué ocurrirá o está ocurriendo, qué necesita
+    atención y cuál es la siguiente acción segura. Los detalles técnicos viven bajo demanda.
+11. La interfaz distingue integridad, señales automáticas, cobertura semántica y decisiones humanas.
+    `Preparado`, `Completado` o ausencia de avisos no se traducen visualmente en «calidad garantizada».
+12. La atención humana es un recurso escaso: las revisiones deduplican casos, conservan contexto y
+    progreso, priorizan lo informativo y no vuelven a presentar una variante rechazada como si fuese
+    una decisión nueva.
 
 ## Densidad y elevación
 
@@ -249,23 +256,25 @@ accesibilidad.
 
 ## Responsive y reflow
 
-La cabecera usa una fila por encima de 960 px y dos filas hasta ese ancho. Contiene solo marca, IA,
-destino y el acceso único a ajustes, actividad, apariencia y diagnóstico; el contador y la acción
-principal pertenecen a la barra local de la cola. En escritorio comparte con títulos, mensajes,
-toolbar y tabla un rail exterior centrado de hasta 1.280 px. El acceso global incorpora un marcador
-solo para errores, pausas, revisiones o recomendaciones accionables; nunca funciona como decoración.
+La interfaz usa una única región superior adaptativa. En la cola contiene marca, destino, `Añadir`,
+la acción principal y el acceso único a ajustes, actividad, apariencia, diagnóstico e IA local; el
+contador sigue siendo el encabezado del contenido. En una página interna esa región se sustituye por
+Volver, título y Ajustes. En escritorio comparte con títulos, mensajes y tabla un rail exterior
+centrado de hasta 1.280 px. El acceso global incorpora un marcador solo para errores, pausas,
+revisiones o recomendaciones accionables; nunca funciona como decoración.
 
 Desde 320 px:
 
-- la cabecera pasa a dos filas y conserva IA, destino y ajustes;
+- la cabecera mantiene una sola fila y el mismo orden; destino, `Añadir` y la acción principal
+  reducen sus etiquetas a iconos con nombre accesible y tooltip;
 - la cola combina Documento + Flujo y mantiene la acción contextual y eliminar;
 - la cola vacía ancla una única zona de entrada acotada cerca de la cabecera, sin hacerla flotar en el
   centro del viewport;
 - la entrada vacía usa un límite neutral visible, un icono de documento local y un botón real
   `Seleccionar archivos`; el acento discontinuo se reserva para interacción y arrastre;
-- tras la primera importación, la tabla abraza las filas visibles dentro de un rail máximo común. Una
-  barra sin contenedor, alineada con ese rail, reúne contador, `Añadir` secundario y la única acción
-  principal; en ancho compacto las acciones ocupan una segunda fila;
+- tras la primera importación, la tabla abraza las filas visibles dentro de un rail máximo común. El
+  contador queda como título sobre la tabla; `Añadir` y la única acción principal aparecen en la
+  cabecera. En vacío se ocultan porque la zona de entrada ya ofrece el selector de archivos;
 - la tabla usa cabecera de 44 px, filas de 80 px y las columnas Documento, Flujo, Salida y Estado;
 - las tarjetas de formato se apilan y el resto de la configuración conserva una única columna; sus
   selectores viven en menús o diálogos puntuales, se anclan al valor de la fila y nunca dejan campos
@@ -278,7 +287,8 @@ Desde 320 px:
   caso;
 - el editor EPUB conserva sus dos paneles en escritorio; en ancho reducido mueve las herramientas
   menos frecuentes a un menú único sin retirar comandos;
-- la vista de componentes distribuye exactamente dos tarjetas y apila ambas en ancho compacto;
+- la vista de componentes apila dos filas compactas, acotadas y alineadas arriba; comprueba el estado
+  al abrirse y conserva un refresco manual secundario;
 - los pies pasan a grids y ninguna acción esencial queda fuera del viewport.
 
 Las barras horizontales solo aparecen dentro de tiras cuya navegación espacial lo requiere. La
@@ -317,6 +327,12 @@ La fuente de verdad continúa siendo `DocumentJob` y `StageState`. La presentaci
 
 No existe un loader indefinido nuevo. Las operaciones largas conservan progreso o una acción de
 cancelación y los estados terminales mantienen explicación y siguiente paso.
+
+La cola proyecta `ExecutionPlan`; la revisión proyecta `ReviewSession`; el cierre proyecta
+`OutcomeSummary`. Estas superficies pueden resumir o aplicar divulgación progresiva, pero nunca
+recalcular el plan, inferir una aprobación o ocultar unidades no revisadas. El resumen por documento
+mantiene separados: archivo publicable, incidencias observadas, cobertura de revisión y trabajo
+humano pendiente.
 
 ## Excepciones y deuda conocida
 

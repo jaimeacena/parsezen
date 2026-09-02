@@ -236,25 +236,130 @@ def test_legacy_job_payload_without_a_product_plan_is_rejected() -> None:
         state_store_module._job_from_json(payload)
 
 
-def test_previous_schema_is_reset_without_touching_source_documents(tmp_path: Path) -> None:
+def test_previous_schema_migration_preserves_queue_reviews_books_and_snapshots(
+    tmp_path: Path,
+) -> None:
     source = tmp_path / "source.pdf"
     source.write_bytes(b"original")
     database = tmp_path / "state.db"
     store = StateStore(database)
-    stored = DocumentJob.create(
+    queued = DocumentJob.create(
         DocumentSource.inspect(source),
         JobConfiguration(),
         order=0,
-        job_id="legacy",
+        job_id="queued",
     )
-    store.replace_jobs((stored,))
+    paused = make_job("paused", 1)
+    paused = paused.replace_stage(
+        paused.stage(StageKind.PREPARE)
+        .transition(StageStatus.RUNNING)
+        .transition(StageStatus.PAUSED)
+    )
+    waiting = make_job("waiting", 2)
+    waiting = waiting.replace_stage(
+        waiting.stage(StageKind.PREPARE)
+        .transition(StageStatus.RUNNING)
+        .transition(StageStatus.COMPLETED)
+        .require_cached_result_review("review-gate")
+    )
+    store.replace_jobs((queued, paused, waiting))
+    review = ReviewSession.create(
+        job_id=waiting.id,
+        stage=StageKind.PREPARE,
+        kind=ReviewKind.REFINEMENT,
+        input_artifact_id="input",
+        input_version=waiting.configuration_revision,
+        units=(ReviewUnit("unit", "original", "proposal"),),
+    )
+    store.save_review(review)
+    book = BookDocument(
+        BookMetadata("Draft", "es"),
+        (BookSection("chapter", "Chapter", "xhtml"),),
+        ("chapter",),
+    )
+    store.save_book(waiting.id, book)
+    store.save_result_snapshot(waiting.id, "snapshot-generation")
     with sqlite3.connect(database) as connection:
         connection.execute("UPDATE metadata SET value = '5' WHERE key = 'schema_version'")
 
     reopened = StateStore(database)
 
-    assert reopened.load_jobs() == ()
+    assert reopened.load_jobs() == (queued, paused, waiting)
+    assert reopened.load_reviews(job_id=waiting.id) == (review,)
+    assert reopened.load_book(waiting.id) == book
+    assert reopened.load_result_snapshot(waiting.id) == "snapshot-generation"
+    assert reopened.migration_backup_path is not None
+    assert reopened.migration_backup_path.is_file()
+    with sqlite3.connect(reopened.migration_backup_path) as backup:
+        assert backup.execute(
+            "SELECT value FROM metadata WHERE key = 'schema_version'"
+        ).fetchone() == ("5",)
+        assert backup.execute("SELECT COUNT(*) FROM jobs").fetchone() == (3,)
     assert source.read_bytes() == b"original"
+
+
+def test_failed_migration_rolls_back_and_keeps_the_backup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = tmp_path / "state.db"
+    store = StateStore(database)
+    job = make_job("preserved", 0)
+    store.replace_jobs((job,))
+    with sqlite3.connect(database) as connection:
+        connection.execute("UPDATE metadata SET value = '5' WHERE key = 'schema_version'")
+    original_migration = state_store_module.MIGRATIONS[5]
+
+    def fail_midway(connection: sqlite3.Connection) -> None:
+        connection.execute(
+            "INSERT INTO job_events(job_id, event_type, payload, created_at) "
+            "VALUES ('preserved', 'partial', '{}', 'now')"
+        )
+        raise RuntimeError("synthetic migration failure")
+
+    monkeypatch.setitem(state_store_module.MIGRATIONS, 5, fail_midway)
+
+    with pytest.raises(StateStoreError):
+        StateStore(database)
+
+    backups = tuple(tmp_path.glob("state.pre-migration-v5-to-v6-*.db"))
+    assert len(backups) == 1
+    with sqlite3.connect(database) as connection:
+        assert connection.execute(
+            "SELECT value FROM metadata WHERE key = 'schema_version'"
+        ).fetchone() == ("5",)
+        assert connection.execute("SELECT COUNT(*) FROM jobs").fetchone() == (1,)
+        assert connection.execute("SELECT COUNT(*) FROM job_events").fetchone() == (0,)
+    monkeypatch.setitem(state_store_module.MIGRATIONS, 5, original_migration)
+    assert StateStore(database).load_jobs() == (job,)
+
+
+def test_future_schema_is_rejected_without_modifying_state(tmp_path: Path) -> None:
+    database = tmp_path / "state.db"
+    store = StateStore(database)
+    job = make_job("future", 0)
+    store.replace_jobs((job,))
+    with sqlite3.connect(database) as connection:
+        connection.execute("UPDATE metadata SET value = '7' WHERE key = 'schema_version'")
+
+    with pytest.raises(StateStoreError, match="newer unsupported"):
+        StateStore(database)
+
+    with sqlite3.connect(database) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM jobs").fetchone() == (1,)
+        assert connection.execute(
+            "SELECT value FROM metadata WHERE key = 'schema_version'"
+        ).fetchone() == ("7",)
+    assert tuple(tmp_path.glob("*.pre-migration-*.db")) == ()
+
+
+def test_new_durable_payloads_are_versioned_and_legacy_payloads_remain_readable() -> None:
+    job = make_job("payload", 0)
+    payload = state_store_module._job_to_json(job)
+
+    assert payload["payload_version"] == 1
+    payload.pop("payload_version")
+    assert state_store_module._job_from_json(payload) == job
 
 
 def test_state_store_preserves_previous_queue_after_invalid_replacement(tmp_path: Path) -> None:

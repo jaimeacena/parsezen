@@ -6,11 +6,12 @@ direcciones configurables: la API está fijada a `127.0.0.1:11434`.
 Ollama solo es necesario para traducción con IA, corrección o la pre-organización automática de
 capítulos. Conversión, EPUB, OCR, personalización manual y traducción con Argos pueden usarse sin él.
 La traducción nueva usa IA local por defecto; Argos permanece como elección manual y nunca actúa como
-alternativa silenciosa. Parsezen fija Hy-MT2 Q4_K_M para traducir y LFM Q6_K para revisar; no pide a
-la persona elegir un modelo conversacional.
+alternativa silenciosa. Parsezen fija Hy-MT2 Q4_K_M para traducir y LFM Q6_K para generar propuestas
+de revisión protegidas por guardas y confirmación humana; no pide a la persona elegir un modelo
+conversacional.
 
-La cabecera comunica su estado y abre `Componentes de IA local`. Esa vista fija muestra exactamente
-las tarjetas `Traducción IA` y `Revisión IA`, con los estados `Preparado`, `Descargable` o `Equipo
+`IA local` se abre desde Ajustes o desde el aviso contextual de una acción que la necesita. Esa vista
+fija muestra exactamente las filas `Traducción IA` y `Revisión IA`, con los estados `Preparado`, `Descargable` o `Equipo
 insuficiente`. No ofrece un selector de tags, endpoints, búsqueda, recomendaciones automáticas ni
 borrado arbitrario. Los documentos conservan una instantánea del perfil efectivo y los cambios solo
 alcanzan trabajos pendientes todavía editables.
@@ -22,11 +23,11 @@ La interfaz muestra una única acción pertinente:
 1. **Instalar Ollama**: usa WinGet o el instalador oficial verificado.
 2. **Iniciar**: abre el proceso local y espera a que responda.
 3. **Proteger y reiniciar**: activa `disable_ollama_cloud` y reinicia el servidor.
-4. **Componentes de IA local**: abre las dos tarjetas de capacidades aprobadas.
+4. **Componentes de IA local**: abre las dos filas de capacidades fijadas.
 
 El usuario no necesita abrir una consola, una aplicación de chat ni un navegador.
 
-## Componentes aprobados
+## Componentes fijados
 
 Cada tarjeta representa una capacidad concreta, no un modelo conversacional intercambiable. La
 preparación se decide con el catálogo versionado de Parsezen y comprobaciones locales de hardware,
@@ -38,6 +39,10 @@ cuantización, contexto, capacidades y versión de Ollama coinciden. Si el model
 `/api/tags`, la tarjeta puede mostrar `Descargable` cuando los demás requisitos se cumplen; la vista
 emite únicamente la capacidad (`translation` o `review`) para que una capa posterior autorizada
 gestione la preparación. Nunca acepta un nombre de modelo, URL o endpoint introducido por el usuario.
+
+`Preparado` significa que la instalación y el contrato local son correctos. No significa que toda
+traducción sea perfecta ni que una propuesta de revisión pueda aprobarse automáticamente. Hy-MT2 es
+el baseline EN→ES verificado; LFM actúa tras una puerta humana y no certifica semánticamente un libro.
 
 Los tags `:cloud` y `-cloud`, las variantes no fijadas y los modelos que no cumplen los requisitos
 quedan fuera. La traducción offline con Argos permanece disponible como elección explícita y no es un
@@ -94,13 +99,13 @@ ollama list
 ollama ps
 ```
 
-Después vuelve a Parsezen y pulsa `Actualizar estados`. La pantalla vuelve a evaluar las dos tarjetas
+Después vuelve a Parsezen y pulsa `Comprobar de nuevo`. La pantalla vuelve a evaluar las dos filas
 sin conservar nombres de tags ni rutas del documento.
 
 ## Validación real
 
-La política de modelos de IA local fija los manifests, adaptadores y gates de los componentes
-aprobados. La pantalla no muestra candidatos ni permite cambiar tags fuera de esa política.
+La política de modelos de IA local fija los manifests, adaptadores, alcances y gates de los
+componentes. La pantalla no muestra candidatos ni permite cambiar tags fuera de esa política.
 
 `Validar con IA real.cmd` recorre una muestra sintética de 20 páginas mediante los componentes
 instalados. Los
@@ -126,7 +131,8 @@ Validar con IA real.cmd --model parsezen/hymt-translation:Q4_K_M --translation-e
 `--profile critical` ejecuta traducción, corrección y estructura; `--profile translation` aísla la
 traducción para comparar modelos especializados. `--profile review` compara conversión directa y
 revisión semántica sin traducir; `--profile translation-review` compara traducción directa y
-revisada con el mismo motor. Los informes conservan únicamente recuentos, fases y tiempos, nunca
+revisada conservando la misma traducción base y añadiendo el revisor solo al segundo brazo. Los
+informes conservan únicamente recuentos, fases y tiempos, nunca
 texto documental. Como referencia histórica —no como opciones actuales—, en la estación objetivo de
 8 GB de VRAM la muestra sintética de cuatro páginas del 12 de agosto de 2026 dio estos resultados:
 
@@ -143,6 +149,10 @@ componente solo queda preparado después de aparecer y verificarse en `/api/tags
 Una prueba representativa no garantiza una traducción perfecta. Mantén un corpus local privado de
 documentos y revisa cualquier actualización de Ollama o de modelo antes de usarla en trabajos
 importantes.
+
+El estado vigente y la siguiente frontera se resumen en [`work-plan.md`](work-plan.md). El piloto
+residual más reciente aprobó humanamente solo una de doce propuestas protegidas; por ello la
+reparación semántica automática permanece experimental y ningún caso dudoso se aplica sin revisión.
 
 ### Evaluación de la revisión semántica
 
@@ -173,5 +183,7 @@ para que futuras comparaciones no mezclen ambos efectos.
 
 El flujo normal aplica ahora esa conclusión de forma progresiva: las comprobaciones deterministas
 pueden recomendar una revisión posterior limitada a los bloques con señales, pero no inician Ollama.
-La persona decide si ejecutarla y confirma cualquier cambio. La revisión completa sigue disponible
-desde la configuración cuando el valor o la dificultad del documento justifican revisar todo el texto.
+La persona decide si ejecutarla y confirma cualquier cambio. La revisión adicional proactiva sigue
+disponible desde la configuración cuando el valor o la
+dificultad del documento justifican ampliar la cobertura; Parsezen informa los bloques realmente
+revisados y no la presenta como verificación completa por el mero hecho de solicitarla.

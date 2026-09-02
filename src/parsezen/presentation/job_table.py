@@ -1124,6 +1124,7 @@ class JobCellDelegate(QStyledItemDelegate):
 class JobTableView(QTableView):
     MAX_VISIBLE_ROWS = 6
     configure_requested = Signal(str, object)
+    source_requested = Signal(str)
     review_requested = Signal(str, object)
     ai_review_requested = Signal(str)
     error_requested = Signal(str, object)
@@ -1262,6 +1263,9 @@ class JobTableView(QTableView):
             return
         if isinstance(presentation, CellPresentation) and presentation.action == "Configurar":
             self.configure_requested.emit(str(index.data(JOB_ID_ROLE)), StageKind.PUBLISH)
+            return
+        if isinstance(presentation, CellPresentation) and presentation.action == "Buscar original":
+            self.source_requested.emit(str(index.data(JOB_ID_ROLE)))
             return
         if bool(index.data(CONFIGURABLE_ROLE)):
             stage = StageKind.PUBLISH if COLUMNS[index.column()] is JobColumn.RESULT else None

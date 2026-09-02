@@ -19,11 +19,13 @@ from parsezen.domain.estimates import (
     ProcessingMetric,
     WorkloadProfile,
 )
+from parsezen.domain.execution_plan import ExecutionStep, compile_execution_plan
 from parsezen.domain.jobs import (
+    AIPhase,
     DocumentFormat,
     DocumentJob,
-    ProcessingPlan,
     TranslationMethod,
+    resolve_ai_profile,
 )
 from parsezen.pdf_conversion import PdfPageRange, resolve_pdf_page_range
 from parsezen.pipeline.contracts import ProcessRequest, ProcessTelemetry
@@ -121,16 +123,23 @@ def build_workload_profile(
             else "Documento extenso"
         )
 
+    execution_plan = compile_execution_plan(job.source, job.configuration)
     translation_method = (
-        job.configuration.translation.method if job.configuration.translation.enabled else None
-    )
-    reviewed = job.configuration.plan is ProcessingPlan.LOCAL_AI_REVIEWED
-    structure_reviewed = reviewed and job.configuration.output.format is DocumentFormat.EPUB
-    model_key = (
-        _model_key(settings.model)
-        if reviewed or translation_method is TranslationMethod.LOCAL_AI
+        TranslationMethod.LOCAL_AI
+        if execution_plan.includes(ExecutionStep.TRANSLATE_AI)
+        else TranslationMethod.OFFLINE
+        if execution_plan.includes(ExecutionStep.TRANSLATE_OFFLINE)
         else None
     )
+    reviewed = execution_plan.includes(ExecutionStep.REVIEW_CONTENT)
+    structure_reviewed = execution_plan.includes(ExecutionStep.REVIEW_STRUCTURE)
+    del settings
+    profiles = []
+    if translation_method is TranslationMethod.LOCAL_AI:
+        profiles.append(resolve_ai_profile(job.configuration.ai, AIPhase.TRANSLATION))
+    if reviewed:
+        profiles.append(resolve_ai_profile(job.configuration.ai, AIPhase.REVIEW))
+    model_key = _ai_profile_key(tuple(profile.identity for profile in profiles))
     profile = WorkloadProfile(
         source_format=job.source.format,
         output_format=job.configuration.output.format,
@@ -362,10 +371,10 @@ def estimate_remaining_time(
     )
 
 
-def _model_key(model: str | None) -> str | None:
-    if not model:
+def _ai_profile_key(profiles: tuple[tuple[object, ...], ...]) -> str | None:
+    if not profiles:
         return None
-    return hashlib.sha256(model.strip().casefold().encode("utf-8")).hexdigest()[:16]
+    return hashlib.sha256(repr(profiles).casefold().encode("utf-8")).hexdigest()[:16]
 
 
 def _baseline_seconds_per_unit(profile: WorkloadProfile) -> float:
@@ -394,19 +403,17 @@ def _baseline_seconds_per_unit(profile: WorkloadProfile) -> float:
 
 
 def _expected_reviews(job: DocumentJob) -> tuple[str, ...]:
+    plan = compile_execution_plan(job.source, job.configuration)
     reviews: list[str] = []
     if job.source.format is DocumentFormat.PDF:
         reviews.append("OCR o conversión si se detectan páginas dudosas")
-    if job.configuration.translation.enabled:
+    if plan.translates:
         reviews.append("incidencias de traducción, si aparecen")
-    if job.configuration.plan is ProcessingPlan.LOCAL_AI_REVIEWED:
+    if plan.includes(ExecutionStep.REVIEW_CONTENT):
         reviews.append("texto revisado por IA local")
-    if (
-        job.configuration.plan is ProcessingPlan.LOCAL_AI_REVIEWED
-        and job.configuration.output.format is DocumentFormat.EPUB
-    ):
+    if plan.includes(ExecutionStep.REVIEW_STRUCTURE):
         reviews.append("estructura revisada por IA local")
-    if job.configuration.output.format is DocumentFormat.EPUB:
+    if plan.includes(ExecutionStep.BUILD_EPUB) or plan.includes(ExecutionStep.PRESERVE_EPUB):
         reviews.append("confirmación EPUB final")
     return tuple(reviews)
 
@@ -422,7 +429,7 @@ def _findings(
             "processing-passes",
             PreflightSeverity.INFO,
             "Trabajo previsto",
-            processing_pass_summary(job.configuration),
+            processing_pass_summary(job.configuration, job.source.format),
         )
     ]
     if profile.force_pdf_ocr:

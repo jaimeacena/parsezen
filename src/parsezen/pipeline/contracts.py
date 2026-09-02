@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
 from parsezen.document_model import ConvertedResource
+from parsezen.domain.execution_plan import ExecutionPlan
 from parsezen.domain.jobs import MarkdownOrganization
 from parsezen.domain.process_lifecycle import ProcessStage
 from parsezen.epub_builder import EpubBookMetadata
@@ -43,6 +44,57 @@ class ProcessTelemetry:
 
 
 @dataclass(frozen=True, slots=True)
+class ProcessSourceRequest:
+    """Source inputs projected from the legacy flat request facade."""
+
+    path: Path
+    convert_to_markdown: bool
+    pdf_page_range: PdfPageRange | None
+    force_pdf_ocr: bool
+    size_bytes: int | None
+    modified_ns: int | None
+    content_sha256: str | None
+    identity_verified: bool
+
+
+@dataclass(frozen=True, slots=True)
+class ProcessTranslationRequest:
+    """Translation inputs projected from the legacy flat request facade."""
+
+    improvement_mode: ImprovementMode | None
+    target_language: str | None
+    offline_language: str | None
+    glossary: tuple[GlossaryEntry, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class ProcessReviewRequest:
+    """Review decisions projected from the legacy flat request facade."""
+
+    content: bool
+    structure: bool
+
+
+@dataclass(frozen=True, slots=True)
+class ProcessPublicationRequest:
+    """Publication inputs projected from the legacy flat request facade."""
+
+    output_directory: Path | None
+    output_format: OutputFormat
+    image_output_directory: Path | None
+    epub_title: str | None
+    epub_author: str | None
+    epub_cover_path: Path | None
+    include_images: bool
+    preserve_styles: bool
+    markdown_organization: MarkdownOrganization
+    markdown_include_metadata: bool
+    markdown_include_page_references: bool
+    epub_first_page_cover: bool
+    epub_remove_cover: bool
+
+
+@dataclass(frozen=True, slots=True)
 class ProcessRequest:
     """Stable facade request for one local document pipeline run."""
 
@@ -73,6 +125,105 @@ class ProcessRequest:
     source_modified_ns: int | None = None
     source_content_sha256: str | None = None
     source_identity_verified: bool = False
+    execution_plan: ExecutionPlan | None = None
+
+    @property
+    def source(self) -> ProcessSourceRequest:
+        """Temporary adapter while callers migrate away from flat source fields."""
+
+        return ProcessSourceRequest(
+            self.source_path,
+            self.convert_to_markdown,
+            self.pdf_page_range,
+            self.force_pdf_ocr,
+            self.source_size_bytes,
+            self.source_modified_ns,
+            self.source_content_sha256,
+            self.source_identity_verified,
+        )
+
+    @property
+    def translation(self) -> ProcessTranslationRequest:
+        """Temporary adapter while callers migrate away from flat translation fields."""
+
+        return ProcessTranslationRequest(
+            self.improvement_mode,
+            self.target_language,
+            self.offline_translation_language,
+            self.glossary,
+        )
+
+    @property
+    def review(self) -> ProcessReviewRequest:
+        """Temporary adapter while callers migrate away from flat review fields."""
+
+        return ProcessReviewRequest(self.review_content, self.review_structure)
+
+    @property
+    def publication(self) -> ProcessPublicationRequest:
+        """Temporary adapter while callers migrate away from flat publication fields."""
+
+        return ProcessPublicationRequest(
+            self.output_directory,
+            self.output_format,
+            self.image_output_directory,
+            self.epub_title,
+            self.epub_author,
+            self.epub_cover_path,
+            self.include_images,
+            self.preserve_styles,
+            self.markdown_organization,
+            self.markdown_include_metadata,
+            self.markdown_include_page_references,
+            self.epub_first_page_cover,
+            self.epub_remove_cover,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class ProcessReviewResult:
+    """Review output projected from the legacy flat result facade."""
+
+    revision_draft: RevisionDraft | None
+    resources: tuple[ConvertedResource, ...]
+    epub_metadata: EpubBookMetadata | None
+    markdown: str | None
+    required: bool
+    approved: bool
+    preserve_epub_package_when_unchanged: bool
+
+
+@dataclass(frozen=True, slots=True)
+class ProcessPublicationResult:
+    """Publication output projected from the legacy flat result facade."""
+
+    final_path: Path
+    raw_markdown_path: Path | None
+    review_original_path: Path | None
+    preserved_images: int
+    epub_chapters: int
+    markdown_organization: MarkdownOrganization
+    markdown_include_metadata: bool
+    markdown_include_page_references: bool
+    markdown_source_name: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class ProcessQualityResult:
+    """Content-free quality evidence projected from the flat result facade."""
+
+    problematic_pdf_pages: tuple[int, ...]
+    pdf_report: PdfQualityReport | None
+    exhaustive_pdf_ocr_used: bool
+    translation_report: TranslationQualityReport | None
+    review_translation_report: TranslationQualityReport | None
+    linguistic_review_coverage: LinguisticReviewCoverage | None
+    preserved_translation_chunks: tuple[int, ...]
+    final_integrity_report: FinalIntegrityReport | None
+
+    @property
+    def translation_for_review(self) -> TranslationQualityReport | None:
+        return self.review_translation_report or self.translation_report
 
 
 @dataclass(frozen=True, slots=True)
@@ -112,10 +263,55 @@ class ProcessResult:
     markdown_source_name: str | None = None
 
     @property
+    def review(self) -> ProcessReviewResult:
+        """Temporary adapter while callers migrate away from flat review fields."""
+
+        return ProcessReviewResult(
+            self.revision_draft,
+            self.revision_resources,
+            self.revision_epub_metadata,
+            self.review_markdown,
+            self.review_required,
+            self.revision_approved,
+            self.preserve_epub_package_on_unchanged_review,
+        )
+
+    @property
+    def publication(self) -> ProcessPublicationResult:
+        """Temporary adapter while callers migrate away from flat publication fields."""
+
+        return ProcessPublicationResult(
+            self.final_path,
+            self.raw_markdown_path,
+            self.review_original_path,
+            self.preserved_images,
+            self.epub_chapters,
+            self.markdown_organization,
+            self.markdown_include_metadata,
+            self.markdown_include_page_references,
+            self.markdown_source_name,
+        )
+
+    @property
+    def quality(self) -> ProcessQualityResult:
+        """Temporary adapter while callers migrate away from flat quality fields."""
+
+        return ProcessQualityResult(
+            self.problematic_pdf_pages,
+            self.pdf_quality_report,
+            self.exhaustive_pdf_ocr_used,
+            self.translation_quality_report,
+            self.review_translation_quality_report,
+            self.linguistic_review_coverage,
+            self.preserved_translation_chunks,
+            self.final_integrity_report,
+        )
+
+    @property
     def translation_quality_for_review(self) -> TranslationQualityReport | None:
         """Return quality evidence aligned with ``review_markdown`` when available."""
 
-        return self.review_translation_quality_report or self.translation_quality_report
+        return self.quality.translation_for_review
 
 
 @dataclass(frozen=True, slots=True)
@@ -155,9 +351,16 @@ ProgressCallback = Callable[[int, int], None]
 
 __all__ = [
     "PreparedDocument",
+    "ProcessPublicationRequest",
+    "ProcessPublicationResult",
+    "ProcessQualityResult",
     "ProcessRequest",
+    "ProcessReviewRequest",
+    "ProcessReviewResult",
     "ProcessResult",
+    "ProcessSourceRequest",
     "ProcessTelemetry",
+    "ProcessTranslationRequest",
     "ProgressCallback",
     "StageCallback",
     "StageTelemetry",

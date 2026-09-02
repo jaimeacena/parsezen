@@ -10,6 +10,10 @@ GitHub permiten comprobar integridad y procedencia, pero no eliminan ese aviso.
 2. Actualizar `version` en `pyproject.toml` con formato `X.Y.Z`.
 3. Ejecutar `python scripts/sync_version.py` y completar `CHANGELOG.md`.
 4. Confirmar que no se han añadido documentos, resultados, cachés, credenciales ni rutas privadas.
+5. Revisar [`work-plan.md`](work-plan.md): todo mecanismo `EXPERIMENTAL` debe seguir aislado y las
+   limitaciones relevantes para la versión deben estar reflejadas en la guía o las notas.
+6. Completar [`acceptance-checklist.md`](acceptance-checklist.md) sobre el commit candidato y conservar
+   el registro de evidencia sin contenido descrito allí.
 
 ## Validar
 

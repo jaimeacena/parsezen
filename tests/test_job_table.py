@@ -187,12 +187,13 @@ def test_configuration_summary_remains_visible_and_accessible() -> None:
 
     assert presentation.title == ""
     assert presentation.operations == (
-        "Traducir y corregir a español",
+        "Traducir a español",
+        "Verificar traducción",
         "Organizar EPUB",
         "Tu revisión final",
     )
     assert presentation.subtitle is None
-    assert presentation.operation_tones == ("default",) * 3
+    assert presentation.operation_tones == ("default",) * 4
     assert index.data(Qt.ItemDataRole.AccessibleTextRole).startswith("Flujo")
 
 
@@ -235,7 +236,8 @@ def test_multiple_documents_keep_independent_clear_flows() -> None:
     )
     assert presentations[1].subtitle is None
     assert presentations[2].operations == (
-        "Traducir y corregir a español",
+        "Traducir a español",
+        "Verificar traducción",
         "Organizar EPUB",
         "Tu revisión final",
     )
@@ -258,13 +260,15 @@ def test_flow_distinguishes_current_completed_future_and_human_review() -> None:
     review_flow = cell_presentation(make_review_job(), JobColumn.FLOW)
     completed_flow = cell_presentation(make_completed_job(), JobColumn.FLOW)
 
-    assert running_flow.operation_tones == ("current", "future", "future")
+    assert running_flow.operation_tones == ("completed", "current", "future", "future")
     assert review_flow.operation_tones == (
+        "completed",
         "completed",
         "future",
         "current_review",
     )
     assert completed_flow.operation_tones == (
+        "completed",
         "completed",
         "completed",
         "completed",
@@ -648,7 +652,8 @@ def test_compact_table_preserves_flow_and_actions_without_scrolling(qtbot) -> No
 
 def test_wrapped_flow_preserves_the_connector_between_every_stage() -> None:
     operations = (
-        "Traducir y corregir a español",
+        "Traducir a español",
+        "Verificar traducción",
         "Organizar EPUB",
         "Tu revisión final",
     )

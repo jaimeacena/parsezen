@@ -7,7 +7,11 @@ from pathlib import Path, PurePosixPath
 
 from parsezen.application.job_execution import JobExecutionController
 from parsezen.application.job_queue import JobQueue
-from parsezen.application.workspace_recovery import recover_workspace, source_is_unchanged
+from parsezen.application.workspace_recovery import (
+    SOURCE_UNAVAILABLE_MESSAGE,
+    recover_workspace,
+    source_is_unchanged,
+)
 from parsezen.document_model import ConvertedResource
 from parsezen.domain.jobs import (
     DocumentFormat,
@@ -17,6 +21,7 @@ from parsezen.domain.jobs import (
     JobStatus,
     OutputConfiguration,
 )
+from parsezen.domain.source_identity import sha256_file
 from parsezen.domain.stages import StageKind
 from parsezen.infrastructure.artifact_store import ArtifactStore
 from parsezen.infrastructure.result_snapshots import ResultSnapshotStore
@@ -171,7 +176,7 @@ def test_source_identity_detects_same_size_replacement_with_preserved_timestamp(
     assert not source_is_unchanged(source)
 
 
-def test_workspace_recovery_ignores_sources_that_no_longer_exist(tmp_path: Path) -> None:
+def test_workspace_recovery_keeps_sources_that_are_temporarily_unavailable(tmp_path: Path) -> None:
     source = tmp_path / "missing.txt"
     source.write_text("Original", encoding="utf-8")
     job = _job(source, "missing")
@@ -179,5 +184,73 @@ def test_workspace_recovery_ignores_sources_that_no_longer_exist(tmp_path: Path)
 
     recovered = recover_workspace((job,), SnapshotLoaderStub(), AppSettings())
 
-    assert recovered.jobs == ()
-    assert recovered.runtime == ()
+    assert tuple(item.id for item in recovered.jobs) == ("missing",)
+    assert tuple(job_id for job_id, _runtime in recovered.runtime) == ("missing",)
+    assert recovered.source_unavailable_job_ids == frozenset({"missing"})
+    assert SOURCE_UNAVAILABLE_MESSAGE in recovered.jobs[0].warnings
+
+
+def test_workspace_recovery_hashes_only_waiting_reviews(tmp_path: Path) -> None:
+    paths = {
+        name: tmp_path / f"{name}.txt"
+        for name in ("queued", "completed", "paused", "failed", "review")
+    }
+    for path in paths.values():
+        path.write_text("Source", encoding="utf-8")
+    jobs = tuple(_job(path, name, order) for order, (name, path) in enumerate(paths.items()))
+    queue = JobQueue(jobs)
+    execution = JobExecutionController(queue)
+    completed_output = tmp_path / "completed.md"
+    completed_output.write_text("Completed", encoding="utf-8")
+    review_output = tmp_path / "review.md"
+    review_output.write_text("Review", encoding="utf-8")
+    execution.complete("completed", completed_output)
+    execution.start_next("paused")
+    execution.pause("paused")
+    execution.fail(
+        "failed",
+        StageKind.PREPARE,
+        error_code="failed",
+        error_message="Failed",
+    )
+    execution.block_completed_result_for_review(
+        "review",
+        StageKind.PREPARE,
+        review_id="review-gate",
+    )
+    hashed: list[Path] = []
+
+    def track_hash(path: Path) -> str:
+        hashed.append(path)
+        return sha256_file(path)
+
+    recovered = recover_workspace(
+        queue.jobs,
+        SnapshotLoaderStub({"review": ProcessResult(review_output)}),
+        AppSettings(),
+        hasher=track_hash,
+    )
+
+    assert tuple(path.name for path in hashed) == ("review.txt",)
+    assert {job.id for job in recovered.jobs} == set(paths)
+
+
+def test_missing_waiting_review_retains_private_artifacts_without_enabling_review(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "missing-review.txt"
+    source.write_text("Original", encoding="utf-8")
+    queue = JobQueue((_job(source, "review"),))
+    JobExecutionController(queue).block_completed_result_for_review(
+        "review",
+        StageKind.PREPARE,
+        review_id="review-gate",
+    )
+    source.unlink()
+
+    recovered = recover_workspace(queue.jobs, SnapshotLoaderStub(), AppSettings())
+
+    assert recovered.source_unavailable_job_ids == frozenset({"review"})
+    assert recovered.retained_artifact_job_ids == frozenset({"review"})
+    assert recovered.reset_paused_job_ids == frozenset()
+    assert dict(recovered.runtime)["review"].result is None

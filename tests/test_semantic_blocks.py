@@ -19,6 +19,14 @@ def test_semantic_block_identity_survives_an_insertion_before_it() -> None:
     assert expanded_ids["Beta paragraph."] == original_ids["Beta paragraph."]
 
 
+def test_semantic_analysis_is_not_limited_by_the_interactive_review_size(monkeypatch) -> None:
+    monkeypatch.setattr("parsezen.revision._MAX_REVIEW_MARKDOWN_CHARACTERS", 3)
+
+    document = analyze_markdown("Four words remain analyzable.\n")
+
+    assert len(document.blocks) == 1
+
+
 def test_semantic_analysis_distinguishes_front_matter_toc_and_body() -> None:
     markdown = (
         "# The Example Book\n\n"
@@ -54,6 +62,37 @@ def test_semantic_analysis_recognizes_a_translated_index_with_reflowable_entries
 
     assert document.toc_blocks == 2
     assert [block.role for block in document.blocks][1:3] == [SemanticRole.TOC] * 2
+
+
+def test_semantic_toc_ends_at_the_first_body_heading_after_one_confirmed_entry() -> None:
+    document = analyze_markdown(
+        "# Manual\n\n# Contents\n\nSection 1 ........ 10\n\n## Section 1\n\nBody text.\n"
+    )
+
+    assert [block.role for block in document.blocks] == [
+        SemanticRole.FRONT_MATTER,
+        SemanticRole.TOC,
+        SemanticRole.TOC,
+        SemanticRole.HEADING,
+        SemanticRole.BODY,
+    ]
+
+
+def test_semantic_generated_toc_table_remains_toc_inside_front_matter() -> None:
+    document = analyze_markdown(
+        "# Manual\n\n"
+        '<table class="document-toc"><tbody><tr>'
+        '<td class="toc-label toc-level-0">Chapter</td>'
+        '<td class="toc-folio">1</td></tr></tbody></table>\n\n'
+        "# Chapter\n\nBody.\n"
+    )
+
+    assert [block.role for block in document.blocks] == [
+        SemanticRole.FRONT_MATTER,
+        SemanticRole.TOC,
+        SemanticRole.HEADING,
+        SemanticRole.BODY,
+    ]
 
 
 def test_document_term_memory_keeps_only_repeated_proper_terms() -> None:
@@ -157,3 +196,114 @@ def test_document_evidence_repairs_generated_toc_table_without_losing_markup() -
         '<strong><em><a href="#page-12">Delineating Planetary Meaning</a></em></strong>'
         in reconciled
     )
+
+
+def test_document_evidence_expands_a_bare_part_marker_from_the_printed_index() -> None:
+    source = (
+        '<table class="document-toc">\n'
+        '<tbody><tr><td class="toc-label toc-level-0">Part II: Light and Shadows</td>'
+        '<td class="toc-folio">101</td></tr></tbody>\n</table>\n\n'
+        "# PII\n\nOpening body.\n"
+    )
+
+    reconciled, changes = reconcile_document_evidence(source)
+
+    assert changes == 1
+    assert "# Part II: Light and Shadows" in reconciled
+
+
+def test_document_evidence_expands_one_unique_part_subtitle_from_the_printed_index() -> None:
+    source = (
+        "# LIGHT AND SHADOWS\n\nCover subtitle.\n\n"
+        '<table class="document-toc">\n'
+        '<tbody><tr><td class="toc-label toc-level-0">Part II: Light and Shadows</td>'
+        '<td class="toc-folio">101</td></tr></tbody>\n</table>\n\n'
+        "### LIGHT AND SHADOWS\n\nOpening body.\n"
+    )
+
+    reconciled, changes = reconcile_document_evidence(source)
+
+    assert changes == 1
+    assert reconciled.startswith("# LIGHT AND SHADOWS")
+    assert "### Part II: Light and Shadows" in reconciled
+
+
+def test_document_evidence_does_not_expand_a_repeated_part_subtitle_heading() -> None:
+    source = (
+        '<table class="document-toc">\n'
+        '<tbody><tr><td class="toc-label toc-level-0">Part II: Light and Shadows</td>'
+        '<td class="toc-folio">101</td></tr></tbody>\n</table>\n\n'
+        "### LIGHT AND SHADOWS\n\nFirst mention.\n\n"
+        "### Light and Shadows\n\nSecond mention.\n"
+    )
+
+    reconciled, changes = reconcile_document_evidence(source)
+
+    assert changes == 0
+    assert reconciled == source
+
+
+def test_document_evidence_rejoins_a_decorative_part_title_from_its_index() -> None:
+    source = (
+        '<table class="document-toc">\n'
+        '<tbody><tr><td class="toc-label toc-level-0">Part I: The Fundamentals</td>'
+        '<td class="toc-folio">1</td></tr></tbody>\n</table>\n\n'
+        "P I\n\n### ART\n\nT F\n\n### HE UNDAMENTALS\n"
+    )
+
+    reconciled, changes = reconcile_document_evidence(source)
+
+    assert changes == 1
+    assert reconciled.endswith("# Part I: The Fundamentals\n")
+    assert "### ART" not in reconciled
+
+
+def test_document_evidence_rejoins_a_decorative_part_title_without_an_index_donor() -> None:
+    source = "P V\n\n### ART\n\nA\n\n### WAKENING\n"
+
+    reconciled, changes = reconcile_document_evidence(source)
+
+    assert changes == 1
+    assert reconciled == "# Part V: Awakening\n"
+
+
+def test_document_evidence_does_not_guess_an_ambiguous_bare_part_marker() -> None:
+    source = (
+        '<table class="document-toc">\n<tbody>'
+        '<tr><td class="toc-label toc-level-0">Part II: First version</td></tr>'
+        '<tr><td class="toc-label toc-level-0">Part II: Second version</td></tr>'
+        "</tbody>\n</table>\n\n# PII\n"
+    )
+
+    reconciled, changes = reconcile_document_evidence(source)
+
+    assert changes == 0
+    assert reconciled == source
+
+
+def test_document_evidence_promotes_one_index_backed_numbered_list_item() -> None:
+    source = (
+        '<table class="document-toc">\n'
+        '<tbody><tr><td class="toc-label toc-level-0">18. Buddhism versus the Buddha</td>'
+        '<td class="toc-folio">106</td></tr></tbody>\n</table>\n\n'
+        "18. BUDDHISM VERSUS THE BUDDHA\n\nOpening body.\n"
+    )
+
+    reconciled, changes = reconcile_document_evidence(source)
+
+    assert changes == 1
+    assert "## 18. BUDDHISM VERSUS THE BUDDHA" in reconciled
+
+
+def test_document_evidence_keeps_repeated_index_backed_list_mentions_as_lists() -> None:
+    source = (
+        '<table class="document-toc">\n'
+        '<tbody><tr><td class="toc-label toc-level-0">18. Practice</td>'
+        '<td class="toc-folio">106</td></tr></tbody>\n</table>\n\n'
+        "18. Practice\n\nA mention.\n\n18. Practice\n\nAnother mention.\n"
+    )
+
+    reconciled, changes = reconcile_document_evidence(source)
+
+    assert changes == 0
+    assert reconciled == source

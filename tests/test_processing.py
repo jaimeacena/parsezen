@@ -371,7 +371,7 @@ def test_epub_checkpoint_key_keeps_the_legacy_identity_without_specialized_profi
 
     assert key == repr(
         (
-            "epub-translation-v11",
+            "epub-translation-v12",
             "es",
             "translate",
             False,
@@ -396,7 +396,7 @@ def test_epub_checkpoint_key_marks_specialized_identity_explicitly() -> None:
 
     key = transform_module.epub_translation_resume_key(request, settings, "es")
 
-    assert "epub-translation-v12-specialized" in key
+    assert "epub-translation-v13-specialized" in key
     assert "translator:7b" in key
 
 
@@ -583,6 +583,36 @@ def test_reviewed_epub_uses_the_exact_chapter_split_chosen_by_the_user(
     assert "PZDOC EPUB CHAPTER" not in navigation
 
 
+def test_reviewed_pdf_epub_keeps_page_evidence_for_planning(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    destination = tmp_path / "book.epub"
+    destination.write_bytes(b"draft")
+    reviewed = "<!-- PZDOC PDF PAGE 1 -->\n\n# Chapter\n\nBody.\n"
+    result = processing_module.ProcessResult(
+        destination,
+        review_markdown=reviewed,
+        revision_epub_metadata=EpubBookMetadata("Book", "en"),
+        review_required=True,
+    )
+    original_build_epub = processing_module.build_epub
+    planned_markdown: list[str] = []
+
+    def capture_build_epub(markdown: str, *args: object, **kwargs: object) -> object:
+        planned_markdown.append(markdown)
+        return original_build_epub(markdown, *args, **kwargs)
+
+    monkeypatch.setattr(processing_module, "build_epub", capture_build_epub)
+
+    updated = apply_reviewed_revision(result, reviewed)
+
+    assert planned_markdown == [reviewed]
+    assert updated.review_markdown == "\n\n# Chapter\n\nBody.\n"
+    with ZipFile(destination) as archive:
+        assert all(b"PZDOC PDF PAGE" not in archive.read(name) for name in archive.namelist())
+
+
 def test_unchanged_headless_epub_review_preserves_existing_package_bytes(
     tmp_path: Path,
 ) -> None:
@@ -738,6 +768,74 @@ def test_chained_ai_translation_and_correction_keep_an_independent_bilingual_pas
     assert result.revision_draft is None
 
 
+def test_adaptive_bilingual_review_reports_its_partial_coverage(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "notes.md"
+    source_markdown = "\n\n".join(f"Source paragraph {index}." for index in range(20))
+    translated = "\n\n".join(f"Párrafo traducido {index}." for index in range(20))
+    source.write_text(source_markdown, encoding="utf-8")
+    quality_report = TranslationQualityReport(
+        "en",
+        "es",
+        "es",
+        checked_segments=20,
+        source_characters=len(source_markdown),
+        translated_characters=len(translated),
+        total_issues=0,
+        issues=(),
+        source_blocks=20,
+        translated_blocks=20,
+    )
+
+    _patch_transform_dependency(
+        monkeypatch,
+        "improve_markdown",
+        lambda *_args, **_kwargs: translated,
+    )
+    _patch_transform_dependency(
+        monkeypatch,
+        "_repair_translation_warnings",
+        lambda _request, _source, value, **_kwargs: value,
+    )
+    _patch_transform_dependency(
+        monkeypatch,
+        "_translation_quality_report",
+        lambda *_args: quality_report,
+    )
+
+    def review(
+        _source: str,
+        current: str,
+        *_args: object,
+        **kwargs: object,
+    ) -> str:
+        callback = kwargs["on_reviewed_segments"]
+        assert callable(callback)
+        callback(3)
+        return current
+
+    _patch_transform_dependency(monkeypatch, "review_translation_markdown", review)
+
+    result = process_document(
+        ProcessRequest(
+            source,
+            convert_to_markdown=True,
+            improvement_mode=ImprovementMode.TRANSLATE,
+            target_language="Español",
+            review_content=True,
+        ),
+        settings=LOCAL_SETTINGS,
+    )
+
+    assert result.linguistic_review_coverage is not None
+    assert result.linguistic_review_coverage.mode is LinguisticReviewMode.TARGETED_BILINGUAL
+    assert result.linguistic_review_coverage.semantically_reviewed_blocks == 3
+    assert result.linguistic_review_coverage.independently_verified_blocks == 3
+    assert result.linguistic_review_coverage.semantically_unreviewed_blocks == 17
+
+
 def test_translation_quality_is_measured_before_review_changes_block_layout(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -838,12 +936,23 @@ def test_aligned_translation_corrects_only_pdf_pages_with_quality_signals(
 
     monkeypatch.setattr(processing_module, "convert_document", convert)
     _patch_transform_dependency(monkeypatch, "improve_markdown", improve)
+
+    def review_translation(
+        original: str,
+        current: str,
+        *_args: object,
+        **kwargs: object,
+    ) -> str:
+        bilingual_review_calls.append((original, current))
+        callback = kwargs["on_reviewed_segments"]
+        assert callable(callback)
+        callback(2)
+        return current
+
     _patch_transform_dependency(
         monkeypatch,
         "review_translation_markdown",
-        lambda original, current, *_args, **_kwargs: (
-            bilingual_review_calls.append((original, current)) or current
-        ),
+        review_translation,
     )
     _patch_transform_dependency(
         monkeypatch,
@@ -1176,9 +1285,12 @@ def test_offline_translation_content_review_compares_source_and_target(
         current: str,
         _settings: AppSettings,
         target_language: str,
-        **_kwargs: object,
+        **kwargs: object,
     ) -> str:
         review_calls.append((original, current, target_language))
+        callback = kwargs["on_reviewed_segments"]
+        assert callable(callback)
+        callback(2)
         return corrected
 
     _patch_transform_dependency(monkeypatch, "review_translation_markdown", review)
@@ -1266,6 +1378,86 @@ def test_inferred_terminology_has_a_bounded_occurrence_budget() -> None:
     )
 
 
+def test_astrology_phrase_glossary_requires_strong_english_spanish_domain_evidence() -> None:
+    source = (
+        "The birth chart uses the triplicity lords and its domicile lord. "
+        "The sect light and exaltation complete the example."
+    )
+
+    glossary = prepare_module.combined_translation_glossary(
+        (),
+        (),
+        source_markdown=source,
+        source_language_code="en",
+        target_language_code="es",
+    )
+
+    assert GlossaryEntry("the birth chart", "la carta natal", adapt_source_case=True) in glossary
+    assert (
+        GlossaryEntry("its domicile lord", "su regente domiciliario", adapt_source_case=True)
+        in glossary
+    )
+    assert GlossaryEntry("exaltation", "exaltación", adapt_source_case=True) in glossary
+    assert all(entry.source.casefold() not in {"chart", "agenda"} for entry in glossary)
+    assert (
+        prepare_module.combined_translation_glossary(
+            (),
+            (),
+            source_markdown="The birth chart is ready.",
+            source_language_code="en",
+            target_language_code="es",
+        )
+        == ()
+    )
+
+
+def test_astrology_glossary_recognizes_decan_books_without_birth_chart_vocabulary() -> None:
+    source = (
+        "Each decan belongs to the zodiac, and the Sun reaches its exaltation here. "
+        "The remaining passage explains the image."
+    )
+
+    glossary = prepare_module.combined_translation_glossary(
+        (),
+        (),
+        source_markdown=source,
+        source_language_code="en",
+        target_language_code="es",
+    )
+
+    assert GlossaryEntry("exaltation", "exaltación", adapt_source_case=True) in glossary
+    assert GlossaryEntry("decan", "decano", adapt_source_case=True) in glossary
+    assert (
+        prepare_module.combined_translation_glossary(
+            (),
+            (),
+            source_markdown="A single decan appears in an unrelated quotation.",
+            source_language_code="en",
+            target_language_code="es",
+        )
+        == ()
+    )
+
+
+def test_explicit_glossary_precedes_the_curated_domain_equivalent() -> None:
+    explicit = GlossaryEntry("the birth chart", "el horóscopo natal")
+    source = (
+        "The birth chart uses the triplicity lords and its domicile lord. "
+        "The sect light completes the example."
+    )
+
+    glossary = prepare_module.combined_translation_glossary(
+        (explicit,),
+        (),
+        source_markdown=source,
+        source_language_code="en",
+        target_language_code="es",
+    )
+
+    assert glossary.count(explicit) == 1
+    assert GlossaryEntry("the birth chart", "la carta natal") not in glossary
+
+
 def test_ai_translation_repair_reuses_encrypted_work_checkpoints(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1318,6 +1510,67 @@ def test_ai_translation_repair_reuses_encrypted_work_checkpoints(
     assert result == "Texto reparado."
     assert callbacks == [(checkpoint.load, checkpoint.save, True)]
     assert repair_results == [(1, 1)]
+
+
+def test_ai_title_repair_uses_an_installed_offline_fallback_after_residual_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = "# SCORPIO II: AN APPARATUS FOR MUTUAL DISTILLATION"
+    translated = source
+    fallback = "# ESCORPIO II: UN APARATO PARA LA DESTILACIÓN MUTUA"
+    offline_calls: list[tuple[str, str, str | None]] = []
+
+    monkeypatch.setattr(
+        transform_module,
+        "retranslate_residual_title",
+        lambda *_args, **_kwargs: translated,
+    )
+    monkeypatch.setattr(
+        transform_module,
+        "is_offline_translation_pair_installed",
+        lambda source_code, target_code: (source_code, target_code) == ("en", "es"),
+    )
+
+    def translate_offline(
+        markdown: str,
+        target_language: str,
+        *,
+        source_language_code: str | None = None,
+        **_kwargs: object,
+    ) -> str:
+        offline_calls.append((markdown, target_language, source_language_code))
+        return fallback
+
+    monkeypatch.setattr(transform_module, "translate_markdown_offline", translate_offline)
+
+    def repair(*_args: object, **kwargs: object) -> SimpleNamespace:
+        repaired = kwargs["translate_segment"](source, translated)
+        return SimpleNamespace(translated=repaired, attempted_segments=1, repaired_segments=1)
+
+    monkeypatch.setattr(transform_module, "repair_untranslated_source_text", repair)
+    monkeypatch.setattr(
+        transform_module,
+        "restore_changed_third_language_headings",
+        lambda _source, current, **_kwargs: current,
+    )
+
+    result = transform_module.repair_translation_warnings(
+        ProcessRequest(
+            Path("book.pdf"),
+            convert_to_markdown=True,
+            improvement_mode=ImprovementMode.TRANSLATE,
+            target_language="Español",
+            output_format=OutputFormat.EPUB,
+        ),
+        source,
+        translated,
+        settings=LOCAL_SETTINGS,
+        cancellation=None,
+        source_language_code="en",
+    )
+
+    assert result == fallback
+    assert offline_calls == [(source, "Español", "en")]
 
 
 def test_translation_repair_rejects_numeric_damage_from_heading_restoration(

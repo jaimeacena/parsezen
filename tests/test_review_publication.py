@@ -8,7 +8,7 @@ from zipfile import ZipFile
 
 import pytest
 
-from parsezen.application.book_editor import BookEditor
+from parsezen.application.book_editor import BookEditor, book_source_fingerprint
 from parsezen.application.job_execution import JobExecutionController
 from parsezen.application.job_queue import JobQueue
 from parsezen.application.review_finalization import (
@@ -109,10 +109,11 @@ def test_epub_draft_is_recoverable_and_reused_before_publication(tmp_path: Path)
     )
     coordinator = ReviewPublicationCoordinator(repository, artifacts, finalization)
 
+    reviewed = "<!-- PZDOC PDF PAGE 1 -->\n\n# Chapter\n\nBody.\n"
     prepared = coordinator.prepare_book(
         "job",
         _result(destination),
-        "<!-- PZDOC PDF PAGE 1 -->\n\n# Chapter\n\nBody.\n",
+        reviewed,
     )
     edited = BookEditor(prepared, artifacts, job_id="job").update_metadata(
         title="Edited title",
@@ -125,10 +126,11 @@ def test_epub_draft_is_recoverable_and_reused_before_publication(tmp_path: Path)
         coordinator.prepare_book(
             "job",
             _result(destination),
-            "<!-- PZDOC PDF PAGE 1 -->\n\n# Chapter\n\nBody.\n",
+            reviewed,
         )
         is edited
     )
+    assert prepared.source_fingerprint == book_source_fingerprint(reviewed)
     assert repository.saved_books[0].metadata.title == "Book"
     assert repository.saved_books[0].metadata.identifier is not None
     assert "PZDOC" not in BookEditor(

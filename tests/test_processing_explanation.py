@@ -114,8 +114,8 @@ def test_linguistic_summary_omits_missing_translation_coverage() -> None:
                 translation=TranslationConfiguration(True, TranslationMethod.LOCAL_AI, None),
                 plan=ProcessingPlan.LOCAL_AI_REVIEWED,
             ),
-            "Traducir y corregir con IA local",
-            "combina traducción y corrección",
+            "Verificar traducción con IA local",
+            "2 pasadas de IA: traducción y verificación",
         ),
         (
             DocumentFormat.MARKDOWN,
@@ -125,7 +125,7 @@ def test_linguistic_summary_omits_missing_translation_coverage() -> None:
                 plan=ProcessingPlan.LOCAL_AI_REVIEWED,
             ),
             "Organizar EPUB con IA local",
-            "2 pasadas de IA: traducción y corrección",
+            "3 pasadas de IA: traducción, verificación",
         ),
         (
             DocumentFormat.EPUB,
@@ -192,7 +192,7 @@ def test_flow_and_pass_summary_cover_product_routes(
                 ),
                 plan=ProcessingPlan.LOCAL_AI_REVIEWED,
             ),
-            ("Traducir y corregir a español",),
+            ("Traducir a español", "Verificar traducción"),
             HumanReviewPolicy.IF_CHANGES,
             "Tu revisión si hay cambios",
         ),
@@ -221,7 +221,7 @@ def test_flow_and_pass_summary_cover_product_routes(
                 ),
                 plan=ProcessingPlan.LOCAL_AI_REVIEWED,
             ),
-            ("Traducir y corregir a español", "Organizar EPUB"),
+            ("Traducir a español", "Verificar traducción", "Organizar EPUB"),
             HumanReviewPolicy.BEFORE_PUBLISHING,
             "Tu revisión final",
         ),
@@ -252,7 +252,7 @@ def test_compact_flow_uses_one_vocabulary_and_explicit_human_policy(
     assert len(flow.sequence_stages) == len(flow.compact_sequence)
 
 
-def test_combined_user_step_tracks_all_of_its_real_execution_phases() -> None:
+def test_independent_translation_review_tracks_its_own_execution_phase() -> None:
     flow = processing_flow(
         DocumentFormat.PDF,
         JobConfiguration(
@@ -267,12 +267,14 @@ def test_combined_user_step_tracks_all_of_its_real_execution_phases() -> None:
     )
 
     assert flow.compact_sequence == (
-        "Traducir y corregir a español",
+        "Traducir a español",
+        "Verificar traducción",
         "Organizar EPUB",
         "Tu revisión final",
     )
     assert flow.sequence_stages == (
-        (StageKind.TRANSLATE, StageKind.REFINE),
+        (StageKind.TRANSLATE,),
+        (StageKind.REFINE,),
         (StageKind.STRUCTURE,),
         (),
     )

@@ -114,6 +114,18 @@ _TOC_TABLE_LABEL_PATTERN = re.compile(
     r"(?P<label>(?:(?!</td>).){3,500})(?P<suffix></td>)",
     re.IGNORECASE,
 )
+_DOCUMENT_TOC_TABLE_PATTERN = re.compile(
+    r'<table\s+class=["\']document-toc["\'][^>]*>.*?</table>',
+    re.IGNORECASE | re.DOTALL,
+)
+_FRAGMENTED_PART_TITLE_PATTERN = re.compile(
+    r"(?mi)^(?:[ \t]*#{1,6}[ \t]+)?P[ \t]*(?P<roman>[IVXLCDM]+)[ \t]*$"
+    r"(?:\r?\n){2}^[ \t]*(?:#{1,6}[ \t]+)?ART[ \t]*$"
+    r"(?:\r?\n){2}^[ \t]*(?:#{1,6}[ \t]+)?"
+    r"(?P<initials>[A-Z](?:[ \t]*[A-Z]){0,5})[ \t]*$"
+    r"(?:\r?\n){2}^[ \t]*(?:#{1,6}[ \t]+)?"
+    r"(?P<suffix>[A-Z][A-Z'’\u2013\u2014-]*(?:[ \t]+[A-Z][A-Z'’\u2013\u2014-]*)*)[ \t]*$"
+)
 
 LOGGER = logging.getLogger(__name__)
 
@@ -170,7 +182,7 @@ class SemanticDocument:
 
 def analyze_markdown(markdown: str) -> SemanticDocument:
     """Classify stable Markdown blocks using bounded, deterministic heuristics."""
-    raw_blocks = split_markdown_blocks(markdown)
+    raw_blocks = split_markdown_blocks(markdown, enforce_review_limit=False)
     page_numbers = _page_numbers(raw_blocks)
     base_roles = tuple(_base_role(block.markdown) for block in raw_blocks)
     toc_positions = _toc_positions(raw_blocks, base_roles)
@@ -183,7 +195,7 @@ def analyze_markdown(markdown: str) -> SemanticDocument:
         base_roles,
         strict=True,
     ):
-        if block.position in toc_positions:
+        if block.position in toc_positions or base_role is SemanticRole.TOC:
             role = SemanticRole.TOC
             confidence = 0.96
         elif block.position < front_matter_end and base_role not in {
@@ -214,7 +226,18 @@ def reconcile_document_evidence(markdown: str) -> tuple[str, int]:
 
     reconciled, spelling_changes = _reconcile_dominant_proper_spellings(markdown)
     reconciled, reference_changes = _reconcile_toc_heading_references(reconciled)
-    changes = spelling_changes + reference_changes
+    reconciled, fragmented_container_changes = _reconcile_fragmented_part_titles(reconciled)
+    reconciled, container_changes = _reconcile_truncated_container_headings(reconciled)
+    reconciled, subtitle_container_changes = _reconcile_subtitle_only_container_headings(reconciled)
+    reconciled, numbered_heading_changes = _promote_index_backed_numbered_headings(reconciled)
+    changes = (
+        spelling_changes
+        + reference_changes
+        + fragmented_container_changes
+        + container_changes
+        + subtitle_container_changes
+        + numbered_heading_changes
+    )
     if changes:
         LOGGER.info("document_evidence_reconciled changes=%d", changes)
     return reconciled, changes
@@ -286,14 +309,13 @@ def _reconcile_toc_heading_references(markdown: str) -> tuple[str, int]:
             continue
         ranked = sorted(
             (
-                SequenceMatcher(None, label.casefold(), heading.casefold(), autojunk=False).ratio(),
+                _toc_heading_reference_score(label, heading),
                 heading,
             )
             for heading in headings
             if _reference_number_tokens(label) == _reference_number_tokens(heading)
-            and len(label.split()) == len(heading.split())
         )
-        if not ranked or ranked[-1][0] < 0.94:
+        if not ranked or ranked[-1][0] < 0.96:
             continue
         best_score, best_heading = ranked[-1]
         if len(ranked) > 1 and ranked[-2][0] >= best_score - 0.02:
@@ -311,6 +333,217 @@ def _reconcile_toc_heading_references(markdown: str) -> tuple[str, int]:
         return markdown, 0
     pieces.append(markdown[cursor:])
     return "".join(pieces), changes
+
+
+def _toc_heading_reference_score(label: str, heading: str) -> float:
+    normalized_label = re.sub(r"\s+", " ", label).strip().casefold()
+    normalized_heading = re.sub(r"\s+", " ", heading).strip().casefold()
+    direct = SequenceMatcher(
+        None,
+        normalized_label,
+        normalized_heading,
+        autojunk=False,
+    ).ratio()
+    compact_label = re.sub(r"[^\w]+", "", normalized_label, flags=re.UNICODE)
+    compact_heading = re.sub(r"[^\w]+", "", normalized_heading, flags=re.UNICODE)
+    compact = (
+        SequenceMatcher(None, compact_label, compact_heading, autojunk=False).ratio()
+        if min(len(compact_label), len(compact_heading)) >= 8
+        else 0.0
+    )
+    return max(direct, compact)
+
+
+def _toc_table_labels(markdown: str, *, level: int) -> tuple[str, ...]:
+    labels: list[str] = []
+    for match in _TOC_TABLE_LABEL_PATTERN.finditer(markdown):
+        level_match = re.search(r"toc-level-(\d)", match.group("prefix"), re.IGNORECASE)
+        if level_match is None or int(level_match.group(1)) != level:
+            continue
+        label = _plain_markdown_label(match.group("label"))
+        if label:
+            labels.append(label)
+    return tuple(labels)
+
+
+def _reconcile_fragmented_part_titles(markdown: str) -> tuple[str, int]:
+    """Rejoin decorative part-title lines split by PDF column reading order."""
+
+    donors: dict[str, list[str]] = {}
+    for label in _toc_table_labels(markdown, level=0):
+        match = re.match(r"(?i)^part\s+([ivxlcdm]+)\b", label)
+        if match is not None:
+            donors.setdefault(match.group(1).casefold(), []).append(label)
+    unique_donors = {
+        numeral: labels[0] for numeral, labels in donors.items() if len(set(labels)) == 1
+    }
+    changes = 0
+
+    def replace(match: re.Match[str]) -> str:
+        nonlocal changes
+        numeral = match.group("roman")
+        donor = unique_donors.get(numeral.casefold())
+        reconstructed = _merge_fragmented_title_words(
+            match.group("initials"),
+            match.group("suffix"),
+        )
+        if donor is None and reconstructed is None:
+            return match.group(0)
+        changes += 1
+        title = donor or f"Part {numeral.upper()}: {reconstructed}"
+        return f"# {title}"
+
+    return _FRAGMENTED_PART_TITLE_PATTERN.sub(replace, markdown), changes
+
+
+def _merge_fragmented_title_words(initials: str, suffix: str) -> str | None:
+    leading = tuple(re.findall(r"[A-Z]", initials.upper()))
+    words = suffix.upper().split()
+    if not leading or not words:
+        return None
+    merged: list[str] = []
+    word_index = 0
+    connectors = {"A", "AN", "AND", "DE", "DEL", "EL", "LA", "OF", "THE", "Y"}
+    for initial in leading:
+        while word_index < len(words) and words[word_index] in connectors:
+            merged.append(words[word_index])
+            word_index += 1
+        if word_index >= len(words):
+            return None
+        merged.append(f"{initial}{words[word_index]}")
+        word_index += 1
+    merged.extend(words[word_index:])
+    visible = " ".join(merged)
+    if len(visible) < 4 or not all(word.isalpha() for word in merged):
+        return None
+    return visible.title()
+
+
+def _reconcile_truncated_container_headings(markdown: str) -> tuple[str, int]:
+    """Expand a bare ``PII``-style heading only from one matching printed part title."""
+
+    donors: dict[str, list[str]] = {}
+    for label in _toc_table_labels(markdown, level=0):
+        match = re.match(r"(?i)^part\s+([ivxlcdm]+)\b", label)
+        if match is not None:
+            donors.setdefault(match.group(1).casefold(), []).append(label)
+    unique_donors = {
+        numeral: labels[0] for numeral, labels in donors.items() if len(set(labels)) == 1
+    }
+    if not unique_donors:
+        return markdown, 0
+
+    changes = 0
+
+    def replace(match: re.Match[str]) -> str:
+        nonlocal changes
+        raw_title = match.group(2)
+        plain_title = _plain_markdown_label(raw_title)
+        marker = re.fullmatch(r"(?i)p\s*([ivxlcdm]+)", plain_title)
+        if marker is None:
+            return match.group(0)
+        donor = unique_donors.get(marker.group(1).casefold())
+        if donor is None:
+            return match.group(0)
+        changes += 1
+        return f"{match.group(1)} {_restore_label_emphasis(raw_title, donor)}"
+
+    return _HEADING_PATTERN.sub(replace, markdown), changes
+
+
+def _reconcile_subtitle_only_container_headings(markdown: str) -> tuple[str, int]:
+    """Restore a decorative part heading when only its unique subtitle survived extraction."""
+
+    donors: dict[str, list[str]] = {}
+    for label in _toc_table_labels(markdown, level=0):
+        match = re.match(
+            r"(?i)^(?:part|parte|book|libro|volume|volumen|tomo)\s+"
+            r"(?:\d{1,3}|[ivxlcdm]+)\s*[:\u2013\u2014-]\s*(?P<subtitle>\S.*)$",
+            label,
+        )
+        if match is None:
+            continue
+        key = re.sub(r"[^\w]+", "", match.group("subtitle"), flags=re.UNICODE).casefold()
+        if len(key) >= 6:
+            donors.setdefault(key, []).append(label)
+    unique_donors = {key: labels[0] for key, labels in donors.items() if len(set(labels)) == 1}
+    if not unique_donors:
+        return markdown, 0
+
+    front_toc_end = max(
+        (match.end() for match in _DOCUMENT_TOC_TABLE_PATTERN.finditer(markdown)),
+        default=0,
+    )
+    heading_matches: dict[str, list[re.Match[str]]] = {}
+    for match in _HEADING_PATTERN.finditer(markdown):
+        if match.start() <= front_toc_end:
+            continue
+        plain = _plain_markdown_label(match.group(2))
+        key = re.sub(r"[^\w]+", "", plain, flags=re.UNICODE).casefold()
+        if key in unique_donors:
+            heading_matches.setdefault(key, []).append(match)
+    promotable = {
+        matches[0].start(): unique_donors[key]
+        for key, matches in heading_matches.items()
+        if len(matches) == 1
+    }
+    if not promotable:
+        return markdown, 0
+
+    changes = 0
+
+    def replace(match: re.Match[str]) -> str:
+        nonlocal changes
+        donor = promotable.get(match.start())
+        if donor is None:
+            return match.group(0)
+        changes += 1
+        return f"{match.group(1)} {_restore_label_emphasis(match.group(2), donor)}"
+
+    return _HEADING_PATTERN.sub(replace, markdown), changes
+
+
+def _promote_index_backed_numbered_headings(markdown: str) -> tuple[str, int]:
+    """Recover chapter headings misread as list items when the printed index confirms them."""
+
+    donors: dict[str, list[str]] = {}
+    for label in _toc_table_labels(markdown, level=0):
+        if re.match(r"^\d{1,3}\s*[.)]\s*\S", label) is None:
+            continue
+        key = re.sub(r"[^\w]+", "", label, flags=re.UNICODE).casefold()
+        donors.setdefault(key, []).append(label)
+    unique_keys = {key for key, labels in donors.items() if len(set(labels)) == 1}
+    if not unique_keys:
+        return markdown, 0
+
+    pattern = re.compile(r"(?m)^(?P<indent>[ \t]{0,3})(?P<label>\d{1,3}[.)][ \t]+[^\r\n]+?)\s*$")
+    matches_by_key: dict[str, list[re.Match[str]]] = {}
+    for match in pattern.finditer(markdown):
+        key = re.sub(
+            r"[^\w]+",
+            "",
+            _plain_markdown_label(match.group("label")),
+            flags=re.UNICODE,
+        )
+        key = key.casefold()
+        if key in unique_keys:
+            matches_by_key.setdefault(key, []).append(match)
+    promotable_starts = {
+        matches[0].start() for matches in matches_by_key.values() if len(matches) == 1
+    }
+    if not promotable_starts:
+        return markdown, 0
+
+    changes = 0
+
+    def replace(match: re.Match[str]) -> str:
+        nonlocal changes
+        if match.start() not in promotable_starts:
+            return match.group(0)
+        changes += 1
+        return f"{match.group('indent')}## {match.group('label')}"
+
+    return pattern.sub(replace, markdown), changes
 
 
 def _strict_spelling_neighbor(dominant: str, rare: str) -> bool:
@@ -488,7 +721,7 @@ def _toc_positions(
         if role is SemanticRole.PROVENANCE or not visible:
             selected.add(block.position)
             continue
-        if role is SemanticRole.HEADING and entries >= 2:
+        if role is SemanticRole.HEADING and entries >= 1:
             active = False
             continue
         if len(visible) <= 160 and re.search(r"\b\d+\s*$", visible):
@@ -527,7 +760,7 @@ def _front_matter_end(
             and (block.position == 0 or evidence > 0)
         ):
             return block.position
-        if block.position in toc_positions:
+        if block.position in toc_positions or base_role is SemanticRole.TOC:
             evidence += 2
             saw_toc = True
         elif _FRONT_MATTER_PATTERN.search(visible):

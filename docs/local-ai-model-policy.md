@@ -7,9 +7,11 @@ locales independientes para traducción y revisión, y la interfaz activa muestr
 dos capacidades fijas. No existe un asistente de recomendaciones, un selector genérico ni un campo
 para tags o endpoints arbitrarios.
 
-La traducción aprobada es `parsezen/hymt-translation:Q4_K_M`, basada en Hy-MT2 Q4_K_M. La revisión
-aprobada es `parsezen/lfm-review:Q6_K`, basada en LFM Q6_K. Sus manifests fijan digest, contexto,
-adaptador, parámetros, licencias y procedencia; no se ofrecen variantes alternativas en la UI.
+El componente de traducción fijado es `parsezen/hymt-translation:Q4_K_M`, basado en Hy-MT2 Q4_K_M.
+El componente de revisión fijado es `parsezen/lfm-review:Q6_K`, basado en LFM Q6_K. Sus manifests
+fijan digest, contexto, adaptador, parámetros, licencias y procedencia; no se ofrecen variantes
+alternativas en la UI. «Fijado» acredita identidad y uso dentro de su contrato, no corrección
+semántica universal ni autorización para aprobar cambios sin una persona.
 
 ## Decisión de producto
 
@@ -18,8 +20,8 @@ arbitrario:
 
 | Capacidad | Contrato objetivo | Estado |
 |---|---|---|
-| Traducción con IA | `parsezen/hymt-translation:Q4_K_M` | Hy-MT2 Q4_K_M aprobado |
-| Revisión bilingüe, revisión de contenido y estructura | `parsezen/lfm-review:Q6_K` | LFM Q6_K aprobado |
+| Traducción con IA | `parsezen/hymt-translation:Q4_K_M` | baseline EN→ES verificado en corpus |
+| Revisión bilingüe, revisión de contenido y estructura | `parsezen/lfm-review:Q6_K` | propuestas protegidas y supervisadas; autoaceptación no aprobada |
 | Traducción sin LLM | Argos offline | se conserva sin cambios |
 | Arbitraje OCR visual | componente visual independiente | fuera de esta selección |
 
@@ -36,8 +38,26 @@ El contrato objetivo no tendrá excepciones de modelo por documento ni degradaci
 - el árbitro visual no se considera parte de la pila textual garantizada.
 
 El procesamiento directo será el recorrido recomendado. Las comprobaciones deterministas pueden
-proponer una revisión dirigida, pero nunca arrancan Ollama por sí solas. La revisión completa sigue
-siendo una decisión explícita para trabajos que justifiquen su coste.
+proponer una revisión dirigida, pero nunca arrancan Ollama por sí solas. La revisión adicional
+proactiva sigue siendo una decisión explícita para trabajos que justifiquen su
+coste y declara su cobertura real; solicitarla no significa que cada bloque haya recibido una
+respuesta válida.
+
+### Alcances que no deben confundirse
+
+La política separa cuatro autorizaciones:
+
+1. **instalable**: procedencia, licencia y requisitos permiten preparar el artefacto;
+2. **preparado**: manifest, digest y metadatos locales coinciden;
+3. **utilizable bajo guardas**: puede generar una traducción o propuesta que el código volverá a
+   validar y, cuando corresponda, mostrará a una persona;
+4. **promocionable automáticamente**: calidad demostrada sobre el corpus completo para aplicar una
+   modificación sin decisión humana.
+
+Hy-MT2 está verificado como baseline de traducción EN→ES bajo las guardas y límites documentados. LFM
+está fijado como generador local de propuestas de revisión y estructura dentro de una puerta humana.
+Ningún revisor actual dispone de autorización de promoción semántica automática. La interfaz puede
+mostrar un componente `Preparado` sin afirmar el cuarto alcance.
 
 ## Identidad reproducible
 
@@ -99,7 +119,104 @@ El benchmark no descarga implícitamente comparadores ni recurre a artefactos co
 selección consideró la calidad después de las guardas de Parsezen, memoria, tiempo, reintentos y
 tamaño instalado. Hy-MT2 superó 27/27 gates, frente a 24/27 de MiLMMT y TranslateGemma. LFM Q6
 igualó la calidad de Q8 con menor tamaño y superó a Qwen en precisión monolingüe; la comprobación
-bilingüe repetida terminó 9/9 sin falsos positivos ni falsos negativos.
+bilingüe repetida terminó 9/9 sin falsos positivos ni falsos negativos. Esta fue una criba de
+selección, menor que el corpus exigido para promoción automática; la evidencia ampliada posterior es
+la que determina el alcance operativo vigente.
+
+### Revalidación ampliada
+
+La selección histórica no sustituye la evaluación sobre documentos representativos del uso real. La
+revalidación privada EN→ES quedó congelada con 41 referencias humanas: 40 lingüísticas y una
+estructural. Mezcla documentos, autores, prosa, títulos, índices, tablas, instrucciones y registros;
+cada referencia recibió adecuación y fluidez 5/5, sin error crítico, tras las rondas humanas
+necesarias. El criterio editorial es español internacional natural, tratamiento de «tú» cuando el
+original se dirige al lector, conservación del registro del autor y equivalentes técnicos asentados.
+
+Sobre esas 41 referencias, Hy-MT2 superó 41/41 puertas duras y obtuvo chrF medio 76,935; Qwen3.5-9B
+superó 39/41 y obtuvo 73,911. Hy-MT2 ganó 27 casos, Qwen 13 y hubo un empate. chrF fue solo una señal
+de cribado: la revisión humana reveló errores de naturalidad, terminología, gramática, elección
+léxica, sentido, tratamiento y registro que las guardas estructurales no pretenden decidir.
+
+La memoria terminológica de producto se limita a sintagmas astrológicos completos y se activa solo
+con varias señales inequívocas del dominio. En los 13 casos afectados conservó las puertas duras y
+mejoró nueve resultados, dejó tres iguales y corrigió aparte el único retroceso aparente de
+capitalización. No se incorporaron sustituciones aisladas ambiguas como `chart` o `agenda`.
+
+También se ensayaron dos cambios globales pequeños sobre Hy-MT2 y se rechazaron. Añadir contexto e
+instrucciones generales al prompt oficial degradó 13 de 14 casos, con una variación media de chrF de
+−3,475 y una puerta dura perdida. Añadir `repeat_penalty=1.05` dejó un empate inestable —cuatro casos
+mejoraron, cuatro empeoraron—, redujo ligeramente la media (−0,065) y perdió una puerta dura. El
+adaptador mantiene por ello el prompt y los parámetros de producción ya aprobados; estas ablaciones
+no justifican una variante global.
+
+El 2 de septiembre de 2026 se comprobó también el par Argos EN→ES realmente instalado como posible
+segundo motor para residuos de IA. Funcionó en alguna frase de prosa, pero dejó rótulos breves sin
+traducir y produjo al menos una salida corrupta; no alcanza la precisión necesaria para decidir por
+tipo de bloque. Se rechaza por ello cualquier degradación automática de párrafos o tablas a Argos. Su
+alcance continúa siendo el motor completo elegido explícitamente y el respaldo, sin descargas, de un
+único título residual que supere las guardas compartidas.
+
+LFM y Qwen se evaluaron aparte como revisores bilingües. La pasada general no corrigió los cuatro
+casos difíciles seleccionados. El piloto focalizado posterior usó un vocabulario cerrado de cinco
+categorías —sentido, terminología, gramática, registro y naturalidad— sobre diez errores humanos
+sembrados y diez referencias limpias. LFM no alteró ningún bloque: mantuvo 20/20 puertas duras y cero
+falsos positivos, pero obtuvo recall cero; 32 respuestas fueron rechazadas en 37 peticiones. Qwen
+tampoco modificó ninguno de los diez casos sembrados, aunque respetó el contrato sin rechazos. Por
+tanto el foco cerrado permanece solo como instrumento experimental, aislado por su propia clave de
+checkpoint, y no se activa en el flujo normal. Un modelo futuro deberá superar las puertas de
+revisión sembrada y controles limpios antes de cambiar esta decisión.
+
+Se descartó también abreviar artificialmente el razonamiento de LFM para obtener antes el array JSON.
+En diez referencias humanas produjo más respuestas completas, pero modificó siete casos, degradó
+cinco frente a la referencia y redujo el chrF medio en 2,636 puntos; las guardas rechazaron además 40
+propuestas en 47 peticiones. El adaptador conserva por ello la plantilla de razonamiento aprobada y
+no interpreta una respuesta JSON válida como evidencia de corrección semántica.
+
+#### Piloto residual sobre holdouts
+
+El 31 de agosto de 2026 se cerró un piloto posterior sobre tres holdouts completos. Las comprobaciones
+detectaron 67 señales residuales. Un clasificador local doble dejó una como falso positivo seguro por
+consenso; los correctores locales solo lograron producir 12 propuestas que superaban las guardas y
+merecían revisión humana. Tras cuatro paquetes de decisiones y varias rondas de corrección:
+
+- una propuesta quedó aprobada y se incorporó al corpus privado;
+- once propuestas no alcanzaron aprobación humana;
+- 54 señales nunca obtuvieron una propuesta suficientemente segura;
+- 65 señales quedaron finalmente como revisión manual requerida.
+
+Estas 65 señales no equivalen a 65 errores confirmados: mezclan posibles fallos, falsos positivos y
+casos cuyo cambio no puede demostrarse automáticamente. La tasa observada de aprobación fue 1/12,
+muy inferior al gate de precisión del 98 %. Por tanto, el mecanismo de reparación residual queda
+**EXPERIMENTAL y NO PROMOCIONABLE**. Ninguna propuesta dudosa se aplica a libros ni al flujo normal.
+
+La siguiente reevaluación debe distinguir primero fallo de detección, contexto, propuesta o guarda;
+no generará otra paráfrasis de los mismos casos sin un mecanismo nuevo. Solo volverá a solicitar
+revisión humana tras superar controles limpios y un descarte interno. El conjunto consolidado conserva
+conteos, hashes y procedencia de ronda; el único par aprobado permanece privado y los rechazos sirven
+como controles negativos.
+
+La auditoría causal privada posterior validó 19 eventos de revisión sobre esos 12 casos. Todas las
+propuestas habían superado las guardas mecánicas, pero la aprobación fue 1/12 en la primera ronda y
+0/7 en las posteriores. Esto identifica la generación de propuestas como el cuello de botella
+observado y demuestra, a la vez, que pasar guardas no acredita sentido ni naturalidad. Las decisiones
+no bastan para etiquetar individualmente detector y contexto: ambos permanecen no demostrados. Una
+taxonomía local doble de las 13 notas solo alcanzó acuerdo completo en una, por lo que se conserva
+como diagnóstico orientativo y nunca como gate.
+
+El descarte privado posterior cambió una sola variable: reemplazó la reescritura completa por parches
+mínimos propuestos independientemente. Terminó con 0/13 candidatos por consenso y ninguna
+modificación del control limpio. Qwen 3.5 produjo nueve respuestas estructuradas de catorce, pero
+Qwen 4B solo una y LFM ninguna; por tanto no existe actualmente una pareja local capaz de sostener el
+contrato dual. No se interpreta la ausencia de cambios como aprobación ni se relaja el consenso. La
+vía queda **RECHAZADA con los modelos instalados**, no habilita corrección automática y solo puede
+reabrirse con una capacidad nueva, no con otra redacción del mismo prompt.
+
+La interfaz privada de revisión permanece ligada al propio equipo por defecto. Cuando la revisión se
+hace desde un móvil, solo puede habilitarse de forma explícita en una red privada de confianza —la red
+local o una VPN privada del usuario— mediante un enlace temporal largo; sin esa clave, la interfaz no
+entrega fragmentos ni acepta decisiones. Este modo no publica contenido en Internet: exige que el
+equipo siga encendido y que ambos dispositivos compartan esa red privada. El enlace caduca al cerrar
+el servidor de revisión.
 
 Traducción, revisión bilingüe, limpieza monolingüe y estructura se evalúan por separado. Un resultado
 general de seguimiento de instrucciones no demuestra por sí solo capacidad de corrección semántica.
@@ -148,7 +265,7 @@ Los siguientes gates protegen el producto y se aplican a cada ejecución, no son
 - una petición sale de loopback o un informe contiene contenido documental;
 - se publica una salida inválida o aparece una regresión estructural EPUB;
 - una modificación aceptada altera cifras, fechas, URLs, código, marcadores, tablas, nombres
-  protegidos o negación;
+  protegidos, símbolos de moneda o porcentaje, o negación;
 - el sistema considera listo un modelo cloud, una capacidad incompatible o un digest distinto;
 - el pipeline supera el límite de pico RSS fijado antes de ejecutar el corpus para el equipo objetivo
   de 16 GB, con entorno y carga secuencial descritos en el manifest privado.

@@ -41,6 +41,14 @@ class TranslationMethod(StrEnum):
     LOCAL_AI = "local_ai"
 
 
+class AIPhase(StrEnum):
+    """The closed set of local-AI phases supported by one job snapshot."""
+
+    TRANSLATION = "translation"
+    REVIEW = "review"
+    VISUAL_OCR = "visual_ocr"
+
+
 class ProcessingPlan(StrEnum):
     """The two deliberate product-level ways to process a document."""
 
@@ -273,6 +281,29 @@ class LocalAIPolicySnapshot:
 
 
 @dataclass(frozen=True, slots=True)
+class ResolvedAIProfile:
+    """Effective, content-free local-AI identity for one processing phase."""
+
+    phase: AIPhase
+    model: str | None
+    context_window: int | None
+    component: LocalAIComponentSnapshot | None = None
+
+    @property
+    def identity(self) -> tuple[object, ...]:
+        """Return every field that can change deterministic local-AI output."""
+
+        component = self.component
+        return (
+            self.phase.value,
+            self.model,
+            self.context_window,
+            component.policy_version if component is not None else None,
+            component.digest if component is not None else None,
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class AIProfileConfiguration:
     """Snapshot of the global local-AI profile used by a queued document."""
 
@@ -302,41 +333,56 @@ class AIProfileConfiguration:
 
     @property
     def effective_translation_model(self) -> str | None:
-        component = self.components.translation
-        return (
-            (component.model if component is not None else None)
-            or self.translation_model
-            or self.model
-        )
+        return resolve_ai_profile(self, AIPhase.TRANSLATION).model
 
     @property
     def effective_review_model(self) -> str | None:
-        component = self.components.review
-        return (
-            (component.model if component is not None else None) or self.review_model or self.model
-        )
+        return resolve_ai_profile(self, AIPhase.REVIEW).model
 
     @property
     def effective_translation_context_window(self) -> int | None:
-        component = self.components.translation
-        return (
-            component.context_window
-            if component is not None and component.context_window is not None
-            else self.translation_context_window
-            if self.translation_context_window is not None
-            else self.context_window
-        )
+        return resolve_ai_profile(self, AIPhase.TRANSLATION).context_window
 
     @property
     def effective_review_context_window(self) -> int | None:
-        component = self.components.review
-        return (
+        return resolve_ai_profile(self, AIPhase.REVIEW).context_window
+
+
+def resolve_ai_profile(
+    configuration: AIProfileConfiguration,
+    phase: AIPhase,
+) -> ResolvedAIProfile:
+    """Resolve one job-owned AI phase: fixed component, specialized profile, global."""
+
+    component = {
+        AIPhase.TRANSLATION: configuration.components.translation,
+        AIPhase.REVIEW: configuration.components.review,
+        AIPhase.VISUAL_OCR: configuration.components.visual_ocr,
+    }[phase]
+    specialized_model = {
+        AIPhase.TRANSLATION: configuration.translation_model,
+        AIPhase.REVIEW: configuration.review_model,
+        AIPhase.VISUAL_OCR: None,
+    }[phase]
+    specialized_context = {
+        AIPhase.TRANSLATION: configuration.translation_context_window,
+        AIPhase.REVIEW: configuration.review_context_window,
+        AIPhase.VISUAL_OCR: None,
+    }[phase]
+    return ResolvedAIProfile(
+        phase=phase,
+        model=(component.model if component is not None else None)
+        or specialized_model
+        or configuration.model,
+        context_window=(
             component.context_window
             if component is not None and component.context_window is not None
-            else self.review_context_window
-            if self.review_context_window is not None
-            else self.context_window
-        )
+            else specialized_context
+            if specialized_context is not None
+            else configuration.context_window
+        ),
+        component=component,
+    )
 
 
 @dataclass(frozen=True, slots=True)

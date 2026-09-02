@@ -9,7 +9,7 @@ import math
 import re
 import unicodedata
 from collections import Counter, defaultdict
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, replace
 from difflib import SequenceMatcher
 from enum import StrEnum
@@ -27,6 +27,7 @@ from PIL import Image, ImageStat
 
 from parsezen.cancellation import CancellationToken, check_cancelled
 from parsezen.document_model import RESOURCE_REFERENCE_PREFIX
+from parsezen.epub_builder import classify_heading_role
 from parsezen.errors import ConversionError, ImprovementError, LocalModelUnavailableError
 from parsezen.ocr_conversion import convert_pdf_pages_with_ocr
 from parsezen.pdf_checkpoints import (
@@ -39,6 +40,7 @@ from parsezen.pdf_checkpoints import (
 from parsezen.pdf_layout import (
     _MarkdownBlock,
     _PdfCharacter,
+    _PdfEmphasisSpan,
     _PdfLine,
     _PdfLink,
     _PdfPage,
@@ -59,6 +61,14 @@ _RUNNING_FOOTER_PATTERN = re.compile(
 )
 _LETTER_PATTERN = re.compile(r"[^\W\d_]", re.UNICODE)
 _BULLET_PATTERN = re.compile(r"^[•●◦▪‣⁃]\s*")
+_ORDERED_LIST_PATTERN = re.compile(
+    r"^(?P<number>[1-9]|1\d|20)(?P<marker>[.)])[ \t]+(?P<text>\S.*)$"
+)
+_ORDERED_LIST_PREFIX_PATTERN = re.compile(r"^(?:[1-9]|1\d|20)[.)][ \t]+")
+_ORDERED_LIST_LABEL_PATTERN = re.compile(
+    r"^(?P<label>[^\W\d_]+(?:[ \t]+[^\W\d_]+)+)[ \t]*(?P<suffix>:.*)$",
+    re.UNICODE,
+)
 _ORDINAL_HEADING_WORDS = (
     r"\d+|[ivxlcdm]+|one|two|three|four|five|six|seven|eight|nine|ten|"
     r"uno|dos|tres|cuatro|cinco|seis|siete|ocho|nueve|diez"
@@ -83,6 +93,93 @@ _SECTION_HEADING_PATTERN = re.compile(
 _SPACED_WORD_PATTERN = re.compile(
     r"(?<!\w)(?:[^\W\d_]\s+){4,}[^\W\d_](?!\w)",
     re.UNICODE,
+)
+_PARTIAL_SPACED_WORD_PATTERN = re.compile(
+    r"(?<!\w)[^\W\d_]{2,3}(?:\s+[^\W\d_]){3,}(?!\w)",
+    re.UNICODE,
+)
+_DEGREE_SHAPED_NATIVE_ZERO_PATTERN = re.compile(r"(?<!\d)(?P<degree>[0-2]?\d)0(?=$|[\s.,;:!?)\]])")
+_ZODIAC_SIGN_NAMES = frozenset(
+    {
+        "Acuario",
+        "Acquario",
+        "Aquarius",
+        "Aquário",
+        "Aries",
+        "Ariete",
+        "Áries",
+        "Balance",
+        "Balança",
+        "Bélier",
+        "Cancer",
+        "Cancro",
+        "Cáncer",
+        "Capricorn",
+        "Capricorne",
+        "Capricornio",
+        "Capricórnio",
+        "Capricorno",
+        "Escorpio",
+        "Escorpião",
+        "Fische",
+        "Gemelli",
+        "Gémeaux",
+        "Géminis",
+        "Gemini",
+        "Geminis",
+        "Gêmeos",
+        "Jungfrau",
+        "Krebs",
+        "Leão",
+        "Leo",
+        "Leone",
+        "Libra",
+        "Lion",
+        "Löwe",
+        "Peixes",
+        "Pesci",
+        "Pisces",
+        "Piscis",
+        "Poissons",
+        "Sagittaire",
+        "Sagitario",
+        "Sagitário",
+        "Sagittario",
+        "Sagittarius",
+        "Schütze",
+        "Scorpio",
+        "Scorpion",
+        "Scorpione",
+        "Skorpion",
+        "Steinbock",
+        "Stier",
+        "Taureau",
+        "Taurus",
+        "Toro",
+        "Touro",
+        "Tauro",
+        "Verseau",
+        "Vierge",
+        "Virgem",
+        "Virgo",
+        "Waage",
+        "Wassermann",
+        "Widder",
+        "Zwillinge",
+    }
+)
+_ZODIAC_SIGN_PATTERN = (
+    "(?:"
+    + "|".join(re.escape(name) for name in sorted(_ZODIAC_SIGN_NAMES, key=len, reverse=True))
+    + ")"
+)
+_INVALID_ZODIAC_DEGREE_PATTERN = re.compile(
+    rf"(?<!\d)(?P<degree>[3-9]\d)(?P<marker>°|0)(?=\s+{_ZODIAC_SIGN_PATTERN}\b)",
+    re.IGNORECASE,
+)
+_INVALID_ZODIAC_DEGREE_ZERO_PATTERN = re.compile(
+    rf"(?<!\d)(?P<degree>[3-9]\d)0(?=\s+{_ZODIAC_SIGN_PATTERN}\b)",
+    re.IGNORECASE,
 )
 _ADJACENT_LINK_PATTERN = re.compile(r"\[([^\]]+)\]\(<([^>]+)>\)\s+\[([^\]]+)\]\(<\2>\)")
 _MAX_HEADING_LENGTH = 120
@@ -164,14 +261,44 @@ _TABLE_CAPTION_LINE_PATTERN = re.compile(
     r"^(?:table|tabla|cuadro)\s+(?:\d+|[ivxlcdm]+)\s*[.\-:]",
     re.IGNORECASE,
 )
+_NUMBERED_FIGURE_CAPTION_PATTERN = re.compile(
+    r"^(?:figures?|figuras?)\s*[0-9iIlLoO]{1,4}"
+    r"(?:\s*(?:[,&+]|\b(?:and|y)\b|[-–—])\s*[0-9iIlLoO]{1,4})*"
+    r"\s*(?:[.:)–—-]|$)",
+    re.IGNORECASE,
+)
 _ROMAN_HEADING_REFERENCE_PATTERN = re.compile(
     r"^(?P<prefix>.+?)\s+(?P<roman>[IVXLCDM]{1,6})(?=\s*(?::|[-–—]|$))"
 )
+_ASTROLOGICAL_SERIES_HEADING_PATTERN = re.compile(
+    r"^(?P<planet>Sun|Moon|Mercury|Venus|Mars|Jupiter|Saturn)\s+in\s+"
+    r"(?P<sign>Aries|Taurus|Gemini|Cancer|Leo|Virgo|Libra|Scorpio|Sagittarius|"
+    r"Capricorn|Aquarius|Pisces)\s+(?P<series>I{1,3}|n|it|ui|in)$",
+    re.IGNORECASE,
+)
+_ASTROLOGICAL_DECAN_TITLE_PATTERN = re.compile(
+    rf"^(?P<sign>{_ZODIAC_SIGN_PATTERN})\s+(?P<series>I{{1,3}})\s*[:—-]\s*\S.*$",
+    re.IGNORECASE,
+)
+_BROKEN_ASTROLOGICAL_DECAN_TITLE_PATTERN = re.compile(
+    rf"^(?P<sign>{_ZODIAC_SIGN_PATTERN})\s+(?P<series>IE)\s+(?P<subtitle>\S.*)$",
+    re.IGNORECASE,
+)
+_FOOTNOTE_DEFINITION_PATTERN = re.compile(r"^(?P<number>\d{1,3})[ \t]+(?P<body>\S(?:.*\S)?)$")
+_INLINE_FOOTNOTE_MARKER_PATTERN = re.compile(
+    r"(?P<prefix>[^\s\d])(?P<number>\d{1,3})(?=(?:\s|$|[.,;:!?]))"
+)
+_SUPERSCRIPT_DIGITS = str.maketrans("0123456789", "⁰¹²³⁴⁵⁶⁷⁸⁹")
 _FULL_PAGE_EXPORT_LETTER_LIMIT = 300
 _MIN_COLUMN_LINES = 3
-_MIN_VECTOR_CURVES = 3
+_MIN_VECTOR_CURVES = 2
 _MAX_CLUSTERED_VECTOR_CURVES = 500
 _VECTOR_CLUSTER_GAP = 12.0
+_OPEN_RASTER_TABLE_RULE_WIDTH_RATIO = 0.58
+_OPEN_RASTER_TABLE_MIN_AREA_RATIO = 0.08
+_OPEN_RASTER_TABLE_MAX_AREA_RATIO = 0.75
+_OPEN_RASTER_TABLE_MIN_SIDE_BY_SIDE_LINES = 8
+_OPEN_RASTER_TABLE_MIN_SIDE_BY_SIDE_RATIO = 0.40
 _MARKDOWN_TABLE_PATTERN = re.compile(r"^\s*\|?.*\|.*\n\s*\|?\s*:?-{3,}", re.MULTILINE)
 _PDF_WARNING_PAGE_PATTERN = re.compile(
     r"^>\s*\*\*Aviso(?: OCR| de conversión) \(página (\d+)\):\*\*",
@@ -181,6 +308,10 @@ _PDF_WARNING_MESSAGE_PATTERN = re.compile(
     r"^>\s*\*\*Aviso(?: OCR| de conversión) \(página \d+\):\*\*\s*"
 )
 _PDF_PAGE_MARKER_PATTERN = re.compile(r"<!--\s*PZDOC PDF PAGE \d+\s*-->", re.IGNORECASE)
+_PDF_OUTLINE_MARKER_PATTERN = re.compile(
+    r"<!--\s*PZDOC PDF OUTLINE [1-6]\s*-->",
+    re.IGNORECASE,
+)
 _PDF_EXTRACTION_SHARD_SIZE = 32
 _SUSPICIOUS_NUMERIC_GLYPH_PATTERN = re.compile(
     r"(?<!\w)(?:"
@@ -219,13 +350,22 @@ _VISUAL_ATOM_PATTERN = re.compile(
 )
 _MAX_VISUAL_ARBITRATION_REGIONS = 8
 _MAX_VISUAL_ARBITRATION_REGIONS_PER_PAGE = 2
+_MIN_VISUAL_TEXT_FALLBACK_PRIORITY = 100
+_SYSTEMIC_SECONDARY_NATIVE_REPAIR_THRESHOLD = 8
 _MAX_HIDDEN_TEXT_AUDIT_PAGES = 6
 _MAX_VISUAL_CROP_BYTES = 4 * 1024 * 1024
+_LITERAL_URL_PATTERN = re.compile(r"(?:https?://|www\.)\S+", re.IGNORECASE)
 
 
 def strip_pdf_page_markers(markdown: str) -> str:
     """Remove private page anchors before publishing user-visible text."""
     return _PDF_PAGE_MARKER_PATTERN.sub("", markdown)
+
+
+def strip_pdf_public_markers(markdown: str) -> str:
+    """Remove every private PDF marker from reader-visible Markdown."""
+
+    return _PDF_OUTLINE_MARKER_PATTERN.sub("", strip_pdf_page_markers(markdown))
 
 
 @dataclass(frozen=True, slots=True)
@@ -276,6 +416,7 @@ class PdfQualityReport:
     secondary_native_arbitrated_regions: int = 0
     visual_reviewed_regions: int = 0
     visual_arbitrated_regions: int = 0
+    document_consensus_arbitrated_regions: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -285,6 +426,16 @@ class PdfEmbeddedResource:
     relative_path: PurePosixPath
     content: bytes
     media_type: str
+    page_number: int
+    bbox: tuple[float, float, float, float] | None = None
+    visual_authority: bool = False
+    visual_text_authority: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class _PdfOutlineEntry:
+    level: int
+    title: str
     page_number: int
 
 
@@ -430,6 +581,58 @@ def convert_pdf_document(
     except (MalformedPDFException, PdfminerException, OSError, ValueError) as exc:
         raise ConversionError(f"No se pudo abrir el PDF {source_path.name}.") from exc
 
+    pages, native_degree_repairs = _repair_native_degree_markers(pages)
+    pages, native_symbol_repairs = _repair_overlapping_native_symbols(pages)
+    pages, repeated_spacing_repairs = _repair_repeated_native_spacing(pages)
+    pre_ocr_secondary_native_text = _extract_secondary_native_text(
+        source_path,
+        {
+            page.number
+            for page in pages
+            if any(
+                _suspicious_non_currency_dollar_count(line.text)
+                for line in page.lines
+                if not line.rotated
+            )
+        },
+        cancellation,
+    )
+    pages, pre_ocr_secondary_repairs = _reconcile_secondary_dollar_glyphs(
+        pages,
+        pre_ocr_secondary_native_text,
+    )
+    systemic_font_mapping = pre_ocr_secondary_repairs >= _SYSTEMIC_SECONDARY_NATIVE_REPAIR_THRESHOLD
+    bounded_line_keys = (
+        {_visual_line_key(line) for page in pages for line in page.lines if not line.rotated}
+        if systemic_font_mapping
+        else None
+    )
+    bounded_secondary_native_text = _extract_secondary_native_line_text(
+        source_path,
+        pages,
+        cancellation,
+        line_keys=bounded_line_keys,
+    )
+    pages, bounded_secondary_repairs = _reconcile_secondary_dollar_glyph_lines(
+        pages,
+        bounded_secondary_native_text,
+    )
+    pre_ocr_secondary_repairs += bounded_secondary_repairs
+    if systemic_font_mapping:
+        pages, systemic_secondary_repairs = _reconcile_systemic_secondary_native_lines(
+            pages,
+            bounded_secondary_native_text,
+        )
+        pre_ocr_secondary_repairs += systemic_secondary_repairs
+    outline_entries = _extract_pdf_outline(
+        source_path,
+        page_range,
+        cancellation,
+    )
+    pages, outline_heading_repairs = _reconcile_pdf_outline_headings(
+        pages,
+        outline_entries,
+    )
     lines = [line for page in pages for line in page.lines]
     ocr_plan = _build_ocr_plan(pages, force_ocr)
     ocr_pages, ocr_failed_pages, required_ocr_failed_pages = _run_planned_ocr(
@@ -453,18 +656,6 @@ def convert_pdf_document(
     if empty_result is not None:
         return PdfConversionResult(empty_result)
 
-    page_images: dict[int, tuple[PdfEmbeddedResource, ...]] = {}
-    omitted_images = 0
-    if include_images:
-        page_images, omitted_images = _extract_embedded_images(
-            source_path,
-            pages,
-            ocr_pages,
-            cancellation,
-            page_range,
-            on_progress,
-        )
-
     body_size = _dominant_body_size(lines)
     heading_sizes = _heading_size_levels(lines, body_size)
     repeated_margins = _repeated_margin_lines(lines, len(pages))
@@ -474,20 +665,56 @@ def convert_pdf_document(
         ocr_pages,
         body_size,
     )
-    secondary_native_text = _extract_secondary_native_text(
-        source_path,
-        {
-            page.number
-            for page in pages
-            if page.number in rendered_ocr_pages
-            and not _should_replace_with_ocr(page, rendered_ocr_pages[page.number])
-        },
-        cancellation,
+    secondary_page_numbers = {
+        page.number
+        for page in pages
+        if page.number in rendered_ocr_pages
+        and not _should_replace_with_ocr(page, rendered_ocr_pages[page.number])
+    }
+    secondary_native_text = dict(pre_ocr_secondary_native_text)
+    secondary_native_text.update(
+        _extract_secondary_native_text(
+            source_path,
+            secondary_page_numbers - set(secondary_native_text),
+            cancellation,
+        )
     )
     pages, secondary_native_arbitrated_regions = _reconcile_secondary_native_text(
         pages,
         rendered_ocr_pages,
         secondary_native_text,
+    )
+    remaining_visual_disagreement_keys = {
+        _visual_line_key(disagreement.line)
+        for disagreement in _visual_text_disagreements(pages, rendered_ocr_pages)
+    }
+    bounded_secondary_disagreement_text = _extract_secondary_native_line_text(
+        source_path,
+        pages,
+        cancellation,
+        line_keys=remaining_visual_disagreement_keys,
+    )
+    pages, bounded_secondary_arbitrated_regions = _reconcile_secondary_native_text_lines(
+        pages,
+        rendered_ocr_pages,
+        bounded_secondary_disagreement_text,
+    )
+    secondary_native_arbitrated_regions += bounded_secondary_arbitrated_regions
+    secondary_native_arbitrated_regions += pre_ocr_secondary_repairs
+    pages, numeric_glyph_arbitrated_regions = _reconcile_suspicious_numbers_from_ocr(
+        pages,
+        rendered_ocr_pages,
+    )
+    pages, document_consensus_arbitrated_regions = _reconcile_document_token_consensus(
+        pages,
+        rendered_ocr_pages,
+    )
+    document_consensus_arbitrated_regions += (
+        numeric_glyph_arbitrated_regions
+        + native_degree_repairs
+        + native_symbol_repairs
+        + repeated_spacing_repairs
+        + outline_heading_repairs
     )
     visual_reviewed_regions = 0
     visual_arbitrated_regions = 0
@@ -501,16 +728,33 @@ def convert_pdf_document(
                 cancellation,
             )
         )
+    page_images: dict[int, tuple[PdfEmbeddedResource, ...]] = {}
+    omitted_images = 0
+    required_figure_failure_pages: set[int] = set()
+    if include_images:
+        page_images, omitted_images, required_figure_failure_pages = _extract_embedded_images(
+            source_path,
+            pages,
+            rendered_ocr_pages,
+            cancellation,
+            page_range,
+            on_progress,
+        )
+    structural_ocr_pages = _ocr_pages_safe_for_structural_rendering(
+        pages,
+        rendered_ocr_pages,
+    )
     markdown, review_issues = _render_document(
         pages,
         body_size,
         heading_sizes,
         repeated_margins,
         referenced_pages,
-        rendered_ocr_pages,
+        structural_ocr_pages,
         ocr_failed_pages,
-        page_images,
-        on_progress,
+        page_images=page_images,
+        required_figure_failure_pages=required_figure_failure_pages,
+        on_progress=on_progress,
     )
     markdown = markdown.strip()
     check_cancelled(cancellation)
@@ -526,6 +770,7 @@ def convert_pdf_document(
         required_ocr_failed_pages=required_ocr_failed_pages,
         secondary_native_pages=set(secondary_native_text),
         secondary_native_arbitrated_regions=secondary_native_arbitrated_regions,
+        document_consensus_arbitrated_regions=document_consensus_arbitrated_regions,
         visual_reviewed_regions=visual_reviewed_regions,
         visual_arbitrated_regions=visual_arbitrated_regions,
     )
@@ -707,6 +952,7 @@ def _notify_pdf_quality(
     required_ocr_failed_pages: set[int] | None = None,
     secondary_native_pages: set[int] | None = None,
     secondary_native_arbitrated_regions: int = 0,
+    document_consensus_arbitrated_regions: int = 0,
     visual_reviewed_regions: int = 0,
     visual_arbitrated_regions: int = 0,
 ) -> None:
@@ -733,6 +979,7 @@ def _notify_pdf_quality(
             required_ocr_failed_pages=tuple(sorted(required_ocr_failed_pages or set())),
             secondary_native_pages=tuple(sorted(secondary_native_pages or set())),
             secondary_native_arbitrated_regions=secondary_native_arbitrated_regions,
+            document_consensus_arbitrated_regions=document_consensus_arbitrated_regions,
             visual_reviewed_regions=visual_reviewed_regions,
             visual_arbitrated_regions=visual_arbitrated_regions,
         )
@@ -806,6 +1053,7 @@ def _extract_pages(
                     )
                     if line is not None:
                         built_lines.extend(_split_wide_line(line))
+                built_lines = _split_lines_at_established_gutters(built_lines)
                 lines = tuple(_reading_order_lines(built_lines))
                 tables = _extract_tables(page)
                 if not tables and _has_spatial_table_candidate(lines):
@@ -901,13 +1149,14 @@ def _extract_embedded_images(
     cancellation: CancellationToken | None,
     page_range: PdfPageRange | None,
     on_progress: PdfProgressCallback | None,
-) -> tuple[dict[int, tuple[PdfEmbeddedResource, ...]], int]:
+) -> tuple[dict[int, tuple[PdfEmbeddedResource, ...]], int, set[int]]:
     """Render meaningful placed images while filtering page scans and backgrounds."""
     page_models = {page.number: page for page in pages}
     selected: dict[int, tuple[PdfEmbeddedResource, ...]] = {}
     seen_content: set[str] = set()
     omitted = 0
     exported = 0
+    required_figure_failure_pages: set[int] = set()
     try:
         with pdfplumber.open(source_path, unicode_norm="NFC") as pdf:
             resolved_range = (
@@ -923,7 +1172,43 @@ def _extract_embedded_images(
                 page = pdf.pages[page_number - 1]
                 check_cancelled(cancellation)
                 model = page_models[page_number]
-                candidates = _exportable_image_boxes(page, model, ocr_pages.get(page_number))
+                ocr_markdown = ocr_pages.get(page_number)
+                required_figure = _requires_full_page_figure_reference(model, ocr_markdown)
+                preserve_cover_visual = len(
+                    pdf.pages
+                ) > 1 and _sparse_raster_cover_should_stay_in_image(model)
+                preserve_final_visual = (
+                    len(pdf.pages) > 1
+                    and page_number == len(pdf.pages)
+                    and _page_letter_count(model) < _MIN_USABLE_NATIVE_LETTERS
+                )
+                disagreement_boxes = _unresolved_text_visual_boxes(
+                    model,
+                    ocr_markdown,
+                    tuple(float(value) for value in page.bbox),
+                )
+                preserve_unresolved_page_visual = disagreement_boxes == (
+                    tuple(float(value) for value in page.bbox),
+                )
+                candidates = list(
+                    _exportable_image_boxes(
+                        page,
+                        model,
+                        ocr_markdown,
+                        preserve_full_page_visual=(
+                            preserve_cover_visual
+                            or preserve_final_visual
+                            or preserve_unresolved_page_visual
+                        ),
+                    )
+                )
+                for disagreement_bbox in disagreement_boxes:
+                    if not any(
+                        _bbox_overlap_ratio(disagreement_bbox, existing) >= 0.85
+                        for existing in candidates
+                    ):
+                        candidates.append(disagreement_bbox)
+                candidates.sort(key=lambda bbox: (bbox[1], bbox[0]))
                 page_resources: list[PdfEmbeddedResource] = []
                 for image_index, bbox in enumerate(candidates, start=1):
                     if exported >= _MAX_EXPORTED_PDF_IMAGES:
@@ -951,7 +1236,7 @@ def _extract_embedded_images(
                         omitted += 1
                         continue
                     digest = sha256(content).hexdigest()
-                    if digest in seen_content:
+                    if digest in seen_content and not required_figure:
                         continue
                     seen_content.add(digest)
                     resource = PdfEmbeddedResource(
@@ -959,11 +1244,31 @@ def _extract_embedded_images(
                         content,
                         "image/jpeg",
                         page_number,
+                        bbox,
+                        (
+                            preserve_cover_visual
+                            or preserve_final_visual
+                            or preserve_unresolved_page_visual
+                        )
+                        and bbox_area_ratio >= _MAX_EXPORTED_IMAGE_AREA_RATIO,
+                        any(
+                            all(
+                                abs(left - right) <= 0.01
+                                for left, right in zip(
+                                    bbox,
+                                    disagreement_bbox,
+                                    strict=True,
+                                )
+                            )
+                            for disagreement_bbox in disagreement_boxes
+                        ),
                     )
                     page_resources.append(resource)
                     exported += 1
                 if page_resources:
                     selected[page_number] = tuple(page_resources)
+                elif required_figure:
+                    required_figure_failure_pages.add(page_number)
                 page.close()
                 if on_progress is not None:
                     on_progress(PdfProgressPhase.IMAGES, current, total)
@@ -971,13 +1276,15 @@ def _extract_embedded_images(
         raise ConversionError(
             f"No se pudieron conservar las imágenes del PDF {source_path.name}."
         ) from exc
-    return selected, omitted
+    return selected, omitted, required_figure_failure_pages
 
 
 def _exportable_image_boxes(
     page: Any,
     model: _PdfPage,
     ocr_markdown: str | None,
+    *,
+    preserve_full_page_visual: bool = False,
 ) -> tuple[tuple[float, float, float, float], ...]:
     page_area = max(float(page.width) * float(page.height), 1.0)
     page_x0, page_top, page_x1, page_bottom = (float(value) for value in page.bbox)
@@ -1002,13 +1309,18 @@ def _exportable_image_boxes(
         elif ratio >= _MAX_EXPORTED_IMAGE_AREA_RATIO:
             full_page.append(record)
 
-    for bbox in _vector_graphic_boxes(page):
+    for bbox in _vector_graphic_boxes(page, model.lines):
         x0, top, x1, bottom = bbox
         ratio = (x1 - x0) * (bottom - top) / page_area
         candidates.append((ratio, bbox))
 
     for table in model.tables:
-        if table.rendering is not _TableRendering.STRUCTURED_TEXT:
+        if (
+            table.rendering is not _TableRendering.STRUCTURED_TEXT
+            and not table.inferred_from_raster
+            and not _unresolved_raster_table(model, table, ocr_markdown)
+            and not _dense_raster_table_requires_visual(model, table)
+        ):
             continue
         x0, top, x1, bottom = table.bbox
         ratio = (x1 - x0) * (bottom - top) / page_area
@@ -1022,12 +1334,15 @@ def _exportable_image_boxes(
     recognized_letters = _heading_letter_count(ocr_markdown or "")
     useful_letters = max(_page_letter_count(model), recognized_letters)
     ocr_contains_table = bool(_MARKDOWN_TABLE_PATTERN.search(ocr_markdown or ""))
+    has_reliable_reflow_table = _has_reliable_reflow_table(model, ocr_markdown)
     ocr_is_toc = _is_toc_markdown(ocr_markdown or "")
     native_is_toc = _is_toc_page(list(model.lines))
+    required_figure = _requires_full_page_figure_reference(model, ocr_markdown)
     fragmented_graphic_text = _fragmented_graphic_text_should_stay_in_image(
         model,
         ocr_markdown,
     )
+    sparse_raster_cover = _sparse_raster_cover_should_stay_in_image(model)
     if fragmented_graphic_text and full_page:
         # On charts, diagrams and decorated plates, dozens of tiny labels can look
         # superficially OCR-like while losing all spatial meaning when reflowed.
@@ -1037,11 +1352,14 @@ def _exportable_image_boxes(
         not candidates
         and full_page
         and not native_is_toc
-        and not ocr_is_toc
+        and (not ocr_is_toc or required_figure)
         and (
-            useful_letters < _FULL_PAGE_EXPORT_LETTER_LIMIT
+            (useful_letters < _FULL_PAGE_EXPORT_LETTER_LIMIT and not has_reliable_reflow_table)
             or model.image_orientation_mismatch
-            or ocr_contains_table
+            or (ocr_contains_table and not has_reliable_reflow_table)
+            or required_figure
+            or preserve_full_page_visual
+            or sparse_raster_cover
         )
     ):
         candidates.append(max(full_page, key=lambda item: item[0]))
@@ -1055,6 +1373,34 @@ def _exportable_image_boxes(
             continue
         retained.append(bbox)
     return tuple(retained)
+
+
+def _requires_full_page_figure_reference(
+    model: _PdfPage,
+    ocr_markdown: str | None,
+) -> bool:
+    """Require a visual reference when a dense scan names a numbered figure explicitly."""
+    return bool(
+        any(ratio >= _MAX_EXPORTED_IMAGE_AREA_RATIO for ratio in model.image_area_ratios)
+        and not _is_toc_page(list(model.lines))
+        and any(_is_numbered_figure_caption(line) for line in model.lines)
+    )
+
+
+def _is_numbered_figure_caption(line: _PdfLine) -> bool:
+    if line.rotated:
+        return False
+    normalized = _repair_artificial_spacing_runs(_normalize_text(line.text))
+    if _NUMBERED_FIGURE_CAPTION_PATTERN.match(normalized):
+        return True
+    compacted = "".join(character.casefold() for character in line.text if character.isalnum())
+    if re.fullmatch(r"(?:figures?|figuras?)\d+", compacted):
+        return True
+    return bool(
+        line.bold
+        and _is_uppercase_text(line.text)
+        and re.match(r"^(?:figures?|figuras?)\d", compacted)
+    )
 
 
 def _composite_image_candidate(
@@ -1081,7 +1427,10 @@ def _composite_image_candidate(
     return union_ratio, union
 
 
-def _vector_graphic_boxes(page: Any) -> tuple[tuple[float, float, float, float], ...]:
+def _vector_graphic_boxes(
+    page: Any,
+    text_lines: tuple[_PdfLine, ...] = (),
+) -> tuple[tuple[float, float, float, float], ...]:
     """Return conservative crops for clustered curve-based illustrations."""
 
     page_x0, page_top, page_x1, page_bottom = (float(value) for value in page.bbox)
@@ -1121,7 +1470,10 @@ def _vector_graphic_boxes(page: Any) -> tuple[tuple[float, float, float, float],
     for cluster in clusters:
         if len(cluster) < _MIN_VECTOR_CURVES:
             continue
-        x0, top, x1, bottom = _union_bbox(cluster)
+        x0, top, x1, bottom = _expand_vector_bbox_with_labels(
+            _union_bbox(cluster),
+            text_lines,
+        )
         padding = min(_VECTOR_CLUSTER_GAP / 2, x0 - page_x0, top - page_top)
         x0 = max(page_x0, x0 - padding)
         top = max(page_top, top - padding)
@@ -1137,6 +1489,25 @@ def _vector_graphic_boxes(page: Any) -> tuple[tuple[float, float, float, float],
         ):
             retained.append((x0, top, x1, bottom))
     return tuple(retained)
+
+
+def _expand_vector_bbox_with_labels(
+    bbox: tuple[float, float, float, float],
+    lines: tuple[_PdfLine, ...],
+) -> tuple[float, float, float, float]:
+    """Include compact axis/diagram labels without pulling surrounding prose into the crop."""
+
+    x0, top, x1, bottom = bbox
+    nearby: list[tuple[float, float, float, float]] = []
+    for line in lines:
+        stripped = line.text.strip()
+        if line.rotated or not stripped or len(stripped) > 8 or _heading_letter_count(stripped) > 1:
+            continue
+        horizontal_gap = max(x0 - line.x1, line.x0 - x1, 0.0)
+        vertical_gap = max(top - line.bottom, line.top - bottom, 0.0)
+        if horizontal_gap <= _VECTOR_CLUSTER_GAP * 2 and vertical_gap <= _VECTOR_CLUSTER_GAP * 2:
+            nearby.append((line.x0, line.top, line.x1, line.bottom))
+    return _union_bbox([bbox, *nearby]) if nearby else bbox
 
 
 def _curve_bbox(
@@ -1322,9 +1693,60 @@ def _render_table_cell(value: str) -> str:
             normalized_lines[-1], line
         ):
             normalized_lines[-1] = f"{normalized_lines[-1][:-1]}{line.lstrip()}"
+        elif _table_cell_line_is_soft_wrap(normalized_lines[-1], line):
+            normalized_lines[-1] = f"{normalized_lines[-1].rstrip()} {line.lstrip()}"
         else:
             normalized_lines.append(line)
     return "\n".join(normalized_lines)
+
+
+_TABLE_CELL_CONTINUATION_WORDS = frozenset(
+    {
+        "a",
+        "an",
+        "and",
+        "at",
+        "by",
+        "con",
+        "de",
+        "del",
+        "el",
+        "en",
+        "for",
+        "from",
+        "in",
+        "la",
+        "of",
+        "on",
+        "or",
+        "para",
+        "por",
+        "the",
+        "to",
+        "with",
+        "y",
+    }
+)
+_TABLE_CELL_LIST_PREFIX_PATTERN = re.compile(r"^(?:[-*•‣▪◦]|\(?\d{1,3}[.)]|[A-ZÁÉÍÓÚÑ][.)])\s+")
+
+
+def _table_cell_line_is_soft_wrap(previous: str, current: str) -> bool:
+    """Join a visual PDF wrap without collapsing explicit items or sentences."""
+
+    left = previous.rstrip()
+    right = current.lstrip()
+    if (
+        not left
+        or not right
+        or left[-1] in ".!?;:"
+        or _TABLE_CELL_LIST_PREFIX_PATTERN.match(right) is not None
+    ):
+        return False
+    first_letter = next((character for character in right if character.isalpha()), "")
+    if first_letter.islower() or left[-1] in ",([{—–":
+        return True
+    last_word = re.search(r"([^\W\d_]+)[’']?$", left, re.UNICODE)
+    return bool(last_word and last_word.group(1).casefold() in _TABLE_CELL_CONTINUATION_WORDS)
 
 
 def _table_rendering(
@@ -1333,11 +1755,28 @@ def _table_rendering(
 ) -> _TableRendering:
     longest = max((len(cell) for row in rows for cell in row), default=0)
     multiline = any("\n" in cell for row in rows for cell in row)
-    if len(rows) > 80 or column_count > 16 or longest > 2_000:
+    if (
+        len(rows) > 80
+        or column_count > 16
+        or longest > 2_000
+        or _table_has_sparse_continuation_rows(rows, column_count)
+    ):
         return _TableRendering.STRUCTURED_TEXT
     if column_count <= 8 and longest <= 220 and not multiline:
         return _TableRendering.MARKDOWN
     return _TableRendering.HTML
+
+
+def _table_has_sparse_continuation_rows(
+    rows: tuple[tuple[str, ...], ...],
+    column_count: int,
+) -> bool:
+    """Flag grids whose apparent rows probably split a smaller set of visual records."""
+
+    if column_count < 4 or len(rows) < 5:
+        return False
+    sparse_rows = sum(0 < sum(bool(cell) for cell in row) <= column_count - 2 for row in rows[1:])
+    return sparse_rows >= 2
 
 
 def _deduplicated_page(page: Any) -> Any:
@@ -1599,6 +2038,7 @@ def _build_line(
         hard_hyphen_end=hard_hyphen_end,
         rotated=rotated,
         italic=italic,
+        emphasis_spans=_source_emphasis_spans(text, raw_chars),
     )
 
 
@@ -1630,6 +2070,182 @@ def _repair_artificial_spacing_runs(text: str) -> str:
         lambda match: re.sub(r"\s+", "", match.group()),
         text,
     )
+
+
+def _repair_native_degree_markers(pages: list[_PdfPage]) -> tuple[list[_PdfPage], int]:
+    """Restore a superscript degree glyph misencoded as zero from native geometry."""
+
+    accepted = 0
+    repaired_pages: list[_PdfPage] = []
+    for page in pages:
+        repaired_lines: list[_PdfLine] = []
+        for line in page.lines:
+            candidates = tuple(
+                sorted(
+                    (
+                        *_DEGREE_SHAPED_NATIVE_ZERO_PATTERN.finditer(line.text),
+                        *_INVALID_ZODIAC_DEGREE_ZERO_PATTERN.finditer(line.text),
+                    ),
+                    key=lambda match: match.start(),
+                )
+            )
+            zero_characters = tuple(character for character in line.chars if character.text == "0")
+            visible_sizes = tuple(
+                character.size
+                for character in line.chars
+                if character.text.strip() and character.size > 0
+            )
+            if not candidates or not visible_sizes:
+                repaired_lines.append(line)
+                continue
+            typical_size = median(visible_sizes)
+            superscript_zeroes = tuple(
+                character
+                for character in zero_characters
+                if character.size <= typical_size * 0.80
+                and line.bottom - character.bottom >= max(1.0, typical_size * 0.18)
+            )
+            if not (len(candidates) == len(zero_characters) == len(superscript_zeroes)):
+                repaired_lines.append(line)
+                continue
+            repaired_text = _DEGREE_SHAPED_NATIVE_ZERO_PATTERN.sub(
+                lambda match: f"{match.group('degree')}°",
+                line.text,
+            )
+            repaired_text = _INVALID_ZODIAC_DEGREE_ZERO_PATTERN.sub(
+                lambda match: f"{match.group('degree')}°",
+                repaired_text,
+            )
+            repaired_lines.append(replace(line, text=repaired_text, chars=()))
+            accepted += len(candidates)
+        repaired_pages.append(replace(page, lines=tuple(repaired_lines)))
+    if accepted:
+        LOGGER.info("pdf_native_degree_geometry_completed accepted=%d", accepted)
+    return repaired_pages, accepted
+
+
+def _repair_overlapping_native_symbols(pages: list[_PdfPage]) -> tuple[list[_PdfPage], int]:
+    """Collapse a proven overlapping punctuation encoding into its visual glyph."""
+
+    accepted = 0
+    repaired_pages: list[_PdfPage] = []
+    for page in pages:
+        repaired_lines: list[_PdfLine] = []
+        for line in page.lines:
+            text_pairs = line.text.count("(%")
+            text_triplets = line.text.count("(3[")
+            if not text_pairs and not text_triplets:
+                repaired_lines.append(line)
+                continue
+            visible = tuple(character for character in line.chars if character.text.strip())
+            overlapping_pairs = 0
+            for left, right in zip(visible, visible[1:], strict=False):
+                if left.text != "(" or right.text != "%":
+                    continue
+                overlap = max(0.0, min(left.x1, right.x1) - max(left.x0, right.x0))
+                smaller_width = min(left.x1 - left.x0, right.x1 - right.x0)
+                same_baseline = (
+                    abs(left.top - right.top) <= 0.5 and abs(left.bottom - right.bottom) <= 0.5
+                )
+                similar_size = min(left.size, right.size) >= max(left.size, right.size) * 0.90
+                if (
+                    smaller_width > 0
+                    and overlap / smaller_width >= 0.20
+                    and same_baseline
+                    and similar_size
+                ):
+                    overlapping_pairs += 1
+            overlapping_triplets = 0
+            for left, middle, right in zip(visible, visible[1:], visible[2:], strict=False):
+                if (left.text, middle.text, right.text) != ("(", "3", "["):
+                    continue
+                left_overlap = max(0.0, min(left.x1, middle.x1) - max(left.x0, middle.x0))
+                right_overlap = max(
+                    0.0,
+                    min(middle.x1, right.x1) - max(middle.x0, right.x0),
+                )
+                left_width = min(left.x1 - left.x0, middle.x1 - middle.x0)
+                right_width = min(middle.x1 - middle.x0, right.x1 - right.x0)
+                same_baseline = (
+                    max(left.top, middle.top, right.top) - min(left.top, middle.top, right.top)
+                    <= 0.5
+                    and max(left.bottom, middle.bottom, right.bottom)
+                    - min(left.bottom, middle.bottom, right.bottom)
+                    <= 0.5
+                )
+                sizes = (left.size, middle.size, right.size)
+                similar_size = min(sizes) >= max(sizes) * 0.90
+                if (
+                    left_width > 0
+                    and right_width > 0
+                    and left_overlap / left_width >= 0.15
+                    and right_overlap / right_width >= 0.15
+                    and same_baseline
+                    and similar_size
+                ):
+                    overlapping_triplets += 1
+            if overlapping_pairs != text_pairs or overlapping_triplets != text_triplets:
+                repaired_lines.append(line)
+                continue
+            repaired_lines.append(
+                replace(
+                    line,
+                    text=line.text.replace("(%", "&").replace("(3[", "&"),
+                    chars=(),
+                )
+            )
+            accepted += text_pairs + text_triplets
+        repaired_pages.append(replace(page, lines=tuple(repaired_lines)))
+    if accepted:
+        LOGGER.info("pdf_native_symbol_geometry_completed accepted=%d", accepted)
+    return repaired_pages, accepted
+
+
+def _repair_repeated_native_spacing(pages: list[_PdfPage]) -> tuple[list[_PdfPage], int]:
+    """Use repeated native lines to remove spacing noise without changing characters."""
+
+    candidates: defaultdict[str, list[_PdfLine]] = defaultdict(list)
+    for page in pages:
+        for line in page.lines:
+            key = _spacing_insensitive_line_key(line.text)
+            if not line.rotated and len(key) >= 8 and _heading_letter_count(key) >= 6:
+                candidates[key].append(line)
+
+    replacements: dict[tuple[int, float, float, str], str] = {}
+    for lines in candidates.values():
+        if len({line.page_number for line in lines}) < 3:
+            continue
+        counts = Counter(line.text for line in lines)
+        canonical, occurrences = min(
+            counts.items(),
+            key=lambda item: (
+                -item[1],
+                len(re.findall(r"\s", item[0])),
+                len(item[0]),
+                item[0].casefold(),
+            ),
+        )
+        if occurrences < 2:
+            continue
+        canonical_spaces = len(re.findall(r"\s", canonical))
+        for line in lines:
+            if (
+                line.text != canonical
+                and len(re.findall(r"\s", line.text)) >= canonical_spaces + 2
+                and _spacing_insensitive_line_key(line.text)
+                == _spacing_insensitive_line_key(canonical)
+            ):
+                replacements[_visual_line_key(line)] = canonical
+    if not replacements:
+        return pages, 0
+    repaired = [_apply_page_text_replacements(page, replacements) for page in pages]
+    LOGGER.info("pdf_repeated_spacing_consensus_completed accepted=%d", len(replacements))
+    return repaired, len(replacements)
+
+
+def _spacing_insensitive_line_key(text: str) -> str:
+    normalized = unicodedata.normalize("NFKC", text).casefold()
+    return re.sub(r"\s+", "", normalized)
 
 
 def _reconstruct_character_text(
@@ -1703,31 +2319,46 @@ def _split_wide_line(line: _PdfLine) -> tuple[_PdfLine, ...]:
     if not boundaries:
         return (line,)
 
-    groups: list[list[_PdfCharacter]] = [[] for _ in range(len(boundaries) + 1)]
-    for character in line.chars:
-        center = (character.x0 + character.x1) / 2
-        group_index = sum(center > boundary for boundary in boundaries)
-        groups[group_index].append(character)
-    if any(not any(character.text.isalnum() for character in group) for group in groups):
+    return _split_line_at_boundaries(line, boundaries)
+
+
+def _split_line_at_boundaries(
+    line: _PdfLine,
+    boundaries: Iterable[float],
+) -> tuple[_PdfLine, ...]:
+    resolved_boundaries = tuple(sorted(boundaries))
+    if not resolved_boundaries:
         return (line,)
 
+    groups: list[list[_PdfCharacter]] = [[] for _ in range(len(resolved_boundaries) + 1)]
+    for character in line.chars:
+        center = (character.x0 + character.x1) / 2
+        group_index = sum(center > boundary for boundary in resolved_boundaries)
+        groups[group_index].append(character)
+    if any(
+        not any(any(value.isalnum() for value in character.text) for character in group)
+        for group in groups
+    ):
+        return (line,)
+
+    source_segments = _source_text_segments_for_character_groups(line.text, groups)
     parts: list[_PdfLine] = []
-    for group in groups:
+    for group, source_segment in zip(groups, source_segments, strict=True):
         compact = tuple(group)
         raw_group_text = "".join(character.text for character in compact).rstrip()
         x0 = min(character.x0 for character in compact)
         x1 = max(character.x1 for character in compact)
         top = min(character.top for character in compact)
         bottom = max(character.bottom for character in compact)
-        text = _repair_artificial_spacing_runs(
-            _reconstruct_character_text(
-                compact,
-                line.font_size,
-                collapse_tracking=False,
-            )
+        reconstructed = _reconstruct_character_text(
+            compact,
+            line.font_size,
+            collapse_tracking=False,
         )
+        text = _repair_artificial_spacing_runs(source_segment or reconstructed)
         if not text:
             continue
+        emphasis_spans = _emphasis_spans_for_segment(line.emphasis_spans, text)
         parts.append(
             replace(
                 line,
@@ -1744,9 +2375,123 @@ def _split_wide_line(line: _PdfLine) -> tuple[_PdfLine, ...]:
                 ),
                 soft_hyphen_end=raw_group_text.endswith("\u00ad"),
                 hard_hyphen_end=text.endswith("-"),
+                bold=(
+                    _emphasis_is_dominant(text, emphasis_spans, bold=True)
+                    if line.emphasis_spans
+                    else line.bold
+                ),
+                italic=(
+                    _emphasis_is_dominant(text, emphasis_spans, bold=False)
+                    if line.emphasis_spans
+                    else line.italic
+                ),
+                emphasis_spans=emphasis_spans,
             )
         )
     return tuple(parts) if len(parts) >= 2 else (line,)
+
+
+def _source_text_segments_for_character_groups(
+    source_text: str,
+    groups: list[list[_PdfCharacter]],
+) -> tuple[str, ...]:
+    """Keep extractor-inferred word spaces when one visual line is split into columns."""
+    nonspace_counts = [
+        sum(not character.isspace() for item in group for character in item.text)
+        for group in groups
+    ]
+    boundaries: list[int] = []
+    source_index = 0
+    for target in nonspace_counts[:-1]:
+        seen = 0
+        while source_index < len(source_text) and seen < target:
+            if not source_text[source_index].isspace():
+                seen += 1
+            source_index += 1
+        boundaries.append(source_index)
+
+    segments: list[str] = []
+    start = 0
+    for end in (*boundaries, len(source_text)):
+        segments.append(_normalize_text(source_text[start:end]))
+        start = end
+    if len(segments) != len(groups):
+        return tuple("" for _group in groups)
+
+    for segment, group in zip(segments, groups, strict=True):
+        source_key = "".join(character for character in segment if not character.isspace())
+        group_key = _normalize_text("".join(character.text for character in group)).replace(" ", "")
+        if source_key != group_key:
+            return tuple("" for _group in groups)
+    return tuple(segments)
+
+
+def _split_lines_at_established_gutters(lines: list[_PdfLine]) -> list[_PdfLine]:
+    """Split a merged row only when neighbouring lines prove a stable two-column gutter."""
+    if len(lines) < _MIN_COLUMN_LINES * 2:
+        return lines
+    page_width = max((line.page_width for line in lines), default=0.0)
+    if page_width <= 0:
+        return lines
+
+    tolerance = page_width * 0.025
+    starts = [
+        line.x0
+        for line in lines
+        if page_width * 0.35 <= line.x0 <= page_width * 0.72
+        and line.x1 - line.x0 <= page_width * 0.48
+    ]
+    gutter_starts: list[float] = []
+    for start in starts:
+        cluster = [candidate for candidate in starts if abs(candidate - start) <= tolerance]
+        if len(cluster) < _MIN_COLUMN_LINES:
+            continue
+        boundary = median(cluster)
+        if not any(abs(boundary - existing) <= tolerance for existing in gutter_starts):
+            gutter_starts.append(boundary)
+
+    resolved = list(lines)
+    for boundary in sorted(gutter_starts):
+        left = [
+            line
+            for line in resolved
+            if line.x0 <= boundary - page_width * 0.12 and line.x1 <= boundary - page_width * 0.012
+        ]
+        right = [
+            line
+            for line in resolved
+            if abs(line.x0 - boundary) <= tolerance and line.x1 - line.x0 >= page_width * 0.12
+        ]
+        if len(left) < _MIN_COLUMN_LINES or len(right) < _MIN_COLUMN_LINES:
+            continue
+        if min(max(line.bottom for line in left), max(line.bottom for line in right)) <= max(
+            min(line.top for line in left), min(line.top for line in right)
+        ):
+            continue
+
+        split: list[_PdfLine] = []
+        for line in resolved:
+            if line.x0 >= boundary or line.x1 <= boundary:
+                split.append(line)
+                continue
+            visible = sorted(
+                (
+                    character
+                    for character in line.chars
+                    if character.text and not character.text.isspace()
+                ),
+                key=lambda character: character.x0,
+            )
+            candidates = [
+                (previous.x1 + current.x0) / 2
+                for previous, current in zip(visible, visible[1:], strict=False)
+                if previous.x1 <= boundary <= current.x0
+                and current.x0 - previous.x1 >= max(line.font_size * 0.55, 4.0)
+            ]
+            parts = _split_line_at_boundaries(line, candidates[:1]) if candidates else (line,)
+            split.extend(parts)
+        resolved = split
+    return resolved
 
 
 def _reading_order_lines(lines: list[_PdfLine]) -> list[_PdfLine]:
@@ -1770,16 +2515,33 @@ def _reading_order_lines(lines: list[_PdfLine]) -> list[_PdfLine]:
             and (line.bold or line.font_size >= typical_font_size * 1.15)
         )
         if separator:
-            result.extend(_order_column_band(band, page_width))
+            result.extend(
+                _order_column_band(
+                    band,
+                    page_width,
+                    previous_line=result[-1] if result else None,
+                )
+            )
             band.clear()
             result.append(line)
         else:
             band.append(line)
-    result.extend(_order_column_band(band, page_width))
+    result.extend(
+        _order_column_band(
+            band,
+            page_width,
+            previous_line=result[-1] if result else None,
+        )
+    )
     return result
 
 
-def _order_column_band(lines: list[_PdfLine], page_width: float) -> list[_PdfLine]:
+def _order_column_band(
+    lines: list[_PdfLine],
+    page_width: float,
+    *,
+    previous_line: _PdfLine | None = None,
+) -> list[_PdfLine]:
     if len(lines) < _MIN_COLUMN_LINES * 2:
         return sorted(lines, key=lambda line: (line.top, line.x0, line.bottom))
     ordered = sorted(lines, key=lambda line: (line.x0, line.top, line.bottom))
@@ -1805,11 +2567,38 @@ def _order_column_band(lines: list[_PdfLine], page_width: float) -> list[_PdfLin
         top for top, _bottom in vertical_spans
     ):
         return sorted(lines, key=lambda line: (line.top, line.x0, line.bottom))
+    continuing_group = _continuing_column_index(groups, previous_line)
+    if continuing_group is not None:
+        groups = [
+            groups[continuing_group],
+            *groups[:continuing_group],
+            *groups[continuing_group + 1 :],
+        ]
     return [
         line
         for group in groups
         for line in sorted(group, key=lambda item: (item.top, item.x0, item.bottom))
     ]
+
+
+def _continuing_column_index(
+    groups: list[list[_PdfLine]],
+    previous_line: _PdfLine | None,
+) -> int | None:
+    if previous_line is None or previous_line.text.rstrip().endswith((".", "!", "?", ":", ";")):
+        return None
+    candidates: list[int] = []
+    for index, group in enumerate(groups):
+        first = min(group, key=lambda line: (line.top, line.x0, line.bottom))
+        gap = first.top - previous_line.bottom
+        if (
+            first.text[:1].islower()
+            and -first.font_size * 0.5
+            <= gap
+            <= max(first.font_size, previous_line.font_size) * 1.25
+        ):
+            candidates.append(index)
+    return candidates[0] if len(candidates) == 1 else None
 
 
 def _reconcile_suspicious_toc_numbers(
@@ -2261,6 +3050,7 @@ def _native_toc_heading_references(
     body_size: float,
     heading_sizes: dict[float, int],
     repeated_margins: set[str],
+    preserved_margin_headings: frozenset[tuple[int, float, float, str]] = frozenset(),
 ) -> tuple[dict[str, frozenset[str]], dict[str, frozenset[str]]]:
     """Index reliable native headings without using TOC text as its own donor."""
 
@@ -2276,6 +3066,7 @@ def _native_toc_heading_references(
                 repeated_margins,
                 previous,
                 body_size,
+                preserved_repeated_headings=preserved_margin_headings,
             ):
                 continue
             gap_before = line.top - previous.bottom if previous is not None else body_size * 2
@@ -2342,6 +3133,43 @@ def _repair_toc_entries_from_native_headings(
     return repaired
 
 
+def _normalize_page_footnotes(
+    lines: list[_PdfLine],
+    body_size: float,
+) -> list[_PdfLine]:
+    """Expose visually proven footnote markers without guessing from bare digits."""
+
+    definitions: dict[int, re.Match[str]] = {}
+    for index, line in enumerate(lines):
+        match = _FOOTNOTE_DEFINITION_PATTERN.match(line.text.strip())
+        if (
+            match is not None
+            and line.top >= line.page_height * 0.72
+            and line.font_size <= body_size * 0.90
+        ):
+            definitions[index] = match
+    if not definitions:
+        return lines
+
+    numbers = {match.group("number") for match in definitions.values()}
+
+    def replace_marker(match: re.Match[str]) -> str:
+        number = match.group("number")
+        if number not in numbers:
+            return match.group(0)
+        return f"{match.group('prefix')}{number.translate(_SUPERSCRIPT_DIGITS)}"
+
+    normalized: list[_PdfLine] = []
+    for index, line in enumerate(lines):
+        definition = definitions.get(index)
+        if definition is not None:
+            text = f"{definition.group('number')}. {definition.group('body')}"
+        else:
+            text = _INLINE_FOOTNOTE_MARKER_PATTERN.sub(replace_marker, line.text)
+        normalized.append(replace(line, text=text) if text != line.text else line)
+    return normalized
+
+
 def _split_toc_reference_label(text: str) -> tuple[str, str]:
     match = _TOC_REFERENCE_PREFIX_PATTERN.match(text.strip())
     if match is None:
@@ -2383,6 +3211,83 @@ def _is_italic_font(font_name: str) -> bool:
     return any(marker in normalized for marker in ("italic", "oblique", "slanted"))
 
 
+def _source_emphasis_spans(
+    text: str,
+    raw_characters: tuple[dict[str, Any], ...],
+) -> tuple[_PdfEmphasisSpan, ...]:
+    """Map trustworthy per-character font changes onto the normalized line text."""
+    target_positions = [index for index, character in enumerate(text) if not character.isspace()]
+    source_styles: list[tuple[bool, bool]] = []
+    for raw_character in raw_characters:
+        raw_text = _normalize_text(str(raw_character.get("text", "")))
+        font_name = str(raw_character.get("fontname", ""))
+        style = (_is_bold_font(font_name), _is_italic_font(font_name))
+        source_styles.extend(style for character in raw_text if not character.isspace())
+    if not target_positions or len(source_styles) != len(target_positions):
+        return ()
+
+    styles: list[tuple[bool, bool]] = [(False, False)] * len(text)
+    for position, style in zip(target_positions, source_styles, strict=True):
+        styles[position] = style
+    for index, character in enumerate(text):
+        if not character.isspace():
+            continue
+        previous_style = styles[index - 1] if index else (False, False)
+        following_style = styles[index + 1] if index + 1 < len(styles) else (False, False)
+        if previous_style == following_style:
+            styles[index] = previous_style
+
+    spans: list[_PdfEmphasisSpan] = []
+    start = 0
+    current = styles[0]
+    for index, style in enumerate([*styles[1:], (False, False)], start=1):
+        if style == current:
+            continue
+        if any(current):
+            left = start
+            right = index
+            while left < right and text[left].isspace():
+                left += 1
+            while right > left and text[right - 1].isspace():
+                right -= 1
+            fragment = text[left:right]
+            if sum(character.isalpha() for character in fragment) >= 2:
+                spans.append(_PdfEmphasisSpan(fragment, current[0], current[1]))
+        start = index
+        current = style
+    return tuple(spans)
+
+
+def _emphasis_spans_for_segment(
+    spans: tuple[_PdfEmphasisSpan, ...],
+    segment: str,
+) -> tuple[_PdfEmphasisSpan, ...]:
+    resolved: list[_PdfEmphasisSpan] = []
+    for span in spans:
+        if span.text in segment:
+            resolved.append(span)
+        elif segment in span.text and sum(character.isalpha() for character in segment) >= 2:
+            resolved.append(_PdfEmphasisSpan(segment, span.bold, span.italic))
+    return tuple(dict.fromkeys(resolved))
+
+
+def _emphasis_is_dominant(
+    text: str,
+    spans: tuple[_PdfEmphasisSpan, ...],
+    *,
+    bold: bool,
+) -> bool:
+    letters = sum(character.isalpha() for character in text)
+    if not letters:
+        return False
+    emphasized = sum(
+        sum(character.isalpha() for character in span.text)
+        for span in spans
+        if (span.bold if bold else span.italic)
+    )
+    return emphasized / letters >= 0.55
+
+
 def _dominant_body_size(lines: list[_PdfLine]) -> float:
     weights: Counter[float] = Counter()
     for line in lines:
@@ -2412,11 +3317,65 @@ def _repeated_margin_lines(lines: list[_PdfLine], page_count: int) -> set[str]:
     del page_count
     pages_by_line: defaultdict[str, set[int]] = defaultdict(set)
     for line in lines:
-        if line.top <= line.page_height * 0.1 or line.bottom >= line.page_height * 0.84:
+        in_standard_margin = (
+            line.top <= line.page_height * 0.1 or line.bottom >= line.page_height * 0.84
+        )
+        in_extended_running_header_band = (
+            line.top <= line.page_height * 0.18
+            and len(line.text.strip()) <= 80
+            and _is_uppercase_text(line.text)
+        )
+        if in_standard_margin or in_extended_running_header_band:
             key = _margin_key(line.text)
             if key:
                 pages_by_line[key].add(line.page_number)
-    return {text for text, pages in pages_by_line.items() if len(pages) >= 3}
+    repeated = {text for text, pages in pages_by_line.items() if len(pages) >= 3}
+    repeated.update(_confirmed_confusable_margin_folios(lines))
+    return repeated
+
+
+def _confirmed_confusable_margin_folios(lines: list[_PdfLine]) -> set[str]:
+    pages_by_offset: defaultdict[int, set[int]] = defaultdict(set)
+    ambiguous: list[tuple[_PdfLine, int]] = []
+    for line in lines:
+        if not _is_top_outer_folio_line(line):
+            continue
+        compact = re.sub(r"\s+", "", line.text.strip())
+        if compact.isdecimal() and len(compact) <= 4:
+            pages_by_offset[int(compact) - line.page_number].add(line.page_number)
+            continue
+        decoded = _confusable_margin_folio_value(compact)
+        if decoded is not None:
+            ambiguous.append((line, decoded))
+
+    confirmed_offsets = {
+        offset for offset, page_numbers in pages_by_offset.items() if len(page_numbers) >= 2
+    }
+    return {
+        _margin_key(line.text)
+        for line, decoded in ambiguous
+        if decoded - line.page_number in confirmed_offsets
+    }
+
+
+def _confusable_margin_folio_value(text: str) -> int | None:
+    if (
+        not 2 <= len(text) <= 4
+        or not any(character.isdecimal() for character in text)
+        or not any(character.isalpha() for character in text)
+    ):
+        return None
+    translated: list[str] = []
+    for character in text:
+        if character.isdecimal():
+            translated.append(character)
+        elif character in "iIlL":
+            translated.append("1")
+        elif character in "oO":
+            translated.append("0")
+        else:
+            return None
+    return int("".join(translated))
 
 
 def _pages_requiring_ocr(pages: list[_PdfPage]) -> set[int]:
@@ -2523,6 +3482,270 @@ def _extract_secondary_native_text(
     return extracted
 
 
+def _extract_secondary_native_line_text(
+    source_path: Path,
+    pages: list[_PdfPage],
+    cancellation: CancellationToken | None,
+    *,
+    line_keys: set[tuple[int, float, float, str]] | None = None,
+) -> dict[tuple[int, float, float, str], str]:
+    """Read unresolved font glyphs from PDFium inside each exact native line box."""
+
+    targets = {
+        page.number: tuple(
+            line
+            for line in page.lines
+            if not line.rotated
+            and (
+                _visual_line_key(line) in line_keys
+                if line_keys is not None
+                else _suspicious_non_currency_dollar_count(line.text) > 0
+            )
+        )
+        for page in pages
+    }
+    targets = {page_number: lines for page_number, lines in targets.items() if lines}
+    if not targets:
+        return {}
+    try:
+        import pypdfium2
+
+        document = pypdfium2.PdfDocument(source_path)
+    except (ImportError, OSError, RuntimeError, ValueError):
+        LOGGER.warning("pdf_secondary_native_line_unavailable pages=%d", len(targets))
+        return {}
+
+    extracted: dict[tuple[int, float, float, str], str] = {}
+    try:
+        for page_number, lines in sorted(targets.items()):
+            check_cancelled(cancellation)
+            if page_number < 1 or page_number > len(document):
+                continue
+            page = document[page_number - 1]
+            text_page = None
+            try:
+                text_page = page.get_textpage()
+                page_height = float(page.get_height())
+                for line in lines:
+                    text = text_page.get_text_bounded(
+                        left=max(0.0, line.x0 - 1.0),
+                        bottom=max(0.0, page_height - line.bottom - 1.0),
+                        right=min(float(page.get_width()), line.x1 + 1.0),
+                        top=min(page_height, page_height - line.top + 1.0),
+                    )
+                    if not isinstance(text, str) or not text.strip() or "\0" in text:
+                        continue
+                    normalized = _WHITESPACE_PATTERN.sub(
+                        " ",
+                        unicodedata.normalize("NFC", text),
+                    ).strip()
+                    if normalized:
+                        extracted[_visual_line_key(line)] = normalized
+            except (OSError, RuntimeError, TypeError, ValueError):
+                continue
+            finally:
+                if text_page is not None:
+                    text_page.close()
+                page.close()
+    finally:
+        document.close()
+    LOGGER.info(
+        "pdf_secondary_native_line_completed pages=%d lines=%d",
+        len(targets),
+        len(extracted),
+    )
+    return extracted
+
+
+def _extract_pdf_outline(
+    source_path: Path,
+    page_range: PdfPageRange | None,
+    cancellation: CancellationToken | None,
+) -> tuple[_PdfOutlineEntry, ...]:
+    """Read source bookmarks as local structural evidence without logging their text."""
+
+    extracted: list[_PdfOutlineEntry] = []
+    try:
+        with pdfplumber.open(source_path, unicode_norm="NFC") as pdf:
+            page_by_object_id = {
+                getattr(page.page_obj, "pageid", None): index
+                for index, page in enumerate(pdf.pages, start=1)
+            }
+            try:
+                records = tuple(pdf.doc.get_outlines())
+            except Exception:  # noqa: BLE001 - malformed optional bookmarks are non-fatal
+                return ()
+            for record in records:
+                check_cancelled(cancellation)
+                if len(record) < 3 or not isinstance(record[0], int):
+                    continue
+                level = int(record[0])
+                destination = record[2]
+                object_id = (
+                    getattr(destination[0], "objid", None)
+                    if isinstance(destination, (list, tuple)) and destination
+                    else None
+                )
+                page_number = page_by_object_id.get(object_id)
+                title = _safe_outline_title(record[1])
+                if (
+                    title is None
+                    or page_number is None
+                    or not 1 <= level <= 6
+                    or (
+                        page_range is not None
+                        and not page_range.first_page <= page_number <= page_range.last_page
+                    )
+                ):
+                    continue
+                extracted.append(_PdfOutlineEntry(level, title, page_number))
+    except (MalformedPDFException, PdfminerException, OSError, TypeError, ValueError):
+        return ()
+    LOGGER.info("pdf_outline_extracted entries=%d", len(extracted))
+    return tuple(extracted)
+
+
+def _safe_outline_title(value: object) -> str | None:
+    title = _WHITESPACE_PATTERN.sub(
+        " ",
+        unicodedata.normalize("NFC", str(value)),
+    ).strip()
+    if (
+        not 3 <= _heading_letter_count(title)
+        or len(title) > _MAX_HEADING_LENGTH
+        or any(character in title for character in "\r\n\0")
+    ):
+        return None
+    return title
+
+
+def _reconcile_pdf_outline_headings(
+    pages: list[_PdfPage],
+    entries: tuple[_PdfOutlineEntry, ...],
+) -> tuple[list[_PdfPage], int]:
+    """Promote only bookmark titles that uniquely match text on their target page."""
+
+    entries_by_page: defaultdict[int, list[_PdfOutlineEntry]] = defaultdict(list)
+    for entry in entries:
+        entries_by_page[entry.page_number].append(entry)
+    changed = 0
+    reconciled_pages: list[_PdfPage] = []
+    for page in pages:
+        page_entries = entries_by_page.get(page.number)
+        if not page_entries:
+            reconciled_pages.append(page)
+            continue
+        lines = list(page.lines)
+        consumed: set[int] = set()
+        replacements: dict[int, tuple[_PdfLine, tuple[int, ...]]] = {}
+        for entry in page_entries:
+            match = _outline_heading_line_match(entry, lines, consumed)
+            if match is None:
+                continue
+            indexes = match
+            source_lines = tuple(lines[index] for index in indexes)
+            first = source_lines[0]
+            merged = replace(
+                first,
+                text=entry.title,
+                chars=(),
+                x0=min(line.x0 for line in source_lines),
+                x1=max(line.x1 for line in source_lines),
+                top=min(line.top for line in source_lines),
+                bottom=max(line.bottom for line in source_lines),
+                font_size=max(line.font_size for line in source_lines),
+                bold=any(line.bold for line in source_lines),
+                italic=all(line.italic for line in source_lines),
+                emphasis_spans=(),
+                links=tuple(dict.fromkeys(link for line in source_lines for link in line.links)),
+                soft_hyphen_end=False,
+                hard_hyphen_end=False,
+                outline_level=min(6, entry.level + 1),
+            )
+            replacements[indexes[0]] = (merged, indexes)
+            consumed.update(indexes)
+            changed += 1
+        if not replacements:
+            reconciled_pages.append(page)
+            continue
+        rebuilt: list[_PdfLine] = []
+        skipped: set[int] = set()
+        for index, line in enumerate(lines):
+            if index in skipped:
+                continue
+            replacement = replacements.get(index)
+            if replacement is None:
+                rebuilt.append(line)
+                continue
+            merged, indexes = replacement
+            rebuilt.append(merged)
+            skipped.update(indexes[1:])
+        reconciled_pages.append(replace(page, lines=tuple(rebuilt)))
+    if changed:
+        LOGGER.info("pdf_outline_headings_reconciled accepted=%d", changed)
+    return reconciled_pages, changed
+
+
+def _outline_heading_line_match(
+    entry: _PdfOutlineEntry,
+    lines: list[_PdfLine],
+    consumed: set[int],
+) -> tuple[int, ...] | None:
+    target_key = _outline_comparison_key(entry.title)
+    target_numbers = _content_number_tokens(entry.title)
+    if len(target_key) < 4:
+        return None
+    ranked: list[tuple[float, int, int, tuple[int, ...]]] = []
+    for start, first in enumerate(lines):
+        if start in consumed or first.rotated:
+            continue
+        indexes: list[int] = []
+        fragments: list[str] = []
+        previous: _PdfLine | None = None
+        for index in range(start, min(len(lines), start + 3)):
+            line = lines[index]
+            if index in consumed or line.rotated:
+                break
+            if previous is not None and line.top - previous.bottom > max(
+                first.font_size * 1.8,
+                18.0,
+            ):
+                break
+            indexes.append(index)
+            fragments.append(line.text)
+            candidate = " ".join(fragments)
+            candidate_key = _outline_comparison_key(candidate)
+            if (
+                len(candidate_key) >= 4
+                and _content_number_tokens(candidate) == target_numbers
+                and 0.70 <= len(candidate_key) / len(target_key) <= 1.30
+            ):
+                score = SequenceMatcher(
+                    None,
+                    target_key,
+                    candidate_key,
+                    autojunk=False,
+                ).ratio()
+                ranked.append((score, -len(indexes), -start, tuple(indexes)))
+            previous = line
+    ranked.sort(reverse=True)
+    if not ranked or ranked[0][0] < 0.94:
+        return None
+    if len(ranked) > 1 and ranked[1][0] >= ranked[0][0] - 0.015:
+        return None
+    return ranked[0][3]
+
+
+def _outline_comparison_key(value: str) -> str:
+    normalized = "".join(
+        character
+        for character in unicodedata.normalize("NFKD", value.casefold())
+        if not unicodedata.combining(character)
+    )
+    normalized = normalized.replace("$", "").replace("�", "")
+    return re.sub(r"[^\w]+", "", normalized, flags=re.UNICODE)
+
+
 def _reconcile_secondary_native_text(
     pages: list[_PdfPage],
     ocr_pages: dict[int, str],
@@ -2565,20 +3788,488 @@ def _reconcile_secondary_native_text(
                 replacements[_visual_line_key(line)] = accepted
     if not replacements:
         return pages, 0
-    reconciled = [
-        replace(
-            page,
-            lines=tuple(
-                replace(line, text=replacements[_visual_line_key(line)])
-                if _visual_line_key(line) in replacements
-                else line
-                for line in page.lines
-            ),
-        )
-        for page in pages
-    ]
+    reconciled = [_apply_page_text_replacements(page, replacements) for page in pages]
     LOGGER.info("pdf_secondary_native_arbitration_completed accepted=%d", len(replacements))
     return reconciled, len(replacements)
+
+
+def _reconcile_secondary_native_text_lines(
+    pages: list[_PdfPage],
+    ocr_pages: dict[int, str],
+    secondary_lines: dict[tuple[int, float, float, str], str],
+) -> tuple[list[_PdfPage], int]:
+    """Accept OCR text only when the same line box yields that reading through PDFium."""
+
+    replacements: dict[tuple[int, float, float, str], str] = {}
+    for disagreement in _visual_text_disagreements(pages, ocr_pages):
+        key = _visual_line_key(disagreement.line)
+        secondary = secondary_lines.get(key)
+        if secondary is None:
+            continue
+        secondary = _aligned_visual_candidate(disagreement.line.text, secondary)
+        ocr = _aligned_visual_candidate(disagreement.line.text, disagreement.ocr_text)
+        if _comparison_line_key(secondary) != _comparison_line_key(ocr):
+            continue
+        accepted = _validated_visual_reading(
+            disagreement.line.text,
+            ocr,
+            ocr,
+        )
+        if accepted is not None and accepted != disagreement.line.text:
+            replacements[key] = accepted
+    if not replacements:
+        return pages, 0
+    reconciled = [_apply_page_text_replacements(page, replacements) for page in pages]
+    LOGGER.info(
+        "pdf_secondary_native_line_arbitration_completed accepted=%d",
+        len(replacements),
+    )
+    return reconciled, len(replacements)
+
+
+def _reconcile_secondary_dollar_glyphs(
+    pages: list[_PdfPage],
+    secondary_pages: dict[int, str],
+) -> tuple[list[_PdfPage], int]:
+    """Repair a broken font glyph only when PDFium preserves the same words and numbers."""
+
+    replacements: dict[tuple[int, float, float, str], str] = {}
+    for page in pages:
+        secondary = secondary_pages.get(page.number)
+        if secondary is None:
+            continue
+        candidates = _visible_ocr_lines(secondary)
+        for line in page.lines:
+            if line.rotated or _suspicious_non_currency_dollar_count(line.text) == 0:
+                continue
+            proposed = _secondary_dollar_glyph_candidate(line.text, candidates)
+            if proposed is not None:
+                replacements[_visual_line_key(line)] = proposed
+    if not replacements:
+        return pages, 0
+    reconciled = [_apply_page_text_replacements(page, replacements) for page in pages]
+    LOGGER.info("pdf_secondary_dollar_glyph_repair_completed accepted=%d", len(replacements))
+    return reconciled, len(replacements)
+
+
+def _reconcile_secondary_dollar_glyph_lines(
+    pages: list[_PdfPage],
+    secondary_lines: dict[tuple[int, float, float, str], str],
+) -> tuple[list[_PdfPage], int]:
+    """Repair remaining font glyphs from a geometry-aligned PDFium line reading."""
+
+    replacements: dict[tuple[int, float, float, str], str] = {}
+    for page in pages:
+        for line in page.lines:
+            key = _visual_line_key(line)
+            secondary = secondary_lines.get(key)
+            if (
+                line.rotated
+                or secondary is None
+                or _suspicious_non_currency_dollar_count(line.text) == 0
+            ):
+                continue
+            proposed = _secondary_dollar_glyph_candidate(line.text, (secondary,))
+            if proposed is not None:
+                replacements[key] = proposed
+    if not replacements:
+        return pages, 0
+    reconciled = [_apply_page_text_replacements(page, replacements) for page in pages]
+    LOGGER.info(
+        "pdf_secondary_dollar_glyph_line_repair_completed accepted=%d",
+        len(replacements),
+    )
+    return reconciled, len(replacements)
+
+
+def _reconcile_systemic_secondary_native_lines(
+    pages: list[_PdfPage],
+    secondary_lines: dict[tuple[int, float, float, str], str],
+) -> tuple[list[_PdfPage], int]:
+    """Use geometry-aligned PDFium text after a document proves systemic font damage."""
+
+    secondary_token_counts = _document_alpha_token_counts(secondary_lines.values())
+    replacements: dict[tuple[int, float, float, str], str] = {}
+    for page in pages:
+        for line in page.lines:
+            key = _visual_line_key(line)
+            secondary = secondary_lines.get(key)
+            if line.rotated or secondary is None:
+                continue
+            proposed = _systemic_secondary_native_line_candidate(
+                line.text,
+                secondary,
+                secondary_token_counts=secondary_token_counts,
+            )
+            if proposed is not None:
+                replacements[key] = proposed
+    if not replacements:
+        return pages, 0
+    reconciled = [_apply_page_text_replacements(page, replacements) for page in pages]
+    LOGGER.info(
+        "pdf_systemic_secondary_native_repair_completed accepted=%d",
+        len(replacements),
+    )
+    return reconciled, len(replacements)
+
+
+def _systemic_secondary_native_line_candidate(
+    native: str,
+    secondary: str,
+    *,
+    secondary_token_counts: Counter[str] | None = None,
+) -> str | None:
+    if (
+        secondary == native
+        or not secondary
+        or any(character in secondary for character in "\r\n\0�")
+        or _suspicious_non_currency_dollar_count(secondary) > 0
+        or _has_suspicious_text_glyph(secondary)
+        or _content_number_tokens(secondary) != _content_number_tokens(native)
+        or not 0.85 <= len(secondary) / max(len(native), 1) <= 1.15
+        or SequenceMatcher(
+            None,
+            native.casefold(),
+            secondary.casefold(),
+            autojunk=False,
+        ).ratio()
+        < 0.88
+    ):
+        return None
+
+    native_compact = _outline_comparison_key(native)
+    secondary_compact = _outline_comparison_key(secondary)
+    if native_compact == secondary_compact:
+        transferred = _secondary_characters_with_native_separators(native, secondary)
+        if transferred is not None:
+            return transferred
+        if secondary_token_counts is not None:
+            return _confirmed_secondary_boundary_join(
+                native,
+                secondary,
+                secondary_token_counts,
+            )
+        return None
+
+    native_atoms = _visual_atoms(native)
+    secondary_atoms = _visual_atoms(secondary)
+    if not native_atoms or len(native_atoms) != len(secondary_atoms):
+        return None
+    changed = 0
+    for native_atom, secondary_atom in zip(native_atoms, secondary_atoms, strict=True):
+        if native_atom == secondary_atom:
+            continue
+        native_key = _diacritic_free_key(native_atom)
+        secondary_key = _diacritic_free_key(secondary_atom)
+        allowance = 2 if native_atom.isupper() and len(native_atom) <= 4 else 1
+        if _levenshtein_distance(native_key, secondary_key) > allowance:
+            return None
+        changed += 1
+    return secondary if 1 <= changed <= 4 else None
+
+
+def _secondary_characters_with_native_separators(native: str, secondary: str) -> str | None:
+    """Adopt PDFium glyphs while keeping native word boundaries and punctuation."""
+
+    native_positions = [index for index, character in enumerate(native) if character.isalnum()]
+    secondary_characters = [character for character in secondary if character.isalnum()]
+    if len(native_positions) != len(secondary_characters):
+        return None
+    native_characters = [native[index] for index in native_positions]
+    if "".join(_diacritic_free_key(character) for character in native_characters) != "".join(
+        _diacritic_free_key(character) for character in secondary_characters
+    ):
+        return None
+    rebuilt = list(native)
+    for index, character in zip(native_positions, secondary_characters, strict=True):
+        rebuilt[index] = character
+    proposed = "".join(rebuilt)
+    return proposed if proposed != native else None
+
+
+def _confirmed_secondary_boundary_join(
+    native: str,
+    secondary: str,
+    secondary_token_counts: Counter[str],
+) -> str | None:
+    """Remove a native word split only when PDFium repeats the joined token elsewhere."""
+
+    native_tokens = tuple(re.finditer(r"[^\W\d_]+", native, re.UNICODE))
+    secondary_tokens = tuple(re.finditer(r"[^\W\d_]+", secondary, re.UNICODE))
+    if len(secondary_tokens) >= len(native_tokens):
+        return None
+
+    def boundaries(tokens: tuple[re.Match[str], ...]) -> set[int]:
+        positions: set[int] = set()
+        consumed = 0
+        for token in tokens[:-1]:
+            consumed += len(token.group(0))
+            positions.add(consumed)
+        return positions
+
+    native_boundaries = boundaries(native_tokens)
+    secondary_boundaries = boundaries(secondary_tokens)
+    if not secondary_boundaries < native_boundaries:
+        return None
+    removed = native_boundaries - secondary_boundaries
+    start = 0
+    for token in secondary_tokens:
+        end = start + len(token.group(0))
+        if any(start < position < end for position in removed):
+            if secondary_token_counts[token.group(0).casefold()] < 2:
+                return None
+        start = end
+    return secondary
+
+
+def _secondary_dollar_glyph_candidate(
+    native: str,
+    secondary_lines: tuple[str, ...],
+) -> str | None:
+    native_tokens = _ocr_addition_token_sequence(native)
+    if not native_tokens or _suspicious_non_currency_dollar_count(native) == 0:
+        return None
+    candidates: list[str] = []
+    for secondary in secondary_lines:
+        proposed = _aligned_visual_candidate(native, secondary)
+        proposed = _align_secondary_token_case(native, proposed)
+        similarity = SequenceMatcher(
+            None,
+            native.casefold(),
+            proposed.casefold(),
+            autojunk=False,
+        ).ratio()
+        if (
+            similarity < 0.90
+            or proposed == native
+            or any(character in proposed for character in "\r\n\0�")
+            or len(proposed) > 300
+            or _suspicious_non_currency_dollar_count(proposed) > 0
+            or _has_suspicious_text_glyph(proposed)
+            or _ocr_addition_token_sequence(proposed) != native_tokens
+            or _content_number_tokens(proposed) != _content_number_tokens(native)
+        ):
+            continue
+        candidates.append(proposed)
+    unique = tuple(dict.fromkeys(candidates))
+    return unique[0] if len(unique) == 1 else None
+
+
+def _align_secondary_token_case(native: str, proposed: str) -> str:
+    """Keep proven native capitalization while adopting PDFium punctuation and diacritics."""
+
+    native_matches = tuple(re.finditer(r"[^\W_]+", native, re.UNICODE))
+    proposed_matches = tuple(re.finditer(r"[^\W_]+", proposed, re.UNICODE))
+    if len(native_matches) != len(proposed_matches):
+        return proposed
+    parts: list[str] = []
+    previous_end = 0
+    for native_match, proposed_match in zip(native_matches, proposed_matches, strict=True):
+        parts.append(proposed[previous_end : proposed_match.start()])
+        parts.append(
+            _align_consensus_token_case(
+                native_match.group(0),
+                proposed_match.group(0),
+            )
+        )
+        previous_end = proposed_match.end()
+    parts.append(proposed[previous_end:])
+    return "".join(parts)
+
+
+def _reconcile_document_token_consensus(
+    pages: list[_PdfPage],
+    ocr_pages: dict[int, str],
+) -> tuple[list[_PdfPage], int]:
+    """Accept one OCR token only when independent document occurrences corroborate it."""
+
+    disagreements = _visual_text_disagreements(pages, ocr_pages)
+    if not disagreements:
+        return pages, 0
+    native_counts = _document_alpha_token_counts(
+        line.text for page in pages for line in page.lines if not line.rotated
+    )
+    ocr_counts = _document_alpha_token_counts(
+        line for markdown in ocr_pages.values() for line in _visible_ocr_lines(markdown)
+    )
+    replacements: dict[tuple[int, float, float, str], str] = {}
+    for disagreement in disagreements:
+        proposed = _document_consensus_candidate(
+            disagreement.line.text,
+            disagreement.ocr_text,
+            native_counts,
+            ocr_counts,
+        )
+        if proposed is not None:
+            replacements[_visual_line_key(disagreement.line)] = proposed
+    if not replacements:
+        return pages, 0
+    reconciled = [_apply_page_text_replacements(page, replacements) for page in pages]
+    LOGGER.info("pdf_document_consensus_completed accepted=%d", len(replacements))
+    return reconciled, len(replacements)
+
+
+def _reconcile_suspicious_numbers_from_ocr(
+    pages: list[_PdfPage],
+    ocr_pages: dict[int, str],
+) -> tuple[list[_PdfPage], int]:
+    """Repair a broken numeric token only when its aligned OCR line selects one value."""
+
+    replacements: dict[tuple[int, float, float, str], str] = {}
+    for page in pages:
+        ocr_markdown = ocr_pages.get(page.number)
+        if not ocr_markdown:
+            continue
+        ocr_lines = _visible_ocr_lines(ocr_markdown)
+        for line in page.lines:
+            if line.rotated:
+                continue
+            suspicious_matches = _suspicious_numeric_glyph_matches(line.text)
+            if not suspicious_matches:
+                continue
+            suspicious_spans = {match.span() for match in suspicious_matches}
+            match = _best_matching_text_line(line.text, ocr_lines)
+            if match is None or match[0] < 0.72:
+                continue
+            confirmed_numbers = set(re.findall(r"(?<!\d)\d{1,4}(?!\d)", match[1]))
+            if not confirmed_numbers:
+                continue
+
+            def reconcile_token(
+                candidate: re.Match[str],
+                confirmed_numbers: set[str] = confirmed_numbers,
+                suspicious_spans: set[tuple[int, int]] = suspicious_spans,
+            ) -> str:
+                if candidate.span() not in suspicious_spans:
+                    return candidate.group(0)
+                values = _numeric_glyph_candidates(candidate.group(0)) & confirmed_numbers
+                return next(iter(values)) if len(values) == 1 else candidate.group(0)
+
+            proposed = _SUSPICIOUS_NUMERIC_GLYPH_PATTERN.sub(reconcile_token, line.text)
+            if proposed != line.text:
+                replacements[_visual_line_key(line)] = proposed
+    if not replacements:
+        return pages, 0
+    reconciled = [_apply_page_text_replacements(page, replacements) for page in pages]
+    LOGGER.info("pdf_numeric_glyph_consensus_completed accepted=%d", len(replacements))
+    return reconciled, len(replacements)
+
+
+def _document_alpha_token_counts(texts: Iterable[str]) -> Counter[str]:
+    counts: Counter[str] = Counter()
+    for text in texts:
+        counts.update(
+            atom.casefold()
+            for atom in _visual_atoms(text)
+            if atom.isalpha() and "\ufffd" not in atom
+        )
+    return counts
+
+
+def _document_consensus_candidate(
+    native: str,
+    ocr: str,
+    native_counts: Counter[str],
+    ocr_counts: Counter[str],
+) -> str | None:
+    native_matches = tuple(_VISUAL_ATOM_PATTERN.finditer(unicodedata.normalize("NFC", native)))
+    ocr_atoms = _visual_atoms(ocr)
+    if not native_matches or len(native_matches) != len(ocr_atoms):
+        return None
+    native_atoms = tuple(match.group(0) for match in native_matches)
+    changed = [
+        index
+        for index, (native_atom, ocr_atom) in enumerate(zip(native_atoms, ocr_atoms, strict=True))
+        if native_atom != ocr_atom
+    ]
+    if not changed or len(changed) > 2:
+        return None
+    current_native_counts = Counter(atom.casefold() for atom in native_atoms if atom.isalpha())
+    supported: list[tuple[int, str]] = []
+    evidence_keys = set(native_counts) | set(ocr_counts)
+    for index in changed:
+        native_atom = native_atoms[index]
+        ocr_atom = ocr_atoms[index]
+        native_key = native_atom.casefold()
+        ocr_key = ocr_atom.casefold()
+        if (
+            native_key == ocr_key
+            or not native_atom.isalpha()
+            or not ocr_atom.isalpha()
+            or abs(len(native_atom) - len(ocr_atom)) > 1
+            or _levenshtein_distance(native_key, ocr_key) != 1
+            or re.search(r"(?<=[a-z])(?=[A-Z])", ocr_atom)
+        ):
+            continue
+        native_has_internal_uppercase = bool(re.search(r"(?<=[a-z])[A-Z]", native_atom))
+        prefixed_title_candidate = (
+            native_atom[1:] == ocr_atom
+            and native_atom[:1].islower()
+            and ocr_atom[:1].isupper()
+            and ocr_atom[1:].islower()
+        )
+        if native_has_internal_uppercase and not prefixed_title_candidate:
+            continue
+        same_base_letters = _diacritic_free_key(native_atom) == _diacritic_free_key(ocr_atom)
+        if same_base_letters and not _has_diacritic(ocr_atom):
+            continue
+        if min(len(native_atom), len(ocr_atom)) < 5 and not (
+            prefixed_title_candidate or same_base_letters
+        ):
+            continue
+        external_native = native_counts[ocr_key] - current_native_counts[ocr_key]
+        if external_native < 1 or ocr_counts[ocr_key] < 1:
+            continue
+        candidate_support = external_native + ocr_counts[ocr_key]
+        native_support = (
+            native_counts[native_key] - current_native_counts[native_key] + ocr_counts[native_key]
+        )
+        if candidate_support < max(2, native_support + 1):
+            continue
+        ambiguous = False
+        for alternative_key in evidence_keys - {native_key, ocr_key}:
+            if (
+                abs(len(alternative_key) - len(native_key)) > 1
+                or _levenshtein_distance(native_key, alternative_key) != 1
+                or native_counts[alternative_key] < 1
+                or ocr_counts[alternative_key] < 1
+            ):
+                continue
+            alternative_support = native_counts[alternative_key] + ocr_counts[alternative_key]
+            if alternative_support >= candidate_support:
+                ambiguous = True
+                break
+        if ambiguous:
+            continue
+        supported.append((index, _align_consensus_token_case(native_atom, ocr_atom)))
+    if len(supported) != 1:
+        return None
+    index, replacement = supported[0]
+    match = native_matches[index]
+    proposed = native[: match.start()] + replacement + native[match.end() :]
+    return _validated_visual_reading(native, ocr, proposed)
+
+
+def _diacritic_free_key(value: str) -> str:
+    return "".join(
+        character
+        for character in unicodedata.normalize("NFKD", value.casefold())
+        if not unicodedata.combining(character)
+    )
+
+
+def _has_diacritic(value: str) -> bool:
+    return _diacritic_free_key(value) != value.casefold()
+
+
+def _align_consensus_token_case(native: str, candidate: str) -> str:
+    if native.isupper():
+        return candidate.upper()
+    if native.islower():
+        return candidate.lower()
+    if native[:1].isupper() and native[1:].islower():
+        return candidate[:1].upper() + candidate[1:].lower()
+    return candidate
 
 
 def _arbitrate_visual_text_disagreements(
@@ -2597,11 +4288,19 @@ def _arbitrate_visual_text_disagreements(
 
     selected: list[_PdfVisualDisagreement] = []
     per_page: Counter[int] = Counter()
+    inferred_table_pages = {
+        page.number for page in pages if any(table.inferred_from_raster for table in page.tables)
+    }
     for disagreement in sorted(
         disagreements,
         key=lambda item: (-item.priority, item.page_number, item.line.top, item.line.x0),
     ):
-        if per_page[disagreement.page_number] >= _MAX_VISUAL_ARBITRATION_REGIONS_PER_PAGE:
+        per_page_limit = (
+            _MAX_VISUAL_ARBITRATION_REGIONS_PER_PAGE * 2
+            if disagreement.page_number in inferred_table_pages
+            else _MAX_VISUAL_ARBITRATION_REGIONS_PER_PAGE
+        )
+        if per_page[disagreement.page_number] >= per_page_limit:
             continue
         selected.append(disagreement)
         per_page[disagreement.page_number] += 1
@@ -2650,15 +4349,7 @@ def _arbitrate_visual_text_disagreements(
 
     if not replacements:
         return pages, reviewed, 0
-    reconciled: list[_PdfPage] = []
-    for page in pages:
-        page_lines = tuple(
-            replace(line, text=replacements[_visual_line_key(line)])
-            if _visual_line_key(line) in replacements
-            else line
-            for line in page.lines
-        )
-        reconciled.append(replace(page, lines=page_lines) if page_lines != page.lines else page)
+    reconciled = [_apply_page_text_replacements(page, replacements) for page in pages]
     LOGGER.info(
         "pdf_visual_arbitration_completed reviewed=%d accepted=%d",
         reviewed,
@@ -2674,7 +4365,9 @@ def _visual_text_disagreements(
     disagreements: list[_PdfVisualDisagreement] = []
     for page in pages:
         ocr_markdown = ocr_pages.get(page.number)
-        if ocr_markdown is None or _should_replace_with_ocr(page, ocr_markdown):
+        if ocr_markdown is None or (
+            not page.has_table and _should_replace_with_ocr(page, ocr_markdown)
+        ):
             continue
         ocr_lines = _visible_ocr_lines(ocr_markdown)
         if not ocr_lines:
@@ -2682,38 +4375,200 @@ def _visual_text_disagreements(
         for line in page.lines:
             if line.rotated or not (3 <= len(line.text) <= 300):
                 continue
+            native_replacement_suspicion = _has_suspicious_text_glyph(line.text)
+            native_numeric_suspicion = _line_has_suspicious_numeric_glyph(line)
+            native_dollar_suspicion = _suspicious_non_currency_dollar_count(line.text) > 0
             native_self_suspicion = bool(
-                "\ufffd" in line.text or _SUSPICIOUS_NUMERIC_GLYPH_PATTERN.search(line.text)
+                native_replacement_suspicion or native_numeric_suspicion or native_dollar_suspicion
             )
             match = _best_matching_text_line(line.text, ocr_lines)
             # A contents folio is often a detached native line but part of the OCR row.
             # Keep a deliberately low preliminary threshold, then validate the aligned
             # candidate with the strict same-atom guard below.
-            if match is None or match[0] < 0.60:
-                if not native_self_suspicion:
-                    continue
-                similarity, candidate = 1.0, line.text
-            else:
+            if match is not None and match[0] >= 0.60:
                 similarity, candidate = match
-            candidate = _aligned_visual_candidate(line.text, candidate)
-            similarity = SequenceMatcher(
-                None,
-                line.text.casefold(),
-                candidate.casefold(),
-                autojunk=False,
-            ).ratio()
-            if similarity < 0.74:
-                if not native_self_suspicion:
-                    continue
-                similarity, candidate = 1.0, line.text
-            priority = _visual_disagreement_priority(line.text, candidate, similarity)
+                candidate = _aligned_visual_candidate(line.text, candidate)
+                similarity = SequenceMatcher(
+                    None,
+                    line.text.casefold(),
+                    candidate.casefold(),
+                    autojunk=False,
+                ).ratio()
+            else:
+                similarity, candidate = 0.0, line.text
+            priority = (
+                _visual_disagreement_priority(line.text, candidate, similarity)
+                if similarity >= 0.74
+                else None
+            )
+            if priority is None:
+                token_candidate = _token_reconciled_visual_candidate(line.text, ocr_lines)
+                if token_candidate is not None:
+                    token_similarity = SequenceMatcher(
+                        None,
+                        line.text.casefold(),
+                        token_candidate.casefold(),
+                        autojunk=False,
+                    ).ratio()
+                    token_priority = _visual_disagreement_priority(
+                        line.text,
+                        token_candidate,
+                        token_similarity,
+                    )
+                    if token_priority is not None:
+                        similarity = token_similarity
+                        candidate = token_candidate
+                        priority = token_priority
             if priority is None and native_self_suspicion:
                 similarity, candidate = 1.0, line.text
-                priority = _visual_disagreement_priority(line.text, candidate, similarity)
+                if native_replacement_suspicion:
+                    priority = 135
+                elif native_numeric_suspicion:
+                    priority = 128
+                else:
+                    priority = 126
             if priority is None:
                 continue
             disagreements.append(_PdfVisualDisagreement(page.number, line, candidate, priority))
     return tuple(disagreements)
+
+
+def _token_reconciled_visual_candidate(
+    native: str,
+    ocr_lines: tuple[str, ...],
+) -> str | None:
+    """Build a bounded same-shape OCR candidate when page layout interleaves columns."""
+
+    native_matches = tuple(_VISUAL_ATOM_PATTERN.finditer(unicodedata.normalize("NFC", native)))
+    if not native_matches:
+        return None
+    ocr_atoms = tuple(atom for line in ocr_lines for atom in _visual_atoms(line) if len(atom) >= 4)
+    counts = Counter(atom.casefold() for atom in ocr_atoms)
+    surfaces: defaultdict[str, Counter[str]] = defaultdict(Counter)
+    for atom in ocr_atoms:
+        surfaces[atom.casefold()][atom] += 1
+    if not counts:
+        return None
+
+    replacements: dict[int, str] = {}
+    for index, match in enumerate(native_matches):
+        atom = match.group(0)
+        if len(atom) < 4 or atom.isdigit() or atom.casefold() in counts:
+            continue
+        ranked: list[tuple[int, int, int, str]] = []
+        for candidate_key, frequency in counts.items():
+            if abs(len(candidate_key) - len(atom)) > 1:
+                continue
+            distance = _levenshtein_distance(atom.casefold(), candidate_key)
+            if distance != 1:
+                continue
+            ranked.append(
+                (distance, -frequency, abs(len(candidate_key) - len(atom)), candidate_key)
+            )
+        if not ranked:
+            continue
+        ranked.sort()
+        best = ranked[0]
+        if len(ranked) > 1 and ranked[1][:3] == best[:3]:
+            continue
+        candidate_key = best[3]
+        surface = surfaces[candidate_key].most_common(1)[0][0]
+        if atom[:1].isupper() and surface[:1].islower():
+            surface = surface[:1].upper() + surface[1:]
+        replacements[index] = surface
+        if len(replacements) >= 2:
+            break
+    if not replacements:
+        return None
+
+    parts: list[str] = []
+    previous_end = 0
+    for index, match in enumerate(native_matches):
+        parts.append(native[previous_end : match.start()])
+        parts.append(replacements.get(index, match.group(0)))
+        previous_end = match.end()
+    parts.append(native[previous_end:])
+    candidate = "".join(parts)
+    return candidate if candidate != native else None
+
+
+def _apply_page_text_replacements(
+    page: _PdfPage,
+    replacements: dict[tuple[int, float, float, str], str],
+) -> _PdfPage:
+    """Apply accepted visual readings to both flow lines and their structured table cells."""
+
+    changed_lines = tuple(
+        replace(line, text=replacements[_visual_line_key(line)])
+        if _visual_line_key(line) in replacements
+        else line
+        for line in page.lines
+    )
+    if not page.tables:
+        return replace(page, lines=changed_lines) if changed_lines != page.lines else page
+
+    changed_tables: list[_PdfTable] = []
+    for table in page.tables:
+        table_replacements = tuple(
+            (line.text, replacements[_visual_line_key(line)])
+            for line in page.lines
+            if _visual_line_key(line) in replacements and _line_inside_table(line, table)
+        )
+        if not table_replacements:
+            changed_tables.append(table)
+            continue
+        rows = [list(row) for row in table.rows]
+        for old, new in table_replacements:
+            matches = [
+                (row_index, column_index)
+                for row_index, row in enumerate(rows)
+                for column_index, cell in enumerate(row)
+                if old in cell
+            ]
+            if len(matches) == 1:
+                row_index, column_index = matches[0]
+                if rows[row_index][column_index].count(old) == 1:
+                    rows[row_index][column_index] = rows[row_index][column_index].replace(
+                        old, new, 1
+                    )
+                    continue
+            atom_replacement = _single_visual_atom_replacement(old, new)
+            if atom_replacement is None:
+                continue
+            old_atom, new_atom = atom_replacement
+            atom_matches = [
+                (row_index, column_index, match.start(), match.end())
+                for row_index, row in enumerate(rows)
+                for column_index, cell in enumerate(row)
+                for match in _VISUAL_ATOM_PATTERN.finditer(cell)
+                if match.group(0) == old_atom
+            ]
+            if len(atom_matches) != 1:
+                continue
+            row_index, column_index, start, end = atom_matches[0]
+            cell = rows[row_index][column_index]
+            rows[row_index][column_index] = cell[:start] + new_atom + cell[end:]
+        updated_rows = tuple(tuple(row) for row in rows)
+        changed_tables.append(
+            replace(table, rows=updated_rows) if updated_rows != table.rows else table
+        )
+    tables = tuple(changed_tables)
+    if changed_lines == page.lines and tables == page.tables:
+        return page
+    return replace(page, lines=changed_lines, tables=tables)
+
+
+def _single_visual_atom_replacement(old: str, new: str) -> tuple[str, str] | None:
+    old_atoms = _visual_atoms(old)
+    new_atoms = _visual_atoms(new)
+    if not old_atoms or len(old_atoms) != len(new_atoms):
+        return None
+    changed = [
+        (old_atom, new_atom)
+        for old_atom, new_atom in zip(old_atoms, new_atoms, strict=True)
+        if old_atom != new_atom
+    ]
+    return changed[0] if len(changed) == 1 else None
 
 
 def _best_matching_text_line(
@@ -2819,6 +4674,23 @@ def _visual_disagreement_priority(
     ):
         return 110 + round(similarity * 10)
     changed_pairs = [(native_atoms[index], ocr_atoms[index]) for index in different]
+    if any(re.search(r"(?<=[a-z])[A-Z]", left) for left, _right in changed_pairs):
+        return 122 + round(similarity * 10)
+    if any(
+        "".join(
+            character
+            for character in unicodedata.normalize("NFKD", left.casefold())
+            if not unicodedata.combining(character)
+        )
+        == "".join(
+            character
+            for character in unicodedata.normalize("NFKD", right.casefold())
+            if not unicodedata.combining(character)
+        )
+        and left.casefold() != right.casefold()
+        for left, right in changed_pairs
+    ):
+        return 108 + round(similarity * 10)
     if all(
         (_is_mixed_visual_glyph(left) and (right.isalpha() or right.isdigit()))
         or (_is_mixed_visual_glyph(right) and (left.isalpha() or left.isdigit()))
@@ -2839,6 +4711,8 @@ def _visual_disagreement_priority(
         and _levenshtein_distance(left.casefold(), right.casefold()) <= 2
         for left, right in changed_pairs
     ):
+        if any(max(len(left), len(right)) >= 11 for left, right in changed_pairs):
+            return 86 + round(similarity * 10)
         title_case = any(left[:1].isupper() or right[:1].isupper() for left, right in changed_pairs)
         return (70 if title_case else 50) + round(similarity * 10)
     return None
@@ -2897,6 +4771,19 @@ def _validated_visual_reading(native: str, ocr: str, proposed: str) -> str | Non
             proposed_atom not in {native_atom, ocr_atom}
             and "\ufffd" not in native_atom + ocr_atom
             and not any(character in proposed_atom for character in "æÆœŒﬁﬂ")
+            and not (
+                min(len(native_atom), len(ocr_atom), len(proposed_atom)) >= 4
+                and _levenshtein_distance(
+                    proposed_atom.casefold(),
+                    native_atom.casefold(),
+                )
+                <= 1
+                and _levenshtein_distance(
+                    proposed_atom.casefold(),
+                    ocr_atom.casefold(),
+                )
+                <= 1
+            )
         ):
             return None
     if not disagreement:
@@ -2930,16 +4817,10 @@ def _plausible_mixed_visual_resolution(source: str, proposed: str) -> bool:
 
 
 def _render_visual_text_crop(page: Any, line: _PdfLine) -> bytes:
-    page_x0, page_top, page_x1, page_bottom = (float(value) for value in page.bbox)
-    line_height = max(line.bottom - line.top, 2.0)
-    bbox = (
-        max(page_x0, line.x0 - max(8.0, line_height * 1.4)),
-        max(page_top, line.top - max(4.0, line_height * 0.8)),
-        min(page_x1, line.x1 + max(8.0, line_height * 1.4)),
-        min(page_bottom, line.bottom + max(4.0, line_height * 0.8)),
+    bbox = _visual_text_crop_bbox(
+        tuple(float(value) for value in page.bbox),
+        line,
     )
-    if bbox[2] <= bbox[0] or bbox[3] <= bbox[1]:
-        raise ValueError("invalid visual crop")
     image = page.crop(bbox, strict=True).to_image(resolution=288, antialias=True).original
     image = image.convert("RGB")
     if image.width * image.height > 4_000_000:
@@ -2954,6 +4835,118 @@ def _render_visual_text_crop(page: Any, line: _PdfLine) -> bytes:
     if len(content) > _MAX_VISUAL_CROP_BYTES:
         raise ValueError("visual crop too large")
     return content
+
+
+def _visual_text_crop_bbox(
+    page_bbox: tuple[float, float, float, float],
+    line: _PdfLine,
+) -> tuple[float, float, float, float]:
+    page_x0, page_top, page_x1, page_bottom = page_bbox
+    line_height = max(line.bottom - line.top, 2.0)
+    vertical_padding = max(1.0, min(2.0, line_height * 0.15))
+    bbox = (
+        max(page_x0, line.x0 - max(8.0, line_height * 1.4)),
+        max(page_top, line.top - vertical_padding),
+        min(page_x1, line.x1 + max(8.0, line_height * 1.4)),
+        min(page_bottom, line.bottom + vertical_padding),
+    )
+    if bbox[2] <= bbox[0] or bbox[3] <= bbox[1]:
+        raise ValueError("invalid visual crop")
+    return bbox
+
+
+def _unresolved_text_visual_boxes(
+    page: _PdfPage,
+    ocr_markdown: str | None,
+    page_bbox: tuple[float, float, float, float],
+) -> tuple[tuple[float, float, float, float], ...]:
+    """Select visual evidence only for text that neither native extraction nor OCR proves."""
+
+    if page.has_table or not ocr_markdown or _visual_only_page_reason(page, ocr_markdown):
+        return ()
+    disagreements = tuple(
+        disagreement
+        for disagreement in _visual_text_disagreements([page], {page.number: ocr_markdown})
+        if disagreement.priority >= _MIN_VISUAL_TEXT_FALLBACK_PRIORITY
+        and not _native_diacritic_is_stronger_than_ocr(
+            disagreement.line.text,
+            disagreement.ocr_text,
+        )
+    )
+    if not disagreements:
+        return ()
+    if len(disagreements) > _MAX_VISUAL_ARBITRATION_REGIONS:
+        return (page_bbox,)
+    return tuple(
+        dict.fromkeys(
+            _visual_text_crop_bbox(page_bbox, disagreement.line)
+            for disagreement in sorted(
+                disagreements,
+                key=lambda item: (-item.priority, item.line.top, item.line.x0),
+            )
+        )
+    )
+
+
+def _visual_text_fallback_line_keys(
+    page: _PdfPage,
+    ocr_markdown: str | None,
+    resources: tuple[PdfEmbeddedResource, ...],
+) -> set[tuple[int, float, float, str]]:
+    """Return only uncertain lines whose exact local visual evidence was exported."""
+
+    if (
+        page.has_table
+        or not ocr_markdown
+        or any(resource.visual_authority for resource in resources)
+    ):
+        return set()
+    disagreements = _visual_text_disagreements([page], {page.number: ocr_markdown})
+    preserved: set[tuple[int, float, float, str]] = set()
+    for disagreement in disagreements:
+        if disagreement.priority < _MIN_VISUAL_TEXT_FALLBACK_PRIORITY:
+            continue
+        if _native_diacritic_is_stronger_than_ocr(
+            disagreement.line.text,
+            disagreement.ocr_text,
+        ):
+            continue
+        line_bbox = (
+            disagreement.line.x0,
+            disagreement.line.top,
+            disagreement.line.x1,
+            disagreement.line.bottom,
+        )
+        if any(
+            resource.visual_text_authority
+            and resource.bbox is not None
+            and _bbox_overlap_ratio(line_bbox, resource.bbox) >= 0.99
+            for resource in resources
+        ):
+            preserved.add(_visual_line_key(disagreement.line))
+    return preserved
+
+
+def _native_diacritic_is_stronger_than_ocr(native: str, ocr: str) -> bool:
+    """Prefer a useful native layer when OCR only strips valid diacritics."""
+
+    native_atoms = _visual_atoms(native)
+    ocr_atoms = _visual_atoms(ocr)
+    if not native_atoms or len(native_atoms) != len(ocr_atoms):
+        return False
+    changed = [
+        (native_atom, ocr_atom)
+        for native_atom, ocr_atom in zip(native_atoms, ocr_atoms, strict=True)
+        if native_atom != ocr_atom
+    ]
+    return bool(changed) and all(
+        native_atom.isalpha()
+        and ocr_atom.isalpha()
+        and _diacritic_free_key(native_atom) == _diacritic_free_key(ocr_atom)
+        and _has_diacritic(native_atom)
+        and not _has_diacritic(ocr_atom)
+        for native_atom, ocr_atom in changed
+    )
 
 
 def _visual_line_key(line: _PdfLine) -> tuple[int, float, float, str]:
@@ -3036,7 +5029,17 @@ def _extract_spatial_tables(page: Any, lines: tuple[_PdfLine, ...]) -> tuple[_Pd
     page_height = max((line.page_height for line in useful), default=0)
     if page_width <= 0 or page_height <= 0:
         return ()
-    rule_groups = _spatial_table_rule_groups(_raster_horizontal_rules(page), useful)
+    full_page_scan = any(ratio >= _FULL_PAGE_IMAGE_AREA_RATIO for ratio in _image_area_ratios(page))
+    minimum_rule_width_ratio = _OPEN_RASTER_TABLE_RULE_WIDTH_RATIO if full_page_scan else 0.70
+    rule_groups = _spatial_table_rule_groups(
+        _raster_horizontal_rules(
+            page,
+            minimum_width_ratio=minimum_rule_width_ratio,
+        ),
+        useful,
+    )
+    toc_page = _is_toc_page(list(useful))
+    has_links = any(line.links for line in useful)
     tables: list[_PdfTable] = []
     previous_bottom = 0.0
     for original_rules in rule_groups:
@@ -3050,27 +5053,40 @@ def _extract_spatial_tables(page: Any, lines: tuple[_PdfLine, ...]) -> tuple[_Pd
         has_caption = any(
             _TABLE_CAPTION_LINE_PATTERN.match(line.text.strip()) for line in region_lines
         )
+        open_table_boundaries = None
+        open_sparse_matrix = False
+        if full_page_scan and not toc_page and not has_links and not has_caption:
+            open_table_boundaries = _open_raster_table_boundaries(
+                page,
+                region_lines,
+                page_width,
+                page_height,
+                rules,
+            )
+            if open_table_boundaries is not None:
+                vertical, horizontal, open_sparse_matrix = open_table_boundaries
         if len(rules) == 2 and has_caption:
             completed_rules = _complete_sparse_table_rules(rules, region_lines, page_width)
             if completed_rules is not None:
                 rules = completed_rules
-        if len(rules) < 3:
-            continue
-        side_by_side = _side_by_side_line_indexes(region_lines, page_width)
-        minimum_side_by_side_lines = 4 if has_caption else 6
-        if len(side_by_side) < minimum_side_by_side_lines:
-            continue
-        boundaries = _spatial_table_boundaries(
-            region_lines,
-            side_by_side,
-            page_width,
-            page_height,
-            rules,
-            allow_singleton_columns=has_caption and len(rules) <= 3,
-        )
-        if boundaries is None:
-            continue
-        vertical, horizontal = boundaries
+        if open_table_boundaries is None:
+            if len(rules) < 3:
+                continue
+            side_by_side = _side_by_side_line_indexes(region_lines, page_width)
+            minimum_side_by_side_lines = 4 if has_caption else 6
+            if len(side_by_side) < minimum_side_by_side_lines:
+                continue
+            boundaries = _spatial_table_boundaries(
+                region_lines,
+                side_by_side,
+                page_width,
+                page_height,
+                rules,
+                allow_singleton_columns=has_caption and len(rules) <= 3,
+            )
+            if boundaries is None:
+                continue
+            vertical, horizontal = boundaries
         try:
             found = page.find_tables(
                 {
@@ -3091,13 +5107,35 @@ def _extract_spatial_tables(page: Any, lines: tuple[_PdfLine, ...]) -> tuple[_Pd
         table = found[0]
         data = table.extract() or []
         rows = tuple(tuple(_normalize_table_cell(cell) for cell in row) for row in data)
+        native_rows = rows
+        if open_sparse_matrix:
+            rows = _restore_visual_matrix_placeholders(page, rows, vertical, horizontal)
+            rows = _repair_consensus_degree_markers(rows)
         column_count = max((len(row) for row in rows), default=0)
         populated = sum(bool(cell) for row in rows for cell in row)
-        minimum_rows = 2 if has_caption else 4
+        minimum_rows = 4 if open_table_boundaries is not None else (2 if has_caption else 4)
+        population_ratio = populated / max(1, len(rows) * column_count)
+        open_table_shape_is_safe = True
+        if open_table_boundaries is not None:
+            if open_sparse_matrix:
+                open_table_shape_is_safe = bool(
+                    4 <= column_count <= 8
+                    and rows
+                    and all(rows[0])
+                    and all(row and row[0] for row in rows)
+                    and population_ratio >= 0.25
+                )
+            else:
+                open_table_shape_is_safe = bool(
+                    column_count == 2
+                    and population_ratio >= 0.85
+                    and all(row and row[0] for row in rows)
+                )
         if (
             not minimum_rows <= len(rows) <= _MAX_PDF_TABLE_ROWS
             or not 2 <= column_count <= 8
-            or populated / (len(rows) * column_count) < 0.60
+            or (open_table_boundaries is None and populated / (len(rows) * column_count) < 0.60)
+            or not open_table_shape_is_safe
             or any(len(row) != column_count for row in rows)
             or any(len(cell) > _MAX_PDF_TABLE_CELL_CHARACTERS for row in rows for cell in row)
         ):
@@ -3115,14 +5153,364 @@ def _extract_spatial_tables(page: Any, lines: tuple[_PdfLine, ...]) -> tuple[_Pd
             or bbox[1] >= bbox[3]
             or bbox[2] > page_width
             or bbox[3] > page_height
-            or not _table_has_exact_character_coverage(page, bbox, rows)
+            or not _table_has_exact_character_coverage(page, bbox, native_rows)
         ):
             continue
         model = _PdfTable((bbox[0], bbox[1], bbox[2], bbox[3]), (), _TableRendering.HTML)
         if any(line.links and _line_inside_table(line, model) for line in lines):
             continue
-        tables.append(_PdfTable(model.bbox, rows, _table_rendering(rows, column_count)))
+        tables.append(
+            _PdfTable(
+                model.bbox,
+                rows,
+                _table_rendering(rows, column_count),
+                inferred_from_raster=open_table_boundaries is not None,
+            )
+        )
     return tuple(tables)
+
+
+def _open_raster_table_boundaries(
+    page: Any,
+    lines: tuple[_PdfLine, ...],
+    page_width: float,
+    page_height: float,
+    rules: tuple[_RasterHorizontalRule, ...],
+) -> tuple[tuple[float, ...], tuple[float, ...], bool] | None:
+    """Recover a strict open-table grid from an ABBYY full-page scan."""
+
+    if not 2 <= len(rules) <= 3:
+        return None
+    first = rules[0]
+    last = rules[-1]
+    widths = tuple(rule.x1 - rule.x0 for rule in rules)
+    overlap = min(rule.x1 for rule in rules) - max(rule.x0 for rule in rules)
+    if min(widths, default=0.0) <= 0 or overlap / min(widths) < 0.90:
+        return None
+    outer_left = float(median(rule.x0 for rule in rules))
+    outer_right = float(median(rule.x1 for rule in rules))
+    area_ratio = (outer_right - outer_left) * (last.top - first.top) / (page_width * page_height)
+    if not _OPEN_RASTER_TABLE_MIN_AREA_RATIO <= area_ratio <= _OPEN_RASTER_TABLE_MAX_AREA_RATIO:
+        return None
+
+    table_lines = tuple(
+        line for line in lines if first.top < (line.top + line.bottom) / 2 < last.top
+    )
+    side_by_side = _side_by_side_line_indexes(table_lines, page_width)
+    if (
+        len(side_by_side) < _OPEN_RASTER_TABLE_MIN_SIDE_BY_SIDE_LINES
+        or len(side_by_side) / max(1, len(table_lines)) < _OPEN_RASTER_TABLE_MIN_SIDE_BY_SIDE_RATIO
+    ):
+        return None
+
+    sparse_matrix = len(rules) == 3
+    if sparse_matrix:
+        vertical = _header_gutter_table_boundaries(table_lines, page_width, rules)
+        if vertical is None:
+            return None
+    else:
+        middle = _RasterHorizontalRule(
+            outer_left,
+            float((first.top + last.top) / 2),
+            outer_right,
+        )
+        repeated = _spatial_table_boundaries(
+            table_lines,
+            side_by_side,
+            page_width,
+            page_height,
+            (first, middle, last),
+        )
+        if repeated is None or len(repeated[0]) != 3:
+            return None
+        vertical = repeated[0]
+
+    horizontal_result = _open_table_horizontal_boundaries(page, vertical, rules)
+    if horizontal_result is None:
+        return None
+    horizontal, labelled_row_ratio = horizontal_result
+    if len(horizontal) - 1 < 4:
+        return None
+    if not sparse_matrix and labelled_row_ratio < 0.75:
+        return None
+    return vertical, horizontal, sparse_matrix
+
+
+def _header_gutter_table_boundaries(
+    lines: tuple[_PdfLine, ...],
+    page_width: float,
+    rules: tuple[_RasterHorizontalRule, ...],
+) -> tuple[float, ...] | None:
+    """Infer matrix columns only from gutters repeated across two header lines."""
+
+    if len(rules) != 3:
+        return None
+    candidates: list[tuple[float, float]] = []
+    for line in lines:
+        center_y = (line.top + line.bottom) / 2
+        if not rules[0].top < center_y < rules[1].top:
+            continue
+        characters = sorted(
+            (
+                character
+                for character in line.chars
+                if character.text and not character.text.isspace()
+            ),
+            key=lambda character: character.x0,
+        )
+        minimum_gap = max(page_width * 0.012, line.font_size * 0.80)
+        for previous, current in zip(characters, characters[1:], strict=False):
+            if current.x0 - previous.x1 >= minimum_gap:
+                candidates.append(((previous.x1 + current.x0) / 2, line.top))
+    if not candidates:
+        return None
+
+    tolerance = page_width * 0.015
+    clusters: list[list[tuple[float, float]]] = []
+    for candidate in sorted(candidates):
+        if not clusters or candidate[0] - median(item[0] for item in clusters[-1]) > tolerance:
+            clusters.append([candidate])
+        else:
+            clusters[-1].append(candidate)
+    internal = tuple(
+        float(median(item[0] for item in cluster))
+        for cluster in clusters
+        if len({round(item[1], 1) for item in cluster}) >= 2
+    )
+    table_lines = tuple(
+        line for line in lines if rules[0].top < (line.top + line.bottom) / 2 < rules[-1].top
+    )
+    vertical = (
+        min(
+            float(median(rule.x0 for rule in rules)),
+            min((line.x0 for line in table_lines), default=page_width),
+        ),
+        *internal,
+        max(
+            float(median(rule.x1 for rule in rules)),
+            max((line.x1 for line in table_lines), default=0.0),
+        ),
+    )
+    if not 5 <= len(vertical) <= 9 or any(
+        left >= right for left, right in zip(vertical, vertical[1:], strict=False)
+    ):
+        return None
+    return vertical
+
+
+def _open_table_horizontal_boundaries(
+    page: Any,
+    vertical: tuple[float, ...],
+    rules: tuple[_RasterHorizontalRule, ...],
+) -> tuple[tuple[float, ...], float] | None:
+    """Split open-table rows only at clear whitespace in the first column."""
+
+    inferred: list[float] = []
+    row_starts: list[dict[str, Any]] = []
+    for upper, lower in zip(rules, rules[1:], strict=False):
+        try:
+            first_column_crop = page.crop(
+                (vertical[0], upper.top, vertical[1], lower.top),
+                strict=False,
+            )
+            raw_lines = sorted(
+                first_column_crop.extract_text_lines(strip=True, return_chars=True),
+                key=lambda line: float(line["top"]),
+            )
+            full_width_lines = sorted(
+                page.crop(
+                    (vertical[0], upper.top, vertical[-1], lower.top),
+                    strict=False,
+                ).extract_text_lines(strip=True, return_chars=True),
+                key=lambda line: float(line["top"]),
+            )
+        except (PdfminerException, KeyError, OSError, TypeError, ValueError):
+            return None
+        raw_lines = [line for line in raw_lines if _normalize_text(str(line.get("text", "")))]
+        full_width_lines = [
+            line for line in full_width_lines if _normalize_text(str(line.get("text", "")))
+        ]
+        if not raw_lines:
+            return None
+        sizes = [
+            float(character.get("size", 0))
+            for line in raw_lines
+            for character in (line.get("chars") or ())
+            if float(character.get("size", 0)) > 0
+        ]
+        minimum_gap = max(3.5, (median(sizes) if sizes else 7.0) * 0.55)
+        segment_starts = [raw_lines[0]]
+        for previous, current in zip(raw_lines, raw_lines[1:], strict=False):
+            gap = float(current["top"]) - float(previous["bottom"])
+            if gap >= minimum_gap:
+                segment_starts.append(current)
+        row_starts.extend(segment_starts)
+        row_tolerance = max(2.0, (median(sizes) if sizes else 7.0) * 0.35)
+        for current, following in zip(segment_starts, segment_starts[1:], strict=False):
+            current_top = float(current["top"])
+            following_top = float(following["top"])
+            previous_bottom = max(
+                (
+                    float(line["bottom"])
+                    for line in full_width_lines
+                    if float(line["top"]) >= current_top - row_tolerance
+                    and float(line["top"]) < following_top - 1.0
+                ),
+                default=float(current["bottom"]),
+            )
+            if previous_bottom >= following_top:
+                return None
+            inferred.append(float((previous_bottom + following_top) / 2))
+
+    horizontal = tuple(sorted((*(rule.top for rule in rules), *inferred)))
+    if len(horizontal) - 1 > _MAX_PDF_TABLE_ROWS or any(
+        top >= bottom for top, bottom in zip(horizontal, horizontal[1:], strict=False)
+    ):
+        return None
+    labelled = sum(_raw_table_line_is_label(line) for line in row_starts)
+    return horizontal, labelled / max(1, len(row_starts))
+
+
+def _restore_visual_matrix_placeholders(
+    page: Any,
+    rows: tuple[tuple[str, ...], ...],
+    vertical: tuple[float, ...],
+    horizontal: tuple[float, ...],
+) -> tuple[tuple[str, ...], ...]:
+    """Restore dash placeholders visible in the scan but absent from hidden OCR text."""
+
+    if (
+        len(rows) + 1 != len(horizontal)
+        or not rows
+        or any(len(row) + 1 != len(vertical) for row in rows)
+    ):
+        return rows
+    try:
+        image = page.to_image(resolution=144, antialias=True).original.convert("L")
+        page_width = float(page.width)
+        page_height = float(page.height)
+    except (OSError, TypeError, ValueError):
+        return rows
+    if page_width <= 0 or page_height <= 0:
+        return rows
+
+    scale_x = image.width / page_width
+    scale_y = image.height / page_height
+    restored = [list(row) for row in rows]
+    for row_index in range(1, len(rows)):
+        for column_index in range(1, len(rows[row_index])):
+            if rows[row_index][column_index]:
+                continue
+            bbox = (
+                vertical[column_index],
+                horizontal[row_index],
+                vertical[column_index + 1],
+                horizontal[row_index + 1],
+            )
+            if _raster_cell_has_short_horizontal_mark(image, bbox, scale_x, scale_y):
+                restored[row_index][column_index] = "—"
+    return tuple(tuple(row) for row in restored)
+
+
+def _repair_consensus_degree_markers(
+    rows: tuple[tuple[str, ...], ...],
+) -> tuple[tuple[str, ...], ...]:
+    """Repair one hidden-OCR degree glyph only when peer headers establish the notation."""
+
+    if not rows or len(rows[0]) < 4:
+        return rows
+    header = rows[0]
+    confirmed = sum(bool(re.search(r"(?<!\d)\d{1,2}°\s*[A-Z]{3,}\b", cell)) for cell in header[1:])
+    if confirmed < max(2, (len(header) - 1) // 2):
+        return rows
+
+    repaired_header: list[str] = []
+    for cell in header:
+        repaired = re.sub(
+            r"(?<!\d)(?P<degree>[0-2]?\d)0(?=\s*[A-Z]{3,}\b)",
+            lambda match: f"{match.group('degree')}°",
+            cell,
+        )
+        repaired_header.append(re.sub(r"(?<=°)(?=[A-Z])", " ", repaired))
+    if tuple(repaired_header) == header:
+        return rows
+    return (tuple(repaired_header), *rows[1:])
+
+
+def _raster_cell_has_short_horizontal_mark(
+    image: Image.Image,
+    bbox: tuple[float, float, float, float],
+    scale_x: float,
+    scale_y: float,
+) -> bool:
+    """Recognize one small dash component while excluding the table's outer rules."""
+
+    x0, top, x1, bottom = bbox
+    inset_x = min(2.0, max(0.75, (x1 - x0) * 0.025))
+    inset_y = min(2.0, max(0.75, (bottom - top) * 0.025))
+    crop_box = (
+        max(0, round((x0 + inset_x) * scale_x)),
+        max(0, round((top + inset_y) * scale_y)),
+        min(image.width, round((x1 - inset_x) * scale_x)),
+        min(image.height, round((bottom - inset_y) * scale_y)),
+    )
+    if crop_box[2] <= crop_box[0] or crop_box[3] <= crop_box[1]:
+        return False
+    crop = image.crop(crop_box)
+    width, height = crop.size
+    pixels = crop.load()
+    visited: set[tuple[int, int]] = set()
+    for y in range(height):
+        for x in range(width):
+            if (x, y) in visited or pixels[x, y] >= 155:
+                continue
+            pending = [(x, y)]
+            visited.add((x, y))
+            component: list[tuple[int, int]] = []
+            while pending:
+                current_x, current_y = pending.pop()
+                component.append((current_x, current_y))
+                for delta_y in (-1, 0, 1):
+                    for delta_x in (-1, 0, 1):
+                        neighbour = (current_x + delta_x, current_y + delta_y)
+                        if (
+                            0 <= neighbour[0] < width
+                            and 0 <= neighbour[1] < height
+                            and neighbour not in visited
+                            and pixels[neighbour[0], neighbour[1]] < 155
+                        ):
+                            visited.add(neighbour)
+                            pending.append(neighbour)
+            component_width = (
+                max(point[0] for point in component) - min(point[0] for point in component) + 1
+            )
+            component_height = (
+                max(point[1] for point in component) - min(point[1] for point in component) + 1
+            )
+            density = len(component) / (component_width * component_height)
+            if (
+                6 <= component_width <= max(8, round(width * 0.45))
+                and component_height <= max(5, round(component_width * 0.25))
+                and component_width >= component_height * 3
+                and len(component) >= component_width * 0.60
+                and density >= 0.30
+            ):
+                return True
+    return False
+
+
+def _raw_table_line_is_label(raw_line: dict[str, Any]) -> bool:
+    text = _normalize_text(str(raw_line.get("text", "")))
+    if _is_uppercase_text(text):
+        return True
+    characters = tuple(raw_line.get("chars") or ())
+    weighted = sum(max(1, len(str(character.get("text", "")))) for character in characters)
+    bold = sum(
+        max(1, len(str(character.get("text", ""))))
+        for character in characters
+        if _is_bold_font(str(character.get("fontname", "")))
+    )
+    return weighted > 0 and bold / weighted >= 0.55
 
 
 def _complete_sparse_table_rules(
@@ -3219,7 +5607,11 @@ def _spatial_table_rule_groups(
     return tuple(groups)
 
 
-def _raster_horizontal_rules(page: Any) -> tuple[_RasterHorizontalRule, ...]:
+def _raster_horizontal_rules(
+    page: Any,
+    *,
+    minimum_width_ratio: float = 0.70,
+) -> tuple[_RasterHorizontalRule, ...]:
     """Locate long horizontal rules that exist only in the rendered page image."""
 
     try:
@@ -3233,7 +5625,17 @@ def _raster_horizontal_rules(page: Any) -> tuple[_RasterHorizontalRule, ...]:
     grouped: list[list[tuple[int, tuple[int, int]]]] = []
     current: list[tuple[int, tuple[int, int]]] = []
     for y in range(height + 1):
-        span = _long_dark_horizontal_span(data, width, height, y) if y < height else None
+        span = (
+            _long_dark_horizontal_span(
+                data,
+                width,
+                height,
+                y,
+                minimum_width_ratio=minimum_width_ratio,
+            )
+            if y < height
+            else None
+        )
         if span is not None and y / height < 0.97:
             current.append((y, span))
         elif current:
@@ -3256,6 +5658,8 @@ def _long_dark_horizontal_span(
     width: int,
     height: int,
     y: int,
+    *,
+    minimum_width_ratio: float = 0.70,
 ) -> tuple[int, int] | None:
     dark_x = bytearray(width)
     for scan_y in range(max(0, y - 2), min(height, y + 3)):
@@ -3279,7 +5683,7 @@ def _long_dark_horizontal_span(
             gap += 1
     if start is not None and (best is None or previous + 1 - start > best[1] - best[0]):
         best = (start, previous + 1)
-    if best is None or best[1] - best[0] < width * 0.70:
+    if best is None or best[1] - best[0] < width * minimum_width_ratio:
         return None
     return best
 
@@ -3307,13 +5711,19 @@ def _spatial_table_boundaries(
     if not 2 <= len(clusters) <= 8:
         return None
     anchors = tuple(float(median(line.x0 for line in cluster)) for cluster in clusters)
+    table_row_lines = tuple(
+        line for line in lines if rules[0].top < (line.top + line.bottom) / 2 < rules[-1].top
+    )
     internal_boundaries: list[float] = []
     minimum_gutter = 0.01
     for left_cluster, right_cluster in zip(clusters, clusters[1:], strict=False):
-        right_edge = min(line.x0 for line in right_cluster)
+        substantial_right_lines = tuple(
+            line for line in right_cluster if _heading_letter_count(line.text) >= 3
+        )
+        right_edge = min(line.x0 for line in (substantial_right_lines or tuple(right_cluster)))
         character_edges = [
             character.x1
-            for line in aligned
+            for line in table_row_lines
             for character in line.chars
             if character.x0 < right_edge and character.x1 <= right_edge
         ]
@@ -3323,9 +5733,6 @@ def _spatial_table_boundaries(
         if right_edge - left_edge < minimum_gutter:
             return None
         internal_boundaries.append(float((left_edge + right_edge) / 2))
-    table_row_lines = tuple(
-        line for line in lines if rules[0].top < (line.top + line.bottom) / 2 < rules[-1].top
-    )
     outer_left = min(
         float(median(rule.x0 for rule in rules)),
         min((line.x0 for line in table_row_lines), default=page_width),
@@ -3457,7 +5864,10 @@ def _repair_repeated_front_matter_ocr_titles(
         if (
             target_page is None
             or page_number > _OCR_TITLE_TARGET_LAST_PAGE
-            or not _should_replace_with_ocr(target_page, markdown)
+            or not (
+                _should_replace_with_ocr(target_page, markdown)
+                or _sparse_raster_cover_should_stay_in_image(target_page)
+            )
             or not (
                 _page_letter_count(target_page) < _GRAPHIC_WARNING_LETTER_LIMIT
                 or _native_page_quality(target_page) < _LOW_NATIVE_QUALITY_THRESHOLD
@@ -3597,6 +6007,228 @@ def _markdown_title_line_parts(line: str) -> tuple[str, str, str] | None:
     return prefix, visible, suffix
 
 
+def _ordered_list_item_indexes(lines: list[_PdfLine], body_size: float) -> set[int]:
+    """Identify only compact, visually consistent sequences starting at one."""
+    candidates: list[tuple[int, int, str, _PdfLine]] = []
+    for index, line in enumerate(lines):
+        match = _ORDERED_LIST_PATTERN.match(line.text)
+        if match is None or line.bold or _heading_letter_count(match.group("text")) < 3:
+            continue
+        candidates.append(
+            (
+                index,
+                int(match.group("number")),
+                match.group("marker"),
+                line,
+            )
+        )
+
+    confirmed: set[int] = set()
+    run: list[tuple[int, int, str, _PdfLine]] = []
+
+    def confirm_run() -> None:
+        if len(run) >= 3:
+            confirmed.update(candidate[0] for candidate in run)
+
+    for candidate in candidates:
+        index, number, marker, line = candidate
+        if number == 1:
+            confirm_run()
+            run = [candidate]
+            continue
+        if not run:
+            continue
+        previous_index, previous_number, previous_marker, previous_line = run[-1]
+        first_line = run[0][3]
+        consistent = (
+            number == previous_number + 1
+            and marker == previous_marker
+            and index - previous_index <= 6
+            and line.top - previous_line.top
+            <= max(body_size, previous_line.font_size, line.font_size) * 8
+            and abs(line.x0 - first_line.x0) <= max(body_size * 1.75, line.page_width * 0.03)
+            and abs(line.font_size - first_line.font_size) <= body_size * 0.25
+        )
+        if consistent:
+            run.append(candidate)
+            continue
+        confirm_run()
+        run = []
+    confirm_run()
+    return confirmed
+
+
+def _ordered_list_continuation(
+    item_start: _PdfLine,
+    previous: _PdfLine,
+    current: _PdfLine,
+    body_size: float,
+    gap_before: float,
+) -> bool:
+    """Join a wrapped list line only when its hanging indent is explicit."""
+    return bool(
+        _ORDERED_LIST_PATTERN.match(current.text) is None
+        and _BULLET_PATTERN.match(current.text) is None
+        and current.x0 - item_start.x0 >= max(body_size * 0.45, 4)
+        and current.x0 - item_start.x0 <= current.page_width * 0.12
+        and _should_join_lines(previous, current, body_size, gap_before)
+    )
+
+
+def _repair_astrological_series_roman_glyphs(
+    pages: list[_PdfPage],
+    body_size: float,
+) -> list[_PdfPage]:
+    """Recover malformed Roman labels only from clean sibling-heading consensus.
+
+    Some embedded PDF fonts expose the visual glyph ``II`` as ``n`` or ``it`` in the text layer.
+    A centered italic placement label is repaired only when nearby clean siblings agree, or when a
+    preceding decan title proves the current member of the series.  The same fonts can expose
+    ``II:`` as ``IE`` in an uppercase decan title; that form is repaired only when the other two
+    titles for the sign prove the missing member of the I/II/III series.  Without consensus native
+    text is left for review.
+    """
+
+    clean_by_sign: defaultdict[str, list[tuple[int, str, _PdfLine]]] = defaultdict(list)
+    broken: list[tuple[int, int, re.Match[str], _PdfLine]] = []
+
+    for page_index, page in enumerate(pages):
+        for line_index, line in enumerate(page.lines):
+            match = _ASTROLOGICAL_SERIES_HEADING_PATTERN.fullmatch(line.text.strip())
+            if (
+                match is None
+                or not line.centered
+                or not line.italic
+                or line.font_size < body_size * 0.95
+            ):
+                continue
+            series = match.group("series")
+            if re.fullmatch(r"I{1,3}", series, re.IGNORECASE) is None:
+                broken.append((page_index, line_index, match, line))
+                continue
+            clean_by_sign[match.group("sign").casefold()].append(
+                (page.number, series.upper(), line)
+            )
+
+    replacements: dict[tuple[int, int], _PdfLine] = {}
+    for page_index, line_index, match, line in broken:
+        evidence = [
+            series
+            for page_number, series, sibling in clean_by_sign[match.group("sign").casefold()]
+            if abs(page_number - line.page_number) <= 1
+            and abs(sibling.font_size - line.font_size) <= max(1.0, body_size * 0.12)
+        ]
+        if len(evidence) < 2 or len(set(evidence)) != 1:
+            continue
+        series = evidence[0]
+        start, end = match.span("series")
+        repaired_text = f"{line.text[:start]}{series}{line.text[end:]}"
+        replacements[(page_index, line_index)] = replace(
+            line,
+            text=repaired_text,
+            chars=(),
+            emphasis_spans=(),
+        )
+
+    clean_decan_series: defaultdict[str, set[str]] = defaultdict(set)
+    decan_anchors: defaultdict[str, list[tuple[int, int, int, str]]] = defaultdict(list)
+    broken_decan_titles: defaultdict[str, list[tuple[int, int, re.Match[str], _PdfLine]]] = (
+        defaultdict(list)
+    )
+    for page_index, page in enumerate(pages):
+        for line_index, line in enumerate(page.lines):
+            if not line.centered or line.font_size < body_size * 1.05:
+                continue
+            clean_match = _ASTROLOGICAL_DECAN_TITLE_PATTERN.fullmatch(line.text.strip())
+            if clean_match is not None:
+                sign = clean_match.group("sign").casefold()
+                series = clean_match.group("series").upper()
+                clean_decan_series[sign].add(series)
+                decan_anchors[sign].append((page_index, line_index, page.number, series))
+                continue
+            letters = tuple(character for character in line.text if character.isalpha())
+            if (
+                not letters
+                or sum(character.isupper() for character in letters) / len(letters) < 0.80
+            ):
+                continue
+            broken_match = _BROKEN_ASTROLOGICAL_DECAN_TITLE_PATTERN.fullmatch(line.text.strip())
+            if broken_match is not None:
+                broken_decan_titles[broken_match.group("sign").casefold()].append(
+                    (page_index, line_index, broken_match, line)
+                )
+
+    expected_series = {"I", "II", "III"}
+    for sign, candidates in broken_decan_titles.items():
+        missing = expected_series - clean_decan_series[sign]
+        if len(candidates) != 1 or len(clean_decan_series[sign]) != 2 or len(missing) != 1:
+            continue
+        page_index, line_index, match, line = candidates[0]
+        start, end = match.span("series")
+        repaired_series = missing.pop()
+        repaired_text = f"{line.text[:start]}{repaired_series}:{line.text[end:]}"
+        replacements[(page_index, line_index)] = replace(
+            line,
+            text=repaired_text,
+            chars=(),
+            emphasis_spans=(),
+        )
+        decan_anchors[sign].append((page_index, line_index, line.page_number, repaired_series))
+
+    for page_index, line_index, match, line in broken:
+        if (page_index, line_index) in replacements:
+            continue
+        anchors = sorted(decan_anchors[match.group("sign").casefold()])
+        preceding = [
+            anchor
+            for anchor in anchors
+            if (anchor[0], anchor[1]) < (page_index, line_index)
+            and line.page_number - anchor[2] <= 12
+        ]
+        if not preceding:
+            continue
+        anchor_page_index, anchor_line_index, _anchor_page_number, series = preceding[-1]
+        next_anchors = [
+            anchor
+            for anchor in anchors
+            if (anchor[0], anchor[1]) > (anchor_page_index, anchor_line_index)
+        ]
+        if next_anchors and (page_index, line_index) >= (next_anchors[0][0], next_anchors[0][1]):
+            continue
+        start, end = match.span("series")
+        repaired_text = f"{line.text[:start]}{series}{line.text[end:]}"
+        replacements[(page_index, line_index)] = replace(
+            line,
+            text=repaired_text,
+            chars=(),
+            emphasis_spans=(),
+        )
+
+    if not replacements:
+        return pages
+    return [
+        replace(
+            page,
+            lines=tuple(
+                replacements.get((page_index, line_index), line)
+                for line_index, line in enumerate(page.lines)
+            ),
+        )
+        for page_index, page in enumerate(pages)
+    ]
+
+
+def _repair_ordered_list_label_spacing(text: str, native_page_words: set[str]) -> str:
+    """Rejoin a tracked label only when its complete word occurs natively nearby."""
+    match = _ORDERED_LIST_LABEL_PATTERN.match(text)
+    if match is None:
+        return text
+    compact_label = re.sub(r"[ \t]+", "", match.group("label"))
+    if compact_label.casefold() not in native_page_words:
+        return text
+    return f"{compact_label}{match.group('suffix')}"
+
+
 def _render_document(
     pages: list[_PdfPage],
     body_size: float,
@@ -3606,15 +6238,24 @@ def _render_document(
     ocr_pages: dict[int, str],
     ocr_failed_pages: set[int],
     page_images: dict[int, tuple[PdfEmbeddedResource, ...]] | None = None,
+    required_figure_failure_pages: set[int] | None = None,
     on_progress: PdfProgressCallback | None = None,
 ) -> tuple[str, tuple[PdfReviewIssue, ...]]:
+    pages = _repair_astrological_series_roman_glyphs(pages, body_size)
     blocks: list[_MarkdownBlock] = []
     previous_body_line: _PdfLine | None = None
+    required_figure_failure_pages = required_figure_failure_pages or set()
+    preserved_margin_headings = _preserved_structural_margin_headings(
+        pages,
+        body_size,
+        repeated_margins,
+    )
     toc_heading_references, toc_roman_references = _native_toc_heading_references(
         pages,
         body_size,
         heading_sizes,
         repeated_margins,
+        preserved_margin_headings,
     )
     publication_years = _publication_year_evidence(pages, ocr_pages)
 
@@ -3627,6 +6268,30 @@ def _render_document(
                 page_number=page.number,
             )
         )
+        if page.number in required_figure_failure_pages:
+            blocks.append(
+                _MarkdownBlock(
+                    kind="warning",
+                    text=(
+                        f"> **Aviso de conversión (página {page.number}):** se detectó una "
+                        "figura numerada en un escaneo, pero no se pudo conservar su referencia "
+                        "visual. Compárala con el PDF original."
+                    ),
+                    page_number=page.number,
+                )
+            )
+        if any(table.inferred_from_raster for table in page.tables):
+            blocks.append(
+                _MarkdownBlock(
+                    kind="warning",
+                    text=(
+                        f"> **Aviso de conversión (página {page.number}):** se ha reconstruido "
+                        "una tabla escaneada a partir de su geometría visual y se ha conservado "
+                        "una referencia gráfica. Revisa la asociación entre filas y columnas."
+                    ),
+                    page_number=page.number,
+                )
+            )
         ocr_markdown = ocr_pages.get(page.number)
         if ocr_markdown is not None:
             ocr_markdown = _strip_native_margin_numbers_from_ocr(
@@ -3639,7 +6304,56 @@ def _render_document(
                     page,
                     ocr_markdown,
                 )
-        if _fragmented_graphic_text_should_stay_in_image(page, ocr_markdown):
+            ocr_markdown = _repair_ocr_spacing_from_native(page, ocr_markdown)
+            ocr_markdown = _repair_ocr_degree_marker_consensus(ocr_markdown)
+            ocr_markdown = _restore_preserved_structural_ocr_headings(
+                page,
+                ocr_markdown,
+                preserved_margin_headings,
+            )
+        page_resources = page_images.get(page.number, ()) if page_images else ()
+        visual_authority_tables = tuple(
+            table
+            for table in page.tables
+            if _table_requires_visual_fallback(page, table, ocr_markdown)
+            and _table_has_visual_crop(table, page_resources)
+        )
+        if visual_authority_tables:
+            blocks.append(
+                _MarkdownBlock(
+                    kind="warning",
+                    text=(
+                        f"> **Aviso de conversión (página {page.number}):** la asociación o "
+                        "grafía de una tabla escaneada no es demostrable. Se conserva su recorte "
+                        "visual y no se publica una cuadrícula textual incierta."
+                    ),
+                    page_number=page.number,
+                )
+            )
+        visual_text_fallback_lines = _visual_text_fallback_line_keys(
+            page,
+            ocr_markdown,
+            page_resources,
+        )
+        if visual_text_fallback_lines:
+            blocks.append(
+                _MarkdownBlock(
+                    kind="warning",
+                    text=(
+                        f"> **Aviso de conversión (página {page.number}):** una o varias "
+                        "grafías no se pueden resolver con seguridad comparando el texto del PDF "
+                        "y el OCR. Se conservan sus recortes visuales y no se publica una lectura "
+                        "textual incierta."
+                    ),
+                    page_number=page.number,
+                )
+            )
+        visual_only_reason = _visual_only_page_reason(page, ocr_markdown)
+        if visual_only_reason is None and any(
+            resource.visual_authority for resource in page_resources
+        ):
+            visual_only_reason = "authoritative_page_visual"
+        if visual_only_reason is not None and page_images and page_images.get(page.number):
             if page.number in referenced_pages:
                 blocks.append(
                     _MarkdownBlock(
@@ -3650,9 +6364,9 @@ def _render_document(
                 )
             _append_page_images(blocks, page.number, page_images)
             LOGGER.info(
-                "pdf_fragmented_graphic_text_preserved_as_image page=%d native_letters=%d "
-                "ocr_letters=%d",
+                "pdf_page_preserved_as_image page=%d reason=%s native_letters=%d ocr_letters=%d",
                 page.number,
+                visual_only_reason,
                 _page_letter_count(page),
                 _heading_letter_count(ocr_markdown or ""),
             )
@@ -3702,6 +6416,8 @@ def _render_document(
             if line.rotated:
                 skipped_rotated = True
                 continue
+            if _visual_line_key(line) in visual_text_fallback_lines:
+                continue
             candidate_lines.append(line)
 
         candidate_lines = _reconcile_spaced_numeric_year(
@@ -3743,6 +6459,7 @@ def _render_document(
                 previous_margin_candidate,
                 body_size,
                 toc_page=toc_page,
+                preserved_repeated_headings=preserved_margin_headings,
             ):
                 continue
             visible_lines.append(line)
@@ -3756,6 +6473,8 @@ def _render_document(
             for line in visible_lines
             if not any(_line_inside_table(line, table) for table in page.tables)
         ]
+        if not toc_page:
+            visible_lines = _normalize_page_footnotes(visible_lines, body_size)
         if toc_page:
             # Contents pages frequently encode all-caps labels without explicit
             # spaces even though the glyph geometry still contains clear word
@@ -3780,24 +6499,119 @@ def _render_document(
             previous_body_line = None
 
         previous_in_page: _PdfLine | None = None
-        pending_tables = list(sorted(page.tables, key=lambda table: table.bbox[1]))
+        active_ordered_list_block: _MarkdownBlock | None = None
+        active_ordered_list_start: _PdfLine | None = None
+        previous_ordered_list_line: _PdfLine | None = None
+        pending_tables = list(
+            sorted(
+                (table for table in page.tables if table not in visual_authority_tables),
+                key=lambda table: table.bbox[1],
+            )
+        )
+        pending_image_insertions = _page_image_insertions(
+            page_images.get(page.number, ()) if page_images else (),
+            visible_lines,
+        )
         toc_entry_lines = [
             line for line in visible_lines if _split_toc_entry_text(line.text) is not None
         ]
         toc_left = min((line.x0 for line in toc_entry_lines), default=0.0)
-        for line in visible_lines:
+        ordered_list_indexes = (
+            set() if toc_page else _ordered_list_item_indexes(visible_lines, body_size)
+        )
+        native_page_words = {
+            word.casefold()
+            for visible_line in visible_lines
+            for word in re.findall(r"[^\W\d_]{4,}", visible_line.text, re.UNICODE)
+        }
+        for line_index, line in enumerate(visible_lines):
+            while pending_image_insertions and pending_image_insertions[0][0] <= line_index:
+                _append_page_image_resource(blocks, pending_image_insertions.pop(0)[1])
+                previous_body_line = None
+                previous_in_page = None
+                active_ordered_list_block = None
+                active_ordered_list_start = None
+                previous_ordered_list_line = None
             while pending_tables and pending_tables[0].bbox[1] <= line.top:
                 _append_pdf_table(blocks, page.number, pending_tables.pop(0))
                 previous_body_line = None
+                active_ordered_list_block = None
+                active_ordered_list_start = None
+                previous_ordered_list_line = None
             gap_before = (
                 line.top - previous_in_page.bottom
                 if previous_in_page is not None
                 else body_size * 2
             )
             level = _heading_level(line, body_size, heading_sizes, gap_before, toc_page)
-            if level is not None:
+            if level is None and _visual_line_key(line) in preserved_margin_headings:
+                # Consensus proved this is the unique visual opening while matching labels on
+                # later pages are running heads. Preserve that structural fact even when the
+                # opening label's type size alone resembles body text.
+                level = 2
+            following_line = (
+                visible_lines[line_index + 1] if line_index + 1 < len(visible_lines) else None
+            )
+            if level is not None and _uppercase_leadin_continues(
+                line,
+                following_line,
+                body_size,
+            ):
+                level = None
+            ordered_match = (
+                _ORDERED_LIST_PATTERN.match(line.text)
+                if line_index in ordered_list_indexes
+                else None
+            )
+            if ordered_match is not None:
+                item_text = _ORDERED_LIST_PREFIX_PATTERN.sub(
+                    "",
+                    _apply_links(line),
+                    count=1,
+                ).strip()
+                item_text = _repair_ordered_list_label_spacing(item_text, native_page_words)
+                item_text = _apply_source_emphasis(line, item_text)
+                active_ordered_list_block = _MarkdownBlock(
+                    kind="list",
+                    text=(
+                        f"{ordered_match.group('number')}{ordered_match.group('marker')} "
+                        f"{item_text}"
+                    ),
+                    page_number=page.number,
+                    source_line=line,
+                )
+                blocks.append(active_ordered_list_block)
+                active_ordered_list_start = line
+                previous_ordered_list_line = line
+                previous_body_line = None
+            elif (
+                active_ordered_list_block is not None
+                and active_ordered_list_start is not None
+                and previous_ordered_list_line is not None
+                and level is None
+                and _ordered_list_continuation(
+                    active_ordered_list_start,
+                    previous_ordered_list_line,
+                    line,
+                    body_size,
+                    gap_before,
+                )
+            ):
+                active_ordered_list_block.text = _join_ordered_list_continuation_text(
+                    active_ordered_list_block.text,
+                    _apply_links(line),
+                    previous_ordered_list_line,
+                    line,
+                )
+                active_ordered_list_block.source_line = line
+                previous_ordered_list_line = line
+                previous_body_line = None
+            elif level is not None:
                 _append_heading(blocks, line, level, gap_before)
                 previous_body_line = None
+                active_ordered_list_block = None
+                active_ordered_list_start = None
+                previous_ordered_list_line = None
             elif _BULLET_PATTERN.match(line.text):
                 item_text = _BULLET_PATTERN.sub("", _apply_links(line), count=1).strip()
                 item_text = _apply_source_emphasis(line, item_text)
@@ -3810,6 +6624,9 @@ def _render_document(
                     )
                 )
                 previous_body_line = None
+                active_ordered_list_block = None
+                active_ordered_list_start = None
+                previous_ordered_list_line = None
             elif toc_page:
                 entry = _split_toc_entry_text(line.text)
                 if entry is not None:
@@ -3856,8 +6673,14 @@ def _render_document(
                             )
                         )
                 previous_body_line = None
+                active_ordered_list_block = None
+                active_ordered_list_start = None
+                previous_ordered_list_line = None
             else:
-                rendered = _apply_source_emphasis(line, _apply_links(line))
+                rendered = _apply_source_emphasis(
+                    line,
+                    _escape_literal_markdown_legend(_apply_links(line)),
+                )
                 if (
                     blocks
                     and blocks[-1].kind == "paragraph"
@@ -3886,6 +6709,9 @@ def _render_document(
                         )
                     )
                 previous_body_line = line
+                active_ordered_list_block = None
+                active_ordered_list_start = None
+                previous_ordered_list_line = None
             previous_in_page = line
 
         for table in pending_tables:
@@ -3911,7 +6737,16 @@ def _render_document(
                 )
             )
             previous_body_line = None
-        if ocr_markdown is not None:
+        if (
+            ocr_markdown is not None
+            and not visual_authority_tables
+            and not visual_text_fallback_lines
+            and _should_include_ocr_additions(
+                page,
+                skipped_vertical=skipped_vertical,
+                resources=page_resources,
+            )
+        ):
             additions = _ocr_additions(page, ocr_markdown)
             if additions:
                 blocks.append(
@@ -3923,13 +6758,14 @@ def _render_document(
                 )
                 previous_body_line = None
 
-        _append_page_images(blocks, page.number, page_images)
+        for _insertion_index, resource in pending_image_insertions:
+            _append_page_image_resource(blocks, resource)
 
         if on_progress is not None:
             on_progress(PdfProgressPhase.STRUCTURING, current, total_pages)
 
     normalized_blocks = _conservative_container_hierarchy(
-        _join_hyphenated_block_continuations(blocks),
+        _demote_prose_like_headings(_join_hyphenated_block_continuations(blocks)),
     )
     return (
         _normalized_blocks_to_markdown(normalized_blocks),
@@ -3945,13 +6781,62 @@ def _append_page_images(
     if not page_images:
         return
     for resource in page_images.get(page_number, ()):
-        blocks.append(
-            _MarkdownBlock(
-                kind="raw",
-                text=(f"![](<{RESOURCE_REFERENCE_PREFIX}{resource.relative_path.as_posix()}>)"),
-                page_number=page_number,
-            )
+        _append_page_image_resource(blocks, resource)
+
+
+def _append_page_image_resource(
+    blocks: list[_MarkdownBlock],
+    resource: PdfEmbeddedResource,
+) -> None:
+    blocks.append(
+        _MarkdownBlock(
+            kind="raw",
+            text=(f"![](<{RESOURCE_REFERENCE_PREFIX}{resource.relative_path.as_posix()}>)"),
+            page_number=resource.page_number,
         )
+    )
+
+
+def _page_image_insertions(
+    resources: tuple[PdfEmbeddedResource, ...],
+    visible_lines: list[_PdfLine],
+) -> list[tuple[int, PdfEmbeddedResource]]:
+    insertions: list[tuple[int, PdfEmbeddedResource]] = []
+    for resource in resources:
+        insertion_index = len(visible_lines)
+        if resource.bbox is not None:
+            x0, _top, x1, bottom = resource.bbox
+            caption_candidates: list[tuple[float, int]] = []
+            for index, line in enumerate(visible_lines):
+                overlap = max(0.0, min(x1, line.x1) - max(x0, line.x0))
+                minimum_width = min(max(x1 - x0, 0.0), max(line.x1 - line.x0, 0.0))
+                gap = line.top - bottom
+                if (
+                    _is_numbered_figure_caption(line)
+                    and minimum_width > 0
+                    and overlap / minimum_width >= 0.45
+                    and -line.font_size <= gap <= line.page_height * 0.15
+                ):
+                    caption_candidates.append((abs(gap), index))
+            if caption_candidates:
+                insertion_index = min(caption_candidates)[1]
+            else:
+                following = [
+                    (line.top, index)
+                    for index, line in enumerate(visible_lines)
+                    if line.top >= bottom
+                ]
+                if following:
+                    insertion_index = min(following)[1]
+        insertions.append((insertion_index, resource))
+    return sorted(
+        insertions,
+        key=lambda item: (
+            item[0],
+            item[1].bbox[1] if item[1].bbox is not None else float("inf"),
+            item[1].relative_path.as_posix(),
+        ),
+    )
 
 
 def _conservative_container_hierarchy(blocks: list[_MarkdownBlock]) -> list[_MarkdownBlock]:
@@ -3961,7 +6846,7 @@ def _conservative_container_hierarchy(blocks: list[_MarkdownBlock]) -> list[_Mar
     containers = [
         index
         for index, block in enumerate(normalized)
-        if block.kind == "heading" and _CONTAINER_HEADING_PATTERN.match(block.text.strip())
+        if block.kind == "heading" and classify_heading_role(block.text.strip()) == "container"
     ]
     if not containers:
         return normalized
@@ -3971,13 +6856,68 @@ def _conservative_container_hierarchy(blocks: list[_MarkdownBlock]) -> list[_Mar
             index
             for index in range(start + 1, end)
             if normalized[index].kind == "heading"
-            and _CHAPTER_HEADING_PATTERN.match(normalized[index].text.strip())
+            and classify_heading_role(normalized[index].text.strip()) == "chapter"
         ]
         if len(chapter_positions) >= 2:
             normalized[start].level = 2
             for index in chapter_positions:
                 normalized[index].level = 3
     return normalized
+
+
+def _demote_prose_like_headings(blocks: list[_MarkdownBlock]) -> list[_MarkdownBlock]:
+    """Undo a page-local font-size false positive without guessing real short titles."""
+
+    normalized: list[tuple[_MarkdownBlock, bool]] = []
+    for original in blocks:
+        block = replace(original)
+        visible = re.sub(r"[*_~]+", "", block.text)
+        sentence_endings = len(re.findall(r"[.!?](?:[*_~]+)?(?:\s|$)", block.text))
+        starts_like_numbered_structure = _SECTION_HEADING_PATTERN.match(visible.strip()) is not None
+        prose_like = block.kind == "heading" and (
+            (len(visible) > _MAX_HEADING_LENGTH * 2 and sentence_endings >= 2)
+            or (starts_like_numbered_structure and classify_heading_role(visible.strip()) is None)
+        )
+        if prose_like:
+            block.kind = "paragraph"
+            block.level = None
+        normalized.append((block, prose_like))
+
+    repaired: list[_MarkdownBlock] = []
+    previous_was_demoted = False
+    for block, was_demoted in normalized:
+        previous = repaired[-1] if repaired else None
+        previous_line = previous.source_line if previous is not None else None
+        current_line = block.source_line
+        if (
+            previous is not None
+            and previous_was_demoted
+            and block.kind == "paragraph"
+            and previous_line is not None
+            and current_line is not None
+            and current_line.text[:1].islower()
+            and previous_line.text.rstrip()[-1:] not in ".!?;:"
+            and _should_join_lines(
+                previous_line,
+                current_line,
+                max(previous_line.font_size, current_line.font_size),
+                current_line.top - previous_line.bottom,
+            )
+        ):
+            previous.text = _join_line_text(
+                previous.text,
+                block.text,
+                previous_line,
+                current_line,
+            )
+            previous.source_line = current_line
+            previous.source_pages = tuple(
+                dict.fromkeys((*previous.source_pages, *block.source_pages))
+            )
+            continue
+        repaired.append(block)
+        previous_was_demoted = was_demoted
+    return repaired
 
 
 def _line_inside_table(line: _PdfLine, table: _PdfTable) -> bool:
@@ -4052,13 +6992,20 @@ def _structured_table_text(rows: tuple[tuple[str, ...], ...]) -> str:
 
 
 def _should_replace_with_ocr(page: _PdfPage, ocr_markdown: str) -> bool:
-    if _fragmented_graphic_text_should_stay_in_image(page, ocr_markdown):
+    if (
+        _visual_only_page_reason(page, ocr_markdown) is not None
+        or _structured_raster_table_requires_visual(page)
+        or _unresolved_raster_table_text(page, ocr_markdown)
+        or any(_dense_raster_table_requires_visual(page, table) for table in page.tables)
+    ):
         return False
     native_letters = _page_letter_count(page)
     ocr_letters = _heading_letter_count(ocr_markdown)
     native_quality = _native_page_quality(page)
     ocr_quality = _text_quality_score(ocr_markdown)
     if page.has_table and _MARKDOWN_TABLE_PATTERN.search(ocr_markdown):
+        if _has_reliable_reflow_table(page, ocr_markdown):
+            return False
         return ocr_quality >= max(0.42, native_quality - 0.08) and _table_ocr_is_faithful(
             page,
             ocr_markdown,
@@ -4066,6 +7013,17 @@ def _should_replace_with_ocr(page: _PdfPage, ocr_markdown: str) -> bool:
     if native_letters < _MIN_USABLE_NATIVE_LETTERS:
         return ocr_letters >= 10 and ocr_quality >= 0.42
     if _has_suspicious_glyph_encoding(page):
+        native_text = _native_page_text(page)
+        if (
+            _suspicious_non_currency_dollar_count(native_text) > 0
+            and not _has_suspicious_text_glyph(native_text)
+            and _suspicious_numeric_glyph_count(native_text) == 0
+        ):
+            # A broken embedded font can map accents and inverted punctuation to
+            # isolated dollar signs. OCR is useful evidence for those local glyphs,
+            # but it must not replace an otherwise useful native page and erase its
+            # typographic hierarchy.
+            return False
         return (
             ocr_letters >= native_letters * 0.65
             and ocr_quality >= max(_MIN_OCR_REPLACEMENT_QUALITY, native_quality + 0.08)
@@ -4077,6 +7035,147 @@ def _should_replace_with_ocr(page: _PdfPage, ocr_markdown: str) -> bool:
             _MIN_OCR_REPLACEMENT_QUALITY, native_quality + 0.12
         )
     return False
+
+
+def _has_reliable_reflow_table(page: _PdfPage, ocr_markdown: str | None) -> bool:
+    return any(
+        table.rendering is not _TableRendering.STRUCTURED_TEXT
+        and not table.inferred_from_raster
+        and not _unresolved_raster_table(page, table, ocr_markdown)
+        and not _dense_raster_table_requires_visual(page, table)
+        for table in page.tables
+    )
+
+
+def _visual_only_page_reason(page: _PdfPage, ocr_markdown: str | None) -> str | None:
+    if _fragmented_graphic_text_should_stay_in_image(page, ocr_markdown):
+        return "fragmented_graphic_text"
+    return None
+
+
+def _sparse_raster_cover_should_stay_in_image(page: _PdfPage) -> bool:
+    return bool(
+        page.number == 1
+        and not page.has_table
+        and any(ratio >= _FULL_PAGE_IMAGE_AREA_RATIO for ratio in page.image_area_ratios)
+        and _page_letter_count(page) < 4
+        and not any(line.links for line in page.lines)
+    )
+
+
+def _unresolved_raster_table_text(page: _PdfPage, ocr_markdown: str | None) -> bool:
+    """Prefer the scan when neither text layer proves typographic table details."""
+    if (
+        not page.has_table
+        or not page.tables
+        or not ocr_markdown
+        or not any(ratio >= _FULL_PAGE_IMAGE_AREA_RATIO for ratio in page.image_area_ratios)
+    ):
+        return False
+
+    return any(_unresolved_raster_table(page, table, ocr_markdown) for table in page.tables)
+
+
+def _unresolved_raster_table(
+    page: _PdfPage,
+    table: _PdfTable,
+    ocr_markdown: str | None,
+) -> bool:
+    if not ocr_markdown or not any(
+        ratio >= _FULL_PAGE_IMAGE_AREA_RATIO for ratio in page.image_area_ratios
+    ):
+        return False
+
+    table_text = "\n".join(cell for row in table.rows for cell in row if cell)
+    native_atoms = tuple(atom for atom in _visual_atoms(table_text) if atom.isalpha())
+    ocr_atoms = tuple(atom for atom in _visual_atoms(ocr_markdown) if atom.isalpha())
+    exact_ocr_atoms = set(ocr_atoms)
+    native_atom_keys = Counter(atom.casefold() for atom in native_atoms)
+    for native_atom in native_atoms:
+        if native_atom in exact_ocr_atoms:
+            continue
+        native_base = _diacritic_free_key(native_atom)
+        for ocr_atom in ocr_atoms:
+            ocr_base = _diacritic_free_key(ocr_atom)
+            if native_base == ocr_base:
+                loses_diacritic = _has_diacritic(native_atom) != _has_diacritic(ocr_atom)
+                changes_acronym_case = (
+                    len(native_atom) >= 3
+                    and native_atom.casefold() == ocr_atom.casefold()
+                    and (
+                        (native_atom.islower() and ocr_atom.isupper())
+                        or (native_atom.isupper() and ocr_atom.islower())
+                    )
+                )
+                if loses_diacritic or changes_acronym_case:
+                    return True
+            if (
+                re.search(r"(?<=[a-z])[A-Z]", native_atom)
+                and len(native_atom) - len(ocr_atom) in {1, 2}
+                and native_atom.casefold().endswith(ocr_atom.casefold())
+            ):
+                return True
+            if (
+                min(len(native_atom), len(ocr_atom)) >= 5
+                and abs(len(native_atom) - len(ocr_atom)) <= 1
+                and _levenshtein_distance(native_atom.casefold(), ocr_atom.casefold()) == 1
+                and native_atom_keys[ocr_atom.casefold()] >= 1
+            ):
+                return True
+    return False
+
+
+def _structured_raster_table_requires_visual(page: _PdfPage) -> bool:
+    return bool(
+        any(ratio >= _FULL_PAGE_IMAGE_AREA_RATIO for ratio in page.image_area_ratios)
+        and any(table.rendering is _TableRendering.STRUCTURED_TEXT for table in page.tables)
+    )
+
+
+def _structured_raster_table_has_visual_crop(
+    page: _PdfPage,
+    table: _PdfTable,
+    resources: tuple[PdfEmbeddedResource, ...],
+) -> bool:
+    return bool(
+        table.rendering is _TableRendering.STRUCTURED_TEXT
+        and _structured_raster_table_requires_visual(page)
+        and _table_has_visual_crop(table, resources)
+    )
+
+
+def _table_requires_visual_fallback(
+    page: _PdfPage,
+    table: _PdfTable,
+    ocr_markdown: str | None,
+) -> bool:
+    return bool(
+        (
+            table.rendering is _TableRendering.STRUCTURED_TEXT
+            and _structured_raster_table_requires_visual(page)
+        )
+        or _dense_raster_table_requires_visual(page, table)
+        or _unresolved_raster_table(page, table, ocr_markdown)
+    )
+
+
+def _table_has_visual_crop(
+    table: _PdfTable,
+    resources: tuple[PdfEmbeddedResource, ...],
+) -> bool:
+    return any(
+        resource.bbox is not None and _bbox_overlap_ratio(table.bbox, resource.bbox) >= 0.90
+        for resource in resources
+    )
+
+
+def _dense_raster_table_requires_visual(page: _PdfPage, table: _PdfTable) -> bool:
+    column_count = max((len(row) for row in table.rows), default=0)
+    return bool(
+        any(ratio >= _FULL_PAGE_IMAGE_AREA_RATIO for ratio in page.image_area_ratios)
+        and len(table.rows) >= 20
+        and column_count >= 4
+    )
 
 
 def _fragmented_graphic_text_should_stay_in_image(
@@ -4099,6 +7198,8 @@ def _fragmented_graphic_text_should_stay_in_image(
         return False
     ocr_lines = _visible_ocr_lines(ocr_markdown)
     ocr_letters = _heading_letter_count(ocr_markdown)
+    if _dense_graphic_label_mosaic(page, ocr_lines):
+        return True
     if len(ocr_lines) < 8 or ocr_letters >= 80:
         return False
     lexical_ocr_words = sum(
@@ -4118,6 +7219,43 @@ def _fragmented_graphic_text_should_stay_in_image(
     return not native_lines or (
         len(native_lines) >= 4 and native_letters / len(native_lines) <= 6.0
     )
+
+
+def _dense_graphic_label_mosaic(
+    page: _PdfPage,
+    ocr_lines: tuple[str, ...],
+) -> bool:
+    if len(ocr_lines) < 16 or _page_letter_count(page) >= 4:
+        return False
+    compact_lines = tuple(" ".join(line.split()) for line in ocr_lines)
+    short_line_ratio = sum(len(line) <= 28 for line in compact_lines) / len(compact_lines)
+    short_word_ratio = sum(len(line.split()) <= 3 for line in compact_lines) / len(compact_lines)
+    sentence_ratio = sum(
+        len(line.split()) >= 5 and line.rstrip().endswith((".", "!", "?")) for line in compact_lines
+    ) / len(compact_lines)
+    graphic_signal_ratio = sum(
+        any(character.isdigit() for character in line)
+        or bool(
+            (letters := [character for character in line if character.isalpha()])
+            and sum(character.isupper() for character in letters) / len(letters) >= 0.65
+        )
+        for line in compact_lines
+    ) / len(compact_lines)
+    return bool(
+        short_line_ratio >= 0.70
+        and short_word_ratio >= 0.70
+        and sentence_ratio <= 0.15
+        and graphic_signal_ratio >= 0.45
+    )
+
+
+def _should_include_ocr_additions(
+    page: _PdfPage,
+    *,
+    skipped_vertical: bool,
+    resources: tuple[PdfEmbeddedResource, ...],
+) -> bool:
+    return not (page.image_orientation_mismatch and skipped_vertical and bool(resources))
 
 
 def _table_ocr_is_faithful(page: _PdfPage, ocr_markdown: str) -> bool:
@@ -4162,21 +7300,143 @@ def _content_number_tokens(text: str) -> Counter[str]:
 
 def _has_suspicious_glyph_encoding(page: _PdfPage) -> bool:
     text = " ".join(line.text for line in page.lines if not line.rotated)
-    return _suspicious_glyph_count(text) >= 3
+    return bool(
+        _has_suspicious_text_glyph(text)
+        or _suspicious_glyph_count(text) >= 3
+        or _suspicious_non_currency_dollar_count(text) >= 1
+    )
+
+
+def _has_suspicious_text_glyph(text: str) -> bool:
+    """Find explicit replacement glyphs or a broken punctuation pair seen in native layers."""
+
+    return "\ufffd" in text or "·." in text
 
 
 def _has_suspicious_numeric_glyph_encoding(page: _PdfPage) -> bool:
     """Find broken font mappings inside numeric TOC tokens without distrusting prose."""
 
-    return any(
-        _SUSPICIOUS_NUMERIC_GLYPH_PATTERN.search(line.text)
-        and (
+    for line in page.lines:
+        if line.rotated:
+            continue
+        if _invalid_zodiac_degree_matches(line.text):
+            return True
+        matches = _suspicious_numeric_glyph_matches(line.text)
+        if not matches:
+            continue
+        if (
             re.search(r"\d[$^]|[$^]\d", line.text)
-            or any(_is_mixed_visual_glyph(atom) for atom in _visual_atoms(line.text))
-        )
-        for line in page.lines
-        if not line.rotated
+            or any(len(_numeric_glyph_candidates(match.group(0))) == 1 for match in matches)
+            or any(_looks_like_broken_numeric_token(match.group(0)) for match in matches)
+        ):
+            return True
+    return False
+
+
+def _suspicious_numeric_glyph_matches(text: str) -> tuple[re.Match[str], ...]:
+    """Return numeric-looking damage outside ordinary identifiers and literal URLs."""
+
+    url_spans = tuple(match.span() for match in _LITERAL_URL_PATTERN.finditer(text))
+    matches: list[re.Match[str]] = []
+    for match in _SUSPICIOUS_NUMERIC_GLYPH_PATTERN.finditer(text):
+        if any(start <= match.start() and match.end() <= end for start, end in url_spans):
+            continue
+        token = match.group(0)
+        if re.fullmatch(r"\$\d+", token):
+            continue
+        if re.search(r"\d[$^]|[$^]\d", token) or _looks_like_broken_numeric_token(token):
+            matches.append(match)
+    return tuple(matches)
+
+
+def _looks_like_broken_numeric_token(token: str) -> bool:
+    """Require every letter in a mixed token to be a known number-shaped glyph."""
+
+    if not (
+        any(character.isdigit() for character in token)
+        and any(character.isalpha() for character in token)
+    ):
+        return False
+    letters = tuple(character for character in token if character.isalpha())
+    if not letters or any(character not in _NUMERIC_GLYPH_EXPANSIONS for character in letters):
+        return False
+    candidates = _numeric_glyph_candidates(token)
+    if token[0].isalpha() and token[-1].isalpha():
+        return any(len(candidate) == len(token) for candidate in candidates)
+    return bool(candidates)
+
+
+def _line_has_suspicious_numeric_glyph(line: _PdfLine) -> bool:
+    return not line.rotated and bool(
+        _suspicious_numeric_glyph_matches(line.text) or _invalid_zodiac_degree_matches(line.text)
     )
+
+
+def _suspicious_numeric_glyph_count(text: str) -> int:
+    return len(_suspicious_numeric_glyph_matches(text)) + len(_invalid_zodiac_degree_matches(text))
+
+
+def _invalid_zodiac_degree_matches(text: str) -> tuple[re.Match[str], ...]:
+    """Return impossible within-sign degrees that require independent visual confirmation."""
+
+    return tuple(_INVALID_ZODIAC_DEGREE_PATTERN.finditer(text))
+
+
+def _ocr_pages_safe_for_structural_rendering(
+    pages: list[_PdfPage],
+    ocr_pages: dict[int, str],
+) -> dict[int, str]:
+    """Keep inconclusive OCR as private evidence instead of reader-visible structure.
+
+    OCR still participates in reconciliation, image preservation, and quality reporting before
+    this boundary. When an impossible zodiac degree remains unresolved on a page whose useful
+    native layer wins over whole-page OCR, allowing that same OCR into structural rendering can
+    turn diagram labels into duplicate prose or lists. The native text and a review warning are
+    safer than publishing those OCR-only additions.
+    """
+
+    safe_pages = dict(ocr_pages)
+    for page in pages:
+        ocr_markdown = ocr_pages.get(page.number)
+        if (
+            ocr_markdown is None
+            or _should_replace_with_ocr(page, ocr_markdown)
+            or not any(
+                _invalid_zodiac_degree_matches(line.text) for line in page.lines if not line.rotated
+            )
+        ):
+            continue
+        safe_pages.pop(page.number, None)
+        LOGGER.info(
+            "pdf_ocr_quarantined_from_structure page=%d reason=unresolved_numeric_glyph",
+            page.number,
+        )
+    return safe_pages
+
+
+def _suspicious_non_currency_dollar_count(text: str) -> int:
+    """Count isolated dollar-like substitutions without distrusting amounts or runs."""
+
+    count = 0
+    for index, character in enumerate(text):
+        if character != "$":
+            continue
+        previous = text[index - 1] if index else ""
+        following = text[index + 1] if index + 1 < len(text) else ""
+        if previous == "$" or following == "$":
+            continue
+        previous_visible = next(
+            (candidate for candidate in reversed(text[:index]) if not candidate.isspace()),
+            "",
+        )
+        following_visible = next(
+            (candidate for candidate in text[index + 1 :] if not candidate.isspace()),
+            "",
+        )
+        if previous_visible.isdigit() or following_visible.isdigit():
+            continue
+        count += 1
+    return count
 
 
 def _suspicious_glyph_count(text: str) -> int:
@@ -4213,8 +7473,8 @@ def _text_quality_score(text: str) -> float:
     short_ratio = sum(len(word) == 1 for word in words) / len(words) if words else 1.0
     suspicious = (
         visible.count("\ufffd")
-        + visible.count("$")
-        + len(_SUSPICIOUS_NUMERIC_GLYPH_PATTERN.findall(visible))
+        + _suspicious_non_currency_dollar_count(visible)
+        + _suspicious_numeric_glyph_count(visible)
         + _suspicious_glyph_count(visible)
         + len(_SPACED_WORD_PATTERN.findall(visible))
     )
@@ -4328,20 +7588,21 @@ def _ocr_additions(page: _PdfPage, ocr_markdown: str) -> str:
     if _is_toc_page(list(page.lines)) and _is_toc_markdown(ocr_markdown):
         return ""
     native_text = " ".join(line.text for line in page.lines)
-    native_tokens = _comparison_tokens(native_text)
-    native_sequence = _comparison_token_sequence(native_text)
+    native_sequence = _ocr_addition_token_sequence(native_text)
+    native_tokens = set(native_sequence)
     additions: list[str] = []
     seen_additions: set[tuple[str, ...]] = set()
     for block in re.split(r"\n\s*\n", ocr_markdown):
         stripped = block.strip()
         if not stripped:
             continue
-        block_tokens = _comparison_tokens(stripped)
+        block_sequence = _ocr_addition_token_sequence(stripped)
+        block_tokens = set(block_sequence)
         alpha_tokens = {token for token in block_tokens if any(char.isalpha() for char in token)}
         is_table = bool(_MARKDOWN_TABLE_PATTERN.search(stripped))
         overlap = block_tokens & native_tokens
         ordered_copy = _is_ordered_ocr_copy(
-            _comparison_token_sequence(stripped),
+            block_sequence,
             native_sequence,
         )
         if block_tokens and (
@@ -4360,6 +7621,12 @@ def _ocr_additions(page: _PdfPage, ocr_markdown: str) -> str:
         seen_additions.add(addition_key)
         additions.append(stripped)
     return "\n\n".join(additions)
+
+
+def _ocr_addition_token_sequence(text: str) -> tuple[str, ...]:
+    """Compare OCR additions without mistaking omitted diacritics for new prose."""
+
+    return tuple(_diacritic_free_key(token) for token in _comparison_token_sequence(text))
 
 
 def _comparison_tokens(text: str) -> set[str]:
@@ -4599,6 +7866,7 @@ def _append_heading(
     gap_before: float,
 ) -> None:
     visible = _display_heading_text(line) if not line.links else _apply_links(line)
+    visible = _escape_literal_markdown_legend(visible)
     text = f"*{visible}*" if line.italic else visible
     if (
         blocks
@@ -4613,6 +7881,14 @@ def _append_heading(
         blocks[-1].text = f"{blocks[-1].text} {text}"
         blocks[-1].source_line = line
         return
+    if line.outline_level is not None:
+        blocks.append(
+            _MarkdownBlock(
+                kind="provenance",
+                text=_pdf_outline_marker(line.outline_level),
+                page_number=line.page_number,
+            )
+        )
     blocks.append(
         _MarkdownBlock(
             kind="heading",
@@ -4625,15 +7901,62 @@ def _append_heading(
 
 
 def _apply_source_emphasis(line: _PdfLine, rendered: str) -> str:
-    if _heading_letter_count(line.text) < 4:
+    applied = False
+    for span in reversed(line.emphasis_spans):
+        fragment = span.text
+        if "*" in fragment or line.text.count(fragment) != 1 or rendered.count(fragment) != 1:
+            continue
+        marker = "***" if span.bold and span.italic else "**" if span.bold else "*"
+        position = rendered.find(fragment)
+        rendered = (
+            rendered[:position] + marker + fragment + marker + rendered[position + len(fragment) :]
+        )
+        applied = True
+    if applied or line.emphasis_spans:
         return rendered
+    marker = _source_emphasis_marker(line)
+    return f"{marker}{rendered}{marker}" if marker is not None else rendered
+
+
+def _source_emphasis_marker(line: _PdfLine) -> str | None:
+    if _heading_letter_count(line.text) < 4:
+        return None
     if line.bold and line.italic:
-        return f"***{rendered}***"
+        return "***"
     if line.bold:
-        return f"**{rendered}**"
+        return "**"
     if line.italic:
-        return f"*{rendered}*"
-    return rendered
+        return "*"
+    return None
+
+
+def _join_ordered_list_continuation_text(
+    existing: str,
+    following: str,
+    previous_line: _PdfLine,
+    current_line: _PdfLine,
+) -> str:
+    previous_marker = _source_emphasis_marker(previous_line)
+    current_marker = _source_emphasis_marker(current_line)
+    stripped = existing.rstrip()
+    if (
+        previous_marker is not None
+        and previous_marker == current_marker
+        and stripped.endswith(previous_marker)
+    ):
+        joined = _join_line_text(
+            stripped[: -len(previous_marker)],
+            following,
+            previous_line,
+            current_line,
+        )
+        return f"{joined}{previous_marker}"
+    return _join_line_text(
+        existing,
+        _apply_source_emphasis(current_line, following),
+        previous_line,
+        current_line,
+    )
 
 
 def _display_heading_text(line: _PdfLine) -> str:
@@ -4685,12 +8008,17 @@ def _should_join_lines(
     body_size: float,
     gap_before: float,
 ) -> bool:
+    same_page = previous.page_number == current.page_number
+    wraps_word = previous.soft_hyphen_end or (
+        previous.hard_hyphen_end and _hard_hyphen_wraps_word(previous.text, current.text)
+    )
+    if same_page and wraps_word and not _lines_share_text_column(previous, current):
+        return False
     if previous.soft_hyphen_end:
         return True
     if previous.hard_hyphen_end and _hard_hyphen_wraps_word(previous.text, current.text):
         return True
 
-    same_page = previous.page_number == current.page_number
     if not same_page:
         # Reconcile only an unmistakable paragraph continuation at a page
         # boundary. Headings, lists, tables and sentence boundaries remain
@@ -4715,29 +8043,54 @@ def _should_join_lines(
     return True
 
 
+def _lines_share_text_column(previous: _PdfLine, current: _PdfLine) -> bool:
+    width = min(max(previous.x1 - previous.x0, 0.0), max(current.x1 - current.x0, 0.0))
+    overlap = max(0.0, min(previous.x1, current.x1) - max(previous.x0, current.x0))
+    return abs(previous.x0 - current.x0) <= current.page_width * 0.08 or (
+        width > 0 and overlap / width >= 0.35
+    )
+
+
 def _join_line_text(
     existing: str,
     following: str,
     previous_line: _PdfLine,
     current_line: _PdfLine,
 ) -> str:
+    left = existing.rstrip()
+    right = following.lstrip()
     if previous_line.soft_hyphen_end:
-        joined = f"{existing.rstrip()}{following.lstrip()}"
-    elif (
-        previous_line.hard_hyphen_end
-        and _hard_hyphen_wraps_word(previous_line.text, current_line.text)
-        and existing.rstrip().endswith("-")
+        joined = _join_adjacent_emphasis_edges(left, right, drop_hyphen=False) or f"{left}{right}"
+    elif previous_line.hard_hyphen_end and _hard_hyphen_wraps_word(
+        previous_line.text, current_line.text
     ):
-        base = existing.rstrip()[:-1]
-        continuation = following.lstrip()
-        if continuation.startswith("**") and "**" in continuation[2:]:
-            prefix, separator, fragment = base.rpartition(" ")
-            joined = f"{prefix}{separator}**{fragment}{continuation[2:]}"
+        emphasized = _join_adjacent_emphasis_edges(left, right, drop_hyphen=True)
+        if emphasized is not None:
+            joined = emphasized
+        elif left.endswith("-"):
+            joined = _carry_continuation_emphasis(left[:-1], right) or f"{left[:-1]}{right}"
         else:
-            joined = f"{base}{continuation}"
+            joined = f"{left} {right}"
     else:
-        joined = f"{existing.rstrip()} {following.lstrip()}"
+        joined = f"{left} {right}"
     return _collapse_adjacent_links(joined)
+
+
+def _join_adjacent_emphasis_edges(left: str, right: str, *, drop_hyphen: bool) -> str | None:
+    for marker in ("***", "**", "*"):
+        suffix = f"-{marker}" if drop_hyphen else marker
+        if left.endswith(suffix) and right.startswith(marker):
+            return f"{left[: -len(suffix)]}{right[len(marker) :]}"
+    return None
+
+
+def _carry_continuation_emphasis(left: str, right: str) -> str | None:
+    for marker in ("***", "**", "*"):
+        if not right.startswith(marker) or marker not in right[len(marker) :]:
+            continue
+        prefix, separator, fragment = left.rpartition(" ")
+        return f"{prefix}{separator}{marker}{fragment}{right[len(marker) :]}"
+    return None
 
 
 def _hard_hyphen_wraps_word(previous: str, current: str) -> bool:
@@ -4768,18 +8121,17 @@ def _heading_level(
 ) -> int | None:
     text = _display_heading_text(line).strip()
     letter_count = _heading_letter_count(text)
-    if (
-        len(text) > _MAX_HEADING_LENGTH
-        or letter_count < 3
-        or text.endswith((".", ";"))
-        or text.startswith(("-", "–", "—", "―"))
-    ):
+    if len(text) > _MAX_HEADING_LENGTH or letter_count < 3 or text.startswith(("-", "–", "—", "―")):
+        return None
+    if line.outline_level is not None:
+        return max(1, min(6, line.outline_level))
+    if text.endswith((".", ";")):
         return None
     if _TOC_HEADING_PATTERN.fullmatch(text):
         return 2
     if toc_page and _toc_entry_page_number(text) is not None:
         return None
-    if _SECTION_HEADING_PATTERN.match(text):
+    if classify_heading_role(text) is not None:
         return 2
     if level := heading_sizes.get(round(line.font_size, 1)):
         return level
@@ -4803,6 +8155,30 @@ def _heading_level(
     return None
 
 
+def _uppercase_leadin_continues(
+    line: _PdfLine,
+    following: _PdfLine | None,
+    body_size: float,
+) -> bool:
+    """Keep a small-caps sentence opening inside its paragraph."""
+
+    if (
+        following is None
+        or not _is_uppercase_text(line.text)
+        or not following.text[:1].islower()
+        or line.font_size > body_size * 1.08
+        or _SECTION_HEADING_PATTERN.match(line.text.strip())
+    ):
+        return False
+    gap = following.top - line.bottom
+    return _lines_share_text_column(line, following) and _should_join_lines(
+        line,
+        following,
+        body_size,
+        gap,
+    )
+
+
 def _omit_margin_line(
     line: _PdfLine,
     repeated_margins: set[str],
@@ -4810,7 +8186,10 @@ def _omit_margin_line(
     body_size: float,
     *,
     toc_page: bool = False,
+    preserved_repeated_headings: frozenset[tuple[int, float, float, str]] = frozenset(),
 ) -> bool:
+    if _visual_line_key(line) in preserved_repeated_headings:
+        return False
     strict_bottom_margin = line.top >= line.page_height * 0.92
     if strict_bottom_margin and _is_page_number(re.sub(r"\s+", "", line.text.strip())):
         # A TOC may legitimately contain detached folios in its body, but a lone
@@ -4821,14 +8200,23 @@ def _omit_margin_line(
     in_top_margin = line.top <= line.page_height * 0.1
     in_top_folio_band = _is_top_outer_folio_line(line)
     in_top_numbered_running_header = _is_top_numbered_running_header(line, body_size)
+    in_top_repeated_header_band = (
+        line.top <= line.page_height * 0.18 and _margin_key(line.text) in repeated_margins
+    )
     in_bottom_margin = line.bottom >= line.page_height * 0.84
     if not (
-        in_top_margin or in_top_folio_band or in_top_numbered_running_header or in_bottom_margin
+        in_top_margin
+        or in_top_folio_band
+        or in_top_numbered_running_header
+        or in_top_repeated_header_band
+        or in_bottom_margin
     ):
         return False
 
     text = line.text.strip()
     if in_top_numbered_running_header:
+        return True
+    if in_top_folio_band and _is_plausible_isolated_confusable_folio(line, body_size):
         return True
     if _margin_key(text) in repeated_margins:
         return True
@@ -4843,6 +8231,216 @@ def _omit_margin_line(
         and len(text) <= 48
         and gap_before >= body_size * 1.5
         and _RUNNING_FOOTER_PATTERN.fullmatch(text)
+    )
+
+
+def _preserved_structural_margin_headings(
+    pages: list[_PdfPage],
+    body_size: float,
+    repeated_margins: set[str],
+) -> frozenset[tuple[int, float, float, str]]:
+    """Retain a repeated Chapter label only on its visually proven opening page."""
+
+    candidates_by_label: dict[str, list[_PdfLine]] = defaultdict(list)
+    for page in pages:
+        for line in page.lines:
+            margin_key = _margin_key(line.text)
+            if (
+                line.rotated
+                # A true chapter opener can be deliberately inset below the running-head band.
+                # It is still safe to consider here because the label must repeat elsewhere and
+                # be followed by a prominent title; only the earliest proved occurrence survives.
+                or line.top > line.page_height * 0.30
+                or margin_key not in repeated_margins
+                or _SECTION_HEADING_PATTERN.fullmatch(line.text.strip()) is None
+            ):
+                continue
+            prominent_title_below = any(
+                candidate is not line
+                and not candidate.rotated
+                and candidate.top >= line.bottom
+                and candidate.top <= line.page_height * 0.42
+                and candidate.font_size >= body_size * 1.35
+                and _heading_letter_count(candidate.text) >= 4
+                for candidate in page.lines
+            )
+            if prominent_title_below:
+                candidates_by_label[margin_key].append(line)
+    return frozenset(
+        _visual_line_key(min(candidates, key=lambda line: (line.page_number, line.top, line.x0)))
+        for candidates in candidates_by_label.values()
+    )
+
+
+def _restore_preserved_structural_ocr_headings(
+    page: _PdfPage,
+    markdown: str,
+    preserved_headings: frozenset[tuple[int, float, float, str]],
+) -> str:
+    """Carry only visually proved native Chapter structure into a whole-page OCR winner."""
+
+    label_keys = {
+        _margin_key(line.text)
+        for line in page.lines
+        if _visual_line_key(line) in preserved_headings
+        and _SECTION_HEADING_PATTERN.fullmatch(line.text.strip()) is not None
+    }
+    if not label_keys:
+        return markdown
+
+    lines = markdown.splitlines()
+    fence: str | None = None
+    for index, line in enumerate(lines):
+        stripped = line.strip()
+        marker = (
+            "```" if stripped.startswith("```") else "~~~" if stripped.startswith("~~~") else None
+        )
+        if marker is not None:
+            if fence is None:
+                fence = marker
+            elif marker == fence:
+                fence = None
+            continue
+        if fence is not None or not stripped or stripped.startswith("#"):
+            continue
+        visible = re.sub(r"[*_`~]", "", stripped).strip()
+        if (
+            _margin_key(visible) in label_keys
+            and _SECTION_HEADING_PATTERN.fullmatch(visible) is not None
+        ):
+            lines[index] = f"## {stripped}"
+    return "\n".join(lines)
+
+
+def _repair_ocr_spacing_from_native(page: _PdfPage, markdown: str) -> str:
+    """Restore spacing only when an OCR line has exactly the native line's characters."""
+
+    native_words = {
+        word.casefold()
+        for line in page.lines
+        if not line.rotated
+        for word in re.findall(r"[^\W\d_]{5,}", line.text, re.UNICODE)
+    }
+    candidates: defaultdict[str, list[_PdfLine]] = defaultdict(list)
+    for line in page.lines:
+        key = _spacing_insensitive_line_key(line.text)
+        if not line.rotated and len(key) >= 12:
+            candidates[key].append(line)
+
+    lines = markdown.splitlines()
+    fence: str | None = None
+    for index, line in enumerate(lines):
+        stripped = line.strip()
+        marker = (
+            "```" if stripped.startswith("```") else "~~~" if stripped.startswith("~~~") else None
+        )
+        if marker is not None:
+            if fence is None:
+                fence = marker
+            elif marker == fence:
+                fence = None
+            continue
+        if (
+            fence is not None
+            or not stripped
+            or stripped.startswith(("#", ">", "|", "![", "- ", "+ ", "* "))
+        ):
+            continue
+        compact_line = _spacing_insensitive_text_with_offsets(stripped)
+        if compact_line is not None:
+            compact, offsets = compact_line
+            replacements: list[tuple[int, int, str]] = []
+            for key, native in candidates.items():
+                if len(native) != 1:
+                    continue
+                compact_start = compact.find(key)
+                if compact_start < 0 or compact.find(key, compact_start + 1) >= 0:
+                    continue
+                compact_end = compact_start + len(key) - 1
+                start = offsets[compact_start]
+                end = offsets[compact_end] + 1
+                source_segment = stripped[start:end]
+                native_text = native[0].text.strip()
+                if len(re.findall(r"\s", source_segment)) < len(re.findall(r"\s", native_text)) + 2:
+                    continue
+                if any(
+                    start < previous_end and end > previous_start
+                    for previous_start, previous_end, _ in replacements
+                ):
+                    continue
+                replacements.append((start, end, native_text))
+            for start, end, replacement in sorted(replacements, reverse=True):
+                stripped = f"{stripped[:start]}{replacement}{stripped[end:]}"
+            if replacements:
+                leading = line[: len(line) - len(line.lstrip())]
+                lines[index] = f"{leading}{stripped}"
+        repaired_words = stripped
+        for pattern in (_SPACED_WORD_PATTERN, _PARTIAL_SPACED_WORD_PATTERN):
+            repaired_words = pattern.sub(
+                lambda match: (
+                    compact
+                    if (compact := re.sub(r"\s+", "", match.group())).casefold() in native_words
+                    else match.group()
+                ),
+                repaired_words,
+            )
+        if repaired_words != stripped:
+            leading = line[: len(line) - len(line.lstrip())]
+            lines[index] = f"{leading}{repaired_words}"
+            stripped = repaired_words
+        native = candidates.get(_spacing_insensitive_line_key(stripped), ())
+        if len(native) != 1:
+            continue
+        native_text = native[0].text.strip()
+        if len(re.findall(r"\s", stripped)) < len(re.findall(r"\s", native_text)) + 2:
+            continue
+        leading = line[: len(line) - len(line.lstrip())]
+        lines[index] = f"{leading}{native_text}"
+    return "\n".join(lines)
+
+
+def _spacing_insensitive_text_with_offsets(text: str) -> tuple[str, tuple[int, ...]] | None:
+    compact: list[str] = []
+    offsets: list[int] = []
+    for index, character in enumerate(text):
+        if character.isspace():
+            continue
+        normalized = unicodedata.normalize("NFKC", character).casefold()
+        if len(normalized) != 1:
+            return None
+        compact.append(normalized)
+        offsets.append(index)
+    return "".join(compact), tuple(offsets)
+
+
+def _repair_ocr_degree_marker_consensus(markdown: str) -> str:
+    """Repair a repeated degree-shaped zero only beside independently retained degree notation."""
+
+    sign_after_value = r"\s*(?:\|\s*)?[*_`~]{0,2}[A-ZÁÉÍÓÚÜÑ][^\W\d_]{2,}\b"
+    candidate_pattern = re.compile(rf"(?<!\d)(?P<degree>[0-2]?\d)0(?={sign_after_value})")
+
+    def repair_block(match: re.Match[str]) -> str:
+        block = match.group(0)
+        confirmed = len(
+            re.findall(
+                rf"(?<!\d)[0-2]?\d°{sign_after_value}",
+                block,
+            )
+        )
+        candidates = tuple(candidate_pattern.finditer(block))
+        if confirmed < 1 or len(candidates) < 3:
+            return block
+        return candidate_pattern.sub(lambda value: f"{value.group('degree')}°", block)
+
+    return re.sub(r"(?s)(?:^|(?<=\n\n)).+?(?=\n\n|$)", repair_block, markdown)
+
+
+def _is_plausible_isolated_confusable_folio(line: _PdfLine, body_size: float) -> bool:
+    decoded = _confusable_margin_folio_value(re.sub(r"\s+", "", line.text.strip()))
+    return bool(
+        decoded is not None
+        and line.font_size <= body_size * 0.90
+        and abs(decoded - line.page_number) <= 64
     )
 
 
@@ -4888,13 +8486,23 @@ def _page_conversion_warning(
     skipped_rotated: bool,
     ocr_markdown: str | None,
 ) -> str | None:
-    if ocr_markdown == "" and not skipped_rotated:
-        return None
-    if any(_SUSPICIOUS_NUMERIC_GLYPH_PATTERN.search(line.text) for line in visible_lines):
+    if any(
+        _has_suspicious_text_glyph(line.text)
+        or _suspicious_non_currency_dollar_count(line.text) > 0
+        for line in visible_lines
+    ):
+        return (
+            f"> **Aviso de conversión (página {page.number}):** la capa de texto contiene "
+            "un glifo ilegible que las lecturas locales no pudieron confirmar. Revisa el PDF "
+            "original."
+        )
+    if any(_line_has_suspicious_numeric_glyph(line) for line in visible_lines):
         return (
             f"> **Aviso de conversión (página {page.number}):** la capa de texto contiene "
             "un glifo numérico ambiguo que el OCR local no pudo confirmar. Revisa el PDF original."
         )
+    if ocr_markdown == "" and not skipped_rotated:
+        return None
     letter_count = sum(_heading_letter_count(line.text) for line in visible_lines)
     mostly_graphical = page.has_images and letter_count < _GRAPHIC_WARNING_LETTER_LIMIT
     if not (mostly_graphical or skipped_rotated):
@@ -4908,12 +8516,13 @@ def _page_conversion_warning(
 
 def _blocks_to_markdown(blocks: list[_MarkdownBlock]) -> str:
     normalized_blocks = _conservative_container_hierarchy(
-        _join_hyphenated_block_continuations(blocks),
+        _demote_prose_like_headings(_join_hyphenated_block_continuations(blocks)),
     )
     return _normalized_blocks_to_markdown(normalized_blocks)
 
 
 def _normalized_blocks_to_markdown(blocks: list[_MarkdownBlock]) -> str:
+    blocks = _promote_structural_toc_section_rows(blocks)
     parts: list[str] = []
     previous_compact_group: str | None = None
     previous_page_number: int | None = None
@@ -4958,6 +8567,55 @@ def _normalized_blocks_to_markdown(blocks: list[_MarkdownBlock]) -> str:
     return _join_page_boundary_hyphenations(markdown)
 
 
+def _promote_structural_toc_section_rows(
+    blocks: list[_MarkdownBlock],
+) -> list[_MarkdownBlock]:
+    """Keep unpaginated part/appendix labels inside an adjacent generated contents table."""
+
+    promoted: list[_MarkdownBlock] = []
+    for index, block in enumerate(blocks):
+        visible = re.sub(r"[*_`~#\[\]]", " ", block.text)
+        visible = re.sub(r"\s+", " ", visible).strip()
+        if (
+            block.kind not in {"toc", "heading"}
+            or not _structural_toc_section_label(block.text)
+            or (block.kind == "heading" and _TOC_HEADING_PATTERN.fullmatch(visible))
+        ):
+            promoted.append(block)
+            continue
+        adjacent_entry = any(
+            0 <= candidate < len(blocks)
+            and blocks[candidate].kind == "toc-entry"
+            and blocks[candidate].page_number == block.page_number
+            for candidate in (index - 1, index + 1)
+        )
+        promoted.append(
+            replace(block, kind="toc-entry", toc_folio=None, toc_level=0)
+            if adjacent_entry
+            else block
+        )
+    return promoted
+
+
+def _structural_toc_section_label(value: str) -> bool:
+    visible = re.sub(r"\]\([^)]+\)", "]", value)
+    visible = re.sub(r"[*_`~#\[\]]", " ", visible)
+    visible = re.sub(r"\s+", " ", visible).strip()
+    if not visible:
+        return False
+    return bool(
+        classify_heading_role(visible) == "container"
+        or re.fullmatch(
+            r"(?:appendices|appendix|ap[eé]ndices|ap[eé]ndice|"
+            r"tables?(?:\s+of\s+.+)?|tablas?(?:\s+de\s+.+)?|"
+            r"bibliography|bibliograf[ií]a|references|referencias|"
+            r"glossary|glosario|index|[ií]ndice)",
+            visible,
+            re.IGNORECASE,
+        )
+    )
+
+
 def _toc_indent_level(line: _PdfLine, left: float, body_size: float) -> int:
     indentation = max(0.0, line.x0 - left)
     unit = max(body_size * 1.8, 10.0)
@@ -4967,12 +8625,14 @@ def _toc_indent_level(line: _PdfLine, left: float, body_size: float) -> int:
 def _toc_entries_html(blocks: list[_MarkdownBlock]) -> str:
     rows: list[str] = []
     for block in blocks:
-        label = _toc_label_xhtml(block.text)
         source_line = block.source_line
-        if source_line is not None and source_line.italic:
-            label = f"<em>{label}</em>"
-        if source_line is not None and source_line.bold:
-            label = f"<strong>{label}</strong>"
+        emphasis_spans = source_line.emphasis_spans if source_line is not None else ()
+        label, inline_emphasis_applied = _toc_label_xhtml(block.text, emphasis_spans)
+        if source_line is not None and not emphasis_spans and not inline_emphasis_applied:
+            if source_line.italic:
+                label = f"<em>{label}</em>"
+            if source_line.bold:
+                label = f"<strong>{label}</strong>"
         rows.append(
             "<tr>"
             f'<td class="toc-label toc-level-{block.toc_level}">{label}</td>'
@@ -4988,11 +8648,45 @@ def _toc_entries_html(blocks: list[_MarkdownBlock]) -> str:
     )
 
 
-def _toc_label_xhtml(markdown: str) -> str:
+def _toc_label_xhtml(
+    markdown: str,
+    emphasis_spans: tuple[_PdfEmphasisSpan, ...] = (),
+) -> tuple[str, bool]:
     link = re.fullmatch(r"\[([^\]]+)]\(<?(#page-\d{1,6})>?\)", markdown)
     if link is None:
-        return escape(markdown)
-    return f'<a href="{escape(link.group(2), quote=True)}">{escape(link.group(1))}</a>'
+        return _toc_visible_label_xhtml(markdown, emphasis_spans)
+    label, applied = _toc_visible_label_xhtml(link.group(1), emphasis_spans)
+    return f'<a href="{escape(link.group(2), quote=True)}">{label}</a>', applied
+
+
+def _toc_visible_label_xhtml(
+    text: str,
+    emphasis_spans: tuple[_PdfEmphasisSpan, ...],
+) -> tuple[str, bool]:
+    matches: list[tuple[int, int, _PdfEmphasisSpan]] = []
+    for span in emphasis_spans:
+        if text.count(span.text) != 1:
+            continue
+        start = text.find(span.text)
+        matches.append((start, start + len(span.text), span))
+    matches.sort(key=lambda item: item[0])
+    if any(
+        current[0] < previous[1] for previous, current in zip(matches, matches[1:], strict=False)
+    ):
+        return escape(text), False
+    output: list[str] = []
+    cursor = 0
+    for start, end, span in matches:
+        output.append(escape(text[cursor:start]))
+        fragment = escape(text[start:end])
+        if span.italic:
+            fragment = f"<em>{fragment}</em>"
+        if span.bold:
+            fragment = f"<strong>{fragment}</strong>"
+        output.append(fragment)
+        cursor = end
+    output.append(escape(text[cursor:]))
+    return "".join(output), bool(matches)
 
 
 def _join_page_boundary_hyphenations(markdown: str) -> str:
@@ -5055,6 +8749,12 @@ def _pdf_page_marker(page_number: int) -> str:
     return f"<!-- PZDOC PDF PAGE {page_number} -->"
 
 
+def _pdf_outline_marker(level: int) -> str:
+    """Carry independently confirmed outline evidence without visible reader text."""
+
+    return f"<!-- PZDOC PDF OUTLINE {max(1, min(6, level))} -->"
+
+
 def _join_hyphenated_block_continuations(
     blocks: list[_MarkdownBlock],
 ) -> list[_MarkdownBlock]:
@@ -5094,6 +8794,13 @@ def _hyphenated_blocks_belong_together(
         or not (previous_line.soft_hyphen_end or previous_line.hard_hyphen_end)
     ):
         return False
+    if current.kind == "heading" and not (
+        current_line.soft_hyphen_end or current_line.hard_hyphen_end
+    ):
+        # A complete heading is a structural boundary.  The heading exception
+        # only exists for a wrapped prose fragment that was misclassified as a
+        # heading; require the second fragment to continue wrapping as well.
+        return False
     if previous_line.soft_hyphen_end:
         return current_line.text[:1].islower()
     return _hard_hyphen_wraps_word(previous_line.text, current_line.text)
@@ -5126,6 +8833,12 @@ def _apply_links(line: _PdfLine) -> str:
         if link.x0 <= line.x0 + 3 and link.x1 >= line.x1 - 3:
             rendered = f"[{_escape_link_label(rendered)}](<{_safe_target(link.target)}>)"
     return rendered
+
+
+def _escape_literal_markdown_legend(text: str) -> str:
+    """Keep a printed ``* =`` legend from becoming a Markdown list item."""
+
+    return re.sub(r"^([ \t]{0,3})([*+-])(?=[ \t]*=[ \t])", r"\1\\\2", text)
 
 
 def _link_has_visible_label(line: _PdfLine, link: _PdfLink) -> bool:
@@ -5215,7 +8928,8 @@ def _repair_suspicious_glyph_encoding(text: str) -> str:
 
 
 def _margin_key(text: str) -> str:
-    return _normalize_text(text).casefold()
+    normalized = _normalize_text(text).casefold()
+    return re.sub(r"(?<=\d)\s+(?=\d)", "", normalized)
 
 
 def _is_uppercase_text(text: str) -> bool:

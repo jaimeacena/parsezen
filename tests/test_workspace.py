@@ -95,7 +95,7 @@ def test_workspace_header_prioritizes_real_reviews(qtbot) -> None:
     assert "1 por revisar" in workspace.queue_summary.text()
 
 
-def test_wide_queue_summary_uses_one_line_across_the_available_toolbar_space(qtbot) -> None:
+def test_wide_queue_summary_stays_as_a_content_heading(qtbot) -> None:
     workspace = ParsezenWorkspace()
     qtbot.addWidget(workspace)
     workspace.resize(1440, 800)
@@ -103,11 +103,9 @@ def test_wide_queue_summary_uses_one_line_across_the_available_toolbar_space(qtb
     workspace.show()
     qtbot.waitExposed(workspace)
 
-    position = workspace.queue_toolbar_layout.getItemPosition(
-        workspace.queue_toolbar_layout.indexOf(workspace.queue_summary)
-    )
     assert workspace.queue_summary.wordWrap() is False
-    assert position == (0, 0, 1, 2)
+    assert workspace.queue_summary.parent() is workspace.queue_pane
+    assert workspace.queue_layout.indexOf(workspace.queue_summary) == 0
     assert workspace.queue_summary.text() == "5 documentos · 5 por revisar"
 
 
@@ -335,7 +333,7 @@ def test_nested_internal_views_restore_focus_at_each_navigation_level(qtbot) -> 
     qtbot.addWidget(workspace)
     workspace.show()
     qtbot.waitExposed(workspace)
-    workspace.local_ai_button.setFocus()
+    workspace.output_directory_button.setFocus()
     editor = QPushButton("Modelo específico")
     workspace.show_internal_view(editor, "Editor")
     editor.setFocus()
@@ -346,22 +344,24 @@ def test_nested_internal_views_restore_focus_at_each_navigation_level(qtbot) -> 
 
     qtbot.waitUntil(editor.hasFocus)
     workspace.close_internal_view(editor)
-    qtbot.waitUntil(workspace.local_ai_button.hasFocus)
+    qtbot.waitUntil(workspace.output_directory_button.hasFocus)
 
 
-def test_workspace_local_ai_view_can_replace_the_global_header(qtbot) -> None:
+def test_workspace_internal_view_replaces_the_global_header(qtbot) -> None:
     workspace = ParsezenWorkspace()
     qtbot.addWidget(workspace)
     manager = QLabel("Modelos")
 
-    workspace.show_internal_view(manager, "IA local", replace_app_header=True)
+    workspace.show_internal_view(manager, "IA local")
     assert workspace.app_header.isHidden()
+    assert workspace.settings_anchor().parent().objectName() == "internalPageHeader"
 
     workspace.close_internal_view(manager)
     assert not workspace.app_header.isHidden()
+    assert workspace.settings_anchor() is workspace.settings_button
 
 
-def test_workspace_exposes_local_ai_readiness_without_requiring_the_manager(
+def test_workspace_keeps_local_ai_readiness_without_a_permanent_header_action(
     qtbot,
 ) -> None:
     workspace = ParsezenWorkspace()
@@ -369,18 +369,19 @@ def test_workspace_exposes_local_ai_readiness_without_requiring_the_manager(
 
     workspace.set_local_ai_status(OllamaStatus.READY, "qwen3:4b-instruct")
 
-    assert workspace.local_ai_button.text() == "IA local · Lista"
-    assert "qwen3:4b-instruct" in workspace.local_ai_button.toolTip()
-    assert "Estado: Lista" in workspace.local_ai_button.accessibleName()
+    assert workspace._local_ai_status is OllamaStatus.READY  # noqa: SLF001
+    assert workspace._local_ai_model == "qwen3:4b-instruct"  # noqa: SLF001
+    assert not hasattr(workspace, "local_ai_button")
 
 
-def test_workspace_invites_review_instead_of_showing_an_ambiguous_ai_state(qtbot) -> None:
+def test_workspace_does_not_reserve_header_space_for_an_unknown_ai_state(qtbot) -> None:
     workspace = ParsezenWorkspace()
     qtbot.addWidget(workspace)
 
     workspace.set_local_ai_status(None, None)
 
-    assert workspace.local_ai_button.text() == "IA local · Revisar"
+    assert workspace._local_ai_status is None  # noqa: SLF001
+    assert not hasattr(workspace, "local_ai_button")
 
 
 def test_workspace_exposes_the_global_destination_compactly(qtbot, tmp_path: Path) -> None:
@@ -389,11 +390,11 @@ def test_workspace_exposes_the_global_destination_compactly(qtbot, tmp_path: Pat
 
     workspace.set_output_directory(tmp_path / "Resultados")
 
-    assert workspace.output_directory_button.text() == "Destino · Resultados"
+    assert workspace.output_directory_button.text() == "Guardar en · Resultados"
     assert str(tmp_path / "Resultados") == workspace.output_directory_button.toolTip()
 
 
-def test_populated_queue_exposes_compact_add_action_above_rows(qtbot) -> None:
+def test_populated_queue_exposes_add_action_in_the_single_header(qtbot) -> None:
     workspace = ParsezenWorkspace()
     qtbot.addWidget(workspace)
     workspace.set_jobs((make_job("one", 0), make_job("two", 1)))
@@ -401,13 +402,14 @@ def test_populated_queue_exposes_compact_add_action_above_rows(qtbot) -> None:
     additions: list[str] = []
     workspace.add_requested.connect(lambda: additions.append("add"))
 
-    assert queue_layout.indexOf(workspace.queue_toolbar) == 0
+    assert queue_layout.indexOf(workspace.queue_summary) == 0
     assert queue_layout.indexOf(workspace.table_panel) == 1
     assert queue_layout.indexOf(workspace.drop_area) == 2
     assert workspace.drop_area.secondary_label.text() == "TXT · MD · DOCX · PDF · EPUB"
     assert workspace.drop_area.isHidden()
-    assert workspace.queue_toolbar.isVisible() or not workspace.isVisible()
+    assert workspace.queue_summary.isVisible() or not workspace.isVisible()
     assert workspace.add_button.text() == "Añadir"
+    assert workspace.add_button.parent() is workspace.app_header
     assert not workspace.add_button.icon().isNull()
     workspace.add_button.click()
     assert additions == ["add"]
@@ -446,10 +448,10 @@ def test_workspace_uses_one_bounded_rail_without_a_redundant_inspector(qtbot) ->
     qtbot.waitExposed(workspace)
 
     assert not hasattr(workspace, "inspector")
-    assert workspace.queue_pane.layout().indexOf(workspace.queue_toolbar) == 0
+    assert workspace.queue_pane.layout().indexOf(workspace.queue_summary) == 0
     assert workspace.queue_pane.layout().indexOf(workspace.table_panel) == 1
     assert workspace.table_panel.layout().indexOf(workspace.job_table) == 0
-    assert workspace.queue_toolbar.width() == workspace.table_panel.width()
+    assert workspace.queue_summary.width() == workspace.table_panel.width()
     assert workspace.app_header.width() == workspace.table_panel.width()
     assert workspace.table_panel.width() <= 1280
     assert workspace.table_panel._outline.geometry() == workspace.table_panel.rect()  # noqa: SLF001
@@ -509,7 +511,8 @@ def test_empty_workspace_anchors_its_only_task_near_the_header(qtbot) -> None:
     qtbot.waitExposed(workspace)
 
     assert not workspace.table_panel.isVisible()
-    assert not workspace.queue_toolbar.isVisible()
+    assert not workspace.queue_summary.isVisible()
+    assert not workspace.add_button.isVisible()
     assert workspace.drop_area.isVisible()
     assert workspace.queue_layout.contentsMargins().top() == SPACING.xxxl
     assert workspace.drop_area.geometry().top() == SPACING.xxxl
@@ -546,40 +549,41 @@ def test_wide_tall_workspace_hugs_one_or_many_queue_rows(qtbot, job_count: int) 
     qtbot.waitExposed(workspace)
 
     assert workspace.job_table.job_model.rowCount() == job_count
-    assert workspace.queue_toolbar.geometry().top() == 0
+    assert workspace.queue_summary.geometry().top() == 0
     assert (
         0
-        < workspace.table_panel.geometry().top() - workspace.queue_toolbar.geometry().bottom()
+        < workspace.table_panel.geometry().top() - workspace.queue_summary.geometry().bottom()
         <= 12
     )
     assert workspace.table_panel.height() == workspace.job_table.height() + 2
     assert workspace.table_panel.width() <= 1280
-    assert workspace.queue_toolbar.width() == workspace.table_panel.width()
+    assert workspace.queue_summary.width() == workspace.table_panel.width()
     assert workspace.add_button.isVisible()
     assert workspace.add_button.x() < workspace.primary_button.x()
     assert workspace.drop_area.isHidden()
 
 
-def test_workspace_header_exposes_ai_and_one_global_menu_without_trust_slogans(qtbot) -> None:
+def test_workspace_header_exposes_queue_actions_and_one_global_menu(qtbot) -> None:
     workspace = ParsezenWorkspace()
     qtbot.addWidget(workspace)
     actions: list[str] = []
-    workspace.local_ai_requested.connect(lambda: actions.append("ai"))
+    workspace.add_requested.connect(lambda: actions.append("add"))
     workspace.settings_requested.connect(lambda: actions.append("settings"))
 
-    workspace.local_ai_button.click()
+    workspace.set_jobs((make_job("one", 0),))
+    workspace.add_button.click()
     workspace.settings_button.click()
 
-    assert actions == ["ai", "settings"]
-    assert workspace.local_ai_button.focusPolicy() is Qt.FocusPolicy.TabFocus
+    assert actions == ["add", "settings"]
+    assert not hasattr(workspace, "local_ai_button")
     assert workspace.output_directory_button.focusPolicy() is Qt.FocusPolicy.TabFocus
     assert workspace.settings_button.focusPolicy() is Qt.FocusPolicy.TabFocus
     assert "Procesamiento local" not in tuple(
         label.text() for label in workspace.findChildren(QLabel)
     )
-    assert workspace.queue_summary.parent() is workspace.queue_toolbar
-    assert workspace.primary_button.parent() is workspace.queue_toolbar
-    assert workspace.add_button.parent() is workspace.queue_toolbar
+    assert workspace.queue_summary.parent() is workspace.queue_pane
+    assert workspace.primary_button.parent() is workspace.app_header
+    assert workspace.add_button.parent() is workspace.app_header
     assert not hasattr(workspace, "theme_button")
 
 
@@ -607,10 +611,16 @@ def test_workspace_reflows_at_320_without_horizontal_overflow(qtbot) -> None:
 
     assert workspace.width() == 320
     assert workspace._compact_layout is True  # noqa: SLF001
-    assert workspace.local_ai_button.y() > workspace.logo.y()
-    assert workspace.primary_button.minimumWidth() == 0
+    assert workspace.output_directory_button.y() == workspace.logo.y()
+    assert workspace.primary_button.minimumWidth() == 38
+    assert workspace.output_directory_button.text() == ""
+    assert workspace.add_button.text() == ""
+    assert workspace.primary_button.text() == ""
+    assert workspace.primary_button.accessibleName() == "Procesar 1 documento"
     assert workspace.job_table.horizontalScrollBarPolicy() == Qt.ScrollBarPolicy.ScrollBarAlwaysOff
-    assert workspace.queue_summary.y() < workspace.add_button.y()
+    assert workspace.queue_summary.mapTo(
+        workspace, workspace.queue_summary.rect().topLeft()
+    ).y() > (workspace.add_button.mapTo(workspace, workspace.add_button.rect().topLeft()).y())
     assert (
         abs(
             workspace.add_button.geometry().center().y()
@@ -632,8 +642,9 @@ def test_workspace_uses_intermediate_header_and_compact_table_at_768(qtbot) -> N
     assert workspace._layout_mode == "medium"  # noqa: SLF001
     assert workspace._compact_layout is False  # noqa: SLF001
     assert workspace.job_table._compact_mode is True  # noqa: SLF001
-    assert workspace.local_ai_button.y() > workspace.settings_button.y()
-    assert workspace.output_directory_button.y() == workspace.local_ai_button.y()
+    assert workspace.output_directory_button.y() == workspace.settings_button.y()
+    assert workspace.add_button.y() == workspace.settings_button.y()
+    assert workspace.primary_button.y() == workspace.settings_button.y()
 
 
 def test_internal_view_hides_unrelated_global_primary_action(qtbot) -> None:

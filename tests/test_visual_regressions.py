@@ -202,25 +202,21 @@ def test_workspace_render_matrix_keeps_core_actions_inside_the_viewport(
 
     for control in (
         workspace.settings_button,
-        workspace.local_ai_button,
         workspace.output_directory_button,
         workspace.primary_button,
         workspace.add_button,
-        workspace.queue_toolbar,
+        workspace.queue_summary,
         workspace.table_panel,
         workspace.content_stack,
     ):
         _assert_fully_visible(control, workspace)
 
     settings_rect = _relative_rect(workspace.settings_button, workspace)
-    ai_rect = _relative_rect(workspace.local_ai_button, workspace)
     output_rect = _relative_rect(workspace.output_directory_button, workspace)
-    if width <= 960:
-        assert ai_rect.top() > settings_rect.top()
-        assert output_rect.top() == ai_rect.top()
-    else:
-        assert abs(ai_rect.center().y() - settings_rect.center().y()) <= 2
-        assert abs(output_rect.center().y() - settings_rect.center().y()) <= 2
+    add_rect = _relative_rect(workspace.add_button, workspace)
+    primary_rect = _relative_rect(workspace.primary_button, workspace)
+    for action_rect in (output_rect, add_rect, primary_rect):
+        assert abs(action_rect.center().y() - settings_rect.center().y()) <= 2
 
 
 @pytest.mark.parametrize("theme", [ThemeMode.LIGHT, ThemeMode.DARK])
@@ -249,11 +245,12 @@ def test_empty_workspace_render_matrix_keeps_one_clear_import_action(
     assert workspace.drop_area.height() == (140 if width <= 640 else 92)
     assert workspace.drop_area.primary_label.text() == "Arrastra documentos aquí"
     assert workspace.drop_area.browse_button.text() == "Seleccionar archivos"
-    assert not workspace.queue_toolbar.isVisible()
+    assert not workspace.queue_summary.isVisible()
+    assert not workspace.add_button.isVisible()
+    assert not workspace.primary_button.isVisible()
     assert not workspace.table_panel.isVisible()
     for control in (
         workspace.settings_button,
-        workspace.local_ai_button,
         workspace.output_directory_button,
         workspace.drop_area,
         workspace.drop_area.browse_button,
@@ -294,17 +291,17 @@ def test_workspace_wide_tall_matrix_preserves_intentional_queue_geometry(
         assert workspace.drop_area.geometry().center().y() < workspace.queue_pane.height() // 3
         assert workspace.drop_area.width() <= 620
         assert not workspace.table_panel.isVisible()
-        assert not workspace.queue_toolbar.isVisible()
+        assert not workspace.queue_summary.isVisible()
     else:
         assert workspace.job_table.job_model.rowCount() == job_count
-        assert workspace.queue_toolbar.geometry().top() == 0
+        assert workspace.queue_summary.geometry().top() == 0
         assert (
-            workspace.table_panel.geometry().top() - workspace.queue_toolbar.geometry().bottom()
+            workspace.table_panel.geometry().top() - workspace.queue_summary.geometry().bottom()
             <= 12
         )
         assert workspace.table_panel.height() == workspace.job_table.height() + 2
         assert workspace.table_panel.width() <= 1280
-        assert workspace.queue_toolbar.width() == workspace.table_panel.width()
+        assert workspace.queue_summary.width() == workspace.table_panel.width()
         assert workspace.add_button.isVisible()
         assert workspace.drop_area.isHidden()
 

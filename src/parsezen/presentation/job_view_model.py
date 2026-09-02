@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import StrEnum
 
+from parsezen.application.workspace_recovery import SOURCE_UNAVAILABLE_MESSAGE
 from parsezen.domain.jobs import DocumentFormat, DocumentJob, JobStatus
 from parsezen.domain.stages import StageKind, StageState, StageStatus
 
@@ -15,6 +16,7 @@ class JobAction(StrEnum):
     OPEN_RESULT = "open_result"
     SHOW_ERROR = "show_error"
     REVIEW_WITH_AI = "review_with_ai"
+    RESTORE_SOURCE = "restore_source"
 
 
 @dataclass(frozen=True, slots=True)
@@ -70,6 +72,13 @@ def focus_stage(job: DocumentJob) -> StageState:
 def next_step_view(job: DocumentJob) -> NextStepView:
     """Map domain state to one stable, actionable next-step presentation."""
 
+    if SOURCE_UNAVAILABLE_MESSAGE in job.warnings:
+        return NextStepView(
+            "Original no disponible",
+            "warning",
+            JobAction.RESTORE_SOURCE,
+            "Buscar original",
+        )
     if not job.is_configured:
         return NextStepView(
             "Pendiente",
@@ -171,6 +180,7 @@ def queue_header_view(jobs: tuple[DocumentJob, ...]) -> QueueHeaderView:
         for job in jobs
         if job.is_configured
         and job.status in {JobStatus.QUEUED, JobStatus.PAUSED, JobStatus.FAILED}
+        and SOURCE_UNAVAILABLE_MESSAGE not in job.warnings
     )
     if runnable:
         runnable_word = "documento" if len(runnable) == 1 else "documentos"

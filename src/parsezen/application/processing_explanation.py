@@ -4,11 +4,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import StrEnum
+from pathlib import Path
 
+from parsezen.domain.execution_plan import ExecutionStep, compile_execution_plan
 from parsezen.domain.jobs import (
     DocumentFormat,
+    DocumentSource,
     JobConfiguration,
-    ProcessingPlan,
     TranslationMethod,
 )
 from parsezen.domain.stages import StageKind
@@ -77,7 +79,11 @@ def processing_flow(
 ) -> ProcessingFlow:
     """Describe the automatic route and any final human decision."""
 
-    reviewed = configuration.plan is ProcessingPlan.LOCAL_AI_REVIEWED
+    plan = compile_execution_plan(
+        DocumentSource(Path("document"), source_format, 0, 0),
+        configuration,
+    )
+    reviewed = plan.includes(ExecutionStep.REVIEW_CONTENT)
     translation = configuration.translation
     output_format = configuration.output.format
     compact_steps: list[str] = []
@@ -98,10 +104,10 @@ def processing_flow(
         add_step("OCR", stages=(StageKind.PREPARE,))
 
     automatic_transformations = 0
-    if translation.enabled:
+    if plan.translates:
         target = _display_language(translation.target_language)
         suffix = f" a {target}" if target else ""
-        if translation.method is TranslationMethod.OFFLINE:
+        if plan.includes(ExecutionStep.TRANSLATE_OFFLINE):
             add_step(
                 f"Traducir{suffix}",
                 f"Traducir con Argos{suffix}",
@@ -115,13 +121,6 @@ def processing_flow(
                     stages=(StageKind.REFINE,),
                 )
                 automatic_transformations += 1
-        elif reviewed:
-            add_step(
-                f"Traducir y corregir{suffix}",
-                f"Traducir y corregir con IA local{suffix}",
-                stages=(StageKind.TRANSLATE, StageKind.REFINE),
-            )
-            automatic_transformations += 1
         else:
             add_step(
                 f"Traducir{suffix}",
@@ -129,7 +128,14 @@ def processing_flow(
                 stages=(StageKind.TRANSLATE,),
             )
             automatic_transformations += 1
-    elif reviewed:
+            if reviewed:
+                add_step(
+                    "Verificar traducción",
+                    "Verificar traducción con IA local",
+                    stages=(StageKind.REFINE,),
+                )
+                automatic_transformations += 1
+    elif plan.includes(ExecutionStep.REVIEW_CONTENT):
         add_step(
             "Corregir contenido",
             "Corregir contenido con IA local",
@@ -137,18 +143,14 @@ def processing_flow(
         )
         automatic_transformations += 1
 
-    if reviewed and output_format is DocumentFormat.EPUB:
+    if plan.includes(ExecutionStep.REVIEW_STRUCTURE):
         add_step(
             "Organizar EPUB",
             "Organizar EPUB con IA local",
             stages=(StageKind.STRUCTURE,),
         )
         automatic_transformations += 1
-    elif (
-        source_format is DocumentFormat.EPUB
-        and output_format is DocumentFormat.EPUB
-        and automatic_transformations == 0
-    ):
+    elif plan.includes(ExecutionStep.PRESERVE_EPUB) and automatic_transformations == 0:
         add_step("Personalizar EPUB", stages=(StageKind.STRUCTURE,))
         automatic_transformations += 1
 
@@ -189,10 +191,17 @@ def processing_flow_steps(
     )
 
 
-def processing_pass_summary(configuration: JobConfiguration) -> str:
+def processing_pass_summary(
+    configuration: JobConfiguration,
+    source_format: DocumentFormat = DocumentFormat.TEXT,
+) -> str:
     """Explain material text passes and the review consequence of one configuration."""
 
-    reviewed = configuration.plan is ProcessingPlan.LOCAL_AI_REVIEWED
+    plan = compile_execution_plan(
+        DocumentSource(Path("document"), source_format, 0, 0),
+        configuration,
+    )
+    reviewed = plan.includes(ExecutionStep.REVIEW_CONTENT)
     translation = configuration.translation
     epub = configuration.output.format is DocumentFormat.EPUB
 
@@ -234,12 +243,12 @@ def processing_pass_summary(configuration: JobConfiguration) -> str:
         )
     if epub:
         return (
-            "2 pasadas de IA: traducción y corrección combinadas, y después estructura. "
-            "La corrección textual queda integrada en la traducción."
+            "3 pasadas de IA: traducción, verificación bilingüe y estructura. "
+            "Las correcciones quedan como propuestas para tu revisión final."
         )
     return (
-        "1 pasada principal de IA que combina traducción y corrección. "
-        "La corrección queda integrada en la traducción."
+        "2 pasadas de IA: traducción y verificación bilingüe. "
+        "Las correcciones quedan como propuestas."
     )
 
 

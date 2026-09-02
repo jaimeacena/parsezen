@@ -29,6 +29,15 @@ class _PdfCharacter:
 
 
 @dataclass(frozen=True, slots=True)
+class _PdfEmphasisSpan:
+    """One source-confirmed bold/italic range inside a normalized PDF line."""
+
+    text: str
+    bold: bool
+    italic: bool
+
+
+@dataclass(frozen=True, slots=True)
 class _PdfLine:
     page_number: int
     page_width: float
@@ -46,6 +55,8 @@ class _PdfLine:
     hard_hyphen_end: bool
     rotated: bool
     italic: bool = False
+    emphasis_spans: tuple[_PdfEmphasisSpan, ...] = ()
+    outline_level: int | None = None
 
     @property
     def centered(self) -> bool:
@@ -75,6 +86,7 @@ class _PdfTable:
     bbox: tuple[float, float, float, float]
     rows: tuple[tuple[str, ...], ...]
     rendering: _TableRendering
+    inferred_from_raster: bool = False
 
 
 @dataclass(frozen=True, slots=True)

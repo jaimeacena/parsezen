@@ -7,6 +7,7 @@ import math
 
 from parsezen.pdf_layout import (
     _PdfCharacter,
+    _PdfEmphasisSpan,
     _PdfLine,
     _PdfLink,
     _PdfPage,
@@ -14,7 +15,7 @@ from parsezen.pdf_layout import (
     _TableRendering,
 )
 
-_PDF_PAGE_CHECKPOINT_VERSION = 12
+_PDF_PAGE_CHECKPOINT_VERSION = 16
 _MAX_PDF_PAGE_CHECKPOINT_BYTES = 8 * 1024 * 1024
 _MAX_PDF_PAGE_LINES = 50_000
 _MAX_PDF_LINE_CHARACTERS = 100_000
@@ -38,6 +39,7 @@ def _serialize_page_checkpoint(page: _PdfPage) -> str:
                 "bbox": list(table.bbox),
                 "rows": [list(row) for row in table.rows],
                 "rendering": table.rendering.value,
+                "inferred_from_raster": table.inferred_from_raster,
             }
             for table in page.tables
         ],
@@ -65,6 +67,9 @@ def _serialize_page_checkpoint(page: _PdfPage) -> str:
                 "font_size": line.font_size,
                 "bold": line.bold,
                 "italic": line.italic,
+                "emphasis_spans": [
+                    [span.text, span.bold, span.italic] for span in line.emphasis_spans
+                ],
                 "links": [
                     [link.target, link.x0, link.x1, link.top, link.bottom] for link in line.links
                 ],
@@ -165,6 +170,7 @@ def _line_from_checkpoint(raw: object, page_number: int) -> _PdfLine:
         "font_size",
         "bold",
         "italic",
+        "emphasis_spans",
         "links",
         "soft_hyphen_end",
         "hard_hyphen_end",
@@ -173,6 +179,7 @@ def _line_from_checkpoint(raw: object, page_number: int) -> _PdfLine:
         raise ValueError
     text = raw["text"]
     raw_chars = raw["chars"]
+    raw_emphasis_spans = raw["emphasis_spans"]
     raw_links = raw["links"]
     if (
         not isinstance(text, str)
@@ -180,6 +187,8 @@ def _line_from_checkpoint(raw: object, page_number: int) -> _PdfLine:
         or "\0" in text
         or not isinstance(raw_chars, list)
         or len(raw_chars) > _MAX_PDF_LINE_CHARACTERS
+        or not isinstance(raw_emphasis_spans, list)
+        or len(raw_emphasis_spans) > _MAX_PDF_LINE_CHARACTERS
         or not isinstance(raw_links, list)
         or len(raw_links) > _MAX_PDF_LINE_LINKS
         or type(raw["bold"]) is not bool
@@ -191,6 +200,7 @@ def _line_from_checkpoint(raw: object, page_number: int) -> _PdfLine:
         raise ValueError
     page_width = _checkpoint_float(raw["page_width"], minimum=0.01)
     page_height = _checkpoint_float(raw["page_height"], minimum=0.01)
+    emphasis_spans = tuple(_emphasis_span_from_checkpoint(value) for value in raw_emphasis_spans)
     return _PdfLine(
         page_number=page_number,
         page_width=page_width,
@@ -208,6 +218,7 @@ def _line_from_checkpoint(raw: object, page_number: int) -> _PdfLine:
         hard_hyphen_end=raw["hard_hyphen_end"],
         rotated=raw["rotated"],
         italic=raw["italic"],
+        emphasis_spans=emphasis_spans,
     )
 
 
@@ -217,7 +228,12 @@ def _table_from_checkpoint(
     page_width: float,
     page_height: float,
 ) -> _PdfTable:
-    if not isinstance(raw, dict) or set(raw) != {"bbox", "rows", "rendering"}:
+    if not isinstance(raw, dict) or set(raw) != {
+        "bbox",
+        "rows",
+        "rendering",
+        "inferred_from_raster",
+    }:
         raise ValueError
     raw_bbox = raw["bbox"]
     raw_rows = raw["rows"]
@@ -226,6 +242,7 @@ def _table_from_checkpoint(
         or len(raw_bbox) != 4
         or not isinstance(raw_rows, list)
         or len(raw_rows) > _MAX_PDF_TABLE_ROWS
+        or type(raw["inferred_from_raster"]) is not bool
     ):
         raise ValueError
     bbox = tuple(_checkpoint_float(value, minimum=0, maximum=100_000) for value in raw_bbox)
@@ -251,6 +268,7 @@ def _table_from_checkpoint(
         (bbox[0], bbox[1], bbox[2], bbox[3]),
         tuple(rows),
         _TableRendering(raw["rendering"]),
+        raw["inferred_from_raster"],
     )
 
 
@@ -269,6 +287,22 @@ def _character_from_checkpoint(raw: object) -> _PdfCharacter:
         size=_checkpoint_float(raw[5], minimum=0),
         upright=raw[6],
     )
+
+
+def _emphasis_span_from_checkpoint(raw: object) -> _PdfEmphasisSpan:
+    if (
+        not isinstance(raw, list)
+        or len(raw) != 3
+        or not isinstance(raw[0], str)
+        or not raw[0]
+        or "\0" in raw[0]
+        or len(raw[0]) > _MAX_PDF_LINE_CHARACTERS
+        or type(raw[1]) is not bool
+        or type(raw[2]) is not bool
+        or not (raw[1] or raw[2])
+    ):
+        raise ValueError
+    return _PdfEmphasisSpan(raw[0], raw[1], raw[2])
 
 
 def _link_from_checkpoint(raw: object) -> _PdfLink:

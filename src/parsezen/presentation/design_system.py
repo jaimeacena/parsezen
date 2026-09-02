@@ -1084,22 +1084,10 @@ def apply_parsezen_theme(
             background-color: {COLORS.action_primary_soft};
             border: 2px solid {COLORS.action_primary};
         }}
-        QFrame#componentSetupCard {{
+        QFrame#componentSetupRow {{
             background-color: {COLORS.surface};
             border: 1px solid {COLORS.border};
-            border-radius: {RADIUS_MEDIUM}px;
-        }}
-        QFrame#componentSetupCard:hover {{
-            background-color: {COLORS.surface_hover};
-        }}
-        QFrame#componentSetupCard[status="prepared"] {{
-            border-color: {COLORS.success};
-        }}
-        QFrame#componentSetupCard[status="downloadable"] {{
-            border-color: {COLORS.info};
-        }}
-        QFrame#componentSetupCard[status="insufficient"] {{
-            border-color: {COLORS.border};
+            border-radius: {RADIUS_SMALL}px;
         }}
         QLabel#componentTitle {{
             color: {COLORS.text_primary};
@@ -1127,6 +1115,18 @@ def apply_parsezen_theme(
         QPushButton#componentDownloadButton,
         QPushButton#componentRefreshButton {{
             min-height: {CONTROLS.default_height}px;
+        }}
+        QPushButton#componentRefreshButton {{
+            color: {COLORS.text_secondary};
+            background-color: transparent;
+            border: none;
+            padding-left: {SPACING.sm}px;
+            padding-right: {SPACING.sm}px;
+        }}
+        QPushButton#componentRefreshButton:hover,
+        QPushButton#componentRefreshButton:focus {{
+            color: {COLORS.action_primary};
+            background-color: {COLORS.surface_hover};
         }}
         QPushButton#componentDownloadButton {{
             color: {COLORS.text_inverse};

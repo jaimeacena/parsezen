@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PySide6.QtWidgets import QScrollArea
+from PySide6.QtWidgets import QApplication, QScrollArea
 
 from parsezen.component_readiness import ComponentReadiness, ReadinessStatus
 from parsezen.local_ai_policy import ComponentCapability
@@ -62,6 +62,55 @@ def test_component_setup_refresh_is_an_explicit_view_signal(qtbot) -> None:
     dialog.refresh_button.click()
 
     assert refreshes == [True]
+
+
+def test_component_setup_uses_top_aligned_compact_rows(qtbot) -> None:
+    dialog = ComponentSetupDialog(
+        states={
+            ComponentCapability.TRANSLATION: ReadinessStatus.PREPARED,
+            ComponentCapability.REVIEW: ReadinessStatus.PREPARED,
+        }
+    )
+    qtbot.addWidget(dialog)
+    dialog.resize(1200, 900)
+    dialog.show()
+    QApplication.processEvents()
+
+    translation = dialog.cards[ComponentCapability.TRANSLATION]
+    review = dialog.cards[ComponentCapability.REVIEW]
+    assert translation.objectName() == "componentSetupRow"
+    assert review.y() > translation.y()
+    assert dialog.content_host.height() < dialog.height() // 2
+    assert dialog.refresh_button.text() == "Comprobar de nuevo"
+
+
+def test_component_setup_stacks_status_without_clipping_at_320px(qtbot) -> None:
+    dialog = ComponentSetupDialog(states={})
+    qtbot.addWidget(dialog)
+    dialog.resize(320, 720)
+    dialog.show()
+    QApplication.processEvents()
+
+    assert dialog.content_host.geometry().right() <= dialog.contentsRect().right()
+    for card in dialog.cards.values():
+        assert card.status_label.y() > card.title_label.y()
+        assert card.geometry().right() <= dialog.content_host.contentsRect().right()
+        assert card.status_label.geometry().right() <= card.contentsRect().right()
+
+
+def test_component_setup_fits_the_internal_page_at_320px(qtbot) -> None:
+    from parsezen.presentation.workspace import ParsezenWorkspace
+
+    workspace = ParsezenWorkspace()
+    setup = ComponentSetupDialog(states={})
+    qtbot.addWidget(workspace)
+    workspace.resize(320, 720)
+    workspace.show()
+    workspace.show_internal_view(setup, "IA local")
+    QApplication.processEvents()
+
+    assert setup.width() <= workspace.content_stack.width()
+    assert setup.content_host.geometry().right() <= setup.contentsRect().right()
 
 
 def test_injected_states_are_replaced_without_accepting_unknown_capabilities(qtbot) -> None:

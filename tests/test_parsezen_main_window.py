@@ -1,10 +1,11 @@
+import sqlite3
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 from threading import Event
 from unittest.mock import Mock
 
-from PySide6.QtCore import QTimer
+from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QCloseEvent
 from PySide6.QtWidgets import (
     QApplication,
@@ -14,12 +15,14 @@ from PySide6.QtWidgets import (
     QSystemTrayIcon,
 )
 
+import parsezen.infrastructure.state_store as state_store_module
 import parsezen.presentation.main_window as main_window_module
 from parsezen.application.job_execution import JobExecutionController
 from parsezen.application.job_queue import JobQueue
 from parsezen.application.job_runtime import JobRuntime
 from parsezen.application.preflight import DocumentPreflight, combine_preflights
 from parsezen.application.quality_review_adapter import create_translation_review
+from parsezen.application.review_flow import ReviewFlowCoordinator
 from parsezen.application.review_materialization import (
     phase_plan_with_materialized_reviews,
     review_for_current_candidate,
@@ -330,7 +333,7 @@ def test_quality_review_rebuild_keeps_the_original_and_updates_the_proposal() ->
         review_required=True,
     )
 
-    rebuilt = ParsezenMainWindow._rebuild_revision_draft_after_quality(  # noqa: SLF001
+    rebuilt = ReviewFlowCoordinator.rebuild_revision_draft(
         result,
         "Propuesta corregida y revisada.\n",
     )
@@ -933,6 +936,10 @@ def test_completed_direct_result_can_start_recommended_targeted_review(
         replace(
             job.configuration,
             output=replace(job.configuration.output, configured=True),
+            ai=AIProfileConfiguration(
+                review_model="reviewer-only:7b",
+                review_context_window=16_384,
+            ),
         ),
     )
     entry = _entries(window)[0]  # noqa: SLF001
@@ -963,6 +970,16 @@ def test_completed_direct_result_can_start_recommended_targeted_review(
     assert reviewing is not None
     assert reviewing.stage(StageKind.REFINE).status is StageStatus.READY
     assert starts and callable(starts[0][2]["processor"])
+    started_settings = starts[0][1]
+    assert isinstance(started_settings, AppSettings)
+    assert (started_settings.model, started_settings.context_window) == (
+        "reviewer-only:7b",
+        16_384,
+    )
+    assert (started_settings.review_model, started_settings.review_context_window) == (
+        "reviewer-only:7b",
+        16_384,
+    )
     assert entry.result is not None
     assert entry.result.review_markdown == "Texto con �.\n"
     assert window.is_processing
@@ -1328,7 +1345,7 @@ def test_main_window_warns_and_retries_when_state_write_fails(
     window.set_source_paths((source,))
     original_replace = window._state_store.replace_jobs
 
-    def fail_write(_jobs) -> None:
+    def fail_write(_jobs, *, events=()) -> None:
         raise StateStoreError("disk unavailable")
 
     monkeypatch.setattr(window._state_store, "replace_jobs", fail_write)
@@ -1499,6 +1516,50 @@ def test_main_window_quarantines_structurally_corrupted_state(
     _entries(window).clear()
 
 
+def test_main_window_keeps_state_and_artifacts_when_migration_fails(
+    qtbot,
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    state_path = tmp_path / "workspace.sqlite3"
+    job = DocumentJob.create(
+        DocumentSource(Path("saved.pdf"), DocumentFormat.PDF, 10, 20),
+        JobConfiguration(),
+        order=0,
+        job_id="saved-job",
+    )
+    StateStore(state_path).replace_jobs((job,))
+    with sqlite3.connect(state_path) as connection:
+        connection.execute("UPDATE metadata SET value = '5' WHERE key = 'schema_version'")
+    artifact = tmp_path / "artifacts" / job.id / "review.pza"
+    artifact.parent.mkdir(parents=True)
+    artifact.write_bytes(b"encrypted review")
+
+    def fail_migration(_connection) -> None:
+        raise RuntimeError("synthetic migration failure")
+
+    monkeypatch.setitem(state_store_module.MIGRATIONS, 5, fail_migration)
+
+    window = ParsezenMainWindow(
+        settings=AppSettings(),
+        auto_discover_ai=False,
+        state_path=state_path,
+    )
+    qtbot.addWidget(window)
+    window._temporal_timer.stop()  # noqa: SLF001
+
+    assert window._queue_persistence.unavailable  # noqa: SLF001
+    assert window._job_queue.jobs == ()  # noqa: SLF001
+    assert "siguen intactos" in window.parsezen_workspace.recovery_warning.text()
+    assert artifact.read_bytes() == b"encrypted review"
+    assert tuple(tmp_path.glob("recovery-unreadable-*")) == ()
+    with sqlite3.connect(state_path) as connection:
+        assert connection.execute(
+            "SELECT value FROM metadata WHERE key = 'schema_version'"
+        ).fetchone() == ("5",)
+        assert connection.execute("SELECT COUNT(*) FROM jobs").fetchone() == (1,)
+
+
 def test_main_window_confirms_close_when_recovery_is_unavailable(
     qtbot,
     tmp_path: Path,
@@ -1622,6 +1683,36 @@ def test_main_window_routes_configuration_review_and_primary_actions(
     window._queue_session._running = False  # noqa: SLF001
 
     assert actions == ["pause", "review", "select", "folder", "prepare", "start"]
+
+
+def test_configuration_sheet_applies_shared_choices_to_compatible_jobs(
+    qtbot,
+    tmp_path: Path,
+) -> None:
+    first = tmp_path / "first.txt"
+    second = tmp_path / "second.txt"
+    first.write_text("First", encoding="utf-8")
+    second.write_text("Second", encoding="utf-8")
+    window = ParsezenMainWindow(
+        settings=AppSettings(),
+        auto_discover_ai=False,
+        state_path=tmp_path / "workspace.sqlite3",
+    )
+    qtbot.addWidget(window)
+    window.set_source_paths((first, second))
+    first_job, second_job = window._job_queue.jobs  # noqa: SLF001
+
+    window._configure_job(first_job.id, None)  # noqa: SLF001
+    editor = window._active_configuration_dialog  # noqa: SLF001
+    assert editor is not None
+    assert editor.apply_compatible_button.text() == "Aplicar a 1 compatibles"
+    editor._set_output_format(DocumentFormat.EPUB)  # noqa: SLF001
+    qtbot.mouseClick(editor.apply_compatible_button, Qt.MouseButton.LeftButton)
+
+    updated = window._job_queue.get(second_job.id)  # noqa: SLF001
+    assert updated is not None
+    assert updated.configuration.output.format is DocumentFormat.EPUB
+    assert updated.configuration.output.title == "second"
 
 
 def test_table_click_opens_the_compact_configuration_sheet(
@@ -2398,7 +2489,7 @@ def test_stale_post_quality_revision_candidate_is_replaced_safely(
     )
     window._state_store.save_review(stale)  # noqa: SLF001
 
-    window._review_materialization.ensure_revision_candidates(  # noqa: SLF001
+    window._review_flow.ensure_revision_candidates(  # noqa: SLF001
         current_draft,
         job,
         (stale,),
@@ -3260,9 +3351,6 @@ def test_main_window_boundary_actions_fail_safely_without_hidden_state(
     window.add_source_paths((second,))
     assert tuple(entry.path for entry in _entries(window)) == (source, second)  # noqa: SLF001
     window._add_dropped_paths(["not", "a", "tuple"])  # noqa: SLF001
-    assert window._validate_pending_requests(()) == ()  # noqa: SLF001
-    assert window._pending_runtime_items(window._settings) == ()  # noqa: SLF001
-    assert window._runtime_for_entry("missing") is None  # noqa: SLF001
     queued = window._job_queue.jobs[0]  # noqa: SLF001
     window._job_queue.configure(  # noqa: SLF001
         queued.id,
@@ -3275,9 +3363,6 @@ def test_main_window_boundary_actions_fail_safely_without_hidden_state(
             ),
         ),
     )
-    assert window._runtime_for_entry(_entries(window)[0].job_id) is not None  # noqa: SLF001
-    assert window._processing_run_flags() == (False, False)  # noqa: SLF001
-    assert not window._local_ai_required()  # noqa: SLF001
 
     window._queue_session.set_prepared_run(None)  # noqa: SLF001
     window._start_processing()  # noqa: SLF001
@@ -3531,9 +3616,10 @@ def test_review_surfaces_preserve_work_across_editor_and_storage_failures(
     window._personalize_epub(entry.runtime, job, "", ())  # noqa: SLF001
 
     entry.result = result
+    original_review_flow = window._review_flow  # noqa: SLF001
     publication = Mock()
     publication.prepare_book.side_effect = ValueError("No se pudo preparar")
-    window._review_publication = publication  # noqa: SLF001
+    window._review_flow = publication  # noqa: SLF001
     window._personalize_epub(entry.runtime, job, result.review_markdown or "", ())  # noqa: SLF001
     assert entry.status is ProjectedStatus.REVIEW_PENDING
 
@@ -3558,6 +3644,7 @@ def test_review_surfaces_preserve_work_across_editor_and_storage_failures(
     assert warnings[-1][0] == "No se pudo guardar el borrador"
     assert entry.status is ProjectedStatus.REVIEW_PENDING
 
+    window._review_flow = original_review_flow  # noqa: SLF001
     empty_entry = JobRuntime()
     assert window._review_quality_phases(empty_entry, job) is None  # noqa: SLF001
     empty_entry.result = ProcessResult(destination)
@@ -3636,17 +3723,9 @@ def test_workspace_commands_route_through_the_active_surface(
     entry.result = ProcessResult(tmp_path / "result.md")
     reviewed: list[str] = []
     opened: list[Path] = []
-    configured: list[tuple[str, object]] = []
     monkeypatch.setattr(window, "_review_job", lambda job_id, _stage: reviewed.append(job_id))
     monkeypatch.setattr(window, "_open_local_path", opened.append)
-    monkeypatch.setattr(
-        window,
-        "_configure_job",
-        lambda job_id, stage: configured.append((job_id, stage)),
-    )
     window._run_primary_action("review")  # noqa: SLF001
     window._run_primary_action("open_folder")  # noqa: SLF001
-    window._run_primary_action("configure_result")  # noqa: SLF001
     assert reviewed == [job.id]
     assert opened == [entry.result.final_path.parent]
-    assert configured

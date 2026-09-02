@@ -4,7 +4,9 @@ from __future__ import annotations
 
 from parsezen.application.configuration_rules import configuration_issues
 from parsezen.application.review_plan import review_steps_for_result
+from parsezen.domain.execution_plan import ExecutionStep, compile_execution_plan
 from parsezen.domain.jobs import (
+    AIPhase,
     AIProfileConfiguration,
     CoverStrategy,
     DocumentFormat,
@@ -16,6 +18,7 @@ from parsezen.domain.jobs import (
     ProcessingPlan,
     TranslationConfiguration,
     TranslationMethod,
+    resolve_ai_profile,
 )
 from parsezen.domain.stages import StageKind
 from parsezen.glossary import GlossaryEntry
@@ -23,7 +26,7 @@ from parsezen.improvement import ImprovementMode
 from parsezen.pdf_conversion import PdfPageRange
 from parsezen.pipeline.contracts import ProcessRequest, ProcessResult
 from parsezen.settings import AppSettings
-from parsezen.workflow import OutputFormat, WorkflowOptions, plan_workflow
+from parsezen.workflow import OutputFormat
 
 
 def review_stage_for_result(
@@ -146,36 +149,29 @@ def request_and_settings_from_job(
     checkpoint_retention_days: int = 30,
 ) -> tuple[ProcessRequest, AppSettings]:
     configuration = job.configuration
+    translation_profile = resolve_ai_profile(configuration.ai, AIPhase.TRANSLATION)
+    review_profile = resolve_ai_profile(configuration.ai, AIPhase.REVIEW)
+    visual_profile = resolve_ai_profile(configuration.ai, AIPhase.VISUAL_OCR)
     issues = configuration_issues(job.source, configuration, allow_noop_same_format=True)
     if issues:
         raise ValueError(issues[0].message)
     output_format = _process_output_format(configuration.output.format)
-    reviewed = configuration.plan is ProcessingPlan.LOCAL_AI_REVIEWED
-    ai_translation = (
-        configuration.translation.enabled
-        and configuration.translation.method is TranslationMethod.LOCAL_AI
-    )
-    review_structure = reviewed and configuration.output.format is DocumentFormat.EPUB
-    options = WorkflowOptions(
-        improvement_enabled=configuration.translation.enabled or reviewed,
-        translate=configuration.translation.enabled,
-        review_content=reviewed,
-        review_structure=review_structure,
-    )
-    plan = plan_workflow((job.source.path.suffix,), output_format, options=options)
+    plan = compile_execution_plan(job.source, configuration)
+    reviewed = plan.includes(ExecutionStep.REVIEW_CONTENT)
+    ai_translation = plan.includes(ExecutionStep.TRANSLATE_AI)
+    offline_translation = plan.includes(ExecutionStep.TRANSLATE_OFFLINE)
+    review_structure = plan.includes(ExecutionStep.REVIEW_STRUCTURE)
     glossary = tuple(
         GlossaryEntry(source, target) for source, target in configuration.translation.glossary
     )
     request = ProcessRequest(
         source_path=job.source.path,
-        convert_to_markdown=plan.convert_to_markdown_for(job.source.path.suffix),
+        convert_to_markdown=plan.includes(ExecutionStep.CONVERT),
         output_directory=configuration.output.directory,
         improvement_mode=(ImprovementMode.TRANSLATE if ai_translation else None),
         target_language=(configuration.translation.target_language if ai_translation else None),
         offline_translation_language=(
-            configuration.translation.target_language
-            if configuration.translation.enabled and not ai_translation
-            else None
+            configuration.translation.target_language if offline_translation else None
         ),
         pdf_page_range=(
             PdfPageRange(
@@ -204,32 +200,15 @@ def request_and_settings_from_job(
         source_size_bytes=job.source.size_bytes,
         source_modified_ns=job.source.modified_ns,
         source_content_sha256=job.source.content_sha256,
+        execution_plan=plan,
     )
     settings = AppSettings(
-        model=configuration.ai.model,
-        context_window=configuration.ai.context_window,
-        translation_model=(
-            configuration.ai.components.translation.model
-            if configuration.ai.components.translation is not None
-            else configuration.ai.translation_model
-        ),
-        translation_context_window=(
-            configuration.ai.components.translation.context_window
-            if configuration.ai.components.translation is not None
-            and configuration.ai.components.translation.context_window is not None
-            else configuration.ai.translation_context_window
-        ),
-        review_model=(
-            configuration.ai.components.review.model
-            if configuration.ai.components.review is not None
-            else configuration.ai.review_model
-        ),
-        review_context_window=(
-            configuration.ai.components.review.context_window
-            if configuration.ai.components.review is not None
-            and configuration.ai.components.review.context_window is not None
-            else configuration.ai.review_context_window
-        ),
+        model=visual_profile.model,
+        context_window=visual_profile.context_window,
+        translation_model=translation_profile.model,
+        translation_context_window=translation_profile.context_window,
+        review_model=review_profile.model,
+        review_context_window=review_profile.context_window,
         output_directory=configuration.output.directory,
         image_output_directory=configuration.output.image_directory,
         timeout_seconds=timeout_seconds,

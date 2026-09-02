@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import html
 import logging
 import re
 import unicodedata
@@ -11,6 +12,8 @@ from dataclasses import dataclass
 from difflib import SequenceMatcher
 from enum import StrEnum
 from hashlib import sha256
+
+from markdown_it import MarkdownIt
 
 LOGGER = logging.getLogger(__name__)
 
@@ -174,11 +177,13 @@ TITLE_LANGUAGE_HINTS = {
             "doctrines",
             "hermetic",
             "historical",
+            "hidden",
             "identifying",
             "interpretation",
             "interpreting",
             "introducing",
             "light",
+            "lying",
             "idle",
             "lord",
             "lords",
@@ -419,6 +424,8 @@ _ESTABLISHED_TITLE_TRANSLATIONS = {
         "angular triads": "tríadas angulares",
         "lot of fortune": "lote de la fortuna",
         "length of life": "duración de la vida",
+        "lying hidden phase": "fase de ocultación",
+        "lying hidden": "oculto",
         "lord": "señor",
         "lords": "señores",
         "mainstream": "ámbito general",
@@ -712,19 +719,46 @@ _SOURCE_LANGUAGE_WORD_RESIDUE_HINTS = {
     "en": frozenset(
         {
             "although",
+            "above",
+            "after",
+            "are",
+            "before",
+            "below",
             "because",
             "between",
+            "by",
             "during",
+            "each",
+            "for",
+            "from",
             "however",
+            "in",
+            "inside",
+            "into",
+            "is",
+            "hidden",
+            "lying",
             "mainstream",
+            "or",
+            "outside",
+            "own",
+            "same",
+            "these",
+            "this",
+            "those",
             "through",
             "toward",
             "towards",
+            "upon",
+            "will",
+            "with",
             "whereas",
             "whether",
             "while",
             "within",
             "without",
+            "you",
+            "your",
         }
     ),
 }
@@ -732,6 +766,18 @@ _SOURCE_LANGUAGE_WORD_RESIDUE_HINTS = {
 _SOURCE_LANGUAGE_MORPHOLOGICAL_RESIDUE_SUFFIXES = {
     "en": ("fulness", "lessness", "manship", "ness", "ship", "wards"),
 }
+_ENGLISH_STRONG_REGISTER_PATTERN = re.compile(
+    r"(?i)(?<!\w)(?:fuck(?:ed|er|ers|ing|s)?|bullshit|motherfuck(?:er|ers|ing)?|"
+    r"pussy|shit(?:ty|ting)?|assholes?)(?!\w)"
+)
+_SPANISH_STRONG_REGISTER_PATTERN = re.compile(
+    r"(?i)(?<!\w)(?:jod(?:er|e|ido|ida|idos|idas|iendo|as|es|emos|éis|en)|"
+    r"foll(?:ar|a|as|amos|áis|an|ando|ado|ada|ados|adas)|mierda|"
+    r"gilipoll(?:as|ez|eces)|coño|cag(?:ón|ona|ones|onas)|polla|"
+    r"put(?:a|o|as|os)|capull(?:o|a|os|as)|hostias?|carajo|"
+    r"cabr(?:ón|ona|ones|onas)|ching(?:ar|a|ado|ando)|verga|"
+    r"pendej(?:o|a|os|as))(?!\w)"
+)
 MAX_SOURCE_WORD_TRANSLATION_ATTENTION_TERMS = 12
 
 ORGANIZATION_NAME_SUFFIXES = frozenset(
@@ -748,7 +794,10 @@ ORGANIZATION_NAME_SUFFIXES = frozenset(
 )
 
 NUMBER_PATTERN = re.compile(r"(?<!\d)[+-]?\d+(?:[.,:/-]\d+)*(?!\d)")
+MEANINGFUL_SYMBOL_PATTERN = re.compile(r"[$€£¥₹₿%‰‱]+")
 NUMERIC_HTML_ENTITY_PATTERN = re.compile(r"&#(?:x[0-9a-f]+|\d+);", re.IGNORECASE)
+SUPERSCRIPT_DIGIT_TRANSLATION = str.maketrans("⁰¹²³⁴⁵⁶⁷⁸⁹", "0123456789")
+SUPERSCRIPT_NUMBER_PATTERN = re.compile(r"[⁰¹²³⁴⁵⁶⁷⁸⁹]+")
 WRITTEN_NUMBER_VALUES = {
     "both": 2,
     "ambos": 2,
@@ -946,6 +995,10 @@ PDF_PAGE_MARKER_PATTERN = re.compile(
 )
 MARKDOWN_LINK_PATTERN = re.compile(r"!?\[([^\]]*)\]\(\s*(?:<[^>]+>|[^\s)]+)(?:\s+[^)]*)?\)")
 RAW_URL_PATTERN = re.compile(r"(?:https?://|mailto:)\S+")
+EMAIL_ADDRESS_PATTERN = re.compile(
+    r"(?<![\w.+-])[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,63}(?![\w.-])",
+    re.IGNORECASE,
+)
 WEB_IDENTIFIER_PATTERN = re.compile(
     r"(?i)^(?:www\.)?[a-z0-9](?:[a-z0-9-]*\.)+[a-z]{2,}(?:/[^\s]*)?$"
 )
@@ -953,6 +1006,10 @@ HTML_TAG_PATTERN = re.compile(r"</?[A-Za-z][^>]*>")
 RAW_TABLE_STRUCTURE_TAG_PATTERN = re.compile(
     r"<\s*(/?)\s*(table|thead|tbody|tr|th|td|br)\b([^>]*)>",
     re.IGNORECASE,
+)
+HTML_TABLE_CELL_CONTENT_PATTERN = re.compile(
+    r"<t[dh]\b[^>]*>(?P<content>.*?)</t[dh]\s*>",
+    re.IGNORECASE | re.DOTALL,
 )
 REFERENCE_DEFINITION_LINE_PATTERN = re.compile(r"(?m)^\s{0,3}\[[^\]]+\]:\s*\S+.*$")
 SENTENCE_SPLIT_PATTERN = re.compile(r"(?<=[.!?])\s+|\n+")
@@ -970,6 +1027,15 @@ class TranslationIssueKind(StrEnum):
     LANGUAGE = "language"
     ALIGNMENT = "alignment"
     FIDELITY = "fidelity"
+
+
+_TRANSLATION_ISSUE_DETAIL_PRIORITY = {
+    TranslationIssueKind.LENGTH: 1,
+    TranslationIssueKind.SOURCE_TEXT: 2,
+    TranslationIssueKind.FIDELITY: 3,
+    TranslationIssueKind.LANGUAGE: 4,
+    TranslationIssueKind.ALIGNMENT: 4,
+}
 
 
 class LinguisticReviewMode(StrEnum):
@@ -1237,6 +1303,19 @@ def _build_translation_quality_report(
             requires_full_review = True
         if len(issues) < MAX_REPORT_ISSUES:
             issues.append(issue)
+            return
+        replacement_index = min(
+            range(len(issues)),
+            key=lambda index: (
+                _TRANSLATION_ISSUE_DETAIL_PRIORITY[issues[index].kind],
+                -index,
+            ),
+        )
+        if (
+            _TRANSLATION_ISSUE_DETAIL_PRIORITY[issue.kind]
+            > _TRANSLATION_ISSUE_DETAIL_PRIORITY[issues[replacement_index].kind]
+        ):
+            issues[replacement_index] = issue
 
     translated_natural_letters = _letter_count(natural_language_text(translated))
     if (
@@ -1675,6 +1754,57 @@ def repair_untranslated_source_text(
             return False
         return True
 
+    def repair_exact_sentence_or_list_item(
+        document: str,
+        source_fragment: str,
+        segment_number: int,
+    ) -> str | None:
+        occurrence = _unique_prose_occurrence(document, source_fragment)
+        if occurrence is None:
+            occurrence = _unique_list_item_fragment_occurrence(document, source_fragment)
+        if occurrence is not None:
+            current_fragment = document[occurrence[0] : occurrence[1]]
+            proposal = propose_repair(
+                source_fragment,
+                current_fragment,
+                segment_number,
+            )
+            if proposal is None:
+                return None
+            return f"{document[: occurrence[0]]}{proposal}{document[occurrence[1] :]}"
+
+        if (
+            "\n" in source_fragment
+            or "\r" in source_fragment
+            or LIST_ITEM_PATTERN.match(source_fragment.strip()) is None
+            or _stripped_line_occurrences(document, source_fragment) != 1
+        ):
+            return None
+        proposal = propose_repair(
+            source_fragment,
+            source_fragment,
+            segment_number,
+        )
+        if proposal is None:
+            return None
+        return _replace_unique_stripped_line(document, source_fragment, proposal)
+
+    def repairable_exact_sentences(
+        source_fragment: str,
+        current_fragment: str,
+    ) -> tuple[str, ...]:
+        return tuple(
+            candidate
+            for candidate in find_untranslated_source_sentences(
+                source_fragment,
+                current_fragment,
+                resolved_source_language,
+            )
+            if not _looks_like_probable_proper_name(candidate, resolved_source_language)
+            and not is_probable_organization_name_line(candidate)
+            and not _looks_like_web_identifier(candidate)
+        )
+
     title_repairs = 0
     for source_title, current_title in _title_source_language_residues(
         source,
@@ -1718,6 +1848,8 @@ def repair_untranslated_source_text(
             translated_blocks = candidate_blocks
 
     for source_block, translated_block in zip(source_blocks, translated_blocks, strict=True):
+        source_part = source_parts[source_block.part_index]
+        current = translated_parts[translated_block.part_index]
         issue = _translation_segment_issue(
             source_block.segment_number,
             source_block.natural_text,
@@ -1733,16 +1865,24 @@ def repair_untranslated_source_text(
                 resolved_source_language,
                 target_language,
             )
-        if issue is None or issue.kind not in {
-            TranslationIssueKind.SOURCE_TEXT,
-            TranslationIssueKind.FIDELITY,
-        }:
+        has_exact_source_sentence = bool(
+            repairable_exact_sentences(
+                source_part,
+                current,
+            )
+        )
+        if (
+            issue is None
+            or issue.kind
+            not in {
+                TranslationIssueKind.SOURCE_TEXT,
+                TranslationIssueKind.FIDELITY,
+            }
+        ) and not has_exact_source_sentence:
             continue
         if attempted >= MAX_AUTOMATIC_SOURCE_TEXT_REPAIRS:
             break
 
-        source_part = source_parts[source_block.part_index]
-        current = translated_parts[translated_block.part_index]
         if page_aligned:
             source_subparts, source_subblocks = _paragraph_repairable_report_blocks(source_part)
             translated_subparts, translated_subblocks = _paragraph_repairable_report_blocks(current)
@@ -1842,27 +1982,20 @@ def repair_untranslated_source_text(
 
             sentence_repairs = 0
             sentence_candidate = current
-            for source_sentence in find_untranslated_source_sentences(
+            for source_sentence in repairable_exact_sentences(
                 source_part,
                 sentence_candidate,
-                resolved_source_language,
             ):
                 if attempted >= MAX_AUTOMATIC_SOURCE_TEXT_REPAIRS:
                     break
-                occurrence = _unique_prose_occurrence(sentence_candidate, source_sentence)
-                if occurrence is None:
-                    continue
-                proposal = propose_repair(
+                repaired_sentence = repair_exact_sentence_or_list_item(
+                    sentence_candidate,
                     source_sentence,
-                    sentence_candidate[occurrence[0] : occurrence[1]],
                     source_block.segment_number,
                 )
-                if proposal is None:
+                if repaired_sentence is None:
                     continue
-                sentence_candidate = (
-                    f"{sentence_candidate[: occurrence[0]]}{proposal}"
-                    f"{sentence_candidate[occurrence[1] :]}"
-                )
+                sentence_candidate = repaired_sentence
                 sentence_repairs += 1
             if sentence_repairs and localized_page_is_safe(
                 source_part,
@@ -1876,27 +2009,20 @@ def repair_untranslated_source_text(
         if not page_aligned:
             sentence_repairs = 0
             sentence_candidate = current
-            for source_sentence in find_untranslated_source_sentences(
+            for source_sentence in repairable_exact_sentences(
                 source_part,
                 sentence_candidate,
-                resolved_source_language,
             ):
                 if attempted >= MAX_AUTOMATIC_SOURCE_TEXT_REPAIRS:
                     break
-                occurrence = _unique_prose_occurrence(sentence_candidate, source_sentence)
-                if occurrence is None:
-                    continue
-                proposal = propose_repair(
+                repaired_sentence = repair_exact_sentence_or_list_item(
+                    sentence_candidate,
                     source_sentence,
-                    sentence_candidate[occurrence[0] : occurrence[1]],
                     source_block.segment_number,
                 )
-                if proposal is None:
+                if repaired_sentence is None:
                     continue
-                sentence_candidate = (
-                    f"{sentence_candidate[: occurrence[0]]}{proposal}"
-                    f"{sentence_candidate[occurrence[1] :]}"
-                )
+                sentence_candidate = repaired_sentence
                 sentence_repairs += 1
             if sentence_repairs and localized_page_is_safe(
                 source_part,
@@ -2252,6 +2378,13 @@ def find_untranslated_source_sentences(
     untranslated: list[str] = []
     raw_candidates: list[str] = []
     for sentence_or_line in SENTENCE_SPLIT_PATTERN.split(source):
+        html_cells = tuple(
+            match.group("content")
+            for match in HTML_TABLE_CELL_CONTENT_PATTERN.finditer(sentence_or_line)
+        )
+        if html_cells:
+            raw_candidates.extend(html_cells)
+            continue
         if sentence_or_line.count("|") >= 2:
             raw_candidates.extend(sentence_or_line.split("|"))
         else:
@@ -2409,6 +2542,7 @@ def natural_language_text(markdown: str) -> str:
     text = MARKDOWN_LINK_PATTERN.sub(lambda match: match.group(1), text)
     text = HTML_TAG_PATTERN.sub(" ", text)
     text = RAW_URL_PATTERN.sub(" ", text)
+    text = EMAIL_ADDRESS_PATTERN.sub(" ", text)
     text = re.sub(r"[\\`*_~#>\[\]{}|]", " ", text)
     text = NUMBER_PATTERN.sub(" ", text)
     return re.sub(r"\s+", " ", text).strip()
@@ -2445,6 +2579,25 @@ def _unique_prose_occurrence(container: str, fragment: str) -> tuple[int, int] |
     if len(matches) != 1:
         return None
     return matches[0].start(), matches[0].end()
+
+
+def _unique_list_item_fragment_occurrence(
+    container: str,
+    fragment: str,
+) -> tuple[int, int] | None:
+    """Locate one sentence fragment that starts at a list item's marker."""
+
+    if "\n" in fragment or "\r" in fragment or LIST_ITEM_PATTERN.match(fragment) is None:
+        return None
+    tokens = fragment.split()
+    if not tokens:
+        return None
+    flexible_fragment = r"[ \t]+".join(re.escape(token) for token in tokens)
+    pattern = re.compile(rf"(?m)^[ \t]*(?P<fragment>{flexible_fragment})")
+    matches = tuple(pattern.finditer(container))
+    if len(matches) != 1:
+        return None
+    return matches[0].span("fragment")
 
 
 @dataclass(frozen=True, slots=True)
@@ -2569,6 +2722,20 @@ def _translation_segment_issue(
             source,
             translated,
         )
+
+    if register_intensity_was_lost(
+        source,
+        translated,
+        source_language=source_language,
+        target_language=target_language,
+    ):
+        return _report_issue(
+            segment_number,
+            TranslationIssueKind.FIDELITY,
+            "El tono vulgar o enfático del original parece haberse suavizado; revisa el registro.",
+            source,
+            translated,
+        )
     if (
         unchanged is not None
         and source_language is not None
@@ -2671,6 +2838,25 @@ def _translation_segment_issue(
                 translated,
             )
     return None
+
+
+def register_intensity_was_lost(
+    source: str,
+    translated: str,
+    *,
+    source_language: str | None,
+    target_language: str,
+) -> bool:
+    """Flag only a narrow English-to-Spanish loss of clearly strong language."""
+
+    if (source_language, target_language) != ("en", "es"):
+        return False
+    source_natural = natural_language_text(source)
+    translated_natural = natural_language_text(translated)
+    return bool(
+        _ENGLISH_STRONG_REGISTER_PATTERN.search(source_natural)
+        and not _SPANISH_STRONG_REGISTER_PATTERN.search(translated_natural)
+    )
 
 
 def _source_language_word_residue(
@@ -2975,6 +3161,8 @@ def replace_established_term_residues(
     translated: str,
     source_language: str,
     target_language: str,
+    *,
+    preserve_source_case: bool = False,
 ) -> str:
     """Localize copied conventional terms in an already aligned compact label."""
 
@@ -3006,6 +3194,8 @@ def replace_established_term_residues(
                 return term.upper()
             if match.group().islower():
                 return term.lower()
+            if preserve_source_case and match.group()[:1].isupper():
+                return f"{term[:1].upper()}{term[1:]}"
             return term
 
         if copied_source.search(result) is not None:
@@ -3331,6 +3521,10 @@ def link_destination_spans(markdown: str) -> list[tuple[int, int, str]]:
 def _validate_structure(source: str, translated: str, *, preserve_paragraphs: bool) -> None:
     if not numeric_tokens_are_conserved(source, translated):
         raise TranslationQualityError("La traducción cambió u omitió números o fechas.")
+    if meaningful_symbols(source) != meaningful_symbols(translated):
+        raise TranslationQualityError(
+            "La traducción cambió u omitió símbolos de moneda o porcentaje."
+        )
     if not _roman_reference_tokens_are_conserved(source, translated):
         raise TranslationQualityError("La traducción cambió números romanos de un título o índice.")
     if markdown_link_destinations(source) != markdown_link_destinations(translated):
@@ -3367,6 +3561,14 @@ def _validate_structure(source: str, translated: str, *, preserve_paragraphs: bo
         raise TranslationQualityError("La traducción añadió o cambió etiquetas HTML.")
     if preserve_paragraphs and _block_count(source) != _block_count(translated):
         raise TranslationQualityError("La traducción cambió la separación de párrafos.")
+    if markdown_emphasis_structure(
+        source,
+        preserve_inline_positions=preserve_paragraphs,
+    ) != markdown_emphasis_structure(
+        translated,
+        preserve_inline_positions=preserve_paragraphs,
+    ):
+        raise TranslationQualityError("La traducción cambió la estructura de énfasis Markdown.")
 
 
 def _validate_content_coverage(source: str, translated: str) -> None:
@@ -3585,6 +3787,12 @@ def _is_translated_short_label_collection(
             for line in translated.splitlines()
             if natural_language_text(line)
         ]
+    if len(blocks) < 4 and re.search(r"<table\b", translated, re.IGNORECASE):
+        blocks = [
+            natural_language_text(html.unescape(value))
+            for value in re.findall(r"(?<=>)[^<>]+(?=<)", translated)
+            if natural_language_text(html.unescape(value))
+        ]
     if len(blocks) < 4 or any(
         _letter_count(block) >= MIN_BLOCK_LANGUAGE_LETTERS for block in blocks
     ):
@@ -3680,10 +3888,30 @@ def numeric_tokens_are_conserved(source: str, translated: str) -> bool:
     return True
 
 
+def meaningful_symbols(text: str) -> Counter[str]:
+    """Count reader-visible currency and percentage signs that carry exact meaning."""
+
+    visible = html.unescape(text)
+    return Counter(
+        character
+        for match in MEANINGFUL_SYMBOL_PATTERN.finditer(visible)
+        for character in match.group(0)
+    )
+
+
 def numeric_token_counts(text: str) -> Counter[str]:
     """Count reader-visible numeric tokens, excluding numeric HTML character entities."""
 
     visible = NUMERIC_HTML_ENTITY_PATTERN.sub("", text)
+
+    def normalize_superscript(match: re.Match[str]) -> str:
+        if match.start() and visible[match.start() - 1] in {"Ã", "Â"}:
+            # Broken UTF-8 commonly contains sequences such as ``Ã³`` or ``Â²``.
+            # Their trailing character is not a document number.
+            return match.group(0)
+        return match.group(0).translate(SUPERSCRIPT_DIGIT_TRANSLATION)
+
+    visible = SUPERSCRIPT_NUMBER_PATTERN.sub(normalize_superscript, visible)
     return Counter(NUMBER_PATTERN.findall(visible))
 
 
@@ -3866,6 +4094,43 @@ def markdown_heading_levels(markdown: str) -> tuple[int, ...]:
     """Return the ordered ATX heading hierarchy."""
 
     return tuple(len(match.group(1)) for match in ATX_HEADING_PATTERN.finditer(markdown))
+
+
+def markdown_emphasis_structure(
+    markdown: str,
+    *,
+    preserve_inline_positions: bool = True,
+) -> tuple[tuple[int, tuple[str, ...]], ...]:
+    """Return semantic Markdown emphasis events for each reader-visible inline block.
+
+    Delimiter spelling is intentionally ignored: ``*text*`` and ``_text_`` carry the same
+    semantics. Keeping one signature per inline block prevents a model from moving emphasis to a
+    different paragraph, heading, list item or table cell while still allowing the words inside
+    the span to be translated.
+    """
+
+    parser = MarkdownIt("commonmark").enable(["table", "strikethrough"])
+    emphasis_tokens = {
+        "em_open",
+        "em_close",
+        "strong_open",
+        "strong_close",
+        "s_open",
+        "s_close",
+    }
+    signatures: list[tuple[int, tuple[str, ...]]] = []
+    inline_position = 0
+    for token in parser.parse(markdown):
+        if token.type != "inline":
+            continue
+        events = tuple(
+            child.type for child in token.children or () if child.type in emphasis_tokens
+        )
+        if events:
+            position = inline_position if preserve_inline_positions else len(signatures)
+            signatures.append((position, events))
+        inline_position += 1
+    return tuple(signatures)
 
 
 def html_tag_structure(markdown: str) -> tuple[tuple[str, str, str], ...]:

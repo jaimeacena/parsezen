@@ -1,8 +1,24 @@
 # Instrucciones para agentes
 
+## Entrada y orientación
+
+- Lee primero `docs/agent-operating-model.md` y el bloque **Ahora** de `docs/work-plan.md`. Usa
+  `docs/architecture.md` como verdad del diseño implementado y `docs/acceptance-checklist.md` como
+  contrato de verificación; no reconstruyas el estado del proyecto desde el historial de una tarea.
+- Antes de modificar, inspecciona estado, diff, archivos, historial, rama, configuración e
+  instrucciones. Identifica la fuente de verdad, el riesgo principal y la comprobación que decidirá
+  el cambio.
+- No enumeres recursivamente `local-benchmarks/` ni sus entornos o renders. Entra por un manifest o
+  informe conocido, consulta primero métricas agregadas y abre solo el material privado imprescindible.
+- Distingue siempre `IMPLEMENTADO`, `VERIFICADO EN CORPUS`, `EXPERIMENTAL`, `PLANEADO`, `RECHAZADO` y
+  `BLOQUEADO`. No llames «verde», «listo» o «mejor» a algo sin indicar alcance y evidencia.
+
+## Reglas de trabajo
+
 - Trabaja siempre dentro del checkout existente de `parsezen`; no crees otro repositorio.
-- Antes de modificar, inspecciona estado, archivos, historial, ramas, configuración e instrucciones.
 - Avanza por incrementos verificables y no implementes fases futuras sin una petición explícita.
+- Formula una hipótesis por incremento. Separa detección, propuesta, guarda y publicación para que un
+  resultado pueda atribuirse a una causa; una muestra pequeña puede descartar, pero no aprobar.
 - Mantén la arquitectura pequeña; evita capas, interfaces y abstracciones sin una necesidad actual.
 - Mantén PySide6 fuera de la lógica de procesamiento.
 - Mantén el sistema visual nuevo en `presentation/design_system.py`; `theme.py` es únicamente una
@@ -36,5 +52,12 @@
 - No registres contenido documental, prompts completos, respuestas completas ni rutas sensibles.
 - Conserva el contenido existente y evalúa las decisiones previas antes de cambiarlas.
 - Ejecuta pytest, `ruff check .` y `ruff format --check .` para cada cambio aplicable.
-- Actualiza README y arquitectura cuando cambien comportamiento, límites o decisiones.
+- Verifica en escalera: reproducción o prueba focal, contratos vecinos, lint/formato y suite completa
+  cuando cambie producto; después usa canarios, corpus, holdouts y revisión humana según el riesgo.
+- Actualiza primero la fuente autoritativa: arquitectura para comportamiento implementado, plan de
+  trabajo para progreso, política para decisiones de IA, aceptación para gates y README/guía para su
+  proyección a la persona. No dupliques el mismo estado en varios documentos.
+- Al cerrar, registra intención, evidencia, cambio, verificaciones, límites, decisión y condición para
+  reabrirla. Promueve referencias humanas y conserva rechazos como controles; no repitas variantes sin
+  un mecanismo nuevo.
 - No afirmes que algo funciona sin haber ejecutado la comprobación correspondiente.
